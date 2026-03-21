@@ -1,0 +1,434 @@
+{
+  "task_id": "18",
+  "repo_owner": "onecommons",
+  "repo_name": "unfurl",
+  "file_path": "unfurl/init.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T03:49:46+00:00",
+    "base_cache_source": "disk_cache",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T03:49:54+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T03:49:59+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "unfurl/init.py",
+    "original_code": "def _getEnsemblePaths(sourcePath, sourceProject):\n    # look for an ensemble-template or service-template in source path\n    template = _looksLike(sourcePath, DefaultNames.EnsembleTemplate)\n    if template:\n        return dict(sourceDir=template[0], ensembleTemplate=template[1])\n    template = _looksLike(sourcePath, DefaultNames.ServiceTemplate)\n    if template:\n        return dict(sourceDir=template[0], serviceTemplate=template[1])\n    else:\n        # we couldn't find one of the default template files, so treat sourcePath\n        # as a path to an ensemble\n        # XXX if sourcePath points to an explicit file we should check if it's a service template first\n        try:\n            localEnv = LocalEnv(sourcePath, project=sourceProject)\n            return dict(manifestPath=localEnv.manifestPath, localEnv=localEnv)\n        except:\n            # nothing found\n            return {}",
+    "satd_comment": "# XXX if sourcePath points to an explicit file we should check if it's a service template first",
+    "target_file": {
+      "ok": true,
+      "path": "unfurl/init.py",
+      "sha": "425e4c4832589d6ff138afd857152b6a87759bfe",
+      "download_url": "https://raw.githubusercontent.com/onecommons/unfurl/main/unfurl/init.py",
+      "content_excerpt": "# Copyright (c) 2020 Adam Souzis\n# SPDX-License-Identifier: MIT\n\"\"\"\nThis module implements creating and cloning project and ensembles as well Unfurl runtimes.\n\"\"\"\n\nimport datetime\nimport os\nimport os.path\nfrom typing import Any, Dict, Optional, Tuple, cast, TYPE_CHECKING\nimport uuid\nimport zipfile\nfrom jinja2.loaders import FileSystemLoader\nfrom pathlib import Path\n\nfrom . import DefaultNames, __version__, get_home_config_path, is_version_unreleased\nfrom .localenv import LocalEnv, Project, LocalConfig\nfrom .repo import (\n    GitRepo,\n    Repo,\n    is_url_or_git_path,\n    normalize_git_url,\n    split_git_url,\n    commit_secrets,\n    sanitize_url,\n)\nfrom .util import (\n    UnfurlBadDocumentError,\n    UnfurlError,\n    assert_not_none,\n    get_base_dir,\n    is_relative_to,\n    substitute_env,\n    API_VERSION,\n)\nfrom .tosca_plugins.functions import get_random_password\nfrom .yamlloader import make_yaml, make_vault_lib, yaml\nfrom .venv import init_engine\nfrom .logs import getLogger\nfrom toscaparser.prereq.csar import CSAR, TOSCA_META\n\nif TYPE_CHECKING:\n    from . import yamlmanifest\nlogger = getLogger(\"unfurl\")\n\n_skeleton_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), \"skeletons\")\n\n\ndef rename_for_backup(dir):\n    ctime = datetime.datetime.fromtimestamp(os.stat(dir).st_ctime)\n    new = dir + \".\" + ctime.strftime(\"%Y-%m-%d-%H-%M-%S\")\n    os.rename(dir, new)\n    return new\n\n\ndef _write_file(folder, filename, content) -> str:\n    if not os.path.isdir(folder):\n        os.makedirs(os.path.normpath(folder))\n    filepath = os.path.join(folder, filename)\n    with open(filepath, \"w\") as f:\n        f.write(content)\n    return filepath\n\n\ndef write_template(folder, filename, template, vars, templateDir=None) -> str:\n    from .eval import RefContext\n    from .runtime import NodeInstance\n    from .support import apply_template\n\n    if templateDir and not (os.path.isabs(templateDir) or templateDir[0] == \".\"):\n        # built-in template\n        templateDir = os.path.join(_skeleton_path, templateDir)\n\n    if templateDir:\n        searchPath = [templateDir, _skeleton_path]\n    else:\n        searchPath = [_skeleton_path]\n\n    if not templateDir or not os.path.exists(os.path.join(templateDir, template)):\n        # use default file if missing from templateDir\n        templateDir = _skeleton_path\n\n    with open(os.path.join(templateDir, template)) as f:\n        source = f.read()\n    if not source:\n        return source\n    instance = NodeInstance()\n    instance._baseDir = _skeleton_path\n\n    overrides = dict(loader=FileSystemLoader(searchPath))\n    content = apply_template(source, RefContext(instance, vars), overrides)\n    if folder is None:\n        return cast(str, content)\n    return _write_file(folder, filename, content)\n\n\ndef write_project_config(\n    projectdir,\n    filename=DefaultNames.LocalConfig,\n    templatePath=DefaultNames.LocalConfig + \".j2\",\n    vars=None,\n    templateDir=None,\n):\n    _vars = dict(include=\"\", manifestPath=None)\n    if vars:\n        _vars.update(vars)\n    return write_template(projectdir, filename, templatePath, _vars, templateDir)\n\n\ndef create_home(\n    home=None, render=False, replace=False, runtime=None, no_runtime=None, **kw\n) -> Optional[str]:\n    \"\"\"\n    Create the home project if missing\n    \"\"\"\n    homePath = get_home_config_path(home)\n    if not homePath:\n        return None\n    exists = os.path.exists(homePath)\n    if exists and not replace:\n        return None\n\n    skeleton = kw.pop(\"skeleton\", \"home\")\n    homedir, filename = os.path.split(homePath)\n    if render:  # just render\n        repo = Repo.find_containing_repo(homedir)\n        # XXX if repo and update: git stash; git checkout rendered\n        ensembleDir = os.path.join(homedir, DefaultNames.EnsembleDirectory)\n        ensembleRepo = Repo.find_containing_repo(ensembleDir)\n        configPath, password_vault = render_project(\n            homedir, repo, ensembleRepo, ensembleDir, skeleton\n        )\n        # XXX if repo and update: git commit -m\"updated\"; git checkout master; git stash pop\n        return configPath\n    else:\n        if exists:\n            rename_for_backup(homedir)\n        else:\n            logger.info(f\"Missing Unfurl home project at {homedir}, creating it now...\")\n\n    newHome, configPath, repo = create_project(\n        homedir,\n        mono=not kw.get(\"poly\"),\n        skeleton=skeleton,\n        runtime=runtime or \"venv:\",\n        no_runtime=no_runtime,\n        msg=\"Create the unfurl home repository\",\n        creating_home=True,\n        **kw,\n    )\n    if repo:\n        repo.repo.git.branch(\"rendered\")  # now create a branch\n    return configPath\n\n\ndef _create_repo(gitDir, ignore=True) -> GitRepo:\n    import git\n\n    if not os.path.isdir(gitDir):\n        os.makedirs(gitDir)\n    repo = git.Repo.init(gitDir)\n    repo.index.add(add_hidden_git_files(gitDir))\n    msg = f\"Initial Commit for {uuid.uuid1()}\"\n    repo.index.commit(msg)\n    repo.create_tag(\"INITIAL\", message=msg)\n\n    if ignore:\n        Repo.ignore_dir(gitDir)\n    return GitRepo(repo)\n\n\ndef write_service_template(projectdir, templateDir, vars):\n    return write_template(\n        projectdir,\n        \"service_template.py\",\n        \"service_template.py.j2\",\n        vars or {},\n        templateDir,\n    )\n\n\ndef write_ensemble_manifest(\n    destDir: str,\n    manifestName: str,\n    specRepo: Optional[GitRepo],\n    specDir=None,\n    extraVars=None,\n    templateDir=None,\n):\n    if specDir:\n        specDir = os.path.abspath(specDir)\n    else:\n        specDir = \"\"\n    if extraVars:\n        revision = extraVars.get(\"revision\") or \"\"\n    else:\n        revision = \"\"\n    if specRepo:\n        vars = dict(specRepoUrl=specRepo.get_url_with_path(specDir, True, revision))\n    else:\n        vars = {}\n    if extraVars:\n        vars.update(extraVars)\n    return write_template(destDir, manifestName, \"manifest.yaml.j2\", vars, templateDir)\n\n\ndef add_hidden_git_files(gitDir):\n    # write .gitignore and  .gitattributes\n    gitIgnorePath = write_template(gitDir, \".gitignore\", \"gitignore.j2\", {})\n    gitAttributesContent = (\n        f\"**/*{DefaultNames.JobsLog} merge=union\\n*.remotelock lockable\\n\"\n    )\n    gitAttributesPath = _write_file(gitDir, \".gitattributes\", gitAttributesContent)\n    return [os.path.abspath(gitIgnorePath), os.path.abspath(gitAttributesPath)]\n\n\ndef _warn_about_new_password(localProjectConfig):\n    logger.warning(\n        \"A password was generated and included in the local config file at %s -- \"\n        \"please keep this password safe, you will need it to decrypt any encrypted files \"\n        \"committed to the repository.\",\n        localProjectConfig,\n    )\n\n\ndef render_project(\n    projectdir: str,\n    projectrepo: Optional[GitRepo],\n    ensembleRepo: Optional[GitRepo],\n    ensembleDir: str = \"\",\n    templateDir: Optional[str] = None,\n    names: Any = DefaultNames,\n    use_context: Optional[str] = None,\n    use_vault=True,\n    skeleton_vars: Optional[Dict[str, Any]] = None,\n    ensemble_template=True,\n    defaultProject: Optional[str] = None,\n):\n    \"\"\"\n    Creates a folder named `projectdir` with a git repository with the following files:\n\n    unfurl.yaml\n    local/unfurl.yaml\n    ensemble-template.yaml\n    ensemble/ensemble.yaml\n\n    Returns the absolute path to unfurl.yaml\n    \"\"\"\n    assert os.path.isabs(projectdir), projectdir + \" must be an absolute path\"\n    # write the project files\n    localConfigFilename = names.LocalConfig\n\n    manifestName = names.Ensemble\n    ensembleDir = ensembleDir or os.path.join(projectdir, names.EnsembleDirectory)\n    ensemblePath = os.path.join(ensembleDir, manifestName)\n\n    if skeleton_vars:\n        vars = skeleton_vars.copy()\n    else:\n        vars = {}\n    if \"api_version\" not in vars:\n        vars[\"api_version\"] = API_VERSION\n    vars[\"defaultProject\"] = defaultProject\n    if use_vault:\n        if not vars.get(\"VAULT_PASSWORD\"):\n            vars[\"VAULT_PASSWORD\"] = get_random_password()\n        vaultpass = vars[\"VAULT_PASSWORD\"]\n        if \"vaultid\" not in vars:\n            # use project name plus a couple of random digits to avoid collisions\n            vars[\"vaultid\"] = (\n                Project.get_name_from_dir(projectdir)\n                + get_random_password(2, \"\", \"\").upper()\n            )\n        vaultid = vars[\"vaultid\"]\n    else:\n        vaultpass = vars[\"VAULT_PASSWORD\"] = \"\"\n        vaultid = \"\"\n\n    localProjectConfig = write_project_config(\n        os.path.join(projectdir, \"local\"),\n        localConfigFilename,\n        \"unfurl.local.yaml.j2\",\n        vars,\n        templateDir,\n    )\n\n    if localProjectConfig:\n        if use_vault and (not skeleton_vars or not skeleton_vars.get(\"VAULT_PASSWORD\")):\n            _warn_about_new_password(localProjectConfig)\n\n        localInclude = \"+?include-local: \" + os.path.join(\"local\", localConfigFilename)\n    else:\n        # no local config\n        use_vault = False\n        localInclude = \"\"\n\n    if use_vault:\n        write_project_config(\n            os.path.join(projectdir, \"secrets\"),\n            names.SecretsConfig,\n            \"secrets.yaml.j2\",\n            vars,\n            templateDir,\n        )\n        secretsInclude = \"+?include-secrets: \" + os.path.join(\n            \"secrets\", names.SecretsConfig\n        )\n    else:\n        secretsInclude = \"\"\n\n    # note: local overrides secrets\n    vars = dict(\n        include=secretsInclude + \"\\n\" + localInclude,\n        vaultid=vaultid,\n        api_version=API_VERSION,\n        defaultProject=defaultProject,\n    )\n    if skeleton_vars:\n        vars.update(skeleton_vars)\n    if use_context:  #  and not localExternal:\n        # since use_context was specified while creating the project set this as the default context\n        vars[\"default_context\"] = use_context\n    if ensembleRepo:\n        vars[\"manifestPath\"] = ensemblePath\n    projectConfigPath = write_project_config(\n        projectdir,\n        names.LocalConfig,\n        \"unfurl.yaml.j2\",\n        vars,\n        templateDir,\n    )\n    write_project_config(\n        projectdir,\n        names.LocalConfigTemplate,\n        \"local-unfurl-template.yaml.j2\",\n        vars,\n        templateDir,\n    )\n\n    if ensemble_template:\n        # write ensemble-template.yaml\n        write_template(\n            projectdir,\n            names.EnsembleTemplate,\n            \"manifest-template.yaml.j2\",\n            vars,\n            templateDir,\n        )\n        # write service_template.py\n        write_service_template(projectdir, templateDir, vars)\n\n    if ensembleRepo:\n        extraVars = dict(\n            ensembleUri=ensembleRepo.get_url_with_path(ensemblePath, True),\n            # include the ensembleTemplate in the root of the specDir\n            ensembleTemplate=names.EnsembleTemplate,\n            api_version=API_VERSION,\n        )\n        if skeleton_vars:\n            extraVars.update(skeleton_vars)\n            extraVars[\"inputs\"] = get_input_vars(skeleton_vars)\n        # write ensemble/ensemble.yaml\n        write_ensemble_manifest(\n            ensembleDir,\n            manifestName,\n            projectrepo,\n            projectdir,\n            extraVars=extraVars,\n            templateDir=templateDir,\n        )\n    return projectConfigPath, make_vault_lib(vaultpass, vaultid)\n\n\ndef _find_external_project(\n    projectdir: str, ensembleRepo: GitRepo, homePath: Optional[str], ensemble_name: str\n):\n    externalProject = None\n    ensembleDir = os.path.join(projectdir, ensemble_name)\n    externalProject = find_project(ensembleRepo.working_dir, homePath)\n    if externalProject:\n        dirname, ensembleDirName = os.path.split(projectdir)\n        if ensembleDirName == DefaultNames.ProjectDirectory:\n            ensembleDirName = os.path.basename(dirname)\n        relPath = externalProject.get_relative_path(\n            os.path.join(ensembleRepo.working_dir, ensembleDirName)\n        )\n        ensembleDir = externalProject.get_unique_path(relPath)\n    return externalProject, ensembleDir\n\n\ndef _find_project_repo(projectdir):\n    repo = Repo.find_containing_repo(proj",
+      "total_lines": 1464
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "datetime",
+        "os",
+        "os.path",
+        "typing:Any",
+        "typing:Dict",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:cast",
+        "typing:TYPE_CHECKING",
+        "uuid",
+        "zipfile",
+        "jinja2.loaders:FileSystemLoader",
+        "pathlib:Path",
+        ":DefaultNames",
+        ":__version__",
+        ":get_home_config_path",
+        ":is_version_unreleased",
+        "localenv:LocalEnv",
+        "localenv:Project",
+        "localenv:LocalConfig",
+        "repo:GitRepo",
+        "repo:Repo",
+        "repo:is_url_or_git_path",
+        "repo:normalize_git_url",
+        "repo:split_git_url",
+        "repo:commit_secrets",
+        "repo:sanitize_url",
+        "util:UnfurlBadDocumentError",
+        "util:UnfurlError",
+        "util:assert_not_none"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/onecommons/unfurl/main/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <img src=\"https://docs.unfurl.run/_images/unfurl_logo.svg\" width=\"400px\">\n</p>\n\n<p align=\"center\">\n  <a href=\"https://badge.fury.io/py/unfurl\"><img src=\"https://badge.fury.io/py/unfurl.svg\" alt=\"PyPI version\" height=\"20\"></a>\n</p>\n\n# Introduction\n\nUnfurl is a command line tool for deploying services and applications.\n\nDescribe your application architecture at a high-level using the [OASIS TOSCA](https://www.oasis-open.org/committees/tc_home.php?wg_abbrev=tosca) standard and Unfurl creates a plan adapted to your deployment environment (e.g. your cloud provider, Kubernetes, or self-hosted machines), using artifacts such as shell scripts, Terraform modules or Ansible playbooks.\n\nAfter deployment, Unfurl records in git all the information needed for a reproducible deployment: the configuration, the artifacts and source repositories used in deployment, as well the state of the deployed resources. This enables intelligent updates as your configuration, dependencies, or environment changes.\n\nThe best way to manage your Unfurl project is to use [Unfurl Cloud](https://unfurl.cloud), our open-source platform for collaboratively developing cloud applications.\n\n## Why use Unfurl?\n\n* You are developing an application consisting of several interconnected services. Even a relatively simple web application has many dependencies that cut across its stack and development and deployment processes. Unfurl can help [manage that complexity without complicated DevOps processes](https://www.unfurl.cloud/blog/why-unfurl).\n\n* You have users that want to deploy your application o"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_getEnsemblePaths test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_getEnsemblePaths(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "unfurl",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "unfurl/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "unfurl/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "changelog-schema.json",
+          "path": "unfurl/changelog-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "cloudmap-schema.json",
+          "path": "unfurl/cloudmap-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "cloudmap.py",
+          "path": "unfurl/cloudmap.py",
+          "type": "file"
+        },
+        {
+          "name": "configurator.py",
+          "path": "unfurl/configurator.py",
+          "type": "file"
+        },
+        {
+          "name": "configurators",
+          "path": "unfurl/configurators",
+          "type": "dir"
+        },
+        {
+          "name": "dsl.py",
+          "path": "unfurl/dsl.py",
+          "type": "file"
+        },
+        {
+          "name": "eval.py",
+          "path": "unfurl/eval.py",
+          "type": "file"
+        },
+        {
+          "name": "filter_plugins",
+          "path": "unfurl/filter_plugins",
+          "type": "dir"
+        },
+        {
+          "name": "graphql.py",
+          "path": "unfurl/graphql.py",
+          "type": "file"
+        },
+        {
+          "name": "init.py",
+          "path": "unfurl/init.py",
+          "type": "file"
+        },
+        {
+          "name": "job.py",
+          "path": "unfurl/job.py",
+          "type": "file"
+        },
+        {
+          "name": "localenv.py",
+          "path": "unfurl/localenv.py",
+          "type": "file"
+        },
+        {
+          "name": "lock.py",
+          "path": "unfurl/lock.py",
+          "type": "file"
+        },
+        {
+          "name": "logs.py",
+          "path": "unfurl/logs.py",
+          "type": "file"
+        },
+        {
+          "name": "lookup_plugins",
+          "path": "unfurl/lookup_plugins",
+          "type": "dir"
+        },
+        {
+          "name": "manifest-schema.json",
+          "path": "unfurl/manifest-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "manifest.py",
+          "path": "unfurl/manifest.py",
+          "type": "file"
+        },
+        {
+          "name": "merge.py",
+          "path": "unfurl/merge.py",
+          "type": "file"
+        },
+        {
+          "name": "packages.py",
+          "path": "unfurl/packages.py",
+          "type": "file"
+        },
+        {
+          "name": "plan.py",
+          "path": "unfurl/plan.py",
+          "type": "file"
+        },
+        {
+          "name": "planrequests.py",
+          "path": "unfurl/planrequests.py",
+          "type": "file"
+        },
+        {
+          "name": "projectpaths.py",
+          "path": "unfurl/projectpaths.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "unfurl/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "repo.py",
+          "path": "unfurl/repo.py",
+          "type": "file"
+        },
+        {
+          "name": "reporting.py",
+          "path": "unfurl/reporting.py",
+          "type": "file"
+        },
+        {
+          "name": "result.py",
+          "path": "unfurl/result.py",
+          "type": "file"
+        },
+        {
+          "name": "runtime.py",
+          "path": "unfurl/runtime.py",
+          "type": "file"
+        },
+        {
+          "name": "server",
+          "path": "unfurl/server",
+          "type": "dir"
+        },
+        {
+          "name": "skeletons",
+          "path": "unfurl/skeletons",
+          "type": "dir"
+        },
+        {
+          "name": "solver.py",
+          "path": "unfurl/solver.py",
+          "type": "file"
+        },
+        {
+          "name": "spec.py",
+          "path": "unfurl/spec.py",
+          "type": "file"
+        },
+        {
+          "name": "support.py",
+          "path": "unfurl/support.py",
+          "type": "file"
+        },
+        {
+          "name": "templates",
+          "path": "unfurl/templates",
+          "type": "dir"
+        },
+        {
+          "name": "testing.py",
+          "path": "unfurl/testing.py",
+          "type": "file"
+        },
+        {
+          "name": "to_json.py",
+          "path": "unfurl/to_json.py",
+          "type": "file"
+        },
+        {
+          "name": "tosca_plugins",
+          "path": "unfurl/tosca_plugins",
+          "type": "dir"
+        },
+        {
+          "name": "unfurl-schema.json",
+          "path": "unfurl/unfurl-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "util.py",
+          "path": "unfurl/util.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "unfurl/__init__.py"
+        },
+        {
+          "name": "__main__.py",
+          "path": "unfurl/__main__.py"
+        },
+        {
+          "name": "changelog-schema.json",
+          "path": "unfurl/changelog-schema.json"
+        },
+        {
+          "name": "cloudmap-schema.json",
+          "path": "unfurl/cloudmap-schema.json"
+        },
+        {
+          "name": "cloudmap.py",
+          "path": "unfurl/cloudmap.py"
+        },
+        {
+          "name": "configurator.py",
+          "path": "unfurl/configurator.py"
+        },
+        {
+          "name": "dsl.py",
+          "path": "unfurl/dsl.py"
+        },
+        {
+          "name": "eval.py",
+          "path": "unfurl/eval.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "unfurl/init.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "8f7a8357c1edca1d64a01b70464d5b530878aa7a",
+          "html_url": "https://github.com/onecommons/unfurl/commit/8f7a8357c1edca1d64a01b70464d5b530878aa7a",
+          "message": "fix(cli): abort with error if job or init --var arguments are repeated with the same name.",
+          "author": "Adam Souzis",
+          "date": "2025-08-16T16:37:07Z"
+        },
+        {
+          "sha": "bbd4b5f8b35d62f63770239ffce6c623329ba985",
+          "html_url": "https://github.com/onecommons/unfurl/commit/bbd4b5f8b35d62f63770239ffce6c623329ba985",
+          "message": "feat(init): add vaultid skeleton var to create projects with ansible vault encryption.",
+          "author": "Adam Souzis",
+          "date": "2025-07-12T01:33:59Z"
+        },
+        {
+          "sha": "9729611ace7417848f5aec11ae16ef00e5900e03",
+          "html_url": "https://github.com/onecommons/unfurl/commit/9729611ace7417848f5aec11ae16ef00e5900e03",
+          "message": "feat(init): Revamp how ensembles and project are registered:\n\n* When creating an ensemble, always register it instead of relying on the project skeleton.\n* Allow \"defaultProject: SELF\" in an environment to indicate that the project manages it.\n* When loading a project only register and update its pa",
+          "author": "Adam Souzis",
+          "date": "2025-04-14T02:14:42Z"
+        },
+        {
+          "sha": "92f70a2da725345a20b27ebbe533bbdf338ae651",
+          "html_url": "https://github.com/onecommons/unfurl/commit/92f70a2da725345a20b27ebbe533bbdf338ae651",
+          "message": "feat(cli): Add a --register project option to the home command.",
+          "author": "Adam Souzis",
+          "date": "2025-04-14T01:41:52Z"
+        },
+        {
+          "sha": "56055bcc7a6f65a022f225ef4a226b23ed5a054a",
+          "html_url": "https://github.com/onecommons/unfurl/commit/56055bcc7a6f65a022f225ef4a226b23ed5a054a",
+          "message": "feat(init): Add --design option to init cli command.",
+          "author": "Adam Souzis",
+          "date": "2025-04-10T04:57:12Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_getEnsemblePaths sourcePath points explicit file should",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "unfurl/init.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "8f7a8357c1edca1d64a01b70464d5b530878aa7a",
+        "html_url": "https://github.com/onecommons/unfurl/commit/8f7a8357c1edca1d64a01b70464d5b530878aa7a",
+        "message": "fix(cli): abort with error if job or init --var arguments are repeated with the same name.",
+        "author": "Adam Souzis",
+        "date": "2025-08-16T16:37:07Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function _getEnsemblePaths",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

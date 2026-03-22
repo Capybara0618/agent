@@ -1,0 +1,470 @@
+{
+  "task_id": "417",
+  "repo_owner": "onecommons",
+  "repo_name": "unfurl",
+  "file_path": "unfurl/util.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T08:28:25+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T08:28:37+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T08:28:40+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "unfurl/util.py",
+    "original_code": "# XXX: can't infer arg \"default\"'s type for now\ndef lookup_class(\n    kind: str, apiVersion: Optional[str] = None, default: Optional[str] = None\n) -> object:\n    if kind in _ClassRegistry:\n        return _ClassRegistry[kind]\n    elif kind in _shortNameRegistry:\n        className = _shortNameRegistry[kind]\n    else:\n        className = kind\n    try:\n        klass = load_class(className)\n    except ImportError:\n        klass = None\n\n    if klass:\n        register_class(className, klass)\n    return klass",
+    "satd_comment": "# XXX: can't infer arg \"default\"'s type for now",
+    "target_file": {
+      "ok": true,
+      "path": "unfurl/util.py",
+      "sha": "f75b9dbaca22b925fceb5f1c2d835fe95b21b143",
+      "download_url": "https://raw.githubusercontent.com/onecommons/unfurl/main/unfurl/util.py",
+      "content_excerpt": "# Copyright (c) 2020 Adam Souzis\n# SPDX-License-Identifier: MIT\nfrom pathlib import Path\nimport sys\nfrom types import ModuleType\nfrom typing import (\n    IO,\n    Any,\n    Dict,\n    Generator,\n    Iterable,\n    List,\n    MutableMapping,\n    Optional,\n    Sequence,\n    Tuple,\n    Type,\n    TypeVar,\n    Union,\n    Iterator,\n    TYPE_CHECKING,\n    cast,\n    overload,\n)\nfrom typing_extensions import SupportsIndex\nimport traceback\nimport itertools\nimport tempfile\nimport atexit\nimport json\nimport re\nimport os\nimport fnmatch\nimport shutil\nfrom collections.abc import Mapping, MutableSequence\nimport os.path\nfrom jsonschema import Draft7Validator, validators, RefResolver\nimport jsonschema.exceptions\nfrom ruamel.yaml.scalarstring import ScalarString, FoldedScalarString\nfrom ansible.parsing.vault import VaultEditor\nfrom ansible.module_utils._text import (\n    to_text,\n    to_bytes,\n    to_native,\n)  # BSD licensed  # noqa: F401\nfrom ansible.utils.unsafe_proxy import AnsibleUnsafeText, AnsibleUnsafeBytes\nimport warnings\nimport codecs\nimport io\nfrom contextlib import contextmanager\nfrom click.termui import unstyle\n\nfrom shutil import which  # noqa: F401\nimport importlib\nimport importlib.util\nfrom .logs import LogExtraLevels, sensitive, is_sensitive\nimport logging\n\n# Used for python typing, prevents circular imports\n# TYPE_CHECKING is always false at runtime\nif TYPE_CHECKING:\n    from .job import ConfigTask\n    from unfurl.configurator import TaskView\n\nlogger = logging.getLogger(\"unfurl\")\n\nAPI_VERSION = \"unfurl/v1.0.0\"\n\ntry:\n    from importlib.metadata import files\nexcept ImportError:\n    from importlib_metadata import files  # type: ignore\n\n_basepath = os.path.abspath(os.path.dirname(__file__))\n\n_package_digest: Optional[str] = None\n\n\ndef get_package_digest() -> str:\n    global _package_digest\n    if _package_digest is not None:\n        return _package_digest\n\n    from git import Repo\n\n    basedir = os.path.dirname(_basepath)\n    if os.path.isdir(os.path.join(basedir, \".git\")):\n        repo = Repo(basedir)\n        # same as pbr's git_version\n        _package_digest = repo.git.log(n=1, pretty=\"format:%h\")\n    else:\n        _package_digest = \"\"\n        pkg_files = files(\"unfurl\")\n        if pkg_files:\n            try:\n                pbr = [p for p in pkg_files if \"pbr.json\" in str(p)][0]\n                _package_digest = json.loads(pbr.read_text())[\"git_version\"]\n            except Exception:  # no git or pbr.json\n                _package_digest = \"\"\n    return str(_package_digest)\n\n\nclass UnfurlError(Exception):\n    def __init__(\n        self, message: object, saveStack: bool = False, log: bool = False\n    ) -> None:\n        stackInfo = None\n        if saveStack:\n            (e_type, e, traceback) = sys.exc_info()\n            if e:\n                message = str(message) + \": \" + str(e)\n                stackInfo = (e_type, e, traceback)\n        super().__init__(message)\n        self.stackInfo = stackInfo\n        if log:\n            logger.error(message, exc_info=True)\n\n    def get_stack_trace(self) -> str:\n        if not self.stackInfo:\n            return \"\"\n        return \"\".join(traceback.format_exception(*self.stackInfo))\n\n\nclass UnfurlValidationError(UnfurlError):\n    def __init__(\n        self,\n        message: object,\n        errors: Optional[List[Exception]] = None,\n        log: bool = False,\n    ) -> None:\n        super().__init__(message, log=log)\n        self.errors = errors or []\n\n\nclass UnfurlBadDocumentError(UnfurlError):\n    def __init__(\n        self,\n        message: object,\n        errors: Optional[Tuple[str, List[object]]] = None,\n        doc: Optional[dict] = None,\n        saveStack: bool = False,\n    ) -> None:\n        super().__init__(message, saveStack=saveStack)\n        self.errors = cast(Tuple[str, List[object]], errors or [])\n        self.doc = doc\n\n\nclass UnfurlSchemaError(UnfurlBadDocumentError):\n    pass\n\n\nclass UnfurlTaskError(UnfurlError):\n    def __init__(\n        self,\n        task: \"TaskView\",\n        message: object,\n        log: int = logging.ERROR,\n        dependency=None,\n    ):\n        task = cast(\"ConfigTask\", task)\n        super().__init__(message, True, False)\n        self.task = task\n        task._errors.append(self)\n        self.severity = log\n        self.dependency = dependency  # what caused the error\n        if log:\n            task.logger.log(log, message, exc_info=True)\n\n\nclass UnfurlAddingResourceError(UnfurlTaskError):\n    def __init__(\n        self,\n        task: \"TaskView\",\n        resourceSpec: Mapping,\n        name: str,\n        log: int = logging.DEBUG,\n    ) -> None:\n        message = f'error updating resource \"{name}\"'\n        super().__init__(task, message, log)\n        self.resourceSpec = resourceSpec\n\n\ndef wrap_sensitive_value(obj: object):\n    # convert to sensitive obj if possible or return the original object\n    # Note: we don't remember the vault and vault id associated with this value\n    # so the value will be rekeyed with whichever vault is associated with the serializing yaml\n    if isinstance(obj, sensitive):\n        return obj\n    elif isinstance(obj, bytes):\n        return sensitive_bytes(obj)\n    elif isinstance(obj, str):\n        return sensitive_str(obj)\n    elif isinstance(obj, Mapping):\n        return sensitive_dict(obj)\n    elif isinstance(obj, MutableSequence):\n        return sensitive_list(obj)\n    else:\n        return obj\n\n\n# also mark AnsibleUnsafe so wrap_var doesn't strip out sensitive status\nclass sensitive_bytes(AnsibleUnsafeBytes, sensitive):\n    \"\"\"Transparent wrapper class to mark bytes as sensitive\"\"\"\n\n    def decode(self, *args: List[object], **kwargs: Mapping) -> \"sensitive_str\":\n        \"\"\"Wrapper method to ensure type conversions maintain sensitive context\"\"\"\n        return sensitive_str(super().decode(*args, **kwargs))\n\n\n# also mark AnsibleUnsafe so wrap_var doesn't strip out sensitive status\nclass sensitive_str(AnsibleUnsafeText, sensitive):\n    \"\"\"Transparent wrapper class to mark a str as sensitive\"\"\"\n\n    def encode(self, *args: List[object], **kwargs: Mapping) -> \"sensitive_bytes\":\n        \"\"\"Wrapper method to ensure type conversions maintain sensitive context\"\"\"\n        return sensitive_bytes(super().encode(*args, **kwargs))\n\n\nclass sensitive_dict(dict, sensitive):\n    \"\"\"Transparent wrapper class to mark a dict as sensitive\"\"\"\n\n\nclass sensitive_list(list, sensitive):\n    \"\"\"Transparent wrapper class to mark a list as sensitive\"\"\"\n\n\ndef to_yaml_text(\n    val: object,\n) -> Union[sensitive, ScalarString, FoldedScalarString, str]:\n    if isinstance(val, (ScalarString, sensitive)):\n        return val\n    # convert or copy string (copy to deal with things like AnsibleUnsafeText)\n    val = str(val)\n    if \"\\n\" in val:\n        return FoldedScalarString(val)\n    return val\n\n\n_T = TypeVar(\"_T\")\n\n\ndef assert_not_none(val: Optional[_T]) -> _T:\n    if val is None:\n        raise TypeError(\"Value can't be None\")\n    return val\n\n\n@overload\ndef assert_form(src: Any, *, test: bool = True) -> Mapping: ...\n\n\n@overload\ndef assert_form(src: Any, types: Type[_T], test: bool = True) -> _T: ...\n\n\n# abstract classes can't be Type[_T], fallback to this hack\n@overload\ndef assert_form(src: Any, types: Any, test: bool = True) -> MutableSequence: ...\n\n\ndef assert_form(src: Any, types=Mapping, test: bool = True):\n    if not isinstance(src, types) or not test:\n        raise TypeError(f\"Wrong shape: {src} isn't a {types}\")\n    return src\n\n\n_ClassRegistry = {}  # type: ignore\n_shortNameRegistry = {}  # type: ignore\n\n\ndef register_short_names(shortNames: Union[Mapping, Iterable]) -> None:\n    _shortNameRegistry.update(shortNames)\n\n\ndef register_class(\n    className: str, factory: object, short_name: str = None, replace: bool = True\n) -> None:\n    if short_name:\n        _shortNameRegistry[short_name] = className\n    if not replace and className in _ClassRegistry:\n        if _ClassRegistry[className] is not factory:\n            raise UnfurlError(f\"class already registered for {className}\")\n    _ClassRegistry[className] = factory\n\n\ndef load_module(path: str, full_name: str = None) -> ModuleType:\n    if full_name is None:\n        full_name = re.sub(r\"\\W\", \"_\", path)  # generate a name from the path\n    if full_name in sys.modules:\n        return sys.modules[full_name]\n\n    with warnings.catch_warnings():\n        warnings.simplefilter(\"ignore\", RuntimeWarning)\n        spec = importlib.util.spec_from_file_location(full_name, os.path.abspath(path))\n        # XXX: spec might be None\n        module = importlib.util.module_from_spec(spec)  # type: ignore\n        spec.loader.exec_module(module)  # type: ignore\n        sys.modules[full_name] = module\n    return module\n\n\ndef load_class(klass: str, defaultModule: str = \"__main__\") -> object:\n    prefix, sep, suffix = klass.rpartition(\".\")\n    module = importlib.import_module(prefix or defaultModule)\n    return getattr(module, suffix, None)\n\n\n_shortNameRegistry = {}\n\n\ndef check_class_registry(kind: str) -> bool:\n    return kind in _ClassRegistry or kind in _shortNameRegistry\n\n\ndef lookup_class(kind: str) -> object:\n    if kind in _ClassRegistry:\n        return _ClassRegistry[kind]\n    elif kind in _shortNameRegistry:\n        className = _shortNameRegistry[kind]\n    else:\n        className = kind\n    try:\n        klass = load_class(className)\n    except ImportError:\n        klass = None\n\n    if klass:\n        register_class(className, klass)\n    return klass\n\n\ndef to_enum(enum, value, default=None):  # type: ignore\n    # from string: Status[name]; to string: status.name\n    if isinstance(value, str):\n        return enum[value]\n    elif default is not None and not value:\n        return default\n    elif isinstance(value, int):\n        return enum(value)\n    else:\n        return value\n\n\ndef to_dotenv(env: dict) -> str:\n    # https://hexdocs.pm/dotenvy/dotenv-file-format.html\n    keys = []\n    for k, v in env.items():\n        # k should be [a-zA-Z_]+[a-zA-Z0-9_]*\n        value = str(v)\n        if value.isalnum():\n            # always single quote to prevent interpolation\n            keys.append(f\"{k}='{value}'\")\n        else:\n            keys.append(f\"{k}={repr(value)}\")\n    return \"\\n\".join(keys)\n\n\ndef dump(\n    obj: object,\n    tp: IO[bytes],\n    suffix: str = \"\",\n    yaml: Optional[ModuleType] = None,\n    encoding: Optional[str] = None,\n) -> None:\n    from .yamlloader import yaml as _yaml\n\n    try:\n        textEncoding = (\n            \"utf-8\" if encoding in [None, \"yaml\", \"vault\", \"json\", \"env\"] else encoding\n        )\n        f = io.TextIOWrapper(tp, textEncoding)\n        explicit = encoding is not None\n        if encoding == \"yaml\" or (\n            not explicit and (suffix.endswith(\".yml\") or suffix.endswith(\".yaml\"))\n        ):\n            (yaml or _yaml).dump(obj, f)\n            return\n        elif encoding == \"json\" or (not explicit and suffix.endswith(\".json\")):\n            json.dump(obj, f, indent=2)  # str to bytes\n            return\n\n        if isinstance(obj, str):\n            obj = codecs.encode(obj, encoding or \"utf-8\")\n        if isinstance(obj, bytes):\n            tp.write(obj)\n            return\n\n        if (suffix.endswith(\".env\") or encoding == \"env\") and isinstance(obj, dict):\n            tp.write(codecs.encode(to_dotenv(obj), \"utf-8\"))  # type: ignore\n            return\n\n        # try to dump any other object as json\n        if obj is not None:  # treat None as 0 byte file\n            json.dump(obj, f, indent=2, sort_keys=True)\n    finally:\n        f.detach()\n\n\ndef _save_to_vault(\n    path: str,\n    obj: object,\n    yaml: Optional[ModuleType] = None,\n    encoding: Optional[str] = None,\n    fd: Union[str, int] = None,\n) -> bool:\n    vaultExt = path.endswith(\".vault\")\n    if vaultExt or encoding == \"vault\":\n        assert yaml and yaml.representer.vault and yaml.representer.vault.secrets\n        vaultlib = yaml.representer.vault\n        vault = VaultEditor(vaultlib)\n        f = io.BytesIO()\n        vpath = path[: -len(\".vault\")] if vaultExt else path\n        dump(obj, f",
+      "total_lines": 862
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "pathlib:Path",
+        "sys",
+        "types:ModuleType",
+        "typing:IO",
+        "typing:Any",
+        "typing:Dict",
+        "typing:Generator",
+        "typing:Iterable",
+        "typing:List",
+        "typing:MutableMapping",
+        "typing:Optional",
+        "typing:Sequence",
+        "typing:Tuple",
+        "typing:Type",
+        "typing:TypeVar",
+        "typing:Union",
+        "typing:Iterator",
+        "typing:TYPE_CHECKING",
+        "typing:cast",
+        "typing:overload",
+        "typing_extensions:SupportsIndex",
+        "traceback",
+        "itertools",
+        "tempfile",
+        "atexit",
+        "json",
+        "re",
+        "os",
+        "fnmatch",
+        "shutil"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/onecommons/unfurl/main/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <img src=\"https://docs.unfurl.run/_images/unfurl_logo.svg\" width=\"400px\">\n</p>\n\n<p align=\"center\">\n  <a href=\"https://badge.fury.io/py/unfurl\"><img src=\"https://badge.fury.io/py/unfurl.svg\" alt=\"PyPI version\" height=\"20\"></a>\n</p>\n\n# Introduction\n\nUnfurl is a command line tool for deploying services and applications.\n\nDescribe your application architecture at a high-level using the [OASIS TOSCA](https://www.oasis-open.org/committees/tc_home.php?wg_abbrev=tosca) standard and Unfurl creates a plan adapted to your deployment environment (e.g. your cloud provider, Kubernetes, or self-hosted machines), using artifacts such as shell scripts, Terraform modules or Ansible playbooks.\n\nAfter deployment, Unfurl records in git all the information needed for a reproducible deployment: the configuration, the artifacts and source repositories used in deployment, as well the state of the deployed resources. This enables intelligent updates as your configuration, dependencies, or environment changes.\n\nThe best way to manage your Unfurl project is to use [Unfurl Cloud](https://unfurl.cloud), our open-source platform for collaboratively developing cloud applications.\n\n## Why use Unfurl?\n\n* You are developing an application consisting of several interconnected services. Even a relatively simple web application has many dependencies that cut across its stack and development and deployment processes. Unfurl can help [manage that complexity without complicated DevOps processes](https://www.unfurl.cloud/blog/why-unfurl).\n\n* You have users that want to deploy your application o"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "lookup_class test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_runtime.py",
+          "path": "tests/test_runtime.py",
+          "sha": "164e53b704415cfc74b3f4bf211d3d1eb1d3ecf6",
+          "html_url": "https://github.com/onecommons/unfurl/blob/65b47ce0551c5e7fe8153f6b3d46bcb4f75b2949/tests/test_runtime.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"lookup_class(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "_tosca.py",
+          "path": "tosca-package/tosca/_tosca.py",
+          "sha": "224b9610badb17963cf5c18d05ea7e609b4243ea",
+          "html_url": "https://github.com/onecommons/unfurl/blob/65b47ce0551c5e7fe8153f6b3d46bcb4f75b2949/tosca-package/tosca/_tosca.py",
+          "score": 1.0
+        },
+        {
+          "name": "util.py",
+          "path": "unfurl/util.py",
+          "sha": "f75b9dbaca22b925fceb5f1c2d835fe95b21b143",
+          "html_url": "https://github.com/onecommons/unfurl/blob/65b47ce0551c5e7fe8153f6b3d46bcb4f75b2949/unfurl/util.py",
+          "score": 1.0
+        },
+        {
+          "name": "planrequests.py",
+          "path": "unfurl/planrequests.py",
+          "sha": "ba8163119ff719b86e93aeaf50339cf35f9bfd8f",
+          "html_url": "https://github.com/onecommons/unfurl/blob/65b47ce0551c5e7fe8153f6b3d46bcb4f75b2949/unfurl/planrequests.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_runtime.py",
+          "path": "tests/test_runtime.py",
+          "sha": "164e53b704415cfc74b3f4bf211d3d1eb1d3ecf6",
+          "html_url": "https://github.com/onecommons/unfurl/blob/65b47ce0551c5e7fe8153f6b3d46bcb4f75b2949/tests/test_runtime.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "unfurl",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "unfurl/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "unfurl/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "changelog-schema.json",
+          "path": "unfurl/changelog-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "cloudmap-schema.json",
+          "path": "unfurl/cloudmap-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "cloudmap.py",
+          "path": "unfurl/cloudmap.py",
+          "type": "file"
+        },
+        {
+          "name": "configurator.py",
+          "path": "unfurl/configurator.py",
+          "type": "file"
+        },
+        {
+          "name": "configurators",
+          "path": "unfurl/configurators",
+          "type": "dir"
+        },
+        {
+          "name": "dsl.py",
+          "path": "unfurl/dsl.py",
+          "type": "file"
+        },
+        {
+          "name": "eval.py",
+          "path": "unfurl/eval.py",
+          "type": "file"
+        },
+        {
+          "name": "filter_plugins",
+          "path": "unfurl/filter_plugins",
+          "type": "dir"
+        },
+        {
+          "name": "graphql.py",
+          "path": "unfurl/graphql.py",
+          "type": "file"
+        },
+        {
+          "name": "init.py",
+          "path": "unfurl/init.py",
+          "type": "file"
+        },
+        {
+          "name": "job.py",
+          "path": "unfurl/job.py",
+          "type": "file"
+        },
+        {
+          "name": "localenv.py",
+          "path": "unfurl/localenv.py",
+          "type": "file"
+        },
+        {
+          "name": "lock.py",
+          "path": "unfurl/lock.py",
+          "type": "file"
+        },
+        {
+          "name": "logs.py",
+          "path": "unfurl/logs.py",
+          "type": "file"
+        },
+        {
+          "name": "lookup_plugins",
+          "path": "unfurl/lookup_plugins",
+          "type": "dir"
+        },
+        {
+          "name": "manifest-schema.json",
+          "path": "unfurl/manifest-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "manifest.py",
+          "path": "unfurl/manifest.py",
+          "type": "file"
+        },
+        {
+          "name": "merge.py",
+          "path": "unfurl/merge.py",
+          "type": "file"
+        },
+        {
+          "name": "packages.py",
+          "path": "unfurl/packages.py",
+          "type": "file"
+        },
+        {
+          "name": "plan.py",
+          "path": "unfurl/plan.py",
+          "type": "file"
+        },
+        {
+          "name": "planrequests.py",
+          "path": "unfurl/planrequests.py",
+          "type": "file"
+        },
+        {
+          "name": "projectpaths.py",
+          "path": "unfurl/projectpaths.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "unfurl/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "repo.py",
+          "path": "unfurl/repo.py",
+          "type": "file"
+        },
+        {
+          "name": "reporting.py",
+          "path": "unfurl/reporting.py",
+          "type": "file"
+        },
+        {
+          "name": "result.py",
+          "path": "unfurl/result.py",
+          "type": "file"
+        },
+        {
+          "name": "runtime.py",
+          "path": "unfurl/runtime.py",
+          "type": "file"
+        },
+        {
+          "name": "server",
+          "path": "unfurl/server",
+          "type": "dir"
+        },
+        {
+          "name": "skeletons",
+          "path": "unfurl/skeletons",
+          "type": "dir"
+        },
+        {
+          "name": "solver.py",
+          "path": "unfurl/solver.py",
+          "type": "file"
+        },
+        {
+          "name": "spec.py",
+          "path": "unfurl/spec.py",
+          "type": "file"
+        },
+        {
+          "name": "support.py",
+          "path": "unfurl/support.py",
+          "type": "file"
+        },
+        {
+          "name": "templates",
+          "path": "unfurl/templates",
+          "type": "dir"
+        },
+        {
+          "name": "testing.py",
+          "path": "unfurl/testing.py",
+          "type": "file"
+        },
+        {
+          "name": "to_json.py",
+          "path": "unfurl/to_json.py",
+          "type": "file"
+        },
+        {
+          "name": "tosca_plugins",
+          "path": "unfurl/tosca_plugins",
+          "type": "dir"
+        },
+        {
+          "name": "unfurl-schema.json",
+          "path": "unfurl/unfurl-schema.json",
+          "type": "file"
+        },
+        {
+          "name": "util.py",
+          "path": "unfurl/util.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "unfurl/__init__.py"
+        },
+        {
+          "name": "__main__.py",
+          "path": "unfurl/__main__.py"
+        },
+        {
+          "name": "changelog-schema.json",
+          "path": "unfurl/changelog-schema.json"
+        },
+        {
+          "name": "cloudmap-schema.json",
+          "path": "unfurl/cloudmap-schema.json"
+        },
+        {
+          "name": "cloudmap.py",
+          "path": "unfurl/cloudmap.py"
+        },
+        {
+          "name": "configurator.py",
+          "path": "unfurl/configurator.py"
+        },
+        {
+          "name": "dsl.py",
+          "path": "unfurl/dsl.py"
+        },
+        {
+          "name": "eval.py",
+          "path": "unfurl/eval.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "unfurl/util.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "873ca4a519c2647168380c96ea603126e8476664",
+          "html_url": "https://github.com/onecommons/unfurl/commit/873ca4a519c2647168380c96ea603126e8476664",
+          "message": "docs: various updates and additions to api docs",
+          "author": "Adam Souzis",
+          "date": "2025-09-16T07:43:09Z"
+        },
+        {
+          "sha": "23f3b81963c2f14920b5d8d11bdccda8080e28d2",
+          "html_url": "https://github.com/onecommons/unfurl/commit/23f3b81963c2f14920b5d8d11bdccda8080e28d2",
+          "message": "feat(cli): make --skip-upstream-check the default and deprecate it. Add --check-upstream / $UNFURL_CHECK_UPSTREAM global option to enable checking upstream repositories",
+          "author": "Adam Souzis",
+          "date": "2025-08-23T04:57:44Z"
+        },
+        {
+          "sha": "ac99a0603074343f53bbae08853ae4a0a6ff53e7",
+          "html_url": "https://github.com/onecommons/unfurl/commit/ac99a0603074343f53bbae08853ae4a0a6ff53e7",
+          "message": "fix(runtime): fix unexpected template evaluation:\n\n* \"q\" expression should mark strings to prevent from being parsed jinja2 templates later\n* don't try to parse outputs from terraform or shell output as jinja2 templates\n* prevent jinaj2 templates that evaluated to dicts from being evaluated as eval ",
+          "author": "Adam Souzis",
+          "date": "2025-05-10T00:24:01Z"
+        },
+        {
+          "sha": "e72ca434f724fde99e4bb94cd9b3243810af1013",
+          "html_url": "https://github.com/onecommons/unfurl/commit/e72ca434f724fde99e4bb94cd9b3243810af1013",
+          "message": "logs: more concise logging of filtered tasks and other logging tweaks.",
+          "author": "Adam Souzis",
+          "date": "2025-05-04T03:38:30Z"
+        },
+        {
+          "sha": "00c26a5cd4cc4fe84c7bd8b2b14db7cf71e6c729",
+          "html_url": "https://github.com/onecommons/unfurl/commit/00c26a5cd4cc4fe84c7bd8b2b14db7cf71e6c729",
+          "message": "utils: add helper for including and excluding files\n\nAnd wire it up with unfurl.yaml but leave unused for now.",
+          "author": "Adam Souzis",
+          "date": "2025-04-12T23:01:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "lookup_class infer default type",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "unfurl/util.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "873ca4a519c2647168380c96ea603126e8476664",
+        "html_url": "https://github.com/onecommons/unfurl/commit/873ca4a519c2647168380c96ea603126e8476664",
+        "message": "docs: various updates and additions to api docs",
+        "author": "Adam Souzis",
+        "date": "2025-09-16T07:43:09Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

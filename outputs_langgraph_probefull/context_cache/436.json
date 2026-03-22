@@ -1,0 +1,359 @@
+{
+  "task_id": "436",
+  "repo_owner": "locustio",
+  "repo_name": "locust",
+  "file_path": "locust/runners.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T08:35:54+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T08:36:04+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T08:36:10+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "locust/runners.py",
+    "original_code": "def spawn_locusts(self, spawn_count=None, stop_timeout=None, wait=False):\n    if spawn_count is None:\n        spawn_count = self.num_clients\n\n    if self.num_requests is not None:\n        RequestStats.global_max_requests = self.num_requests\n\n    bucket = self.weight_locusts(spawn_count, stop_timeout)\n    spawn_count = len(bucket)\n    if self.state == STATE_INIT or self.state == STATE_STOPPED:\n        self.state = STATE_HATCHING\n        self.num_clients = spawn_count\n    else:\n        self.num_clients += spawn_count\n\n    logger.info(\"Hatching and swarming %i clients at the rate %g clients/s...\" % (spawn_count, self.hatch_rate))\n    occurence_count = dict([(l.__name__, 0) for l in self.locust_classes])\n\n    def hatch():\n        sleep_time = 1.0 / self.hatch_rate\n        while True:\n            if not bucket:\n                logger.info(\"All locusts hatched: %s\" % \", \".join([\"%s: %d\" % (name, count) for name, count in occurence_count.iteritems()]))\n                events.hatch_complete.fire(self.num_clients)\n                return\n\n            locust = bucket.pop(random.randint(0, len(bucket)-1))\n            occurence_count[locust.__name__] += 1\n            def start_locust(_):\n                try:\n                    locust().run()\n                except GreenletExit:\n                    pass\n            new_locust = self.locusts.spawn(start_locust, locust)\n            if len(self.locusts) % 10 == 0:\n                logger.debug(\"%i locusts hatched\" % len(self.locusts))\n            gevent.sleep(sleep_time)\n\n    hatch()\n    if wait:\n        self.locusts.join()\n        logger.info(\"All locusts dead\\n\")\n        print_stats(self.request_stats)\n        print_percentile_stats(self.request_stats) #TODO use an event listener, or such, for this?",
+    "satd_comment": "#TODO use an event listener, or such, for this?",
+    "target_file": {
+      "ok": true,
+      "path": "locust/runners.py",
+      "sha": "9d660c76059a511669c5e82e1e73f3d884fe4680",
+      "download_url": "https://raw.githubusercontent.com/locustio/locust/master/locust/runners.py",
+      "content_excerpt": "from __future__ import annotations\n\nfrom locust import __version__\n\nimport functools\nimport inspect\nimport json\nimport logging\nimport os\nimport re\nimport socket\nimport sys\nimport time\nimport traceback\nfrom abc import abstractmethod\nfrom collections import defaultdict\nfrom collections.abc import Callable, Iterator, MutableMapping, ValuesView\nfrom operator import itemgetter, methodcaller\nfrom types import TracebackType\nfrom typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast\nfrom uuid import uuid4\n\nimport gevent\nimport greenlet\nimport psutil\nfrom gevent.event import Event\nfrom gevent.pool import Group\n\nfrom . import argument_parser\nfrom .dispatch import UsersDispatcher\nfrom .exception import RPCError, RPCReceiveError, RPCSendError, StopTest\nfrom .log import get_logs, greenlet_exception_logger\nfrom .rpc import Message, rpc\nfrom .stats import RequestStats, StatsError, setup_distributed_stats_event_listeners\nfrom .util.directory import get_abspaths_in\nfrom .util.url import is_url\n\nif TYPE_CHECKING:\n    from . import User\n    from .env import Environment\n\nlogger = logging.getLogger(__name__)\n\nSTATE_INIT, STATE_SPAWNING, STATE_RUNNING, STATE_CLEANUP, STATE_STOPPING, STATE_STOPPED, STATE_MISSING = [\n    \"ready\",\n    \"spawning\",\n    \"running\",\n    \"cleanup\",\n    \"stopping\",\n    \"stopped\",\n    \"missing\",\n]\nWORKER_REPORT_INTERVAL = 3.0\nWORKER_LOG_REPORT_INTERVAL = 10\nCPU_MONITOR_INTERVAL = 10.0\nCPU_WARNING_THRESHOLD = 90\nHEARTBEAT_INTERVAL = 1\nHEARTBEAT_LIVENESS = 3\nHEARTBEAT_DEAD_INTERNAL = -60\nMASTER_HEARTBEAT_TIMEOUT = 60\nFALLBACK_INTERVAL = 5\nCONNECT_TIMEOUT = 5\nCONNECT_RETRY_COUNT = 60\n\n\ndef locust_exception_handler(environment: Environment):\n    exception_logger = greenlet_exception_logger(logger)\n\n    def handler(greenlet):\n        if greenlet.exc_info[0] is StopTest:\n            logger.error(greenlet.exc_info[1])\n            logger.warning(\"Stopping Locust...\")\n            if environment.parsed_options.headless:\n                environment.runner.quit()\n            else:\n                environment.runner.stop()\n        else:\n            exception_logger(greenlet)\n\n    return handler\n\n\nclass ExceptionDict(TypedDict):\n    count: int\n    msg: str\n    traceback: str\n    nodes: set[str]\n\n\nclass Runner:\n    \"\"\"\n    Orchestrates the load test by starting and stopping the users.\n\n    Use one of the :meth:`create_local_runner <locust.env.Environment.create_local_runner>`,\n    :meth:`create_master_runner <locust.env.Environment.create_master_runner>` or\n    :meth:`create_worker_runner <locust.env.Environment.create_worker_runner>` methods on\n    the :class:`Environment <locust.env.Environment>` instance to create a runner of the\n    desired type.\n    \"\"\"\n\n    def __init__(self, environment: Environment) -> None:\n        self.environment = environment\n        self.user_greenlets = Group()\n        self.greenlet = Group()\n        self.state = STATE_INIT\n        self.spawning_greenlet: gevent.Greenlet | None = None\n        self.shape_greenlet: gevent.Greenlet | None = None\n        self.shape_last_tick: tuple[int, float] | tuple[int, float, list[type[User]] | None] | None = None\n        self.current_cpu_usage: float = 0.0\n        self.cpu_warning_emitted: bool = False\n        self.worker_cpu_warning_emitted: bool = False\n        self.current_memory_usage: int = 0\n        self.greenlet.spawn(self.monitor_cpu_and_memory).link_exception(locust_exception_handler(self.environment))\n        self.exceptions: dict[int, ExceptionDict] = {}\n        # Because of the way the ramp-up/ramp-down is implemented, target_user_classes_count\n        # is only updated at the end of the ramp-up/ramp-down.\n        # See https://github.com/locustio/locust/issues/1883#issuecomment-919239824 for context.\n        self.target_user_classes_count: dict[str, int] = {}\n        # target_user_count is set before the ramp-up/ramp-down occurs.\n        self.target_user_count: int = 0\n        self.custom_messages: dict[str, tuple[Callable, bool]] = {}\n\n        self._users_dispatcher: UsersDispatcher | None = None\n\n        # set up event listeners for recording requests\n        def on_request(request_type, name, response_time, response_length, exception=None, **_kwargs):\n            self.stats.log_request(request_type, name, response_time, response_length)\n            if exception:\n                self.stats.log_error(request_type, name, exception)\n\n        self.environment.events.request.add_listener(on_request)\n\n        self.connection_broken = False\n        self.final_user_classes_count: dict[str, int] = {}  # just for the ratio report, fills before runner stops\n\n        # register listener that resets stats when spawning is complete\n        def on_spawning_complete(user_count: int) -> None:\n            self.update_state(STATE_RUNNING)\n            if environment.reset_stats:\n                logger.info(\"Resetting stats\\n\")\n                self.stats.reset_all()\n\n        self.environment.events.spawning_complete.add_listener(on_spawning_complete)\n\n    def __del__(self) -> None:\n        # don't leave any stray greenlets if runner is removed\n        if self.greenlet and len(self.greenlet) > 0:\n            self.greenlet.kill(block=False)\n\n    @property\n    def user_classes(self) -> list[type[User]]:\n        return self.environment.user_classes\n\n    @property\n    def user_classes_by_name(self) -> dict[str, type[User]]:\n        return self.environment.user_classes_by_name\n\n    @property\n    def stats(self) -> RequestStats:\n        return self.environment.stats\n\n    @property\n    def errors(self) -> dict[str, StatsError]:\n        return self.stats.errors\n\n    @property\n    def user_count(self) -> int:\n        \"\"\"\n        :returns: Number of currently running users\n        \"\"\"\n        return len(self.user_greenlets)\n\n    @property\n    def user_classes_count(self) -> dict[str, int]:\n        \"\"\"\n        :returns: Number of currently running users for each user class\n        \"\"\"\n        user_classes_count = {user_class.__name__: 0 for user_class in self.user_classes}\n        for user_greenlet in self.user_greenlets:\n            try:\n                user = user_greenlet.args[0]\n            except IndexError:\n                # TODO: Find out why args is sometimes empty. In gevent code,\n                #       the supplied args are cleared in the gevent.greenlet.Greenlet.__free,\n                #       so it seems a good place to start investigating. My suspicion is that\n                #       the supplied args are emptied whenever the greenlet is dead, so we can\n                #       simply ignore the greenlets with empty args.\n                logger.debug(\n                    \"ERROR: While calculating number of running users, we encountered a user that didn't have proper args %s (user_greenlet.dead=%s)\",\n                    user_greenlet,\n                    user_greenlet.dead,\n                )\n                continue\n            user_classes_count[user.__class__.__name__] += 1\n        return user_classes_count\n\n    def update_state(self, new_state: str) -> None:\n        \"\"\"\n        Updates the current state\n        \"\"\"\n        # I (cyberwiz) commented out this logging, because it is too noisy even for debug level\n        # Uncomment it if you are specifically debugging state transitions\n        # logger.debug(\"Updating state to '%s', old state was '%s'\" % (new_state, self.state))\n        self.state = new_state\n\n    def cpu_log_warning(self) -> bool:\n        \"\"\"Called at the end of the test\"\"\"\n        if self.cpu_warning_emitted:\n            logger.warning(\n                \"CPU usage was too high at some point during the test! See https://docs.locust.io/en/stable/running-distributed.html for how to distribute the load over multiple CPU cores or machines\"\n            )\n        return self.cpu_warning_emitted\n\n    def spawn_users(self, user_classes_spawn_count: dict[str, int], wait: bool = False):\n        if self.state == STATE_INIT or self.state == STATE_STOPPED:\n            self.update_state(STATE_SPAWNING)\n\n        logger.debug(\n            f\"Spawning additional {json.dumps(user_classes_spawn_count)} ({json.dumps(self.user_classes_count)} already running)...\"\n        )\n\n        def spawn(user_class: str, spawn_count: int) -> list[User]:\n            n = 0\n            new_users: list[User] = []\n            while n < spawn_count:\n                new_user = self.user_classes_by_name[user_class](self.environment)\n                assert hasattr(new_user, \"environment\"), (\n                    f\"Attribute 'environment' is missing on user {user_class}. Perhaps you defined your own __init__ and forgot to call the base constructor? (super().__init__(*args, **kwargs))\"\n                )\n                new_user.start(self.user_greenlets)\n                new_users.append(new_user)\n                n += 1\n                if n % 10 == 0 or n == spawn_count:\n                    logger.debug(\"%i users spawned\" % self.user_count)\n            logger.debug(f\"All users of class {user_class} spawned\")\n            return new_users\n\n        new_users: list[User] = []\n        for user_class, spawn_count in user_classes_spawn_count.items():\n            new_users += spawn(user_class, spawn_count)\n\n        if wait:\n            self.user_greenlets.join()\n            logger.info(\"All users stopped\\n\")\n        return new_users\n\n    def stop_users(self, user_classes_stop_count: dict[str, int]) -> None:\n        async_calls_to_stop = Group()\n        stop_group = Group()\n\n        for user_class, stop_count in user_classes_stop_count.items():\n            if self.user_classes_count[user_class] == 0:\n                continue\n\n            to_stop: list[greenlet.greenlet] = []\n            for user_greenlet in self.user_greenlets:\n                if len(to_stop) == stop_count:\n                    break\n                try:\n                    user = user_greenlet.args[0]\n                except IndexError:\n                    logger.error(\n                        \"While stopping users, we encountered a user that didn't have proper args %s\", user_greenlet\n                    )\n                    continue\n                if type(user) is self.user_classes_by_name[user_class]:\n                    to_stop.append(user)\n\n            if not to_stop:\n                continue\n\n            while True:\n                user_to_stop: User = to_stop.pop()\n                logger.debug(f\"Stopping {user_to_stop.greenlet.name}\")\n                if user_to_stop.greenlet is greenlet.getcurrent():\n                    # User called runner.quit(), so don't block waiting for killing to finish\n                    user_to_stop.group.killone(user_to_stop.greenlet, block=False)\n                elif self.environment.stop_timeout:\n                    async_calls_to_stop.add(gevent.spawn_later(0, user_to_stop.stop, force=False))\n                    stop_group.add(user_to_stop.greenlet)\n                else:\n                    async_calls_to_stop.add(gevent.spawn_later(0, user_to_stop.stop, force=True))\n                if not to_stop:\n                    break\n\n        async_calls_to_stop.join()\n\n        if not stop_group.join(timeout=self.environment.stop_timeout):\n            logger.info(\n                f\"Not all users finished their tasks & terminated in {self.environment.stop_timeout} seconds. Stopping them...\"\n            )\n            stop_group.kill(block=True)\n\n        logger.debug(\n            \"%g users have been stopped, %g still running\", sum(user_classes_stop_count.values()), self.user_count\n        )\n\n    def monitor_cpu_and_memory(self) -> NoReturn:\n        process = psutil.Process()\n        while True:\n            gevent.sleep(CPU_MONITOR_INTERVAL)\n            self.current_cpu_usage = process.cpu_percent()\n            self.current_memory_usage = process.memory_info().rss\n            if self.current_cpu_usage > CPU_WARNING_THRESHOLD:\n                self.environment.events.cpu_warning.fire(environment=self.environment, cpu_usage=self.current_cpu_usage)\n                if not s",
+      "total_lines": 1529
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "locust:__version__",
+        "functools",
+        "inspect",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "socket",
+        "sys",
+        "time",
+        "traceback",
+        "abc:abstractmethod",
+        "collections:defaultdict",
+        "collections.abc:Callable",
+        "collections.abc:Iterator",
+        "collections.abc:MutableMapping",
+        "collections.abc:ValuesView",
+        "operator:itemgetter",
+        "operator:methodcaller",
+        "types:TracebackType",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:NoReturn",
+        "typing:TypedDict",
+        "typing:cast",
+        "uuid:uuid4",
+        "gevent",
+        "greenlet",
+        "psutil"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/locustio/locust/master/README.md",
+      "content_excerpt": "# Locust\n\n[![PyPI](https://img.shields.io/pypi/v/locust.svg)](https://pypi.org/project/locust/)\n[![Supported Python Versions](https://img.shields.io/pypi/pyversions/locust?color=brightgreen)](https://pypi.org/project/locust/)\n[![Downloads](https://static.pepy.tech/personalized-badge/locust?period=total&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/locust)\n[![GitHub contributors](https://img.shields.io/github/contributors/locustio/locust.svg)](https://github.com/locustio/locust/graphs/contributors)\n[![Support Ukraine Badge](https://bit.ly/support-ukraine-now)](https://github.com/support-ukraine/support-ukraine)\n\nLocust is an open source performance/load testing tool for HTTP and other protocols. Its developer-friendly approach lets you define your tests in regular Python code.\n\nLocust tests can be run from command line or using its web-based UI. Throughput, response times and errors can be viewed in real time and/or exported for later analysis.\n\nYou can import regular Python libraries into your tests, and with Locust's pluggable architecture it is infinitely expandable. Unlike when using most other tools, your test design will never be limited by a GUI or domain-specific language.\n\nTo get started right away, head over to the [documentation](http://docs.locust.io/en/stable/installation.html).\n\n## Features\n\n#### Write user test scenarios in plain old Python\n\nIf you want your users to loop, perform some conditional behaviour or do some calculations, you just use the regular programming constructs provided by Python"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "spawn_locusts test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"spawn_locusts(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "locust",
+      "count": 25,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "locust/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "locust/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "argument_parser.py",
+          "path": "locust/argument_parser.py",
+          "type": "file"
+        },
+        {
+          "name": "clients.py",
+          "path": "locust/clients.py",
+          "type": "file"
+        },
+        {
+          "name": "contrib",
+          "path": "locust/contrib",
+          "type": "dir"
+        },
+        {
+          "name": "debug.py",
+          "path": "locust/debug.py",
+          "type": "file"
+        },
+        {
+          "name": "dispatch.py",
+          "path": "locust/dispatch.py",
+          "type": "file"
+        },
+        {
+          "name": "env.py",
+          "path": "locust/env.py",
+          "type": "file"
+        },
+        {
+          "name": "event.py",
+          "path": "locust/event.py",
+          "type": "file"
+        },
+        {
+          "name": "exception.py",
+          "path": "locust/exception.py",
+          "type": "file"
+        },
+        {
+          "name": "html.py",
+          "path": "locust/html.py",
+          "type": "file"
+        },
+        {
+          "name": "input_events.py",
+          "path": "locust/input_events.py",
+          "type": "file"
+        },
+        {
+          "name": "log.py",
+          "path": "locust/log.py",
+          "type": "file"
+        },
+        {
+          "name": "main.py",
+          "path": "locust/main.py",
+          "type": "file"
+        },
+        {
+          "name": "opentelemetry.py",
+          "path": "locust/opentelemetry.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "locust/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "rpc",
+          "path": "locust/rpc",
+          "type": "dir"
+        },
+        {
+          "name": "runners.py",
+          "path": "locust/runners.py",
+          "type": "file"
+        },
+        {
+          "name": "shape.py",
+          "path": "locust/shape.py",
+          "type": "file"
+        },
+        {
+          "name": "stats.py",
+          "path": "locust/stats.py",
+          "type": "file"
+        },
+        {
+          "name": "test",
+          "path": "locust/test",
+          "type": "dir"
+        },
+        {
+          "name": "user",
+          "path": "locust/user",
+          "type": "dir"
+        },
+        {
+          "name": "util",
+          "path": "locust/util",
+          "type": "dir"
+        },
+        {
+          "name": "web.py",
+          "path": "locust/web.py",
+          "type": "file"
+        },
+        {
+          "name": "webui",
+          "path": "locust/webui",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "locust/__init__.py"
+        },
+        {
+          "name": "__main__.py",
+          "path": "locust/__main__.py"
+        },
+        {
+          "name": "argument_parser.py",
+          "path": "locust/argument_parser.py"
+        },
+        {
+          "name": "clients.py",
+          "path": "locust/clients.py"
+        },
+        {
+          "name": "debug.py",
+          "path": "locust/debug.py"
+        },
+        {
+          "name": "dispatch.py",
+          "path": "locust/dispatch.py"
+        },
+        {
+          "name": "env.py",
+          "path": "locust/env.py"
+        },
+        {
+          "name": "event.py",
+          "path": "locust/event.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "locust/runners.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b35dd231c7d84cf31478823c4f708d089b5a1d76",
+          "html_url": "https://github.com/locustio/locust/commit/b35dd231c7d84cf31478823c4f708d089b5a1d76",
+          "message": "Merge runners exception handlers",
+          "author": "Amadeu Pereira",
+          "date": "2025-12-19T13:58:01Z"
+        },
+        {
+          "sha": "9147975f3c77c834a96ea85ad3e6db0acd5950ae",
+          "html_url": "https://github.com/locustio/locust/commit/9147975f3c77c834a96ea85ad3e6db0acd5950ae",
+          "message": "Stop runner instead of quitting on StopTest",
+          "author": "Amadeu Pereira",
+          "date": "2025-12-19T13:01:14Z"
+        },
+        {
+          "sha": "2c7e6614854dff5798407e5d728c502606ee4971",
+          "html_url": "https://github.com/locustio/locust/commit/2c7e6614854dff5798407e5d728c502606ee4971",
+          "message": "Rename StopTest exception",
+          "author": "Amadeu Pereira",
+          "date": "2025-12-19T12:58:36Z"
+        },
+        {
+          "sha": "e668e9977538dba5c1143445e6571f028aaa1509",
+          "html_url": "https://github.com/locustio/locust/commit/e668e9977538dba5c1143445e6571f028aaa1509",
+          "message": "Add LocustStopTest exception",
+          "author": "Amadeu Pereira",
+          "date": "2025-12-19T12:45:23Z"
+        },
+        {
+          "sha": "2492928fb64199b243efe8af05bdaa46cf097f33",
+          "html_url": "https://github.com/locustio/locust/commit/2492928fb64199b243efe8af05bdaa46cf097f33",
+          "message": "Simplify custom messages case statement in runners.py",
+          "author": "Lars Holmberg",
+          "date": "2025-11-29T12:50:54Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "spawn_locusts TODO event listener such this",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "locust/runners.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "b35dd231c7d84cf31478823c4f708d089b5a1d76",
+        "html_url": "https://github.com/locustio/locust/commit/b35dd231c7d84cf31478823c4f708d089b5a1d76",
+        "message": "Merge runners exception handlers",
+        "author": "Amadeu Pereira",
+        "date": "2025-12-19T13:58:01Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

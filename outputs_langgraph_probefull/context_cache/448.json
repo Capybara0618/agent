@@ -1,0 +1,389 @@
+{
+  "task_id": "448",
+  "repo_owner": "huggingface",
+  "repo_name": "optimum-intel",
+  "file_path": "optimum/intel/openvino/modeling_diffusion.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T08:41:54+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T08:42:05+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T08:42:11+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "optimum/intel/openvino/modeling_diffusion.py",
+    "original_code": "def __init__(\n    self,\n    model: openvino.runtime.Model,\n    parent_model: OVBaseModel,\n    ov_config: Optional[Dict[str, str]] = None,\n    model_name: str = \"encoder\",\n    model_dir: str = None,\n):\n    self.model = model\n    self.parent_model = parent_model\n    self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}\n    self.input_dtype = {\n        inputs.get_any_name(): OV_TO_NP_TYPE[inputs.get_element_type().get_type_name()]\n        for inputs in self.model.inputs\n    }\n    self.ov_config = ov_config or {**self.parent_model.ov_config}\n    self.request = None\n    self._model_name = model_name\n    self._model_dir = Path(model_dir or parent_model._model_save_dir)\n    config_path = self._model_dir / model_name / self.CONFIG_NAME\n    self.config = self.parent_model._dict_from_json_file(config_path) if config_path.is_file() else {}\n\n    # TODO : disable if self._model_dir tmp directory\n    if \"CACHE_DIR\" not in self.ov_config:\n        self.ov_config[\"CACHE_DIR\"] = os.path.join(self._model_dir, self._model_name)",
+    "satd_comment": "# TODO : disable if self._model_dir tmp directory",
+    "target_file": {
+      "ok": true,
+      "path": "optimum/intel/openvino/modeling_diffusion.py",
+      "sha": "de5b7e1b39a2699a8e1fd1adecb81988e64977e9",
+      "download_url": "https://raw.githubusercontent.com/huggingface/optimum-intel/main/optimum/intel/openvino/modeling_diffusion.py",
+      "content_excerpt": "#  Copyright 2022 The HuggingFace Team. All rights reserved.\n#\n#  Licensed under the Apache License, Version 2.0 (the \"License\");\n#  you may not use this file except in compliance with the License.\n#  You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n#  Unless required by applicable law or agreed to in writing, software\n#  distributed under the License is distributed on an \"AS IS\" BASIS,\n#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n#  See the License for the specific language governing permissions and\n#  limitations under the License.\n\nimport importlib\nimport inspect\nimport logging\nimport os\nimport shutil\nfrom abc import abstractmethod\nfrom collections import OrderedDict\nfrom pathlib import Path\nfrom tempfile import gettempdir\nfrom typing import Any, Dict, List, Optional, Tuple, Union\n\nimport numpy as np\nimport openvino\nimport torch\nfrom diffusers import (\n    AutoPipelineForImage2Image,\n    AutoPipelineForInpainting,\n    AutoPipelineForText2Image,\n    DiffusionPipeline,\n    LatentConsistencyModelImg2ImgPipeline,\n    LatentConsistencyModelPipeline,\n    StableDiffusionImg2ImgPipeline,\n    StableDiffusionInpaintPipeline,\n    StableDiffusionPipeline,\n    StableDiffusionXLImg2ImgPipeline,\n    StableDiffusionXLInpaintPipeline,\n    StableDiffusionXLPipeline,\n    pipelines,\n)\nfrom diffusers.configuration_utils import ConfigMixin\nfrom diffusers.schedulers import SchedulerMixin\nfrom diffusers.schedulers.scheduling_utils import SCHEDULER_CONFIG_NAME\nfrom diffusers.utils.constants import CONFIG_NAME\nfrom huggingface_hub import snapshot_download\nfrom huggingface_hub.constants import HUGGINGFACE_HUB_CACHE\nfrom huggingface_hub.utils import validate_hf_hub_args\nfrom openvino import Core\nfrom openvino._offline_transformations import compress_model_transformation\nfrom transformers import CLIPFeatureExtractor, CLIPTokenizer\nfrom transformers.modeling_outputs import ModelOutput\nfrom transformers.utils import http_user_agent\n\nfrom optimum.utils import (\n    DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER,\n    DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER,\n    DIFFUSION_MODEL_UNET_SUBFOLDER,\n    DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER,\n    DIFFUSION_MODEL_VAE_ENCODER_SUBFOLDER,\n)\n\nfrom ...exporters.openvino import main_export\nfrom ..utils.import_utils import is_diffusers_version\nfrom .configuration import OVConfig, OVQuantizationConfigBase, OVQuantizationMethod, OVWeightQuantizationConfig\nfrom .loaders import OVTextualInversionLoaderMixin\nfrom .modeling_base import OVBaseModel, OVModelHostMixin\nfrom .utils import (\n    ONNX_WEIGHTS_NAME,\n    OV_TO_PT_TYPE,\n    OV_XML_FILE_NAME,\n    TemporaryDirectory,\n    _print_compiled_model_properties,\n    classproperty,\n    model_has_dynamic_inputs,\n    np_to_pt_generators,\n)\n\n\nif is_diffusers_version(\">=\", \"0.25.0\"):\n    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution\nelse:\n    from diffusers.models.vae import DiagonalGaussianDistribution\n\n# Required EncoderDecoderCache object from transformers\nif is_diffusers_version(\">=\", \"0.32\"):\n    from diffusers import LTXPipeline\nelse:\n    LTXPipeline = object\n\n\nif is_diffusers_version(\">=\", \"0.29.0\"):\n    from diffusers import StableDiffusion3Img2ImgPipeline, StableDiffusion3Pipeline\nelse:\n    StableDiffusion3Pipeline, StableDiffusion3Img2ImgPipeline = object, object\n\nif is_diffusers_version(\">=\", \"0.30.0\"):\n    from diffusers import FluxPipeline, StableDiffusion3InpaintPipeline\nelse:\n    StableDiffusion3InpaintPipeline = object\n    FluxPipeline = object\n\n\nif is_diffusers_version(\">=\", \"0.31.0\"):\n    from diffusers import FluxImg2ImgPipeline, FluxInpaintPipeline\nelse:\n    FluxImg2ImgPipeline = object\n    FluxInpaintPipeline = object\n\nif is_diffusers_version(\">=\", \"0.32.0\"):\n    from diffusers import FluxFillPipeline, SanaPipeline\nelse:\n    FluxFillPipeline = object\n    SanaPipeline = object\n\nif is_diffusers_version(\">=\", \"0.33.0\"):\n    from diffusers import SanaSprintPipeline\nelse:\n    SanaSprintPipeline = object\n\n\nif is_diffusers_version(\">=\", \"0.35.0\"):\n    from diffusers.models.cache_utils import CacheMixin\nelse:\n    CacheMixin = object\n\nDIFFUSION_MODEL_TRANSFORMER_SUBFOLDER = \"transformer\"\nDIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER = \"text_encoder_3\"\n\ncore = Core()\n\nlogger = logging.getLogger(__name__)\n\n\n# TODO: support DiffusionPipeline.from_pipe()\n# TODO: makes more sense to have a compositional OVMixin class\n# TODO: instead of one bloated __init__, we should consider an __init__ per pipeline\nclass OVDiffusionPipeline(OVBaseModel, DiffusionPipeline):\n    auto_model_class = DiffusionPipeline\n    config_name = \"model_index.json\"\n    _library_name = \"diffusers\"\n\n    @classproperty\n    def _all_ov_model_paths(cls) -> Dict[str, str]:\n        models_paths = {\n            \"unet\": os.path.join(DIFFUSION_MODEL_UNET_SUBFOLDER, OV_XML_FILE_NAME),\n            \"transformer\": os.path.join(DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER, OV_XML_FILE_NAME),\n            \"vae_decoder\": os.path.join(DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER, OV_XML_FILE_NAME),\n            \"vae_encoder\": os.path.join(DIFFUSION_MODEL_VAE_ENCODER_SUBFOLDER, OV_XML_FILE_NAME),\n            \"text_encoder\": os.path.join(DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER, OV_XML_FILE_NAME),\n            \"text_encoder_2\": os.path.join(DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER, OV_XML_FILE_NAME),\n            \"text_encoder_3\": os.path.join(DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER, OV_XML_FILE_NAME),\n        }\n        return models_paths\n\n    def __init__(\n        self,\n        scheduler: SchedulerMixin,\n        unet: Optional[openvino.Model] = None,\n        vae_decoder: Optional[openvino.Model] = None,\n        # optional pipeline models\n        vae_encoder: Optional[openvino.Model] = None,\n        text_encoder: Optional[openvino.Model] = None,\n        text_encoder_2: Optional[openvino.Model] = None,\n        text_encoder_3: Optional[openvino.Model] = None,\n        transformer: Optional[openvino.Model] = None,\n        # optional pipeline submodels\n        tokenizer: Optional[CLIPTokenizer] = None,\n        tokenizer_2: Optional[CLIPTokenizer] = None,\n        tokenizer_3: Optional[CLIPTokenizer] = None,\n        feature_extractor: Optional[CLIPFeatureExtractor] = None,\n        # stable diffusion xl specific arguments\n        force_zeros_for_empty_prompt: bool = True,\n        requires_aesthetics_score: bool = False,\n        add_watermarker: Optional[bool] = None,\n        # openvino specific arguments\n        device: str = \"CPU\",\n        compile: bool = True,\n        compile_only: bool = False,\n        dynamic_shapes: bool = True,\n        ov_config: Optional[Dict[str, str]] = None,\n        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,\n        quantization_config: Optional[Union[OVWeightQuantizationConfig, Dict]] = None,\n        **kwargs,\n    ):\n        self._device = device.upper()\n        self.is_dynamic = dynamic_shapes\n        self._compile_only = compile_only\n        self.model_save_dir = model_save_dir\n        self.ov_config = {} if ov_config is None else {**ov_config}\n        self.preprocessors = kwargs.get(\"preprocessors\", [])\n\n        if self._compile_only:\n            if not compile:\n                raise ValueError(\n                    \"`compile_only` mode does not support disabling compilation.\"\n                    \"Please provide `compile=True` if you want to use `compile_only=True` or set `compile_only=False`\"\n                )\n\n            main_model = unet if unet is not None else transformer\n            if not isinstance(main_model, openvino.CompiledModel):\n                raise ValueError(\"`compile_only` expect that already compiled model will be provided\")\n\n            model_is_dynamic = model_has_dynamic_inputs(main_model)\n            if dynamic_shapes ^ model_is_dynamic:\n                requested_shapes = \"dynamic\" if dynamic_shapes else \"static\"\n                compiled_shapes = \"dynamic\" if model_is_dynamic else \"static\"\n                raise ValueError(\n                    f\"Provided compiled model with {compiled_shapes} shapes but requested to use {requested_shapes}. \"\n                    f\"Please set `compile_only=False` or `dynamic_shapes={model_is_dynamic}`\"\n                )\n\n        self.unet = OVModelUnet(unet, self, DIFFUSION_MODEL_UNET_SUBFOLDER) if unet is not None else None\n        self.transformer = (\n            OVModelTransformer(transformer, self, DIFFUSION_MODEL_TRANSFORMER_SUBFOLDER)\n            if transformer is not None\n            else None\n        )\n\n        if unet is None and transformer is None:\n            raise ValueError(\"`unet` or `transformer` model should be provided for pipeline work\")\n        self.vae_decoder = OVModelVaeDecoder(vae_decoder, self, DIFFUSION_MODEL_VAE_DECODER_SUBFOLDER)\n        self.vae_encoder = (\n            OVModelVaeEncoder(vae_encoder, self, DIFFUSION_MODEL_VAE_ENCODER_SUBFOLDER)\n            if vae_encoder is not None\n            else None\n        )\n        self.text_encoder = (\n            OVModelTextEncoder(text_encoder, self, DIFFUSION_MODEL_TEXT_ENCODER_SUBFOLDER)\n            if text_encoder is not None\n            else None\n        )\n        self.text_encoder_2 = (\n            OVModelTextEncoder(text_encoder_2, self, DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER)\n            if text_encoder_2 is not None\n            else None\n        )\n        self.text_encoder_3 = (\n            OVModelTextEncoder(text_encoder_3, self, DIFFUSION_MODEL_TEXT_ENCODER_3_SUBFOLDER)\n            if text_encoder_3 is not None\n            else None\n        )\n        # We wrap the VAE Decoder & Encoder in a single object to simulate diffusers API\n        self.vae = OVModelVae(decoder=self.vae_decoder, encoder=self.vae_encoder)\n\n        self.scheduler = scheduler\n        self.tokenizer = tokenizer\n        self.tokenizer_2 = tokenizer_2\n        self.tokenizer_3 = tokenizer_3\n        self.feature_extractor = feature_extractor\n\n        # we allow passing these as torch models for now\n        self.image_encoder = kwargs.pop(\"image_encoder\", None)  # TODO: maybe mplement OVModelImageEncoder\n        self.safety_checker = kwargs.pop(\"safety_checker\", None)  # TODO: maybe mplement OVModelSafetyChecker\n\n        all_pipeline_init_args = {\n            \"vae\": self.vae,\n            \"unet\": self.unet,\n            \"transformer\": self.transformer,\n            \"text_encoder\": self.text_encoder,\n            \"text_encoder_2\": self.text_encoder_2,\n            \"text_encoder_3\": self.text_encoder_3,\n            \"safety_checker\": self.safety_checker,\n            \"image_encoder\": self.image_encoder,\n            \"scheduler\": self.scheduler,\n            \"tokenizer\": self.tokenizer,\n            \"tokenizer_2\": self.tokenizer_2,\n            \"tokenizer_3\": self.tokenizer_3,\n            \"feature_extractor\": self.feature_extractor,\n            \"requires_aesthetics_score\": requires_aesthetics_score,\n            \"force_zeros_for_empty_prompt\": force_zeros_for_empty_prompt,\n            \"add_watermarker\": add_watermarker,\n        }\n\n        diffusers_pipeline_args = {}\n        for key in inspect.signature(self.auto_model_class).parameters.keys():\n            if key in all_pipeline_init_args:\n                diffusers_pipeline_args[key] = all_pipeline_init_args[key]\n        # inits diffusers pipeline specific attributes (registers modules and config)\n        self.auto_model_class.__init__(self, **diffusers_pipeline_args)\n        # we use auto_model_class.__init__ here because we can't call super().__init__\n        # as OptimizedModel already defines an __init__ which is the first in the MRO\n\n        self._openvino_config = None\n        if quantization_config:\n            self._openvino_config = OVConfig(quantization_config=quantization_config)\n        self._set_ov_config_parameters()\n\n        if self.is_dynamic and not self._compile_only:\n            self.reshape(batch_size=-1, height=-1, width=-1, num_images_per_prompt=-1)\n\n        if compile and not self._compile_on",
+      "total_lines": 1825
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "importlib",
+        "inspect",
+        "logging",
+        "os",
+        "shutil",
+        "abc:abstractmethod",
+        "collections:OrderedDict",
+        "pathlib:Path",
+        "tempfile:gettempdir",
+        "typing:Any",
+        "typing:Dict",
+        "typing:List",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:Union",
+        "numpy",
+        "openvino",
+        "torch",
+        "diffusers:AutoPipelineForImage2Image",
+        "diffusers:AutoPipelineForInpainting",
+        "diffusers:AutoPipelineForText2Image",
+        "diffusers:DiffusionPipeline",
+        "diffusers:LatentConsistencyModelImg2ImgPipeline",
+        "diffusers:LatentConsistencyModelPipeline",
+        "diffusers:StableDiffusionImg2ImgPipeline",
+        "diffusers:StableDiffusionInpaintPipeline",
+        "diffusers:StableDiffusionPipeline",
+        "diffusers:StableDiffusionXLImg2ImgPipeline",
+        "diffusers:StableDiffusionXLInpaintPipeline",
+        "diffusers:StableDiffusionXLPipeline"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/huggingface/optimum-intel/main/README.md",
+      "content_excerpt": "<p align=\"center\">\n    <img src=\"https://huggingface.co/datasets/optimum/documentation-images/resolve/main/intel/logo/hf_intel_logo.png\" />\n</p>\n\n# Optimum Intel\n\n🤗 [Optimum Intel](https://huggingface.co/docs/optimum-intel/en/index) is the interface between the 🤗 Transformers and Diffusers libraries and the different tools and libraries provided by [OpenVINO](https://docs.openvino.ai) to accelerate end-to-end pipelines on Intel architectures.\n\n[OpenVINO](https://docs.openvino.ai) is an open-source toolkit that enables high performance inference capabilities for Intel CPUs, GPUs, and special DL inference accelerators ([see](https://docs.openvino.ai/2024/about-openvino/compatibility-and-support/supported-devices.html) the full list of supported devices). It is supplied with a set of tools to optimize your models with compression techniques such as quantization, pruning and knowledge distillation. Optimum Intel provides a simple interface to optimize your Transformers and Diffusers models, convert them to the OpenVINO Intermediate Representation (IR) format and run inference using OpenVINO Runtime.\n\n\n## Installation\n\nTo install the latest release of 🤗 Optimum Intel with the corresponding required dependencies, you can use `pip` as follows:\n\n```bash\npython -m pip install -U \"optimum-intel[openvino]\"\n```\n\nOptimum Intel is a fast-moving project with regular additions of new model support, so you may want to install from source with the following command:\n\n```bash\npython -m pip install \"optimum-intel\"@git+https://github.com/huggingface/optimum-intel.git\n```\n\n**Deprecation Notice:*"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_modeling.py",
+          "path": "tests/openvino/test_modeling.py",
+          "sha": "32266ea54b2bf8f988cc691d06f982710bed69dd",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/tests/openvino/test_modeling.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_diffusion.py",
+          "path": "tests/openvino/test_diffusion.py",
+          "sha": "8efc69f8ecca856a617ab640306e2c2e4f57b1fe",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/tests/openvino/test_diffusion.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "model_config.py",
+          "path": "optimum/exporters/ipex/model_config.py",
+          "sha": "5cd7f1e79d8f7e95e7bbeea820cf8ef75467c2e3",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/exporters/ipex/model_config.py",
+          "score": 1.0
+        },
+        {
+          "name": "modeling_sentence_transformers.py",
+          "path": "optimum/intel/ipex/modeling_sentence_transformers.py",
+          "sha": "7e68111e30718ec799a8156d3ff2487e6548a481",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/intel/ipex/modeling_sentence_transformers.py",
+          "score": 1.0
+        },
+        {
+          "name": "modeling_utils.py",
+          "path": "optimum/exporters/ipex/modeling_utils.py",
+          "sha": "72769b8c7ff3590e34d34dc6afd94f05a2fbc119",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/exporters/ipex/modeling_utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "modeling_base.py",
+          "path": "optimum/intel/neural_compressor/modeling_base.py",
+          "sha": "47381b437ab92e27df8e2af90b0bd5b782e62df6",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/intel/neural_compressor/modeling_base.py",
+          "score": 1.0
+        },
+        {
+          "name": "modeling_decoder.py",
+          "path": "optimum/intel/openvino/modeling_decoder.py",
+          "sha": "ccf177df9d7db671fe548d73fdaa23a20d30315e",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/intel/openvino/modeling_decoder.py",
+          "score": 1.0
+        },
+        {
+          "name": "dummy_openvino_and_sentence_transformers_objects.py",
+          "path": "optimum/intel/utils/dummy_openvino_and_sentence_transformers_objects.py",
+          "sha": "fd13e5f56a7f24b6a0c9b6beecfe11612fa8d68b",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/intel/utils/dummy_openvino_and_sentence_transformers_objects.py",
+          "score": 1.0
+        },
+        {
+          "name": "modeling_base.py",
+          "path": "optimum/intel/openvino/modeling_base.py",
+          "sha": "a97416cea1c385fcde08ab323967f879d63171dd",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/intel/openvino/modeling_base.py",
+          "score": 1.0
+        },
+        {
+          "name": "modeling_utils.py",
+          "path": "optimum/intel/utils/modeling_utils.py",
+          "sha": "cab9e5efa3e6420cf792462038e994b144e922d2",
+          "html_url": "https://github.com/huggingface/optimum-intel/blob/abe58d751b4e2cf88e05e87eaf9f01ee23dfded8/optimum/intel/utils/modeling_utils.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "optimum/intel/openvino",
+      "count": 16,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "optimum/intel/openvino/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "configuration.py",
+          "path": "optimum/intel/openvino/configuration.py",
+          "type": "file"
+        },
+        {
+          "name": "loaders.py",
+          "path": "optimum/intel/openvino/loaders.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling.py",
+          "path": "optimum/intel/openvino/modeling.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_base.py",
+          "path": "optimum/intel/openvino/modeling_base.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_decoder.py",
+          "path": "optimum/intel/openvino/modeling_decoder.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_diffusion.py",
+          "path": "optimum/intel/openvino/modeling_diffusion.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_open_clip.py",
+          "path": "optimum/intel/openvino/modeling_open_clip.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_sam.py",
+          "path": "optimum/intel/openvino/modeling_sam.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_sentence_transformers.py",
+          "path": "optimum/intel/openvino/modeling_sentence_transformers.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_seq2seq.py",
+          "path": "optimum/intel/openvino/modeling_seq2seq.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_text2speech.py",
+          "path": "optimum/intel/openvino/modeling_text2speech.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_timm.py",
+          "path": "optimum/intel/openvino/modeling_timm.py",
+          "type": "file"
+        },
+        {
+          "name": "modeling_visual_language.py",
+          "path": "optimum/intel/openvino/modeling_visual_language.py",
+          "type": "file"
+        },
+        {
+          "name": "quantization.py",
+          "path": "optimum/intel/openvino/quantization.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "optimum/intel/openvino/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "optimum/intel/openvino/__init__.py"
+        },
+        {
+          "name": "configuration.py",
+          "path": "optimum/intel/openvino/configuration.py"
+        },
+        {
+          "name": "loaders.py",
+          "path": "optimum/intel/openvino/loaders.py"
+        },
+        {
+          "name": "modeling.py",
+          "path": "optimum/intel/openvino/modeling.py"
+        },
+        {
+          "name": "modeling_base.py",
+          "path": "optimum/intel/openvino/modeling_base.py"
+        },
+        {
+          "name": "modeling_decoder.py",
+          "path": "optimum/intel/openvino/modeling_decoder.py"
+        },
+        {
+          "name": "modeling_open_clip.py",
+          "path": "optimum/intel/openvino/modeling_open_clip.py"
+        },
+        {
+          "name": "modeling_sam.py",
+          "path": "optimum/intel/openvino/modeling_sam.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "optimum/intel/openvino/modeling_diffusion.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "fd4bc67643f5b67f9b56d82dc240768914f92d99",
+          "html_url": "https://github.com/huggingface/optimum-intel/commit/fd4bc67643f5b67f9b56d82dc240768914f92d99",
+          "message": "Revert clean up export quant api (#1598)\n\n* Revert \"[OpenVINO] Clean-up model export & quantization API (#1575)\"\n\nThis reverts commit 45df0197ecf34360ba2dda6a2911cd8b9fd2e175. Since it brought regression for model conversion in case nncf is not installed.\n\nSigned-off-by: Kazantsev, Roman <roman.kaza",
+          "author": "Roman Kazantsev",
+          "date": "2026-01-28T15:53:34Z"
+        },
+        {
+          "sha": "45df0197ecf34360ba2dda6a2911cd8b9fd2e175",
+          "html_url": "https://github.com/huggingface/optimum-intel/commit/45df0197ecf34360ba2dda6a2911cd8b9fd2e175",
+          "message": "[OpenVINO] Clean-up model export & quantization API (#1575)\n\n* Initial commit\n\n* Add docstring\n\n* Rework a bit\n\n* Keep the previous name\n\n* Fix\n\n* Use name_or_path\n\n* Add condition\n\n* Fixes\n\n* Fix gpt-oss issues\n\n* Infer task in main_quantize\n\n* Reorder\n\n* Reorder arguments\n\n* str or Path\n\n* Tweak\n\n",
+          "author": "Nikita Savelyev",
+          "date": "2026-01-19T08:41:01Z"
+        },
+        {
+          "sha": "a46ca78fb4e4a8544fe36de87bec4c792dd3ed8b",
+          "html_url": "https://github.com/huggingface/optimum-intel/commit/a46ca78fb4e4a8544fe36de87bec4c792dd3ed8b",
+          "message": "[OpenVINO] Save OV models immediately after quantization via CLI (#1559)\n\n* Initial commit\n\n* Tweak\n\n* Fix more tests\n\n* Rename\n\n* Fix\n\n* Remove deprecated properties\n\n* Remove gc.collect\n\n* See all test results on windows\n\n* Revert \"See all test results on windows\"\n\nThis reverts commit ec0b028864cc",
+          "author": "Nikita Savelyev",
+          "date": "2025-12-22T14:38:11Z"
+        },
+        {
+          "sha": "a484bc6ee1175bbe8868bb53d2c42ab4c4802aa6",
+          "html_url": "https://github.com/huggingface/optimum-intel/commit/a484bc6ee1175bbe8868bb53d2c42ab4c4802aa6",
+          "message": "[OpenVINO] Add model-specific quantization ignored scopes (#1556)\n\n* Initial commit\n\n* Fix\n\n* Fix 2\n\n* Update test ignored scope\n\n* Add TODO\n\n* Use maybe_save_preprocessor\n\n* Add type check\n\n* Remove export_model_id where possible\n\n* Fix test\n\n* Bring back the VLM config initialization\n\n* Fix ignore",
+          "author": "Nikita Savelyev",
+          "date": "2025-12-17T11:03:59Z"
+        },
+        {
+          "sha": "3ad13105eea3d11af3ad91eb19a29a8508e5bdb0",
+          "html_url": "https://github.com/huggingface/optimum-intel/commit/3ad13105eea3d11af3ad91eb19a29a8508e5bdb0",
+          "message": "[OpenVINO] Refactor CLI quantization (#1525)\n\n* Refactor how quantization is applied during optimum-cli\n\nTiny fix\n\n* Additional refactoring\n\n* Rely on single model export entry point\n\n* Rename to _preprocess_quantization_config\n\n* Make model_name_or_path arg obligatory\n\n* Simplify _resolve_default_q",
+          "author": "Nikita Savelyev",
+          "date": "2025-12-12T10:01:07Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO disable self _model_dir directory",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "optimum/intel/openvino/modeling_diffusion.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "fd4bc67643f5b67f9b56d82dc240768914f92d99",
+        "html_url": "https://github.com/huggingface/optimum-intel/commit/fd4bc67643f5b67f9b56d82dc240768914f92d99",
+        "message": "Revert clean up export quant api (#1598)\n\n* Revert \"[OpenVINO] Clean-up model export & quantization API (#1575)\"\n\nThis reverts commit 45df0197ecf34360ba2dda6a2911cd8b9fd2e175. Since it brought regression for model conversion in case nncf is not installed.\n\nSigned-off-by: Kazantsev, Roman <roman.kaza",
+        "author": "Roman Kazantsev",
+        "date": "2026-01-28T15:53:34Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying condition",
+        "localized code snippet in __init__",
+        "no complex dependencies or architecture changes",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

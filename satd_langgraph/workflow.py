@@ -11,9 +11,9 @@ bootstrap_vendor()
 
 from langgraph.graph import END, START, StateGraph
 
-from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer
+from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIRepairProbe, OpenAIReviewer
 from .csv_loader import load_satd_csv
-from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, SATDRecord, preprocess_python_code, record_to_graph_input, trace_from_state
+from .schema import AnalysisResult, GraphState, ProbeResult, RepairAttempt, ReviewResult, SATDRecord, preprocess_python_code, record_to_graph_input, trace_from_state
 
 
 class LangGraphSATDWorkflow:
@@ -31,6 +31,7 @@ class LangGraphSATDWorkflow:
         client = OpenAICompatClient(model=model)
         self.context_client = client
         self.analyzer = OpenAIAnalyzer(client)
+        self.prober = OpenAIRepairProbe(client)
         self.fixer = OpenAIFixer(client)
         self.reviewer = OpenAIReviewer(client)
         self.graph = self._build_graph()
@@ -39,12 +40,14 @@ class LangGraphSATDWorkflow:
     def _build_graph(self):
         graph = StateGraph(GraphState)
         graph.add_node("analyze", self._analyze_node)
+        graph.add_node("probe", self._probe_node)
         graph.add_node("repair", self._repair_node)
         graph.add_node("review", self._review_node)
         graph.add_node("accept", self._accept_node)
         graph.add_node("drop", self._drop_node)
         graph.add_edge(START, "analyze")
-        graph.add_conditional_edges("analyze", self._route_after_analysis, {"repair": "repair", "drop": "drop"})
+        graph.add_conditional_edges("analyze", self._route_after_analysis, {"probe": "probe", "drop": "drop"})
+        graph.add_conditional_edges("probe", self._route_after_probe, {"repair": "repair", "drop": "drop"})
         graph.add_edge("repair", "review")
         graph.add_conditional_edges("review", self._route_after_review, {"accept": "accept", "repair": "repair", "drop": "drop"})
         graph.add_edge("accept", END)
@@ -67,7 +70,30 @@ class LangGraphSATDWorkflow:
             f"repairable={analysis.repairable} score={analysis.repairability_score:.2f} "
             f"mismatch={analysis.historical_snapshot_mismatch} github={analysis.github_evidence_strength}"
         )
-        return {"github_context": context_bundle, "analysis": analysis, "status": "repairable" if analysis.repairable else "dropped_by_analyzer"}
+        return {"github_context": context_bundle, "analysis": analysis, "status": "probe_pending" if not analysis.hard_reject else "dropped_by_analyzer"}
+
+
+    def _probe_node(self, state: GraphState) -> dict:
+        self._log(f"[task {state['task_id']}] probe start")
+        context_bundle = state.get("github_context") or self._load_or_build_base_context(state)
+        try:
+            probe = self.prober.run({**state, "github_context": context_bundle})
+        except Exception as exc:
+            if self.context_client._is_content_filter_error(exc):
+                self._log(f"[task {state['task_id']}] probe content-filtered; using fallback reject")
+                probe = self._fallback_probe(state)
+            else:
+                raise
+        self._log(
+            f"[task {state['task_id']}] probe done passed={probe.passed} predicted={probe.predicted_success_score:.2f} align={probe.probe_problem_alignment:.2f}"
+        )
+        return {
+            "github_context": context_bundle,
+            "probe_context_used": True,
+            "probe": probe,
+            "latest_probe": probe,
+            "status": "probe_passed" if probe.passed else "dropped_by_probe",
+        }
 
     def _repair_node(self, state: GraphState) -> dict:
         next_round = state["round_id"] + 1
@@ -85,6 +111,7 @@ class LangGraphSATDWorkflow:
         return {
             "github_context": context_bundle,
             "repair_context_used": bool((context_bundle.get("metadata") or {}).get("repair_cached")),
+            "full_repair_executed": True,
             "status": "repairing",
             "round_id": repair.round_id,
             "latest_repair": repair,
@@ -123,15 +150,24 @@ class LangGraphSATDWorkflow:
         }
 
     def _drop_node(self, state: GraphState) -> dict:
-        if state["analysis"] and not state["analysis"].repairable:
+        if state["analysis"] and state["analysis"].hard_reject:
             self._log(f"[task {state['task_id']}] dropped by analyzer reason={state['analysis'].drop_reason}")
             return {"status": "dropped_by_analyzer"}
+        if state.get("probe") and not state["probe"].passed:
+            self._log(f"[task {state['task_id']}] dropped by probe reason={state['probe'].filter_reason}")
+            return {"status": "dropped_by_probe"}
         self._log(f"[task {state['task_id']}] dropped after review rounds={state['round_id']}")
         return {"status": "dropped_after_review", "review_strict_gate_result": state.get("review_strict_gate_result") or "rejected"}
 
     def _route_after_analysis(self, state: GraphState) -> str:
         analysis = state["analysis"]
-        if analysis is None or not analysis.repairable:
+        if analysis is None or analysis.hard_reject:
+            return "drop"
+        return "probe"
+
+    def _route_after_probe(self, state: GraphState) -> str:
+        probe = state.get("probe")
+        if probe is None or not probe.passed:
             return "drop"
         return "repair"
 
@@ -212,13 +248,24 @@ class LangGraphSATDWorkflow:
     def _summarize(self, traces: list) -> dict:
         total = len(traces)
         analyze_filtered_count = sum(1 for trace in traces if trace.status == "dropped_by_analyzer")
+        probe_filtered_count = sum(1 for trace in traces if trace.status == "dropped_by_probe")
         review_rejected_count = sum(1 for trace in traces if trace.status == "dropped_after_review")
         workflow_output_count = sum(1 for trace in traces if trace.status == "accepted")
         successful_repair_count = sum(1 for trace in traces if trace.status == "accepted" and trace.exact_match)
+        probe_passed_count = sum(1 for trace in traces if trace.probe and trace.probe.get("passed"))
+        full_repair_executed_count = sum(1 for trace in traces if trace.full_repair_executed)
+        probe_filtered_em_yes_count = sum(1 for trace in traces if trace.status == "dropped_by_probe" and str(trace.em_label).strip().upper() in {"YES", "1", "TRUE"})
+        probe_passed_em_yes_count = sum(1 for trace in traces if trace.probe and trace.probe.get("passed") and str(trace.em_label).strip().upper() in {"YES", "1", "TRUE"})
 
         return {
             "input_satd_count": total,
+            "analyze_hard_filtered_count": analyze_filtered_count,
             "analyze_filtered_count": analyze_filtered_count,
+            "probe_filtered_count": probe_filtered_count,
+            "probe_passed_count": probe_passed_count,
+            "full_repair_executed_count": full_repair_executed_count,
+            "probe_filtered_em_yes_count": probe_filtered_em_yes_count,
+            "probe_passed_em_yes_count": probe_passed_em_yes_count,
             "review_rejected_count": review_rejected_count,
             "workflow_output_count": workflow_output_count,
             "successful_repair_count": successful_repair_count,
@@ -241,8 +288,9 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_hard_reject", "analysis_expected_fixability_hint", "analysis_why_not_hard_reject",
+            "probe_context_used", "probe_passed", "probe_fix_plan", "probe_confidence", "probe_problem_alignment", "probe_minimality", "probe_semantic_risk", "probe_self_consistency", "probe_success_score", "predicted_success_score", "probe_filter_reason",
+            "repair_context_used", "full_repair_executed", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
@@ -291,7 +339,22 @@ class LangGraphSATDWorkflow:
             "analysis_drop_reason": analysis.get("drop_reason"),
             "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch"),
             "analysis_github_evidence_strength": analysis.get("github_evidence_strength"),
+            "analysis_hard_reject": analysis.get("hard_reject"),
+            "analysis_expected_fixability_hint": analysis.get("expected_fixability_hint"),
+            "analysis_why_not_hard_reject": analysis.get("why_not_hard_reject"),
+            "probe_context_used": trace.probe_context_used,
+            "probe_passed": (trace.probe or {}).get("passed") if trace.probe else None,
+            "probe_fix_plan": (trace.probe or {}).get("probe_fix_plan") if trace.probe else None,
+            "probe_confidence": (trace.probe or {}).get("probe_confidence") if trace.probe else None,
+            "probe_problem_alignment": (trace.probe or {}).get("probe_problem_alignment") if trace.probe else None,
+            "probe_minimality": (trace.probe or {}).get("probe_minimality") if trace.probe else None,
+            "probe_semantic_risk": (trace.probe or {}).get("probe_semantic_risk") if trace.probe else None,
+            "probe_self_consistency": (trace.probe or {}).get("probe_self_consistency") if trace.probe else None,
+            "probe_success_score": (trace.probe or {}).get("probe_success_score") if trace.probe else None,
+            "predicted_success_score": (trace.probe or {}).get("predicted_success_score") if trace.probe else None,
+            "probe_filter_reason": (trace.probe or {}).get("filter_reason") if trace.probe else None,
             "repair_context_used": trace.repair_context_used,
+            "full_repair_executed": trace.full_repair_executed,
             "review_strict_gate_result": trace.review_strict_gate_result,
             "original_code": trace.original_code,
             "processed_manual_code": trace.processed_manual_code,
@@ -320,6 +383,8 @@ class LangGraphSATDWorkflow:
         steps = []
         analysis = trace.analysis or {}
         steps.append("analysis:pass" if analysis.get("repairable") else f"analysis:{analysis.get('decision') or 'drop'}")
+        if trace.probe:
+            steps.append("probe:pass" if trace.probe.get("passed") else "probe:reject")
         if trace.repair_context_used:
             steps.append("repair_context:used")
         for repair in trace.repairs:
@@ -336,6 +401,8 @@ class LangGraphSATDWorkflow:
     def _drop_stage(self, trace) -> str:
         if trace.status == "dropped_by_analyzer":
             return "analyzer"
+        if trace.status == "dropped_by_probe":
+            return "probe"
         if trace.status == "dropped_after_review" and trace.reviews:
             last_round = trace.reviews[-1].get("round_id")
             return f"review_round_{last_round}"
@@ -347,8 +414,9 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_hard_reject", "analysis_expected_fixability_hint", "analysis_why_not_hard_reject",
+            "probe_context_used", "probe_passed", "probe_fix_plan", "probe_confidence", "probe_problem_alignment", "probe_minimality", "probe_semantic_risk", "probe_self_consistency", "probe_success_score", "predicted_success_score", "probe_filter_reason",
+            "repair_context_used", "full_repair_executed", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
@@ -389,7 +457,22 @@ class LangGraphSATDWorkflow:
                     "analysis_drop_reason": analysis.get("drop_reason"),
                     "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch"),
                     "analysis_github_evidence_strength": analysis.get("github_evidence_strength"),
+                    "analysis_hard_reject": analysis.get("hard_reject"),
+                    "analysis_expected_fixability_hint": analysis.get("expected_fixability_hint"),
+                    "analysis_why_not_hard_reject": analysis.get("why_not_hard_reject"),
+                    "probe_context_used": trace.probe_context_used,
+                    "probe_passed": (trace.probe or {}).get("passed") if trace.probe else None,
+                    "probe_fix_plan": (trace.probe or {}).get("probe_fix_plan") if trace.probe else None,
+                    "probe_confidence": (trace.probe or {}).get("probe_confidence") if trace.probe else None,
+                    "probe_problem_alignment": (trace.probe or {}).get("probe_problem_alignment") if trace.probe else None,
+                    "probe_minimality": (trace.probe or {}).get("probe_minimality") if trace.probe else None,
+                    "probe_semantic_risk": (trace.probe or {}).get("probe_semantic_risk") if trace.probe else None,
+                    "probe_self_consistency": (trace.probe or {}).get("probe_self_consistency") if trace.probe else None,
+                    "probe_success_score": (trace.probe or {}).get("probe_success_score") if trace.probe else None,
+                    "predicted_success_score": (trace.probe or {}).get("predicted_success_score") if trace.probe else None,
+                    "probe_filter_reason": (trace.probe or {}).get("filter_reason") if trace.probe else None,
                     "repair_context_used": trace.repair_context_used,
+                    "full_repair_executed": trace.full_repair_executed,
                     "review_strict_gate_result": trace.review_strict_gate_result,
                     "original_code": trace.original_code,
                     "processed_manual_code": trace.processed_manual_code,
@@ -509,8 +592,9 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_hard_reject", "analysis_expected_fixability_hint", "analysis_why_not_hard_reject",
+            "probe_context_used", "probe_passed", "probe_fix_plan", "probe_confidence", "probe_problem_alignment", "probe_minimality", "probe_semantic_risk", "probe_self_consistency", "probe_success_score", "predicted_success_score", "probe_filter_reason",
+            "repair_context_used", "full_repair_executed", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
@@ -523,12 +607,14 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_hard_reject", "analysis_expected_fixability_hint", "analysis_why_not_hard_reject",
+            "probe_context_used", "probe_passed", "probe_fix_plan", "probe_confidence", "probe_problem_alignment", "probe_minimality", "probe_semantic_risk", "probe_self_consistency", "probe_success_score", "predicted_success_score", "probe_filter_reason",
+            "repair_context_used", "full_repair_executed", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
         ]
         rows = []
         for trace in traces:
             analysis = trace.analysis or {}
+            probe = trace.probe or {}
             rows.append({
                 "task_id": trace.task_id,
                 "project": trace.project,
@@ -545,6 +631,12 @@ class LangGraphSATDWorkflow:
                 "analysis_satd_type": analysis.get("satd_type"),
                 "analysis_risk_level": analysis.get("risk_level"),
                 "analysis_scope_radius": analysis.get("scope_radius"),
+                "analysis_intent_clarity": analysis.get("intent_clarity"),
+                "analysis_change_locality": analysis.get("change_locality"),
+                "analysis_semantic_risk": analysis.get("semantic_risk"),
+                "analysis_context_sufficiency": analysis.get("context_sufficiency"),
+                "analysis_verifiability": analysis.get("verifiability"),
+                "analysis_analyze_score": analysis.get("analyze_score"),
                 "analysis_context_score": analysis.get("context_score"),
                 "analysis_clarity_score": analysis.get("clarity_score"),
                 "analysis_validation_signals": json.dumps(analysis.get("validation_signals", []), ensure_ascii=False),
@@ -555,7 +647,22 @@ class LangGraphSATDWorkflow:
                 "analysis_drop_reason": analysis.get("drop_reason"),
                 "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch"),
                 "analysis_github_evidence_strength": analysis.get("github_evidence_strength"),
+                "analysis_hard_reject": analysis.get("hard_reject"),
+                "analysis_expected_fixability_hint": analysis.get("expected_fixability_hint"),
+                "analysis_why_not_hard_reject": analysis.get("why_not_hard_reject"),
+                "probe_context_used": trace.probe_context_used,
+                "probe_passed": probe.get("passed"),
+                "probe_fix_plan": probe.get("probe_fix_plan"),
+                "probe_confidence": probe.get("probe_confidence"),
+                "probe_problem_alignment": probe.get("probe_problem_alignment"),
+                "probe_minimality": probe.get("probe_minimality"),
+                "probe_semantic_risk": probe.get("probe_semantic_risk"),
+                "probe_self_consistency": probe.get("probe_self_consistency"),
+                "probe_success_score": probe.get("probe_success_score"),
+                "predicted_success_score": probe.get("predicted_success_score"),
+                "probe_filter_reason": probe.get("filter_reason"),
                 "repair_context_used": trace.repair_context_used,
+                "full_repair_executed": trace.full_repair_executed,
                 "review_strict_gate_result": trace.review_strict_gate_result,
                 "original_code": trace.original_code,
                 "processed_manual_code": trace.processed_manual_code,
@@ -670,11 +777,15 @@ class LangGraphSATDWorkflow:
             result_rows.append({
                 "task_id": trace.task_id,
                 "status": trace.status,
+                "em_label": trace.em_label or "",
                 "exact_match": str(bool(trace.exact_match)) if trace.exact_match is not None else "",
+                "probe_passed": str(bool(trace.probe.get("passed"))) if trace.probe else "",
+                "full_repair_executed": str(bool(trace.full_repair_executed)),
             })
 
         total = len(result_rows)
         analyze_filtered_count = sum(1 for row in result_rows if row.get("status") == "dropped_by_analyzer")
+        probe_filtered_count = sum(1 for row in result_rows if row.get("status") == "dropped_by_probe")
         review_rejected_count = sum(1 for row in result_rows if row.get("status") == "dropped_after_review")
         workflow_output_count = sum(1 for row in result_rows if row.get("status") == "accepted")
         successful_repair_count = sum(
@@ -682,10 +793,20 @@ class LangGraphSATDWorkflow:
             for row in result_rows
             if row.get("status") == "accepted" and str(row.get("exact_match")).lower() == "true"
         )
+        probe_passed_count = sum(1 for row in result_rows if str(row.get("probe_passed")).lower() == "true")
+        full_repair_executed_count = sum(1 for row in result_rows if str(row.get("full_repair_executed")).lower() == "true")
+        probe_filtered_em_yes_count = sum(1 for row in result_rows if row.get("status") == "dropped_by_probe" and str(row.get("em_label")).strip().upper() in {"YES", "1", "TRUE"})
+        probe_passed_em_yes_count = sum(1 for row in result_rows if str(row.get("probe_passed")).lower() == "true" and str(row.get("em_label")).strip().upper() in {"YES", "1", "TRUE"})
 
         return {
             "input_satd_count": total,
+            "analyze_hard_filtered_count": analyze_filtered_count,
             "analyze_filtered_count": analyze_filtered_count,
+            "probe_filtered_count": probe_filtered_count,
+            "probe_passed_count": probe_passed_count,
+            "full_repair_executed_count": full_repair_executed_count,
+            "probe_filtered_em_yes_count": probe_filtered_em_yes_count,
+            "probe_passed_em_yes_count": probe_passed_em_yes_count,
             "review_rejected_count": review_rejected_count,
             "workflow_output_count": workflow_output_count,
             "successful_repair_count": successful_repair_count,
@@ -753,7 +874,14 @@ class LangGraphSATDWorkflow:
         return AnalysisResult(
             decision="drop",
             repairable=False,
+            hard_reject=True,
             repairability_score=0.0,
+            intent_clarity=0.0,
+            change_locality=0.0,
+            semantic_risk=1.0,
+            context_sufficiency=0.0,
+            verifiability=0.0,
+            analyze_score=0.0,
             confidence=0.0,
             satd_type="content_filtered",
             reason="Analyzer prompt was blocked by provider content filtering.",
@@ -769,6 +897,25 @@ class LangGraphSATDWorkflow:
             drop_reason="insufficient_context",
             historical_snapshot_mismatch=bool(metadata.get("historical_snapshot_mismatch")),
             github_evidence_strength=str(metadata.get("github_evidence_strength") or "low"),
+            expected_fixability_hint="blocked_by_provider",
+            why_not_hard_reject="content_filter_fallback",
+        )
+
+
+    def _fallback_probe(self, state: GraphState) -> ProbeResult:
+        return ProbeResult(
+            passed=False,
+            probe_fix_plan="Probe blocked by provider content filtering.",
+            probe_repaired_code=state["original_code"],
+            probe_confidence=0.0,
+            probe_problem_alignment=0.0,
+            probe_minimality=0.0,
+            probe_semantic_risk=1.0,
+            probe_self_consistency=0.0,
+            probe_success_score=0.0,
+            predicted_success_score=0.0,
+            rationale="probe_content_filter_fallback",
+            filter_reason="provider_content_filter",
         )
 
     def _fallback_repair(self, state: GraphState, round_id: int) -> RepairAttempt:
@@ -786,10 +933,15 @@ class LangGraphSATDWorkflow:
             round_id=state["round_id"],
             approved=False,
             review_score=0.0,
+            problem_alignment=0.0,
+            minimality=0.0,
+            semantic_preservation=0.0,
+            internal_consistency=0.0,
             issues=["Reviewer prompt was blocked by provider content filtering."],
             revision_advice="Stop automatic approval for this SATD because reviewer prompting was content-filtered.",
             reject_type="content_filter",
             rationale="Reviewer prompt was blocked by provider content filtering.",
+            softened_gate_used=False,
         )
 
     def _log(self, message: str) -> None:

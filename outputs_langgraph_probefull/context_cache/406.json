@@ -1,0 +1,442 @@
+{
+  "task_id": "406",
+  "repo_owner": "linaro",
+  "repo_name": "lava",
+  "file_path": "lava_dispatcher/action.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T08:23:44+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T08:23:56+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T08:24:04+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lava_dispatcher/action.py",
+    "original_code": "def run_cmd(self, command_list, allow_fail=False, error_msg=None, cwd=None):\n    \"\"\"\n    Run the given command on the dispatcher. If the command fail, a\n    JobError will be raised unless allow_fail is set to True.\n    The command output will be visible (almost) in real time.\n\n    :param: command_list - the command to run (as a list)\n    :param: allow_fail - if True, do not raise a JobError when the command fail (return non 0)\n    :param: error_msg - the exception message.\n    :param: cwd - the current working directory for this command\n    \"\"\"\n    # Build the command list (adding 'nice' at the front)\n    if isinstance(command_list, str):\n        command_list = shlex.split(command_list)\n    elif not isinstance(command_list, list):\n        raise LAVABug(\"commands to run_cmd need to be a list or a string\")\n    command_list = [\"nice\"] + [str(s) for s in command_list]\n\n    # Start the subprocess\n    self.logger.debug(\"Calling: '%s'\", \"' '\".join(command_list))\n    start = time.time()\n    # TODO: when python >= 3.6 use encoding and errors\n    # see https://docs.python.org/3.6/library/subprocess.html#subprocess.Popen\n    proc = subprocess.Popen(  # nosec - managed\n        command_list,\n        cwd=cwd,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n        bufsize=1,  # line buffered\n        universal_newlines=True,  # text stream\n    )\n\n    # Poll stdout and stderr until the process terminate\n    poller = select.epoll()\n    poller.register(proc.stdout, select.EPOLLIN)\n    poller.register(proc.stderr, select.EPOLLIN)\n    while proc.poll() is None:\n        for fd, event in poller.poll():\n            # When the process terminate, we might get an EPOLLHUP\n            if event is not select.EPOLLIN:\n                continue\n            # Print stdout or stderr\n            # We can't use readlines as it will block.\n            if fd == proc.stdout.fileno():\n                line = proc.stdout.readline()\n                self.logger.debug(\">> %s\", line)\n            elif fd == proc.stderr.fileno():\n                line = proc.stderr.readline()\n                self.logger.error(\">> %s\", line)\n\n    # The process has terminated but some output might be remaining.\n    # readlines won't block now because the process has terminated.\n    for line in proc.stdout.readlines():\n        self.logger.debug(\">> %s\", line)\n    for line in proc.stderr.readlines():\n        self.logger.error(\">> %s\", line)\n\n    # Check the return code\n    ret = proc.wait()\n    self.logger.debug(\"Returned %d in %s seconds\", ret, int(time.time() - start))\n    if ret and not allow_fail:\n        self.logger.error(\"Unable to run '%s'\", command_list)\n        raise self.command_exception(error_msg)",
+    "satd_comment": "# TODO: when python >= 3.6 use encoding and errors\n# see https://docs.python.org/3.6/library/subprocess.html#subprocess.Popen",
+    "target_file": {
+      "ok": true,
+      "path": "lava_dispatcher/action.py",
+      "sha": "e97c72cbf1434a19e4d8a32fa875b3928fd2f657",
+      "download_url": "https://raw.githubusercontent.com/Linaro/lava/master/lava_dispatcher/action.py",
+      "content_excerpt": "# Copyright (C) 2014-2019 Linaro Limited\n#\n# Author: Neil Williams <neil.williams@linaro.org>\n#\n# SPDX-License-Identifier: GPL-2.0-or-later\nfrom __future__ import annotations\n\nimport contextlib\nimport copy\nimport logging\nimport subprocess  # nosec - internal\nimport time\nimport traceback\nimport warnings\nfrom functools import reduce\nfrom shlex import split as shlex_split\nfrom typing import TYPE_CHECKING\n\nimport pexpect\nfrom pexpect.popen_spawn import PopenSpawn as PexpectPopenSpawn\n\nfrom lava_common.decorators import nottest\nfrom lava_common.exceptions import (\n    InfrastructureError,\n    JobError,\n    LAVABug,\n    LAVAError,\n    LAVATimeoutError,\n    TestError,\n)\nfrom lava_common.log import YAMLLogger\nfrom lava_common.timeout import Timeout\nfrom lava_dispatcher.utils.strings import seconds_to_str\n\nif TYPE_CHECKING:\n    from collections.abc import Iterator, KeysView\n    from typing import Any, ClassVar, TypeVar\n\n    from .job import Job\n    from .shell import ShellSession\n\n    TAction = TypeVar(\"TAction\", bound=\"Action\")\n\n\nclass InternalObject:\n    \"\"\"\n    An object within the dispatcher pipeline which should not be included in\n    the description of the pipeline.\n    \"\"\"\n\n    pass\n\n\nclass Pipeline:\n    \"\"\"\n    Pipelines ensure that actions are run in the correct sequence whilst\n    allowing for retries and other requirements.\n    When an action is added to a pipeline, the level of that action within\n    the overall job is set along with the formatter and output filename\n    of the per-action log handler.\n    \"\"\"\n\n    def __init__(\n        self,\n        job: Job,\n        parent: Action | None = None,\n        parameters: dict[str, Any] | None = None,\n    ):\n        self.actions: list[Action] = []\n        self.parent: Action | None = None\n        self.parameters = {} if parameters is None else parameters\n        self.job = job\n        if parent is not None:\n            # parent must be an Action\n            if not isinstance(parent, Action):\n                raise LAVABug(\"Internal pipelines need an Action as a parent\")\n            if not parent.level:\n                raise LAVABug(\n                    \"Tried to create a pipeline using a parent action with no level set.\"\n                )\n            self.parent = parent\n\n    def _check_action(self, action: Action) -> None:\n        if not action:\n            raise LAVABug(\"Need an action to add to the pipeline, not None.\")\n        elif not issubclass(type(action), Action):\n            raise LAVABug(\"Only actions can be added to a pipeline: %s\" % action)\n        # if isinstance(action, DiagnosticAction):\n        #     raise LAVABug(\"Diagnostic actions need to be triggered, not added to a pipeline.\")\n\n    def add_action(\n        self, action: Action, parameters: dict[str, Any] | None = None\n    ) -> None:\n        self._check_action(action)\n        self.actions.append(action)\n\n        if self.parent:  # action\n            self.parent.pipeline = self\n            action.level = \"%s.%s\" % (self.parent.level, len(self.actions))\n            action.section = self.parent.section\n        else:\n            action.level = \"%s\" % (len(self.actions))\n\n        # Use the pipeline parameters if the function was walled without\n        # parameters.\n        if parameters is None:\n            parameters = self.parameters\n        action.parameters = parameters\n\n        # Compute the timeout\n        device_timeouts = self.job.device.get(\"timeouts\", {})\n        device_named_actions_timeouts = device_timeouts.get(\"actions\", {})\n        devices_named_connections_timeouts = device_timeouts.get(\"connections\", {})\n        job_timeouts = self.job.parameters.get(\"timeouts\", {})\n        job_named_actions_timeouts = job_timeouts.get(\"actions\", {})\n        job_named_connections_timeouts = job_timeouts.get(\"connections\", {})\n\n        # Set the action timeout. The order is from lowest priority to highest:\n        # 1. Job's global action timeout\n        action._override_action_timeout(job_timeouts.get(\"action\"))\n        # 2. Device named actions timeout\n        action._override_action_timeout(device_named_actions_timeouts.get(action.name))\n        # 3. Action block timeout\n        action._override_action_timeout(parameters.get(\"timeout\"))\n        # 4. RetryAction child action timeout\n        if self.parent is not None and self.parent.max_retries > 1:\n            action._override_action_timeout(\n                {\"seconds\": self.parent.timeout.duration // self.parent.max_retries}\n            )\n        # 5. Job's global named action timeout\n        action._override_action_timeout(job_named_actions_timeouts.get(action.name))\n        # 6. Action block named action timeout\n        if action_block_timeouts := parameters.get(\"timeouts\"):\n            action._override_action_timeout(action_block_timeouts.get(action.name))\n\n        if action.timeout.duration > self.job.timeout.duration:\n            action.logger.warning(\n                \"Action timeout for %s exceeds Job timeout\", action.name\n            )\n\n        # Set the action timeout. The order is from lowest priority to highest:\n        # 1. Job's global connection timeout\n        action._override_connection_timeout(job_timeouts.get(\"connection\"))\n        # 2. Device named connection timeout\n        action._override_connection_timeout(\n            devices_named_connections_timeouts.get(action.name)\n        )\n        # 3. Job's global named connection timeout\n        action._override_connection_timeout(\n            job_named_connections_timeouts.get(action.name)\n        )\n\n        # If the action has an internal pipeline, initialise that here. Child\n        # action timeout should be propagated from parent to child, parent\n        # timeout should be set first.\n        action.populate(parameters)\n\n    def describe(self) -> list[dict[str, Any]]:\n        \"\"\"\n        Describe the current pipeline, recursing through any\n        internal pipelines.\n        :return: a recursive dictionary\n        \"\"\"\n        desc: list[dict[str, Any]] = []\n        for action in self.actions:\n            current = {\n                \"class\": type(action).__name__,\n                \"name\": action.name,\n                \"level\": action.level,\n                \"max_retries\": action.max_retries,\n                \"description\": action.description,\n                \"summary\": action.summary,\n                \"timeout\": action.timeout.duration,\n            }\n            if hasattr(action, \"url\"):\n                current[\"url\"] = action.url.geturl()\n            if action.pipeline is not None:\n                sub_desc = action.pipeline.describe()\n                if sub_desc:\n                    current[\"pipeline\"] = sub_desc\n            desc.append(current)\n        return desc\n\n    @property\n    def errors(self) -> list[str]:\n        sub_action_errors = [a.errors for a in self.actions]\n        if not sub_action_errors:  # allow for jobs with no actions\n            return []\n        return reduce(lambda a, b: a + b, sub_action_errors)\n\n    def validate_actions(self) -> None:\n        for action in self.actions:\n            try:\n                action.validate()\n            except JobError as exc:\n                action.errors = \"%s %s: %s\" % (action.level, action.name, str(exc))\n\n        # If this is the root pipeline, raise the errors\n        if self.parent is None and self.errors:\n            raise JobError(\"Invalid job data: %s\\n\" % self.errors)\n\n    def cleanup(\n        self, connection: ShellSession, max_end_time: int | None = None\n    ) -> None:\n        \"\"\"\n        Recurse through internal pipelines running action.cleanup(),\n        in order of the pipeline levels.\n        \"\"\"\n        error = False\n        for child in self.actions:\n            try:\n                if max_end_time is not None and child.name == \"finalize\":\n                    child.cleanup(connection, max_end_time)\n                else:\n                    child.cleanup(connection)\n            except Exception as exc:\n                # Just log the exception and continue the cleanup\n                child.logger.error(\n                    \"Failed to clean after action '%s': %s\", child.name, str(exc)\n                )\n                child.logger.exception(traceback.format_exc())\n                error = True\n        if error:\n            raise InfrastructureError(\"Failed to clean after job\")\n\n    def run_actions(self, connection: ShellSession, max_end_time: int) -> ShellSession:\n        for action in self.actions:\n            failed = False\n            namespace = action.parameters.get(\"namespace\", \"common\")\n            # Begin the action\n            try:\n                parent = self.parent if self.parent else self.job\n                with action.timeout(parent, max_end_time) as action_max_end_time:\n                    # Add action start timestamp to the log message\n                    # Log in INFO for root actions and in DEBUG for the other actions\n                    timeout = seconds_to_str(action_max_end_time - action.timeout.start)\n                    msg = \"start: %s %s (timeout %s) [%s]\" % (\n                        action.level,\n                        action.name,\n                        timeout,\n                        namespace,\n                    )\n                    if self.parent is None:\n                        action.logger.info(msg)\n                    else:\n                        action.logger.debug(msg)\n\n                    new_connection = action.run(connection, action_max_end_time)\n            except LAVATimeoutError as exc:\n                action.logger.exception(str(exc))\n                # allows retries without setting errors, which make the job incomplete.\n                failed = True\n                action.results = {\"fail\": str(exc)}\n                if action.timeout.can_skip(action.parameters):\n                    if self.parent is None:\n                        action.logger.warning(\n                            \"skip_timeout is set for %s - continuing to next action block.\"\n                            % (action.name)\n                        )\n                    else:\n                        raise\n                    new_connection = None\n                else:\n                    raise TestError(str(exc))\n            except LAVAError as exc:\n                action.logger.exception(str(exc))\n                # allows retries without setting errors, which make the job incomplete.\n                failed = True\n                action.results = {\"fail\": str(exc)}\n                raise\n            except Exception as exc:\n                action.logger.exception(traceback.format_exc())\n                # allows retries without setting errors, which make the job incomplete.\n                failed = True\n                action.results = {\"fail\": str(exc)}\n                # Raise a LAVABug that will be correctly classified later\n                raise LAVABug(str(exc))\n            finally:\n                # Add action end timestamp to the log message\n                duration = round(action.timeout.elapsed_time)\n                msg = \"end: %s %s (duration %s) [%s]\" % (\n                    action.level,\n                    action.name,\n                    seconds_to_str(duration),\n                    namespace,\n                )\n                if self.parent is None:\n                    action.logger.info(msg)\n                else:\n                    action.logger.debug(msg)\n                # set results including retries and failed actions\n                action.log_action_results(fail=failed)\n\n            if new_connection:\n                connection = new_connection\n        return connection\n\n    def _iter_actions(self) -> Iterator[Action]:\n        for action in self.actions:\n            yield action\n            if action.pipeline is not None:\n                yield from action.pipeline._iter_actions()\n\n    def find_action(self, action_class: type[TAction]) -> TAction:\n        for action in self._iter_actions():\n            if isinstance(action, action_class):\n   ",
+      "total_lines": 1040
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "contextlib",
+        "copy",
+        "logging",
+        "subprocess",
+        "time",
+        "traceback",
+        "warnings",
+        "functools:reduce",
+        "shlex:split",
+        "typing:TYPE_CHECKING",
+        "pexpect",
+        "pexpect.popen_spawn:PopenSpawn",
+        "lava_common.decorators:nottest",
+        "lava_common.exceptions:InfrastructureError",
+        "lava_common.exceptions:JobError",
+        "lava_common.exceptions:LAVABug",
+        "lava_common.exceptions:LAVAError",
+        "lava_common.exceptions:LAVATimeoutError",
+        "lava_common.exceptions:TestError",
+        "lava_common.log:YAMLLogger",
+        "lava_common.timeout:Timeout",
+        "lava_dispatcher.utils.strings:seconds_to_str",
+        "collections.abc:Iterator",
+        "collections.abc:KeysView",
+        "typing:Any",
+        "typing:ClassVar",
+        "typing:TypeVar",
+        "job:Job",
+        "shell:ShellSession"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/Linaro/lava/master/README.md",
+      "content_excerpt": "LAVA\n====\n\nLAVA is an automated validation architecture primarily aimed at testing\ndeployments of systems based around the Linux kernel on ARM devices,\nspecifically ARMv7 and later.\n\nThis repository contains the dispatcher and server source code.\n\nInstallation instructions\n=========================\n\nFor latest information, see the lava-server documentation:\n* [first installation](https://docs.lavasoftware.org/lava/first-installation.html)\n* [installing on Debian](https://docs.lavasoftware.org/lava/installing_on_debian.html)\n\nSupport\n=======\n\nRead the [support](https://docs.lavasoftware.org/lava/support.html) page.\n\nReporting Bugs\n==============\n\nBugs should first be discussed by subscribing to the\n[lava-users](https://lists.lavasoftware.org/mailman3/lists/lava-users.lists.lavasoftware.org/)\nmailing list.\n\nBug reports and new LAVA features are tracked using\n[GitLab](https://gitlab.com/lava/lava/issues).\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "run_cmd test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_docker.py",
+          "path": "tests/lava_dispatcher/test_docker.py",
+          "sha": "df7c22780c93f9f135bfd9219b67641d12045cbd",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/test_docker.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_uuu.py",
+          "path": "tests/lava_dispatcher/test_uuu.py",
+          "sha": "8228182b4da640291e99d8e0c7cd9fcfad0027d8",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/test_uuu.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_fvp.py",
+          "path": "tests/lava_dispatcher/test_fvp.py",
+          "sha": "bea7aa9527e89f133bea78ce49c39c09ac404cfc",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/test_fvp.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_commands.py",
+          "path": "tests/lava_dispatcher/actions/test_commands.py",
+          "sha": "07441c8d7a40565ad4d9fa5d7aef7f726fd69e45",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/actions/test_commands.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_fastboot.py",
+          "path": "tests/lava_dispatcher/test_fastboot.py",
+          "sha": "b27b26efa8e98939de7ecd707e85104bead8b030",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/test_fastboot.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_action.py",
+          "path": "tests/lava_dispatcher/test_action.py",
+          "sha": "fa0cf7447ccabedcf82a95f2a1710d8ad2dac36c",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/test_action.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_apply_overlay.py",
+          "path": "tests/lava_dispatcher/actions/deploy/test_apply_overlay.py",
+          "sha": "98f3fbcb47e0315f2e9028e034f61cfdf8e5b68f",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/actions/deploy/test_apply_overlay.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_fvp.py",
+          "path": "tests/lava_dispatcher/actions/boot/test_fvp.py",
+          "sha": "ce1fcccb5f1bcbc18a322852577868e3cab9c339",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/tests/lava_dispatcher/actions/boot/test_fvp.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"run_cmd(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "power.py",
+          "path": "lava_dispatcher/power.py",
+          "sha": "7ba943d82c8cb5d8582ebd589dfef77fb194f6a3",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/power.py",
+          "score": 1.0
+        },
+        {
+          "name": "uuu.py",
+          "path": "lava_dispatcher/utils/uuu.py",
+          "sha": "16c8b6cbb7a33f86eaf7dc2a2a4134497a91811e",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/utils/uuu.py",
+          "score": 1.0
+        },
+        {
+          "name": "docker.py",
+          "path": "lava_dispatcher/utils/docker.py",
+          "sha": "f4ba1c8fa59a8eb086c155820013d1840a6f8843",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/utils/docker.py",
+          "score": 1.0
+        },
+        {
+          "name": "cmsis_dap.py",
+          "path": "lava_dispatcher/actions/boot/cmsis_dap.py",
+          "sha": "49ce13ccead5fa34a6455b9c57fde420f774f4f8",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/actions/boot/cmsis_dap.py",
+          "score": 1.0
+        },
+        {
+          "name": "containers.py",
+          "path": "lava_dispatcher/utils/containers.py",
+          "sha": "aadf0ac1c80799a8df5fc356ba3d619da6c12dd8",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/utils/containers.py",
+          "score": 1.0
+        },
+        {
+          "name": "vemsd.py",
+          "path": "lava_dispatcher/actions/deploy/vemsd.py",
+          "sha": "71232526f423ecc54145af23dc149bbce8cdc65c",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/actions/deploy/vemsd.py",
+          "score": 1.0
+        },
+        {
+          "name": "action.py",
+          "path": "lava_dispatcher/action.py",
+          "sha": "e97c72cbf1434a19e4d8a32fa875b3928fd2f657",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/action.py",
+          "score": 1.0
+        },
+        {
+          "name": "prepare.py",
+          "path": "lava_dispatcher/actions/deploy/prepare.py",
+          "sha": "ce658fee9d083d48c4cdb407066de9db95851e5e",
+          "html_url": "https://github.com/Linaro/lava/blob/6757ddafbf7a9e1af03a7556cc9da1a8fca93e58/lava_dispatcher/actions/deploy/prepare.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lava_dispatcher",
+      "count": 18,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "lava_dispatcher/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "action.py",
+          "path": "lava_dispatcher/action.py",
+          "type": "file"
+        },
+        {
+          "name": "actions",
+          "path": "lava_dispatcher/actions",
+          "type": "dir"
+        },
+        {
+          "name": "connection.py",
+          "path": "lava_dispatcher/connection.py",
+          "type": "file"
+        },
+        {
+          "name": "connections",
+          "path": "lava_dispatcher/connections",
+          "type": "dir"
+        },
+        {
+          "name": "deployment_data.py",
+          "path": "lava_dispatcher/deployment_data.py",
+          "type": "file"
+        },
+        {
+          "name": "device.py",
+          "path": "lava_dispatcher/device.py",
+          "type": "file"
+        },
+        {
+          "name": "dynamic_vm_keys",
+          "path": "lava_dispatcher/dynamic_vm_keys",
+          "type": "dir"
+        },
+        {
+          "name": "job.py",
+          "path": "lava_dispatcher/job.py",
+          "type": "file"
+        },
+        {
+          "name": "lava_test_shell",
+          "path": "lava_dispatcher/lava_test_shell",
+          "type": "dir"
+        },
+        {
+          "name": "logical.py",
+          "path": "lava_dispatcher/logical.py",
+          "type": "file"
+        },
+        {
+          "name": "menus",
+          "path": "lava_dispatcher/menus",
+          "type": "dir"
+        },
+        {
+          "name": "parser.py",
+          "path": "lava_dispatcher/parser.py",
+          "type": "file"
+        },
+        {
+          "name": "power.py",
+          "path": "lava_dispatcher/power.py",
+          "type": "file"
+        },
+        {
+          "name": "protocols",
+          "path": "lava_dispatcher/protocols",
+          "type": "dir"
+        },
+        {
+          "name": "shell.py",
+          "path": "lava_dispatcher/shell.py",
+          "type": "file"
+        },
+        {
+          "name": "utils",
+          "path": "lava_dispatcher/utils",
+          "type": "dir"
+        },
+        {
+          "name": "worker.py",
+          "path": "lava_dispatcher/worker.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lava_dispatcher/__init__.py"
+        },
+        {
+          "name": "connection.py",
+          "path": "lava_dispatcher/connection.py"
+        },
+        {
+          "name": "deployment_data.py",
+          "path": "lava_dispatcher/deployment_data.py"
+        },
+        {
+          "name": "device.py",
+          "path": "lava_dispatcher/device.py"
+        },
+        {
+          "name": "job.py",
+          "path": "lava_dispatcher/job.py"
+        },
+        {
+          "name": "logical.py",
+          "path": "lava_dispatcher/logical.py"
+        },
+        {
+          "name": "parser.py",
+          "path": "lava_dispatcher/parser.py"
+        },
+        {
+          "name": "power.py",
+          "path": "lava_dispatcher/power.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lava_dispatcher/action.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "a285010c3e5b80619c884d41d8fab73d560896eb",
+          "html_url": "https://github.com/Linaro/lava/commit/a285010c3e5b80619c884d41d8fab73d560896eb",
+          "message": "Allow pass strict env to run_cmd\n\n`run_cmd` will call `PopenSpawn`, for `PopenSpawn's` arg `env`, it will\n1) if env defined as None, will use all environments in current process\n2) if env defined as {\"FOO\": \"BAR\"}, will simply use \"FOO\" only\n3) if env defined as {}, then all environment variables wi",
+          "author": "Larry Shen",
+          "date": "2026-01-23T02:52:47Z"
+        },
+        {
+          "sha": "917ad88979c7b4423d0ca5d1fd2d9a32572cbee2",
+          "html_url": "https://github.com/Linaro/lava/commit/917ad88979c7b4423d0ca5d1fd2d9a32572cbee2",
+          "message": "Merge branch 'action-timeout' into 'master'\n\nlava_dispatcher: defer action timeout and job timeout comparison\n\nCloses #681\n\nSee merge request lava/lava!2948",
+          "author": "Rémi Duraffort",
+          "date": "2025-09-09T12:49:39Z"
+        },
+        {
+          "sha": "a68f32bb0ef68ab5ebb96c107881a562966d078a",
+          "html_url": "https://github.com/Linaro/lava/commit/a68f32bb0ef68ab5ebb96c107881a562966d078a",
+          "message": "lava_dispatcher: defer action timeout and job timeout comparison\n\nThe comparison should be done with the final action timeout not with\nevery levels.\n\nFixes https://gitlab.com/lava/lava/-/issues/681\n\nSigned-off-by: Chase Qi <chase.qi@linaro.org>",
+          "author": "Chase Qi",
+          "date": "2025-09-09T10:26:46Z"
+        },
+        {
+          "sha": "6c80fc9006637f2290b2c3323c88a3744c4b15d5",
+          "html_url": "https://github.com/Linaro/lava/commit/6c80fc9006637f2290b2c3323c88a3744c4b15d5",
+          "message": "Merge branch 'overlay' into 'master'\n\nlava_dispatcher: check job context first for getting constant\n\nSee merge request lava/lava!2946",
+          "author": "Rémi Duraffort",
+          "date": "2025-09-09T08:10:37Z"
+        },
+        {
+          "sha": "862ab529420bac697aef1b56dc4d6db2cee1c2fe",
+          "html_url": "https://github.com/Linaro/lava/commit/862ab529420bac697aef1b56dc4d6db2cee1c2fe",
+          "message": "prepare_guestfs: move tmp files into the job tmp dir",
+          "author": "Rémi Duraffort",
+          "date": "2025-09-09T07:30:47Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "run_cmd TODO when python encoding errors",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lava_dispatcher/action.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "a285010c3e5b80619c884d41d8fab73d560896eb",
+        "html_url": "https://github.com/Linaro/lava/commit/a285010c3e5b80619c884d41d8fab73d560896eb",
+        "message": "Allow pass strict env to run_cmd\n\n`run_cmd` will call `PopenSpawn`, for `PopenSpawn's` arg `env`, it will\n1) if env defined as None, will use all environments in current process\n2) if env defined as {\"FOO\": \"BAR\"}, will simply use \"FOO\" only\n3) if env defined as {}, then all environment variables wi",
+        "author": "Larry Shen",
+        "date": "2026-01-23T02:52:47Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment with link to official Python docs",
+        "code snippet shows subprocess.Popen usage",
+        "function is self-contained and local",
+        "no complex dependencies or architecture changes",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

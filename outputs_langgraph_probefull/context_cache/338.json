@@ -1,0 +1,336 @@
+{
+  "task_id": "338",
+  "repo_owner": "google",
+  "repo_name": "deepvariant",
+  "file_path": "scripts/run_deepvariant.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T07:57:07+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T07:57:18+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T07:57:26+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "scripts/run_deepvariant.py",
+    "original_code": "def make_examples_command(ref,\n                          reads,\n                          examples,\n                          extra_args,\n                          runtime_by_region_path=None,\n                          **kwargs):\n  \"\"\"Returns a make_examples (command, logfile) for subprocess.\n\n  Args:\n    ref: Input FASTA file.\n    reads: Input BAM file.\n    examples: Output tfrecord file containing tensorflow.Example files.\n    extra_args: Comma-separated list of flag_name=flag_value.\n    runtime_by_region_path: Output path for runtime by region metrics.\n    **kwargs: Additional arguments to pass in for make_examples.\n\n  Returns:\n    (string, string) A command to run, and a log file to output to.\n  \"\"\"\n  command = [\n      'time', 'seq 0 {} |'.format(FLAGS.num_shards - 1),\n      'parallel -q --halt 2 --line-buffer', '/opt/deepvariant/bin/make_examples'\n  ]\n  command.extend(['--mode', 'calling'])\n  command.extend(['--ref', '\"{}\"'.format(ref)])\n  command.extend(['--reads', '\"{}\"'.format(reads)])\n  command.extend(['--examples', '\"{}\"'.format(examples)])\n\n  if runtime_by_region_path is not None:\n    command.extend(\n        ['--runtime_by_region', '\"{}\"'.format(runtime_by_region_path)])\n\n  conflict_args = None\n  if FLAGS.model_type == 'WGS':  # TODO: add WES.\n    special_args = {}\n    special_args['channels'] = 'insert_size'\n    kwargs = _update_kwargs_with_warning(kwargs, special_args)\n  elif FLAGS.model_type == 'PACBIO':\n    special_args = {}\n    special_args['pileup_image_width'] = 199\n    special_args['realign_reads'] = False\n    special_args['vsc_min_fraction_indels'] = 0.12\n    special_args['alt_aligned_pileup'] = 'diff_channels'\n    special_args['add_hp_channel'] = True\n    special_args['sort_by_haplotypes'] = special_args[\n        'parse_sam_aux_fields'] = bool(FLAGS.use_hp_information)\n    kwargs = _update_kwargs_with_warning(kwargs, special_args)\n    conflict_args = ['sort_by_haplotypes', 'parse_sam_aux_fields']\n  # Extend the command with all items in kwargs and extra_args.\n  kwargs = _update_kwargs_with_warning(kwargs, _extra_args_to_dict(extra_args),\n                                       conflict_args)\n  command = _extend_command_by_args_dict(command, kwargs)\n\n  command.extend(['--task {}'])\n  logfile = None\n  if FLAGS.logging_dir:\n    logfile = '{}/make_examples.log'.format(FLAGS.logging_dir)\n  return (' '.join(command), logfile)",
+    "satd_comment": "# TODO: add WES.",
+    "target_file": {
+      "ok": true,
+      "path": "scripts/run_deepvariant.py",
+      "sha": "b6e9c07b3afa014ef087fd04dd37983aef1511ed",
+      "download_url": "https://raw.githubusercontent.com/google/deepvariant/r1.10/scripts/run_deepvariant.py",
+      "content_excerpt": "# Copyright 2020 Google LLC.\n#\n# Redistribution and use in source and binary forms, with or without\n# modification, are permitted provided that the following conditions\n# are met:\n#\n# 1. Redistributions of source code must retain the above copyright notice,\n#    this list of conditions and the following disclaimer.\n#\n# 2. Redistributions in binary form must reproduce the above copyright\n#    notice, this list of conditions and the following disclaimer in the\n#    documentation and/or other materials provided with the distribution.\n#\n# 3. Neither the name of the copyright holder nor the names of its\n#    contributors may be used to endorse or promote products derived from this\n#    software without specific prior written permission.\n#\n# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"\n# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE\n# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE\n# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE\n# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR\n# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF\n# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS\n# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN\n# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE\n# POSSIBILITY OF SUCH DAMAGE.\n\"\"\"Runs all 3 steps to go from input DNA reads to output VCF/gVCF files.\n\nThis script currently provides the most common use cases and standard models.\nIf you want to access more flags that are available in `make_examples`,\n`call_variants`, and `postprocess_variants`, you can also call them separately\nusing the binaries in the Docker image.\n\nFor more details, see:\nhttps://github.com/google/deepvariant/blob/r1.10/docs/deepvariant-quick-start.md\n\"\"\"\n\nimport enum\nimport json\nimport os\nimport re\nimport subprocess\nimport sys\nimport tempfile\nfrom typing import Any, Optional\n\nfrom absl import app\nfrom absl import flags\nfrom absl import logging\nimport tensorflow as tf\n\nFLAGS = flags.FLAGS\n\n\nclass ModelType(enum.Enum):\n  WGS = 'WGS'\n  WES = 'WES'\n  PACBIO = 'PACBIO'\n  ONT_R104 = 'ONT_R104'\n  HYBRID_PACBIO_ILLUMINA = 'HYBRID_PACBIO_ILLUMINA'\n  MASSEQ = 'MASSEQ'\n  RNASEQ = 'RNASEQ'\n\n\n# Required flags.\n_MODEL_TYPE = flags.DEFINE_enum(\n    'model_type',\n    None,\n    [m.value for m in ModelType],\n    (\n        'Required. Type of model to use for variant calling. Set this flag to'\n        ' use the default model associated with each type, and it will set'\n        ' necessary flags corresponding to each model. If you want to use a'\n        ' customized model, add --customized_model flag in addition to this'\n        ' flag.'\n    ),\n)\n_REF = flags.DEFINE_string(\n    'ref',\n    None,\n    (\n        'Required. Genome reference to use. Must have an associated FAI index'\n        ' as well. Supports text or gzipped references. Should match the'\n        ' reference used to align the BAM file provided to --reads.'\n    ),\n)\n_READS = flags.DEFINE_string(\n    'reads',\n    None,\n    (\n        'Required. Aligned, sorted, indexed BAM file containing the reads we'\n        ' want to call. Should be aligned to a reference genome compatible with'\n        ' --ref.'\n    ),\n)\n_OUTPUT_VCF = flags.DEFINE_string(\n    'output_vcf', None, 'Required. Path where we should write VCF file.'\n)\n# Optional flags.\n_HAPLOID_CONTIGS = flags.DEFINE_string(\n    'haploid_contigs',\n    None,\n    (\n        'Optional list of non autosomal chromosomes. For all listed'\n        ' chromosomes, HET probabilities are not considered. For samples with'\n        ' XY karyotype it is expected to set --haploid_contigs=\"chrX,chrY\" for'\n        ' GRCh38 and --haploid_contigs=\"X,Y\" for GRCh37. For samples with'\n        ' XX karyotype --haploid_contigs flag should not be used.'\n    ),\n)\n\n_PAR_REGIONS = flags.DEFINE_string(\n    'par_regions_bed',\n    None,\n    (\n        'Optional BED file containing Human Pseudoautosomal Region (PAR)'\n        ' regions. This should be specific to the reference used. For example'\n        ' GRCh38 PAR bed file would be different from GRCh37 bed file. Regions'\n        ' in this bed file are treated as diploid, effectively subtracting them'\n        ' from the --haploid_contigs.'\n    ),\n)\n\n_DRY_RUN = flags.DEFINE_boolean(\n    'dry_run',\n    False,\n    'Optional. If True, only prints out commands without executing them.',\n)\n_INTERMEDIATE_RESULTS_DIR = flags.DEFINE_string(\n    'intermediate_results_dir',\n    None,\n    (\n        'Optional. If specified, this should be an existing '\n        'directory that is visible insider docker, and will be '\n        'used to to store intermediate outputs.'\n    ),\n)\n_LOGGING_DIR = flags.DEFINE_string(\n    'logging_dir',\n    None,\n    (\n        'Optional. Directory where we should write log files '\n        'for each stage and optionally runtime reports.'\n    ),\n)\n_RUNTIME_REPORT = flags.DEFINE_boolean(\n    'runtime_report',\n    False,\n    (\n        'Output make_examples runtime metrics '\n        'and create a visual runtime report using runtime_by_region_vis. '\n        'Only works with --logging_dir.'\n    ),\n)\n_VERSION = flags.DEFINE_boolean(\n    'version',\n    None,\n    'Optional. If true, print out version number and exit.',\n    allow_hide_cpp=True,\n)\n\n# Optional flags for call_variants and make_examples.\n_CUSTOMIZED_MODEL = flags.DEFINE_string(\n    'customized_model',\n    None,\n    (\n        'Optional. A path to a model checkpoint to load for the `call_variants`'\n        ' step. If not set, the default for each --model_type will be used'\n    ),\n)\n_CUSTOMIZED_MODEL_JSON = flags.DEFINE_string(\n    'customized_model_json',\n    None,\n    (\n        'Optional. File path to a model.example_info.json to pair with'\n        ' --customized_model. If not set, we will use the'\n        ' model.example_info.json found in the model directory.'\n    ),\n)\n_DISABLE_SMALL_MODEL = flags.DEFINE_boolean(\n    'disable_small_model',\n    False,\n    'Optional. Disable the use of the small model to call variants during '\n    'the `make_examples` step.',\n)\n_CUSTOMIZED_SMALL_MODEL = flags.DEFINE_string(\n    'customized_small_model',\n    None,\n    (\n        'Optional. A path to a small model checkpoint to call variants during '\n        'the `make_examples` step.'\n    ),\n)\n_NUM_SHARDS = flags.DEFINE_integer(\n    'num_shards', 1, 'Optional. Number of shards for make_examples step.'\n)\n_REGIONS = flags.DEFINE_string(\n    'regions',\n    None,\n    (\n        'Optional. Space-separated list of regions we want to process. Elements'\n        ' can be region literals (e.g., chr20:10-20) or paths to BED/BEDPE'\n        ' files.'\n    ),\n)\n_SAMPLE_NAME = flags.DEFINE_string(\n    'sample_name',\n    None,\n    (\n        'Sample name to use instead of the sample name from the input reads BAM'\n        ' (SM tag in the header). This flag is used for both make_examples and'\n        ' postprocess_variants.'\n    ),\n)\n_USE_HP_INFORMATION = flags.DEFINE_boolean(\n    'use_hp_information',\n    None,\n    (\n        '(Deprecated in v1.4.0) Optional. If True, corresponding flags will be'\n        ' set to properly use the HP information present in the BAM input.'\n    ),\n)\n_MAKE_EXAMPLES_EXTRA_ARGS = flags.DEFINE_string(\n    'make_examples_extra_args',\n    None,\n    (\n        'A comma-separated list of flag_name=flag_value. \"flag_name\" has to be'\n        ' valid flags for make_examples.py. If the flag_value is boolean, it'\n        ' has to be flag_name=true or flag_name=false.'\n    ),\n)\n_CALL_VARIANTS_EXTRA_ARGS = flags.DEFINE_string(\n    'call_variants_extra_args',\n    None,\n    (\n        'A comma-separated list of flag_name=flag_value. \"flag_name\" has to be'\n        ' valid flags for call_variants.py. If the flag_value is boolean, it'\n        ' has to be flag_name=true or flag_name=false.'\n    ),\n)\n# Optional flag for postprocess variants\n_POSTPROCESS_CPUS = flags.DEFINE_integer(\n    'postprocess_cpus',\n    None,\n    'Optional. Number of cpus to use during'\n    ' postprocess_variants. Set to 0 to disable multiprocessing. Default is'\n    ' None which sets to num_shards.',\n)\n_POSTPROCESS_VARIANTS_EXTRA_ARGS = flags.DEFINE_string(\n    'postprocess_variants_extra_args',\n    None,\n    (\n        'A comma-separated list of flag_name=flag_value. \"flag_name\" has to be'\n        ' valid flags for postprocess_variants.py. If the flag_value is'\n        ' boolean, it has to be flag_name=true or flag_name=false.'\n    ),\n)\n_PHASE_VCF = flags.DEFINE_boolean(\n    'phase_vcf',\n    None,\n    'Optional. If true, emit phasing information in the VCF output. Available'\n    ' for long-read models (PacBio, ONT) only. Default is True for PacBio and'\n    ' ONT models and False for others.',\n)\n\n# Optional flags for postprocess_variants.\n_OUTPUT_GVCF = flags.DEFINE_string(\n    'output_gvcf', None, 'Optional. Path where we should write gVCF file.'\n)\n\n# Optional flags for vcf_stats_report.\n_VCF_STATS_REPORT = flags.DEFINE_boolean(\n    'vcf_stats_report',\n    False,\n    (\n        'Optional. Output a visual report (HTML) of '\n        'statistics about the output VCF.'\n    ),\n)\n_REPORT_TITLE = flags.DEFINE_string(\n    'report_title',\n    None,\n    (\n        'Optional. Title for the VCF stats report (HTML).'\n        'If not provided, the title will be the sample name.'\n    ),\n)\n_EMIT_VCF_BY_SMALL_MODEL_GQ_VALUES = flags.DEFINE_list(\n    'emit_vcf_by_small_model_gq_values',\n    None,\n    '[Experimental] When set as a list of integers, DeepVariant classifies all'\n    ' candidates using both small and CNN models. It then generates separate'\n    ' VCF files for each specified GQ (Genotype Quality) threshold by'\n    ' initiating multiple post-processing jobs. This experimental feature aims'\n    ' to analyze the combined accuracy of the two models across different GQ'\n    ' thresholds for all samples.',\n)\n\nMODEL_TYPE_MAP = {\n    ModelType.WGS: '/opt/models/wgs',\n    ModelType.WES: '/opt/models/wes',\n    ModelType.PACBIO: '/opt/models/pacbio',\n    ModelType.ONT_R104: '/opt/models/ont_r104',\n    ModelType.HYBRID_PACBIO_ILLUMINA: '/opt/models/hybrid_pacbio_illumina',\n    ModelType.MASSEQ: '/opt/models/masseq',\n    ModelType.RNASEQ: '/opt/models/rnaseq',\n}\n\n# Current release version of DeepVariant.\n# Should be the same in dv_vcf_constants.py.\nDEEP_VARIANT_VERSION = '1.10.0'\n\n\ndef _is_quoted(value):\n  if value.startswith('\"') and value.endswith('\"'):\n    return True\n  if value.startswith(\"'\") and value.endswith(\"'\"):\n    return True\n  return False\n\n\ndef _add_quotes(value):\n  if isinstance(value, str) and _is_quoted(value):\n    return value\n  return '\"{}\"'.format(value)\n\n\ndef trim_suffix(string: str, suffix: str) -> str:\n  if string.endswith(suffix):\n    return string[: -len(suffix)]\n  else:\n    return string\n\n\ndef split_extra_args(input_string: str) -> list[str]:\n  \"\"\"Splits into strs that do not contain commas or are enclosed in quotes.\"\"\"\n  pattern = r\"[^,]+=[\\\"'][^\\\"']*[\\\"']|[^,]+\"\n  return re.findall(pattern, input_string)\n\n\ndef _extra_args_to_dict(extra_args: str) -> dict[str, Any]:\n  \"\"\"Parses comma-separated list of flag_name=flag_value to dict.\"\"\"\n  args_dict = {}\n  if extra_args is None:\n    return args_dict\n  for extra_arg in split_extra_args(extra_args):\n    (flag_name, flag_value) = extra_arg.split('=')\n    flag_name = flag_name.strip('-')\n    # Check for boolean values.\n    if flag_value.lower() == 'true':\n      flag_value = True\n    elif flag_value.lower() == 'false':\n      flag_value = False\n    args_dict[flag_name] = flag_value\n  return args_dict\n\n\ndef _extend_command_by_args_dict(command, extra_args):\n  \"\"\"Adds `extra_args` to the command string.\"\"\"\n  for key in sorted(extra_args):\n    value = extra_args[key]\n    if value is None:\n      continue\n    if isinstance(value, bool):\n      added_arg = '' if value else 'no'\n      added_arg += key\n      command.extend(['--' + added_arg])\n  ",
+      "total_lines": 920
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "enum",
+        "json",
+        "os",
+        "re",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "typing:Any",
+        "typing:Optional",
+        "absl:app",
+        "absl:flags",
+        "absl:logging",
+        "tensorflow"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/google/deepvariant/r1.10/README.md",
+      "content_excerpt": "<img src=\"docs/images/dv_logo.png\" width=50% height=50%>\n\n[![release](https://img.shields.io/badge/release-v1.10-green?logo=github)](https://github.com/google/deepvariant/releases)\n[![announcements](https://img.shields.io/badge/announcements-blue)](https://groups.google.com/d/forum/deepvariant-announcements)\n[![blog](https://img.shields.io/badge/blog-orange)](https://goo.gl/deepvariant)\n\nDeepVariant is a deep learning-based variant caller that takes aligned reads (in\nBAM or CRAM format), produces pileup image tensors from them, classifies each\ntensor using a convolutional neural network, and finally reports the results in\na standard VCF or gVCF file.\n\nDeepVariant supports germline variant-calling in diploid organisms.\n\n**DeepVariant case-studies for germline variant calling:**\n\n*   NGS (Illumina or Element) data for either a\n    [whole genome](docs/deepvariant-case-study.md) or\n    [whole exome](docs/deepvariant-exome-case-study.md).\n*   PacBio HiFi data\n    [PacBio case study](docs/deepvariant-pacbio-model-case-study.md).\n*   Oxford Nanopore R10.4.1\n    [Simplex case study](docs/deepvariant-ont-r104-simplex-case-study.md).\n*   Complete Genomics\n    [T7 case study](docs/deepvariant-complete-t7-case-study.md);\n    [G400 case study](docs/deepvariant-complete-g400-case-study.md).\n*   [Roche SBX case study](docs/roche-sbx-case-study.md) for SBX-D and SBX-Fast data.\n*   Pangenome-mapping-based case-study:\n    [vg case study](docs/deepvariant-vg-case-study.md).\n*   RNA data for\n    [PacBio Iso-Seq/MAS-Seq case study](docs/deepvariant-masseq-case-study.md)\n    and [Illumina RNA-se"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "make_examples_command test",
+      "count": 1,
+      "items": [
+        {
+          "name": "run_deeptrio_test.py",
+          "path": "scripts/run_deeptrio_test.py",
+          "sha": "bee2c1e855807cd48c7c3de873165c220d79b97e",
+          "html_url": "https://github.com/google/deepvariant/blob/45f2627504c59785ea2b88d0256a2ec347bce7b4/scripts/run_deeptrio_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"make_examples_command(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "run_oracle_inference.py",
+          "path": "scripts/run_oracle_inference.py",
+          "sha": "08dc1ee98a8bd959ad4019163efa89d250e67dac",
+          "html_url": "https://github.com/google/deepvariant/blob/45f2627504c59785ea2b88d0256a2ec347bce7b4/scripts/run_oracle_inference.py",
+          "score": 1.0
+        },
+        {
+          "name": "run_deeptrio.py",
+          "path": "scripts/run_deeptrio.py",
+          "sha": "3254bd9796134a905f11ba37b3ecdc2638fc63d2",
+          "html_url": "https://github.com/google/deepvariant/blob/45f2627504c59785ea2b88d0256a2ec347bce7b4/scripts/run_deeptrio.py",
+          "score": 1.0
+        },
+        {
+          "name": "run_deepvariant.py",
+          "path": "scripts/run_deepvariant.py",
+          "sha": "b6e9c07b3afa014ef087fd04dd37983aef1511ed",
+          "html_url": "https://github.com/google/deepvariant/blob/45f2627504c59785ea2b88d0256a2ec347bce7b4/scripts/run_deepvariant.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "scripts",
+      "count": 18,
+      "entries": [
+        {
+          "name": "create_golden.sh",
+          "path": "scripts/create_golden.sh",
+          "type": "file"
+        },
+        {
+          "name": "create_golden_deeptrio.sh",
+          "path": "scripts/create_golden_deeptrio.sh",
+          "type": "file"
+        },
+        {
+          "name": "docker_utils.sh",
+          "path": "scripts/docker_utils.sh",
+          "type": "file"
+        },
+        {
+          "name": "inference_deepsomatic.sh",
+          "path": "scripts/inference_deepsomatic.sh",
+          "type": "file"
+        },
+        {
+          "name": "inference_deeptrio.sh",
+          "path": "scripts/inference_deeptrio.sh",
+          "type": "file"
+        },
+        {
+          "name": "inference_deepvariant.sh",
+          "path": "scripts/inference_deepvariant.sh",
+          "type": "file"
+        },
+        {
+          "name": "inference_utils.sh",
+          "path": "scripts/inference_utils.sh",
+          "type": "file"
+        },
+        {
+          "name": "install_nvidia_docker.sh",
+          "path": "scripts/install_nvidia_docker.sh",
+          "type": "file"
+        },
+        {
+          "name": "install_singularity.sh",
+          "path": "scripts/install_singularity.sh",
+          "type": "file"
+        },
+        {
+          "name": "run_deepsomatic.py",
+          "path": "scripts/run_deepsomatic.py",
+          "type": "file"
+        },
+        {
+          "name": "run_deepsomatic_test.py",
+          "path": "scripts/run_deepsomatic_test.py",
+          "type": "file"
+        },
+        {
+          "name": "run_deeptrio.py",
+          "path": "scripts/run_deeptrio.py",
+          "type": "file"
+        },
+        {
+          "name": "run_deeptrio_test.py",
+          "path": "scripts/run_deeptrio_test.py",
+          "type": "file"
+        },
+        {
+          "name": "run_deepvariant.py",
+          "path": "scripts/run_deepvariant.py",
+          "type": "file"
+        },
+        {
+          "name": "run_oracle_inference.py",
+          "path": "scripts/run_oracle_inference.py",
+          "type": "file"
+        },
+        {
+          "name": "run_oracle_inference_test.py",
+          "path": "scripts/run_oracle_inference_test.py",
+          "type": "file"
+        },
+        {
+          "name": "run_pangenome_aware_deepvariant.py",
+          "path": "scripts/run_pangenome_aware_deepvariant.py",
+          "type": "file"
+        },
+        {
+          "name": "run_pangenome_aware_deepvariant_test.py",
+          "path": "scripts/run_pangenome_aware_deepvariant_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "create_golden.sh",
+          "path": "scripts/create_golden.sh"
+        },
+        {
+          "name": "create_golden_deeptrio.sh",
+          "path": "scripts/create_golden_deeptrio.sh"
+        },
+        {
+          "name": "docker_utils.sh",
+          "path": "scripts/docker_utils.sh"
+        },
+        {
+          "name": "inference_deepsomatic.sh",
+          "path": "scripts/inference_deepsomatic.sh"
+        },
+        {
+          "name": "inference_deeptrio.sh",
+          "path": "scripts/inference_deeptrio.sh"
+        },
+        {
+          "name": "inference_deepvariant.sh",
+          "path": "scripts/inference_deepvariant.sh"
+        },
+        {
+          "name": "inference_utils.sh",
+          "path": "scripts/inference_utils.sh"
+        },
+        {
+          "name": "install_nvidia_docker.sh",
+          "path": "scripts/install_nvidia_docker.sh"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "scripts/run_deepvariant.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "be559ee6a0170d3c6ca7f1efaa4146f31ad5462e",
+          "html_url": "https://github.com/google/deepvariant/commit/be559ee6a0170d3c6ca7f1efaa4146f31ad5462e",
+          "message": "Add `checkpoint_json` flag to `postprocess_variants`\n\nPiperOrigin-RevId: 866055578",
+          "author": "shafin",
+          "date": "2026-02-05T20:11:05Z"
+        },
+        {
+          "sha": "8d9afd18eccb28b79fcf3c2576515baa5776df7a",
+          "html_url": "https://github.com/google/deepvariant/commit/8d9afd18eccb28b79fcf3c2576515baa5776df7a",
+          "message": "Read small model configuration from `model.example_info.json`.\n\nPiperOrigin-RevId: 863336982",
+          "author": "shafin",
+          "date": "2026-01-30T20:03:17Z"
+        },
+        {
+          "sha": "972d554d79c442199d4f8830763e722d6b8d5bf9",
+          "html_url": "https://github.com/google/deepvariant/commit/972d554d79c442199d4f8830763e722d6b8d5bf9",
+          "message": "Update run_deepvariant.py to support RNA-seq models.\n\nPiperOrigin-RevId: 861842885",
+          "author": "danielecook",
+          "date": "2026-01-27T20:40:48Z"
+        },
+        {
+          "sha": "5e8427c4699fd2614dd7d22852eddb2f32be0cd7",
+          "html_url": "https://github.com/google/deepvariant/commit/5e8427c4699fd2614dd7d22852eddb2f32be0cd7",
+          "message": "Update DeepVariant version to 1.10\n\nPiperOrigin-RevId: 860248444",
+          "author": "shafin",
+          "date": "2026-01-23T22:08:59Z"
+        },
+        {
+          "sha": "3fd48c72c7d2e2f1ca77a836f3ed9578d0837a70",
+          "html_url": "https://github.com/google/deepvariant/commit/3fd48c72c7d2e2f1ca77a836f3ed9578d0837a70",
+          "message": "Move the SM training & inference code to Keras 3.\n\nPiperOrigin-RevId: 853530640",
+          "author": "shezanmirzan",
+          "date": "2026-01-08T04:46:02Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "make_examples_command TODO",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "scripts/run_deepvariant.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "be559ee6a0170d3c6ca7f1efaa4146f31ad5462e",
+        "html_url": "https://github.com/google/deepvariant/commit/be559ee6a0170d3c6ca7f1efaa4146f31ad5462e",
+        "message": "Add `checkpoint_json` flag to `postprocess_variants`\n\nPiperOrigin-RevId: 866055578",
+        "author": "shafin",
+        "date": "2026-02-05T20:11:05Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

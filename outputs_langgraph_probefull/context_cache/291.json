@@ -1,0 +1,446 @@
+{
+  "task_id": "291",
+  "repo_owner": "kozec",
+  "repo_name": "sc-controller",
+  "file_path": "scc/sccdaemon.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T07:39:46+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T07:39:57+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T07:40:01+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "scc/sccdaemon.py",
+    "original_code": "def __init__(self, connection, mapper, rfile, wfile):\n\tself.connection = connection\n\tself.rfile = rfile\n\tself.wfile = wfile\n\tself.mapper = mapper\n\tself.gesture_action = None\n\t# TODO: Simplify this:\n\tself.locked_actions = set()\n\tself.replaced_actions = set()\n\tself.observed_actions = set()",
+    "satd_comment": "# TODO: Simplify this:",
+    "target_file": {
+      "ok": true,
+      "path": "scc/sccdaemon.py",
+      "sha": "5a23f1ea60a592a8032b57170ee14f58763d455c",
+      "download_url": "https://raw.githubusercontent.com/kozec/sc-controller/master/scc/sccdaemon.py",
+      "content_excerpt": "#!/usr/bin/env python2\n\"\"\"\nSC-Controller - Daemon class\n\"\"\"\nfrom __future__ import unicode_literals\n\nfrom scc.lib import xwrappers as X\nfrom scc.lib import xinput\nfrom scc.lib.daemon import Daemon\nfrom scc.constants import SCButtons, DAEMON_VERSION, HapticPos\nfrom scc.constants import LEFT, RIGHT, STICK, RSTICK, CPAD, DPAD\nfrom scc.tools import find_profile, find_menu, nameof, shsplit, shjoin\nfrom scc.uinput import CannotCreateUInputException\nfrom scc.tools import set_logging_level, find_binary, clamp\nfrom scc.device_monitor import create_device_monitor\nfrom scc.cemuhook_server import CemuhookServer\nfrom scc.custom import load_custom_module\nfrom scc.gestures import GestureDetector\nfrom scc.parser import TalkingActionParser\nfrom scc.controller import HapticData\nfrom scc.scheduler import Scheduler\nfrom scc.menu_data import MenuData\nfrom scc.profile import Profile\nfrom scc.actions import Action\nfrom scc.config import Config\nfrom scc.poller import Poller\nfrom scc.mapper import Mapper\nfrom scc import drivers\n\nfrom SocketServer import UnixStreamServer, ThreadingMixIn, StreamRequestHandler\nimport os, sys, pkgutil, signal, time, json, logging\nimport threading, traceback, subprocess, shlex\nlog = logging.getLogger(\"SCCDaemon\")\ntlog = logging.getLogger(\"Socket Thread\")\n\nclass ThreadingUnixStreamServer(ThreadingMixIn, UnixStreamServer): daemon_threads = True\n\n\nclass SCCDaemon(Daemon):\n\t\n\tdef __init__(self, piddile, socket_file):\n\t\tset_logging_level(True, True)\n\t\tDaemon.__init__(self, piddile)\n\t\tConfig()\t\t\t\t\t# Generates ~/.config/scc and default config if needed\n\t\tself.started = False\n\t\tself.exiting = False\n\t\tself.socket_file = socket_file\n\t\tself.poller = Poller()\n\t\tself.dev_monitor = create_device_monitor(self)\n\t\tself.scheduler = Scheduler()\n\t\tself.xdisplay = None\n\t\tself.sserver = None\t\t\t# UnixStreamServer instance\n\t\tself.errors = []\n\t\tself.alone = False\t\t\t# Set by launching script from --alone flag\n\t\tself.custom_py_loaded = False\n\t\tself.osd_daemon = None\n\t\tself.default_profile = None\n\t\tself.autoswitch_daemon = None\n\t\t# TODO: Use osd_ids for all menus\n\t\tself.osd_ids = {}\n\t\tself.controllers = []\n\t\tself.mainloops = [ self.poller.poll, self.scheduler.run ]\n\t\tself.rescan_cbs = [ ]\n\t\tself.on_exit_cbs = []\n\t\tself.subprocs = []\n\t\tself.lock = threading.Lock()\n\t\tself.cemuhook = None\n\t\tself.default_mapper = None\n\t\tself.free_mappers = [ ]\n\t\tself.clients = set()\n\t\tself.cwd = os.getcwd()\n\t\n\t\n\tdef init_drivers(self):\n\t\t\"\"\"\n\t\tSearchs and initializes all controller drivers.\n\t\tSee __init__.py in scc.drivers.\n\t\t\"\"\"\n\t\tlog.debug(\"Initializing drivers...\")\n\t\tcfg = Config()\n\t\tself._to_start = set()  # del-eted later by start_drivers\n\t\tto_init = []\n\t\tfor importer, modname, ispkg in pkgutil.walk_packages(path=drivers.__path__, onerror=lambda x: None):\n\t\t\tif not ispkg and modname != \"driver\":\n\t\t\t\tif modname == \"usb\" or cfg[\"drivers\"].get(modname):\n\t\t\t\t\t# 'usb' driver has to be always active\n\t\t\t\t\tmod = getattr(__import__('scc.drivers.%s' % (modname,)).drivers, modname)\n\t\t\t\t\tif hasattr(mod, \"init\"):\n\t\t\t\t\t\tto_init.append(mod)\n\t\t\t\telse:\n\t\t\t\t\tlog.warn(\"Skipping disabled driver '%s'\", modname)\n\t\t\n\t\tfrom scc.drivers import MOD_INIT_ORDER as order\n\t\tindex_fn = lambda n: order.index(n) if n in order else 1024\n\t\tsort_fn = lambda m: index_fn(m.__name__)\n\t\t\n\t\tfor mod in sorted(to_init, key=sort_fn):\n\t\t\tif getattr(mod, \"init\")(self, cfg):\n\t\t\t\tif hasattr(mod, \"start\"):\n\t\t\t\t\tself._to_start.add(getattr(mod, \"start\"))\n\t\n\t\n\tdef init_default_mapper(self):\n\t\t\"\"\"\n\t\tdefault_mapper is persistent mapper assigned to first Controller instance.\n\t\tEven if all controllers are removed, this mapper stays active. This is\n\t\tneeded so various stuff (mainlg GUI) doesn't need to check if there is\n\t\tany controller connected all the time.\n\t\t\"\"\"\n\t\t# But, despite all above, it's just mapper as every other :)\n\t\treturn self.init_mapper()\n\t\n\t\n\tdef set_default_profile(self, profile_file):\n\t\t\"\"\"\n\t\tSets profile that is used for first available controller\n\t\t\"\"\"\n\t\tself.default_profile = profile_file\n\t\n\t\n\tdef start_drivers(self):\n\t\tfor s in self._to_start:\n\t\t\ts(self)\n\t\tdel self._to_start\n\t\n\t\n\tdef stop_drivers(self):\n\t\tfor s in self.drivers_to_stop:\n\t\t\ts(self)\n\t\n\t\n\tdef get_poller(self):\n\t\t\"\"\" Returns poller that can be used for polling file descriptors \"\"\"\n\t\treturn self.poller\n\t\n\t\n\tdef get_device_monitor(self):\n\t\t\"\"\"\n\t\tReturns device monitor that can be used to listen for device adding and removals\n\t\t\"\"\"\n\t\treturn self.dev_monitor\n\t\n\t\n\tdef get_scheduler(self):\n\t\t\"\"\" Returns scheduler instance \"\"\"\n\t\treturn self.scheduler\n\t\n\t\n\tdef add_mainloop(self, fn):\n\t\t\"\"\"\n\t\tAdds function that is called in every mainloop iteration.\n\t\tCan be called only durring initialization, in driver 'init' method.\n\t\t\"\"\"\n\t\tif fn not in self.mainloops:\n\t\t\tself.mainloops.append(fn)\n\t\n\t\n\tdef remove_mainloop(self, fn):\n\t\t\"\"\"\n\t\tRemoves function added by add_mainloop\n\t\t\"\"\"\n\t\tif fn in self.mainloops:\n\t\t\tself.mainloops.remove(fn)\n\t\n\t\n\tdef add_on_exit(self, fn):\n\t\t\"\"\"\n\t\tAdds function that is called just before daemon is stopped.\n\t\tUsefull for cleanup.\n\t\t\"\"\"\n\t\tif fn not in self.on_exit_cbs:\n\t\t\tself.on_exit_cbs.append(fn)\n\t\n\t\n\tdef add_on_rescan(self, fn):\n\t\t\"\"\"\n\t\tAdds function that is called when `Rescan.` message is recieved.\n\t\t\"\"\"\n\t\tif fn not in self.on_exit_cbs:\n\t\t\tself.rescan_cbs.append(fn)\n\t\n\t\n\tdef _set_profile(self, mapper, filename):\n\t\t# Called from socket server thread\n\t\tp = Profile(TalkingActionParser())\n\t\tp.load(filename).compress()\n\t\tself.profile_file = filename\n\t\t\n\t\tif mapper.profile.gyro and not p.gyro:\n\t\t\t# Turn off gyro sensor that was enabled but is no longer needed\n\t\t\tif mapper.get_controller():\n\t\t\t\tlog.debug(\"Turning gyrosensor OFF\")\n\t\t\t\tmapper.get_controller().set_gyro_enabled(False)\n\t\telif not mapper.profile.gyro and p.gyro:\n\t\t\t# Turn on gyro sensor that was turned off, if profile has gyro action set\n\t\t\tif mapper.get_controller():\n\t\t\t\tlog.debug(\"Turning gyrosensor ON\")\n\t\t\t\tmapper.get_controller().set_gyro_enabled(True)\n\t\t# Cancel everything\n\t\tmapper.cancel_all()\n\t\t# Release all buttons\n\t\tmapper.release_virtual_buttons()\n\t\t# Reset mouse (issue #222)\n\t\tmapper.mouse.reset()\n\t\t\n\t\t# This last line kinda depends on GIL...\n\t\tmapper.profile = p\n\t\t# Re-apply all locks\n\t\tfor c in self.clients:\n\t\t\tc.reaply_locks(self, mapper)\n\t\tif mapper.get_controller():\n\t\t\tself.send_profile_info(mapper.get_controller(), self._send_to_all)\n\t\telse:\n\t\t\tself.send_profile_info(None, self._send_to_all, mapper=mapper)\n\t\n\t\n\tdef _send_to_all(self, message_str):\n\t\t\"\"\"\n\t\tSends message to all connect clients.\n\t\tShould be called while lock is acquired.\n\t\tMessage should be utf-8 encoded str.\n\t\t\"\"\"\n\t\tfor client in self.clients:\n\t\t\ttry:\n\t\t\t\tclient.wfile.write(message_str)\n\t\t\texcept: pass\n\t\n\t\n\tdef on_sa_turnoff(self, mapper, action):\n\t\t\"\"\" Called when 'turnoff' action is used \"\"\"\n\t\tif mapper.get_controller():\n\t\t\tmapper.get_controller().turnoff()\n\t\n\t\n\tdef on_sa_restart(self, *a):\n\t\t\"\"\" Called when 'restart' action is used \"\"\"\n\t\twith self.lock:\n\t\t\tfor c in self.clients:\n\t\t\t\tc.close()\n\t\tos.system(\"%s %s None restart &\" % ( sys.executable, sys.argv[0] ))\n\t\n\t\n\tdef on_sa_led(self, mapper, action):\n\t\t\"\"\" Called when 'led' action is used \"\"\"\n\t\tif mapper.get_controller():\n\t\t\tmapper.get_controller().set_led_level(action.brightness)\n\t\n\t\n\tdef on_sa_shell(self, mapper, action):\n\t\t\"\"\" Called when 'shell' action is used \"\"\"\n\t\treturn subprocess.Popen(action.command, shell=True)\n\t\n\t\n\tdef on_sa_gestures(self, mapper, action, x, y, what):\n\t\t\"\"\" Called when 'gestures' action is used \"\"\"\n\t\t# TODO: Take up_direction from action\n\t\tgd = None\n\t\twith self.lock:\n\t\t\tif action.osd_enabled and self.osd_daemon:\n\t\t\t\t# When OSD is enabled, gesture detection is handled\n\t\t\t\t# by scc-osd-daemon.\n\t\t\t\tself.osd_daemon.gesture_action = action\n\t\t\t\tself._osd('gesture',\n\t\t\t\t\t\"--controller\", mapper.get_controller().get_id(),\n\t\t\t\t \t'--control-with', what)\n\t\t\t\tlog.debug(\"Gesture detection request sent to scc-osd-daemon\")\n\t\t\telse:\n\t\t\t\t# Otherwise it is handled internally\n\t\t\t\tup_direction = 0\n\t\t\t\tgd = self._start_gesture(\n\t\t\t\t\tmapper,\n\t\t\t\t\twhat,\n\t\t\t\t\tup_direction,\n\t\t\t\t\tlambda gesture_string : action.gesture(mapper, gesture_string)\n\t\t\t\t)\n\t\tif gd:\n\t\t\tgd.enable()\n\t\t\tlog.debug(\"Gesture detection started on %s\", what)\n\t\t\tgd.whole(mapper, x, y, what)\n\t\n\tdef on_sa_cemuhook(self, mapper, action, data):\n\t\t\"\"\" Called by 'cemuhook' action \"\"\"\n\t\tif self.cemuhook is None:\n\t\t\ttry:\n\t\t\t\tself.cemuhook = CemuhookServer(self)\n\t\t\texcept Exception, e:\n\t\t\t\tlog.error(\"Failed to initialize CemuHookUDP Motion Provider: %s\", e)\n\t\t\t\treturn\n\t\tself.cemuhook.feed(data)\n\t\n\tdef _osd(self, *data):\n\t\t\"\"\"\n\t\tHas to be called with self.lock held.\n\t\tReturns True on success.\n\t\t\"\"\"\n\t\t# Pre-format data\n\t\tdata = b\"OSD: %s\\n\" % (shjoin(data) ,)\n\t\t\n\t\t# Check if scc-osd-daemon is available\n\t\tif not self.osd_daemon:\n\t\t\tlog.warning(\"Cannot show OSD; there is no scc-osd-daemon registered\")\n\t\t\treturn False\n\t\t# Send request\n\t\ttry:\n\t\t\tself.osd_daemon.wfile.write(data)\n\t\t\tself.osd_daemon.wfile.flush()\n\t\texcept Exception, e:\n\t\t\tlog.error(\"Failed to display OSD: %s\", e)\n\t\t\tself.osd_daemon = None\n\t\t\treturn False\n\t\treturn True\n\t\n\t\n\tdef on_sa_osd(self, mapper, action):\n\t\t\"\"\" Called when 'osd' action is used \"\"\"\n\t\twith self.lock:\n\t\t\tself._osd('message', '-t', action.timeout, '-s', action.size, action.text)\n\t\n\t\n\tdef on_sa_clearosd(self, mapper, action):\n\t\t\"\"\" Called when 'clearosd' action is used \"\"\"\n\t\twith self.lock:\n\t\t\tself._osd('clear')\n\t\n\t\n\tdef on_sa_area(self, mapper, action, x1, y1, x2, y2):\n\t\t\"\"\" Called when *AreaAction has OSD enabled \"\"\"\n\t\twith self.lock:\n\t\t\tself._osd('area', '-x', x1, '-y', y1, '--width', x2-x1, '--height', y2-y1)\n\t\n\t\n\tdef on_sa_clear_osd(self, *a):\n\t\twith self.lock:\n\t\t\tself._osd('clear')\n\t\n\t\n\tdef on_sa_keyboard(self, mapper, action):\n\t\t\"\"\" Called when 'keyboard' action is used \"\"\"\n\t\twith self.lock:\n\t\t\tself._osd('keyboard')\n\t\n\t\n\tdef on_sa_menu(self, mapper, action, *pars):\n\t\t\"\"\" Called when 'menu' action is used \"\"\"\n\t\tp = [ action.MENU_TYPE ]\n\t\tif mapper.get_controller():\n\t\t\tp += [ \"--controller\", mapper.get_controller().get_id() ]\n\t\tif \".\" in action.menu_id:\n\t\t\tpath = find_menu(action.menu_id)\n\t\t\tif not path:\n\t\t\t\tlog.error(\"Cannot show menu: Menu '%s' not found\", action.menu_id)\n\t\t\t\treturn\n\t\t\tp += [ \"--from-file\", path ]\n\t\telse:\n\t\t\tp += [ \"--from-profile\", mapper.profile.get_filename(), action.menu_id ]\n\t\tp += list(pars)\n\t\t\n\t\twith self.lock:\n\t\t\tself._osd(*p)\n\t\n\ton_sa_gridmenu = on_sa_menu\n\t\n\t\n\tdef on_sa_dialog(self, mapper, action, *pars):\n\t\t# Replace actions with id, title pairs\n\t\tdata = []\n\t\tself.osd_ids = {}\n\t\tfor x in pars:\n\t\t\tif isinstance(x, Action):\n\t\t\t\tid = str(hash(x))\n\t\t\t\tself.osd_ids[id] = x.strip()\n\t\t\t\tdata += [ id, x.describe(Action.AC_MENU) ]\n\t\t\telse:\n\t\t\t\tdata.append(x)\n\t\t\n\t\twith self.lock:\n\t\t\tself._osd(\"dialog\", *data)\n\t\n\t\n\tdef on_sa_profile(self, mapper, action):\n\t\t\"\"\" Called when 'profile' action is used \"\"\"\n\t\tname = action.profile\n\t\tif \"/\" in name:\n\t\t\t# Small sanity check\n\t\t\tlog.error(\"Cannot load profile: Profile '%s' not found\", name)\n\t\t\treturn\n\t\tpath = find_profile(name)\n\t\tif path:\n\t\t\twith self.lock:\n\t\t\t\ttry:\n\t\t\t\t\tself._set_profile(mapper, path)\n\t\t\t\t\tlog.info(\"Loaded profile '%s'\", name)\n\t\t\t\texcept Exception, e:\n\t\t\t\t\tlog.exception(e)\n\t\t\treturn\n\t\tlog.error(\"Cannot load profile: Profile '%s' not found\", name)\n\t\n\t\n\tdef on_start(self):\n\t\tos.chdir(self.cwd)\n\t\n\t\n\tdef on_controller_status(self, sc, onoff):\n\t\tif onoff:\n\t\t\tlog.debug(\"Controller turned ON\")\n\t\telse:\n\t\t\tlog.debug(\"Controller turned OFF\")\n\t\n\t\n\tdef sigterm(self, *a):\n\t\tself.exiting = True\n\t\tfor fn in self.on_exit_cbs:\n\t\t\tfn(self)\n\t\tfor d in (self.osd_daemon, self.autoswitch_daemon):\n\t\t\tif d: d.wfile.close()\n\t\tself.osd_daemon, self.autoswitch_daemon = None, None\n\t\tfor p in self.subprocs:\n\t\t\tp.kill()\n\t\tself.subprocs = []\n\t\tsys.exit(0)\n\t\n\t\n\tdef connect_x(self):\n\t\t\"\"\" Creates connection to X Server \"\"\"\n\t\tif \"WAYLAND_DISPLAY\" in os.environ:\n\t\t\tlog.warning(\"Wayland detected. Disabling X11 support, some functionality will be unavailable\")\n\t\t\tself.xdisplay = None\n\t\t\treturn\n\t\tif \"DISPLAY\" not in os.environ:\n\t\t\tlog.warning(\"DISPLAY ",
+      "total_lines": 1440
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [],
+      "error": "syntax_error: leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers (<unknown>, line 672)"
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/kozec/sc-controller/master/README.md",
+      "content_excerpt": "# SC Controller [![Build Status](https://travis-ci.org/kozec/sc-controller.svg?branch=master)](https://travis-ci.org/kozec/sc-controller)\n\n\nUser-mode driver, mapper and GTK3 based GUI for Steam Controller, DS4 and similar controllers.\n\n[![screenshot1](docs/screenshot1-tn.png?raw=true)](docs/screenshot1.png?raw=true)\n[![screenshot2](docs/screenshot2-tn.png?raw=true)](docs/screenshot2.png?raw=true)\n[![screenshot3](docs/screenshot3-tn.png?raw=true)](docs/screenshot3.png?raw=true)\n[![screenshot3](docs/screenshot4-tn.png?raw=true)](docs/screenshot4.png?raw=true)\n\n## Features\n- Allows to setup, configure and use Steam Controller(s) without ever launching Steam\n- Supports profiles switchable in GUI or with controller button\n- Stick, Pads and Gyroscope input\n- Haptic Feedback and in-game Rumble support\n- OSD, Menus, On-Screen Keyboard for desktop *and* in games.\n- Automatic profile switching based on active window.\n- Macros, button cycling, rapid fire, modeshift, mouse regions...\n- Emulates Xbox360 controller, mouse, trackball and keyboard.\n\nBased on [Standalone Steam Controller Driver](https://github.com/ynsta/steamcontroller) by [Ynsta](https://github.com/ynsta).\n\n## Like what I'm doing?\n\n[![Help me become filthy rich on Liberapay](https://img.shields.io/badge/Help%20me%20become%20filthy%20rich%20on-Liberapay-yellow.svg)](https://liberapay.com/kozec) <sup>or</sup> [![donate anything with PayPal](https://img.shields.io/badge/donate_anything_with-Paypal-blue.svg)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=77DQD3L9K8RPU&lc=SK&item_name=kozec&item_number=scc&curre"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_inputs.py",
+          "path": "tests/test_inputs.py",
+          "sha": "4f74330ac492d302261cc69298baf666388b524a",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/tests/test_inputs.py",
+          "score": 1.0
+        },
+        {
+          "name": "tester.py",
+          "path": "scc/gui/creg/tester.py",
+          "sha": "7783aaed253c881aecc743c0ac2c7ca8af1996ed",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/gui/creg/tester.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "enum.py",
+          "path": "scc/lib/enum.py",
+          "sha": "3db21b033532566206c05479bf4bd6d64136e6e3",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/lib/enum.py",
+          "score": 1.0
+        },
+        {
+          "name": "usb1.py",
+          "path": "scc/lib/usb1.py",
+          "sha": "7e1eb880608f8c63bbd12cc6e20978fc4ef11a09",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/lib/usb1.py",
+          "score": 1.0
+        },
+        {
+          "name": "uinput.py",
+          "path": "scc/uinput.py",
+          "sha": "ad7a01f256e257ec93c5e4d7eca214371cd7215f",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/uinput.py",
+          "score": 1.0
+        },
+        {
+          "name": "macros.py",
+          "path": "scc/macros.py",
+          "sha": "42e3e93bc1505b68775d0a5b93b42c5591fffd86",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/macros.py",
+          "score": 1.0
+        },
+        {
+          "name": "gestures.py",
+          "path": "scc/gestures.py",
+          "sha": "468d767bbc249893c389952a0a6be9ff69f347b6",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/gestures.py",
+          "score": 1.0
+        },
+        {
+          "name": "menu_data.py",
+          "path": "scc/menu_data.py",
+          "sha": "308ec928c967bec1d07bd76e2f9b8c5eea127fc6",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/menu_data.py",
+          "score": 1.0
+        },
+        {
+          "name": "parser.py",
+          "path": "scc/gui/parser.py",
+          "sha": "cd219b28794aa2496b5a1bec63a03989f6487cb8",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/gui/parser.py",
+          "score": 1.0
+        },
+        {
+          "name": "dpad.py",
+          "path": "scc/gui/ae/dpad.py",
+          "sha": "b657b30cc2edc497f665bf7cba74af955cc53e24",
+          "html_url": "https://github.com/kozec/sc-controller/blob/2e2fe855afff693950827a45637cea3290eae782/scc/gui/ae/dpad.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "scc",
+      "count": 34,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "scc/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "actions.py",
+          "path": "scc/actions.py",
+          "type": "file"
+        },
+        {
+          "name": "aliases.py",
+          "path": "scc/aliases.py",
+          "type": "file"
+        },
+        {
+          "name": "c_branch.h",
+          "path": "scc/c_branch.h",
+          "type": "file"
+        },
+        {
+          "name": "cemuhook_server.c",
+          "path": "scc/cemuhook_server.c",
+          "type": "file"
+        },
+        {
+          "name": "cemuhook_server.py",
+          "path": "scc/cemuhook_server.py",
+          "type": "file"
+        },
+        {
+          "name": "cheader.py",
+          "path": "scc/cheader.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "scc/config.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "scc/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "controller.py",
+          "path": "scc/controller.py",
+          "type": "file"
+        },
+        {
+          "name": "custom.py",
+          "path": "scc/custom.py",
+          "type": "file"
+        },
+        {
+          "name": "device_monitor.py",
+          "path": "scc/device_monitor.py",
+          "type": "file"
+        },
+        {
+          "name": "drivers",
+          "path": "scc/drivers",
+          "type": "dir"
+        },
+        {
+          "name": "foreign",
+          "path": "scc/foreign",
+          "type": "dir"
+        },
+        {
+          "name": "gestures.py",
+          "path": "scc/gestures.py",
+          "type": "file"
+        },
+        {
+          "name": "gui",
+          "path": "scc/gui",
+          "type": "dir"
+        },
+        {
+          "name": "lib",
+          "path": "scc/lib",
+          "type": "dir"
+        },
+        {
+          "name": "macros.py",
+          "path": "scc/macros.py",
+          "type": "file"
+        },
+        {
+          "name": "mapper.py",
+          "path": "scc/mapper.py",
+          "type": "file"
+        },
+        {
+          "name": "menu_data.py",
+          "path": "scc/menu_data.py",
+          "type": "file"
+        },
+        {
+          "name": "modifiers.py",
+          "path": "scc/modifiers.py",
+          "type": "file"
+        },
+        {
+          "name": "osd",
+          "path": "scc/osd",
+          "type": "dir"
+        },
+        {
+          "name": "parser.py",
+          "path": "scc/parser.py",
+          "type": "file"
+        },
+        {
+          "name": "paths.py",
+          "path": "scc/paths.py",
+          "type": "file"
+        },
+        {
+          "name": "poller.py",
+          "path": "scc/poller.py",
+          "type": "file"
+        },
+        {
+          "name": "profile.py",
+          "path": "scc/profile.py",
+          "type": "file"
+        },
+        {
+          "name": "sccdaemon.py",
+          "path": "scc/sccdaemon.py",
+          "type": "file"
+        },
+        {
+          "name": "scheduler.py",
+          "path": "scc/scheduler.py",
+          "type": "file"
+        },
+        {
+          "name": "scripts.py",
+          "path": "scc/scripts.py",
+          "type": "file"
+        },
+        {
+          "name": "special_actions.py",
+          "path": "scc/special_actions.py",
+          "type": "file"
+        },
+        {
+          "name": "tools.py",
+          "path": "scc/tools.py",
+          "type": "file"
+        },
+        {
+          "name": "uinput.c",
+          "path": "scc/uinput.c",
+          "type": "file"
+        },
+        {
+          "name": "uinput.py",
+          "path": "scc/uinput.py",
+          "type": "file"
+        },
+        {
+          "name": "x11",
+          "path": "scc/x11",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "scc/__init__.py"
+        },
+        {
+          "name": "actions.py",
+          "path": "scc/actions.py"
+        },
+        {
+          "name": "aliases.py",
+          "path": "scc/aliases.py"
+        },
+        {
+          "name": "c_branch.h",
+          "path": "scc/c_branch.h"
+        },
+        {
+          "name": "cemuhook_server.c",
+          "path": "scc/cemuhook_server.c"
+        },
+        {
+          "name": "cemuhook_server.py",
+          "path": "scc/cemuhook_server.py"
+        },
+        {
+          "name": "cheader.py",
+          "path": "scc/cheader.py"
+        },
+        {
+          "name": "config.py",
+          "path": "scc/config.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "scc/sccdaemon.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "4d0e6c7d469bc14119adfbf90ea2bcc45e331b95",
+          "html_url": "https://github.com/kozec/sc-controller/commit/4d0e6c7d469bc14119adfbf90ea2bcc45e331b95",
+          "message": "Finalized support for deck",
+          "author": "kozec",
+          "date": "2022-06-20T07:25:17Z"
+        },
+        {
+          "sha": "02c16f4766d1630e3ec75302b356ae6be6f4641b",
+          "html_url": "https://github.com/kozec/sc-controller/commit/02c16f4766d1630e3ec75302b356ae6be6f4641b",
+          "message": "Unicode profile names related fixes. Fixes #565",
+          "author": "kozec",
+          "date": "2020-11-08T17:47:44Z"
+        },
+        {
+          "sha": "6844423429d39cd38865acae2680d2de4562f967",
+          "html_url": "https://github.com/kozec/sc-controller/commit/6844423429d39cd38865acae2680d2de4562f967",
+          "message": "Fix: Getting killed by Chinese. Fixes #492",
+          "author": "kozec",
+          "date": "2019-08-29T08:49:49Z"
+        },
+        {
+          "sha": "bf55aa03be439a78b915e8882af3c946cbbf4d8b",
+          "html_url": "https://github.com/kozec/sc-controller/commit/bf55aa03be439a78b915e8882af3c946cbbf4d8b",
+          "message": "Allow gesture recognition on CPAD. Ref #493",
+          "author": "kozec",
+          "date": "2019-08-27T19:14:27Z"
+        },
+        {
+          "sha": "3a29a7f5f27fb9ae56cd3c2b8af964b5e3507eca",
+          "html_url": "https://github.com/kozec/sc-controller/commit/3a29a7f5f27fb9ae56cd3c2b8af964b5e3507eca",
+          "message": "Backported cemuhook to python code (ref #449)",
+          "author": "kozec",
+          "date": "2019-06-26T08:27:43Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO Simplify this",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "scc/sccdaemon.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "4d0e6c7d469bc14119adfbf90ea2bcc45e331b95",
+        "html_url": "https://github.com/kozec/sc-controller/commit/4d0e6c7d469bc14119adfbf90ea2bcc45e331b95",
+        "message": "Finalized support for deck",
+        "author": "kozec",
+        "date": "2022-06-20T07:25:17Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

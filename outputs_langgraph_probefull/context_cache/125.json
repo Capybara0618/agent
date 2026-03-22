@@ -1,0 +1,267 @@
+{
+  "task_id": "125",
+  "repo_owner": "openego",
+  "repo_name": "edisgo",
+  "file_path": "edisgo/flex_opt/reinforce_measures.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T06:32:46+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T06:32:56+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T06:33:05+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "edisgo/flex_opt/reinforce_measures.py",
+    "original_code": "def extend_substation_overloading(network, critical_stations):\n    \"\"\"\n    Reinforce HV/MV station due to overloading issues.\n\n    In a first step a parallel transformer of the same kind is installed.\n    If this is not sufficient as many standard transformers as needed are\n    installed.\n\n    Parameters\n    ----------\n    network : :class:`~.grid.network.Network`\n    critical_stations : dict\n        Dictionary with critical :class:`~.grid.components.MVStation` and\n        maximum apparent power from power flow analysis.\n        Format: {MVStation: S_max}\n\n    Returns\n    -------\n    Dictionary with lists of added and removed transformers.\n\n    \"\"\"\n\n    # get parameters for standard transformer\n    try:\n        standard_transformer = network.equipment_data['mv_trafos'].loc[\n            network.config['grid_expansion_standard_equipment'][\n                'hv_mv_transformer']]\n    except KeyError:\n        print('Standard HV/MV transformer is not in equipment list.')\n\n    # ToDo: differentiate between load and feed-in case!\n    load_factor = \\\n        network.config['grid_expansion_load_factors'][\n            'mv_feedin_case_transformer']\n\n    transformers_changes = {'added': {}, 'removed': {}}\n    for station in critical_stations:\n\n        # list of maximum power of each transformer in the station\n        s_max_per_trafo = [_.type.S_nom for _ in station.transformers]\n\n        # maximum station load from power flow analysis\n        s_station_pfa = critical_stations[station]\n\n        # determine missing transformer power to solve overloading issue\n        s_trafo_missing = s_station_pfa - (sum(s_max_per_trafo) * load_factor)\n\n        # check if second transformer of the same kind is sufficient\n        # if true install second transformer, otherwise install as many\n        # standard transformers as needed\n        if max(s_max_per_trafo) >= s_trafo_missing:\n            # if station has more than one transformer install a new\n            # transformer of the same kind as the transformer that best\n            # meets the missing power demand\n            duplicated_transformer = min(\n                [_ for _ in station.transformers\n                 if _.type.S_nom > s_trafo_missing],\n                key=lambda j: j.type.S_nom - s_trafo_missing)\n\n            new_transformer = Transformer(\n                id='MVStation_{}_transformer_{}'.format(\n                    str(station.id), str(len(station.transformers) + 1)),\n                geom=duplicated_transformer.geom,\n                grid=duplicated_transformer.grid,\n                voltage_op=duplicated_transformer.voltage_op,\n                type=copy.deepcopy(duplicated_transformer.type))\n\n            # add transformer to station and return value\n            station.add_transformer(new_transformer)\n            transformers_changes['added'][station] = [new_transformer]\n\n        else:\n            # get any transformer to get attributes for new transformer from\n            station_transformer = station.transformers[0]\n\n            # calculate how many parallel standard transformers are needed\n            number_transformers = math.ceil(\n                s_station_pfa / standard_transformer.S_nom)\n\n            # add transformer to station\n            new_transformers = []\n            for i in range(number_transformers):\n                new_transformer = Transformer(\n                    id='MVStation_{}_transformer_{}'.format(\n                        str(station.id), str(i + 1)),\n                    geom=station_transformer.geom,\n                    grid=station_transformer.grid,\n                    voltage_op=station_transformer.voltage_op,\n                    type=copy.deepcopy(standard_transformer))\n                new_transformers.append(new_transformer)\n            transformers_changes['added'][station] = new_transformers\n            transformers_changes['removed'][station] = station.transformers\n            station.transformers = new_transformers\n\n    if transformers_changes['added']:\n        logger.debug(\"==> MV station has been reinforced due to overloading \"\n                     \"issues.\")\n\n    return transformers_changes",
+    "satd_comment": "# ToDo: differentiate between load and feed-in case!",
+    "target_file": {
+      "ok": true,
+      "path": "edisgo/flex_opt/reinforce_measures.py",
+      "sha": "18d83a699ca2ba33a26e86cc940e9d6744752944",
+      "download_url": "https://raw.githubusercontent.com/openego/eDisGo/dev/edisgo/flex_opt/reinforce_measures.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport logging\nimport math\n\nfrom typing import TYPE_CHECKING, Any\n\nimport networkx as nx\nimport numpy as np\nimport pandas as pd\n\nfrom networkx.algorithms.shortest_paths.weighted import (\n    _dijkstra as dijkstra_shortest_path_length,\n)\n\nfrom edisgo.network.grids import LVGrid, MVGrid\nfrom edisgo.tools.tools import get_downstream_buses\n\nif TYPE_CHECKING:\n    from edisgo import EDisGo\n\nlogger = logging.getLogger(__name__)\n\n\ndef reinforce_mv_lv_station_overloading(edisgo_obj, critical_stations):\n    \"\"\"\n    Reinforce MV/LV substations due to overloading issues.\n\n    In a first step a parallel transformer of the same kind is installed.\n    If this is not sufficient as many standard transformers as needed are\n    installed.\n\n    Parameters\n    ----------\n    edisgo_obj : :class:`~.EDisGo`\n    critical_stations : :pandas:`pandas.DataFrame<DataFrame>`\n        Dataframe containing over-loaded MV/LV stations, their missing apparent\n        power at maximal over-loading and the corresponding time step.\n        Index of the dataframe are the representatives of the grids with\n        over-loaded stations. Columns are 's_missing' containing the missing\n        apparent power at maximal over-loading in MVA as float and 'time_index'\n        containing the corresponding time step the over-loading occured in as\n        :pandas:`pandas.Timestamp<Timestamp>`.\n\n    Returns\n    -------\n    dict\n        Dictionary with added and removed transformers in the form::\n\n        {'added': {'Grid_1_station': ['transformer_reinforced_1',\n                                      ...,\n                                      'transformer_reinforced_x'],\n                   'Grid_10_station': ['transformer_reinforced_10']\n                   },\n         'removed': {'Grid_1_station': ['transformer_1']}\n        }\n\n    \"\"\"\n    transformers_changes = _reinforce_station_overloading(\n        edisgo_obj, critical_stations, voltage_level=\"lv\"\n    )\n\n    if transformers_changes[\"added\"]:\n        logger.debug(\n            \"==> {} LV station(s) has/have been reinforced due to \"\n            \"overloading issues.\".format(str(len(transformers_changes[\"added\"])))\n        )\n\n    return transformers_changes\n\n\ndef reinforce_hv_mv_station_overloading(edisgo_obj, critical_stations):\n    \"\"\"\n    Reinforce HV/MV station due to overloading issues.\n\n    In a first step a parallel transformer of the same kind is installed.\n    If this is not sufficient as many standard transformers as needed are\n    installed.\n\n    Parameters\n    ----------\n    edisgo_obj : :class:`~.EDisGo`\n    critical_stations : pandas:`pandas.DataFrame<DataFrame>`\n        Dataframe containing over-loaded HV/MV stations, their missing apparent\n        power at maximal over-loading and the corresponding time step.\n        Index of the dataframe are the representatives of the grids with\n        over-loaded stations. Columns are 's_missing' containing the missing\n        apparent power at maximal over-loading in MVA as float and 'time_index'\n        containing the corresponding time step the over-loading occured in as\n        :pandas:`pandas.Timestamp<Timestamp>`.\n\n    Returns\n    -------\n    dict\n        Dictionary with added and removed transformers in the form::\n\n        {'added': {'Grid_1_station': ['transformer_reinforced_1',\n                                      ...,\n                                      'transformer_reinforced_x'],\n                   'Grid_10_station': ['transformer_reinforced_10']\n                   },\n         'removed': {'Grid_1_station': ['transformer_1']}\n        }\n\n    \"\"\"\n    transformers_changes = _reinforce_station_overloading(\n        edisgo_obj, critical_stations, voltage_level=\"mv\"\n    )\n\n    if transformers_changes[\"added\"]:\n        logger.debug(\"==> MV station has been reinforced due to overloading issues.\")\n\n    return transformers_changes\n\n\ndef _reinforce_station_overloading(edisgo_obj, critical_stations, voltage_level):\n    \"\"\"\n    Reinforce stations due to overloading issues.\n\n    In a first step a parallel transformer of the same kind is installed.\n    If this is not sufficient as many standard transformers as needed are\n    installed.\n\n    Parameters\n    ----------\n    edisgo_obj : :class:`~.EDisGo`\n    critical_stations : :pandas:`pandas.DataFrame<DataFrame>`\n        Dataframe containing over-loaded MV/LV stations, their missing apparent\n        power at maximal over-loading and the corresponding time step.\n        Index of the dataframe are the representatives of the grids with\n        over-loaded stations. Columns are 's_missing' containing the missing\n        apparent power at maximal over-loading in MVA as float and 'time_index'\n        containing the corresponding time step the over-loading occured in as\n        :pandas:`pandas.Timestamp<Timestamp>`.\n    voltage_level : str\n        Voltage level, over-loading is handled for. Possible options are\n        \"mv\" or \"lv\".\n\n    Returns\n    -------\n    dict\n        Dictionary with added and removed transformers in the form::\n\n        {'added': {'Grid_1_station': ['transformer_reinforced_1',\n                                      ...,\n                                      'transformer_reinforced_x'],\n                   'Grid_10_station': ['transformer_reinforced_10']\n                   },\n         'removed': {'Grid_1_station': ['transformer_1']}\n        }\n\n    \"\"\"\n    if voltage_level == \"lv\":\n        try:\n            standard_transformer = edisgo_obj.topology.equipment_data[\n                \"lv_transformers\"\n            ].loc[\n                edisgo_obj.config[\"grid_expansion_standard_equipment\"][\n                    \"mv_lv_transformer\"\n                ]\n            ]\n        except KeyError:\n            raise KeyError(\"Standard MV/LV transformer is not in equipment list.\")\n    elif voltage_level == \"mv\":\n        try:\n            standard_transformer = edisgo_obj.topology.equipment_data[\n                \"mv_transformers\"\n            ].loc[\n                edisgo_obj.config[\"grid_expansion_standard_equipment\"][\n                    \"hv_mv_transformer\"\n                ]\n            ]\n        except KeyError:\n            raise KeyError(\"Standard HV/MV transformer is not in equipment list.\")\n    else:\n        raise ValueError(\n            f\"{voltage_level} is not a valid option for input variable 'voltage_level' in \"\n            \"function _station_overloading. Try 'mv' or \"\n            \"'lv'.\"\n        )\n\n    transformers_changes = {\"added\": {}, \"removed\": {}}\n    for station in critical_stations.index:\n        grid = critical_stations.at[station, \"grid\"]\n        # list of maximum power of each transformer in the station\n        s_max_per_trafo = grid.transformers_df.s_nom\n        # missing capacity\n        s_trafo_missing = critical_stations.at[station, \"s_missing\"]\n\n        # check if second transformer of the same kind is sufficient\n        # if true install second transformer, otherwise install as many\n        # standard transformers as needed\n        if max(s_max_per_trafo) >= s_trafo_missing:\n            # if station has more than one transformer install a new\n            # transformer of the same kind as the transformer that best\n            # meets the missing power demand\n            new_transformers = grid.transformers_df.loc[\n                [\n                    grid.transformers_df[s_max_per_trafo >= s_trafo_missing][\n                        \"s_nom\"\n                    ].idxmin()\n                ]\n            ]\n            name = new_transformers.index[0].split(\"_\")\n            name.insert(-1, \"reinforced\")\n            name[-1] = len(grid.transformers_df) + 1\n            new_transformers.index = [\"_\".join([str(_) for _ in name])]\n\n            # add new transformer to list of added transformers\n            transformers_changes[\"added\"][station] = [new_transformers.index[0]]\n        else:\n            # get any transformer to get attributes for new transformer from\n            duplicated_transformer = grid.transformers_df.iloc[[0]]\n            name = duplicated_transformer.index[0].split(\"_\")\n            name.insert(-1, \"reinforced\")\n            duplicated_transformer.s_nom = standard_transformer.S_nom\n            duplicated_transformer.type_info = standard_transformer.name\n            if voltage_level == \"lv\":\n                duplicated_transformer.r_pu = standard_transformer.r_pu\n                duplicated_transformer.x_pu = standard_transformer.x_pu\n\n            # set up as many new transformers as needed\n            number_transformers = math.ceil(\n                (s_trafo_missing + s_max_per_trafo.sum()) / standard_transformer.S_nom\n            )\n\n            index = []\n\n            for i in range(number_transformers):\n                name[-1] = i + 1\n                index.append(\"_\".join([str(_) for _ in name]))\n\n            if number_transformers > 1:\n                new_transformers = duplicated_transformer.iloc[\n                    np.arange(len(duplicated_transformer)).repeat(number_transformers)\n                ]\n            else:\n                new_transformers = duplicated_transformer.copy()\n\n            new_transformers.index = index\n\n            # add new transformer to list of added transformers\n            transformers_changes[\"added\"][station] = new_transformers.index.values\n            # add previous transformers to list of removed transformers\n            transformers_changes[\"removed\"][station] = grid.transformers_df.index.values\n            # remove previous transformers from topology\n            if voltage_level == \"lv\":\n                edisgo_obj.topology.transformers_df.drop(\n                    grid.transformers_df.index.values, inplace=True\n                )\n            else:\n                edisgo_obj.topology.transformers_hvmv_df.drop(\n                    grid.transformers_df.index.values, inplace=True\n                )\n\n        # add new transformers to topology\n        if voltage_level == \"lv\":\n            edisgo_obj.topology.transformers_df = pd.concat(\n                [\n                    edisgo_obj.topology.transformers_df,\n                    new_transformers,\n                ]\n            )\n        else:\n            edisgo_obj.topology.transformers_hvmv_df = pd.concat(\n                [\n                    edisgo_obj.topology.transformers_hvmv_df,\n                    new_transformers,\n                ]\n            )\n    return transformers_changes\n\n\ndef reinforce_mv_lv_station_voltage_issues(edisgo_obj, critical_stations):\n    \"\"\"\n    Reinforce MV/LV substations due to voltage issues.\n\n    A parallel standard transformer is installed.\n\n    Parameters\n    ----------\n    edisgo_obj : :class:`~.EDisGo`\n    critical_stations : :pandas:`pandas.DataFrame<DataFrame>`\n        Dataframe with maximum deviations from allowed lower or upper voltage limits\n        in p.u. for all MV-LV stations with voltage issues. For more information on\n        dataframe see :attr:`~.flex_opt.check_tech_constraints.voltage_issues`.\n\n    Returns\n    -------\n    :obj:`dict`\n        Dictionary with added transformers in the form::\n\n            {'added': {'Grid_1': ['transformer_reinforced_1',\n                                  ...,\n                                  'transformer_reinforced_x'],\n                       'Grid_10': ['transformer_reinforced_10']\n                       }\n            }\n\n    \"\"\"\n\n    # get parameters for standard transformer\n    try:\n        standard_transformer = edisgo_obj.topology.equipment_data[\n            \"lv_transformers\"\n        ].loc[\n            edisgo_obj.config[\"grid_expansion_standard_equipment\"][\"mv_lv_transformer\"]\n        ]\n    except KeyError:\n        raise KeyError(\"Standard MV/LV transformer is not in equipment list.\")\n\n    transformers_changes = {\"added\": {}}\n    for station in critical_stations.index:\n        grid_id = critical_stations.at[station, \"lv_grid_id\"]\n        grid = edisgo_obj.topology.get_lv_grid(int(grid_id))\n        # get any transformer to get attributes for new transforme",
+      "total_lines": 1164
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "logging",
+        "math",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "networkx",
+        "numpy",
+        "pandas",
+        "networkx.algorithms.shortest_paths.weighted:_dijkstra",
+        "edisgo.network.grids:LVGrid",
+        "edisgo.network.grids:MVGrid",
+        "edisgo.tools.tools:get_downstream_buses",
+        "edisgo:EDisGo"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/openego/eDisGo/dev/README.md",
+      "content_excerpt": "<img align=\"right\" width=\"200\" height=\"200\" src=\"https://raw.githubusercontent.com/openego/eDisGo/dev/doc/images/edisgo_logo.png\">\n\n\n# Overview\n\n[![Coverage Status](https://coveralls.io/repos/github/openego/eDisGo/badge.svg?branch=dev)](https://coveralls.io/github/openego/eDisGo?branch=dev)\n[![Tests & coverage](https://github.com/openego/eDisGo/actions/workflows/tests-coverage.yml/badge.svg)](https://github.com/openego/eDisGo/actions/workflows/tests-coverage.yml)\n![Python Versions](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue)\n\n\n\n# eDisGo\n\nThe python package eDisGo serves as a toolbox to evaluate flexibility measures\nas an economic alternative to conventional grid expansion in\nmedium and low voltage grids.\nSee [documentation](https://edisgo.readthedocs.io/en/dev/) for further information.\n\n\n# LICENSE\n\nCopyright (C) 2017 Reiner Lemoine Institut gGmbH\n\nThis program is free software: you can redistribute it and/or modify it under\nthe terms of the GNU Affero General Public License as published by the Free\nSoftware Foundation, either version 3 of the License, or (at your option) any\nlater version.\n\nThis program is distributed in the hope that it will be useful, but WITHOUT\nANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS\nFOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more\ndetails.\n\nYou should have received a copy of the GNU General Public License along with\nthis program. If not, see https://www.gnu.org/licenses/.\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "extend_substation_overloading test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"extend_substation_overloading(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "edisgo/flex_opt",
+      "count": 10,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "edisgo/flex_opt/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "battery_storage_operation.py",
+          "path": "edisgo/flex_opt/battery_storage_operation.py",
+          "type": "file"
+        },
+        {
+          "name": "charging_strategies.py",
+          "path": "edisgo/flex_opt/charging_strategies.py",
+          "type": "file"
+        },
+        {
+          "name": "check_tech_constraints.py",
+          "path": "edisgo/flex_opt/check_tech_constraints.py",
+          "type": "file"
+        },
+        {
+          "name": "costs.py",
+          "path": "edisgo/flex_opt/costs.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "edisgo/flex_opt/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "heat_pump_operation.py",
+          "path": "edisgo/flex_opt/heat_pump_operation.py",
+          "type": "file"
+        },
+        {
+          "name": "q_control.py",
+          "path": "edisgo/flex_opt/q_control.py",
+          "type": "file"
+        },
+        {
+          "name": "reinforce_grid.py",
+          "path": "edisgo/flex_opt/reinforce_grid.py",
+          "type": "file"
+        },
+        {
+          "name": "reinforce_measures.py",
+          "path": "edisgo/flex_opt/reinforce_measures.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "edisgo/flex_opt/__init__.py"
+        },
+        {
+          "name": "battery_storage_operation.py",
+          "path": "edisgo/flex_opt/battery_storage_operation.py"
+        },
+        {
+          "name": "charging_strategies.py",
+          "path": "edisgo/flex_opt/charging_strategies.py"
+        },
+        {
+          "name": "check_tech_constraints.py",
+          "path": "edisgo/flex_opt/check_tech_constraints.py"
+        },
+        {
+          "name": "costs.py",
+          "path": "edisgo/flex_opt/costs.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "edisgo/flex_opt/exceptions.py"
+        },
+        {
+          "name": "heat_pump_operation.py",
+          "path": "edisgo/flex_opt/heat_pump_operation.py"
+        },
+        {
+          "name": "q_control.py",
+          "path": "edisgo/flex_opt/q_control.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "edisgo/flex_opt/reinforce_measures.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "e5c9f0c7e5aa1e70c35aeda0d85ebafc1549a529",
+          "html_url": "https://github.com/openego/eDisGo/commit/e5c9f0c7e5aa1e70c35aeda0d85ebafc1549a529",
+          "message": "Feature/#222 replace flake8 isort and Black with Ruff (#611)\n\n* Replace flake8, isort, pyupgrade, and Black with Ruff\n\nConsolidate linting and formatting toolchain: flake8, isort,\npyupgrade, and Black are replaced by ruff-check and ruff-format.\n\n* add ruff support to whatsnew\n\n* add ruff and pytest ",
+          "author": "joda9",
+          "date": "2026-03-20T07:06:27Z"
+        },
+        {
+          "sha": "0357e539aa50e780ead146f9a483d9a0b8eb7954",
+          "html_url": "https://github.com/openego/eDisGo/commit/0357e539aa50e780ead146f9a483d9a0b8eb7954",
+          "message": "Fix DataFrame compatibility and optimize operations (#530)\n\n* fix: replace direct indexing with iloc for pandas DataFrame compatibility\n\n* fix: replace direct indexing with iloc for DataFrame compatibility\n\n* fix: simplify groupby call in grid_expansion_costs function\n\n* fix: change designated_charg",
+          "author": "joda9",
+          "date": "2025-12-09T08:58:48Z"
+        },
+        {
+          "sha": "b7230c1427d1597f2a3d2a0118307a7977ced95e",
+          "html_url": "https://github.com/openego/eDisGo/commit/b7230c1427d1597f2a3d2a0118307a7977ced95e",
+          "message": "Bug fix avoid float becoming object type",
+          "author": "birgits",
+          "date": "2023-05-09T14:47:22Z"
+        },
+        {
+          "sha": "3a28aa280d8569745d4ded2c11f5ccb906420da3",
+          "html_url": "https://github.com/openego/eDisGo/commit/3a28aa280d8569745d4ded2c11f5ccb906420da3",
+          "message": "add comments at hard to undrstand parts",
+          "author": "Kilian Helfenbein",
+          "date": "2023-05-09T08:02:32Z"
+        },
+        {
+          "sha": "48255d3f4ed21f750fb4b0ddb76791d1bd28c660",
+          "html_url": "https://github.com/openego/eDisGo/commit/48255d3f4ed21f750fb4b0ddb76791d1bd28c660",
+          "message": "make sure to idntify station node correctly",
+          "author": "Kilian Helfenbein",
+          "date": "2023-05-09T07:30:40Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "extend_substation_overloading ToDo differentiate between load feed",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "edisgo/flex_opt/reinforce_measures.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "e5c9f0c7e5aa1e70c35aeda0d85ebafc1549a529",
+        "html_url": "https://github.com/openego/eDisGo/commit/e5c9f0c7e5aa1e70c35aeda0d85ebafc1549a529",
+        "message": "Feature/#222 replace flake8 isort and Black with Ruff (#611)\n\n* Replace flake8, isort, pyupgrade, and Black with Ruff\n\nConsolidate linting and formatting toolchain: flake8, isort,\npyupgrade, and Black are replaced by ruff-check and ruff-format.\n\n* add ruff support to whatsnew\n\n* add ruff and pytest ",
+        "author": "joda9",
+        "date": "2026-03-20T07:06:27Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

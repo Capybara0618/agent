@@ -1,0 +1,404 @@
+{
+  "task_id": "303",
+  "repo_owner": "edraak",
+  "repo_name": "edx-platform",
+  "file_path": "common/lib/xmodule/xmodule/capa_module.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T07:44:01+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T07:44:12+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T07:44:17+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "common/lib/xmodule/xmodule/capa_module.py",
+    "original_code": "def save_problem(self, get):\n    '''\n    Save the passed in answers.\n    Returns a dict { 'success' : bool, ['error' : error-msg]},\n    with the error key only present if success is False.\n    '''\n    event_info = dict()\n    event_info['state'] = self.lcp.get_state()\n    event_info['problem_id'] = self.location.url()\n\n    answers = self.make_dict_of_responses(get)\n    event_info['answers'] = answers\n\n    # Too late. Cannot submit\n    if self.closed():\n        event_info['failure'] = 'closed'\n        self.system.track_function('save_problem_fail', event_info)\n        return {'success': False,\n                'error': \"Problem is closed\"}\n\n    # Problem submitted. Student should reset before saving\n    # again.\n    if self.lcp.done and self.rerandomize == \"always\":\n        event_info['failure'] = 'done'\n        self.system.track_function('save_problem_fail', event_info)\n        return {'success': False,\n                'error': \"Problem needs to be reset prior to save.\"}\n\n    self.lcp.student_answers = answers\n\n    # TODO: should this be save_problem_fail?  Looks like success to me...\n    self.system.track_function('save_problem_fail', event_info)\n    return {'success': True}",
+    "satd_comment": "# TODO: should this be save_problem_fail?  Looks like success to me...",
+    "target_file": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/capa_module.py",
+      "sha": "d44a82276c6fb626bc46939285ac465bce3be110",
+      "download_url": "https://raw.githubusercontent.com/Edraak/edx-platform/master/common/lib/xmodule/xmodule/capa_module.py",
+      "content_excerpt": "\"\"\"Implements basics of Capa, including class CapaModule.\"\"\"\nimport json\nimport logging\nimport sys\nimport re\nfrom lxml import etree\n\nfrom pkg_resources import resource_string\n\nimport dogstats_wrapper as dog_stats_api\nfrom .capa_base import CapaMixin, CapaFields, ComplexEncoder\nfrom capa import responsetypes\nfrom .progress import Progress\nfrom xmodule.util.misc import escape_html_characters\nfrom xmodule.x_module import XModule, module_attr, DEPRECATION_VSCOMPAT_EVENT\nfrom xmodule.raw_module import RawDescriptor\nfrom xmodule.exceptions import NotFoundError, ProcessingError\n\nlog = logging.getLogger(\"edx.courseware\")\n\n\nclass CapaModule(CapaMixin, XModule):\n    \"\"\"\n    An XModule implementing LonCapa format problems, implemented by way of\n    capa.capa_problem.LoncapaProblem\n\n    CapaModule.__init__ takes the same arguments as xmodule.x_module:XModule.__init__\n    \"\"\"\n    icon_class = 'problem'\n\n    js = {\n        'coffee': [\n            resource_string(__name__, 'js/src/capa/display.coffee'),\n            resource_string(__name__, 'js/src/javascript_loader.coffee'),\n        ],\n        'js': [\n            resource_string(__name__, 'js/src/collapsible.js'),\n            resource_string(__name__, 'js/src/capa/imageinput.js'),\n            resource_string(__name__, 'js/src/capa/schematic.js'),\n        ]\n    }\n\n    js_module_name = \"Problem\"\n    css = {'scss': [resource_string(__name__, 'css/capa/display.scss')]}\n\n    def __init__(self, *args, **kwargs):\n        \"\"\"\n        Accepts the same arguments as xmodule.x_module:XModule.__init__\n        \"\"\"\n        super(CapaModule, self).__init__(*args, **kwargs)\n\n    def handle_ajax(self, dispatch, data):\n        \"\"\"\n        This is called by courseware.module_render, to handle an AJAX call.\n\n        `data` is request.POST.\n\n        Returns a json dictionary:\n        { 'progress_changed' : True/False,\n          'progress' : 'none'/'in_progress'/'done',\n          <other request-specific values here > }\n        \"\"\"\n        handlers = {\n            'hint_button': self.hint_button,\n            'problem_get': self.get_problem,\n            'problem_check': self.check_problem,\n            'problem_reset': self.reset_problem,\n            'problem_save': self.save_problem,\n            'problem_show': self.get_answer,\n            'score_update': self.update_score,\n            'input_ajax': self.handle_input_ajax,\n            'ungraded_response': self.handle_ungraded_response\n        }\n\n        _ = self.runtime.service(self, \"i18n\").ugettext\n\n        generic_error_message = _(\n            \"We're sorry, there was an error with processing your request. \"\n            \"Please try reloading your page and trying again.\"\n        )\n\n        not_found_error_message = _(\n            \"The state of this problem has changed since you loaded this page. \"\n            \"Please refresh your page.\"\n        )\n\n        if dispatch not in handlers:\n            return 'Error: {} is not a known capa action'.format(dispatch)\n\n        before = self.get_progress()\n\n        try:\n            result = handlers[dispatch](data)\n\n        except NotFoundError as err:\n            _, _, traceback_obj = sys.exc_info()\n            raise ProcessingError(not_found_error_message), None, traceback_obj\n\n        except Exception as err:\n            _, _, traceback_obj = sys.exc_info()\n            raise ProcessingError(generic_error_message), None, traceback_obj\n\n        after = self.get_progress()\n\n        result.update({\n            'progress_changed': after != before,\n            'progress_status': Progress.to_js_status_str(after),\n            'progress_detail': Progress.to_js_detail_str(after),\n        })\n\n        return json.dumps(result, cls=ComplexEncoder)\n\n\nclass CapaDescriptor(CapaFields, RawDescriptor):\n    \"\"\"\n    Module implementing problems in the LON-CAPA format,\n    as implemented by capa.capa_problem\n    \"\"\"\n    INDEX_CONTENT_TYPE = 'CAPA'\n\n    module_class = CapaModule\n\n    has_score = True\n    show_in_read_only_mode = True\n    template_dir_name = 'problem'\n    mako_template = \"widgets/problem-edit.html\"\n    js = {'coffee': [resource_string(__name__, 'js/src/problem/edit.coffee')]}\n    js_module_name = \"MarkdownEditingDescriptor\"\n    css = {\n        'scss': [\n            resource_string(__name__, 'css/editor/edit.scss'),\n            resource_string(__name__, 'css/problem/edit.scss')\n        ]\n    }\n\n    # The capa format specifies that what we call max_attempts in the code\n    # is the attribute `attempts`. This will do that conversion\n    metadata_translations = dict(RawDescriptor.metadata_translations)\n    metadata_translations['attempts'] = 'max_attempts'\n\n    @classmethod\n    def filter_templates(cls, template, course):\n        \"\"\"\n        Filter template that contains 'latex' from templates.\n\n        Show them only if use_latex_compiler is set to True in\n        course settings.\n        \"\"\"\n        return 'latex' not in template['template_id'] or course.use_latex_compiler\n\n    def get_context(self):\n        _context = RawDescriptor.get_context(self)\n        _context.update({\n            'markdown': self.markdown,\n            'enable_markdown': self.markdown is not None,\n            'enable_latex_compiler': self.use_latex_compiler,\n        })\n        return _context\n\n    # VS[compat]\n    # TODO (cpennington): Delete this method once all fall 2012 course are being\n    # edited in the cms\n    @classmethod\n    def backcompat_paths(cls, path):\n        dog_stats_api.increment(\n            DEPRECATION_VSCOMPAT_EVENT,\n            tags=[\"location:capa_descriptor_backcompat_paths\"]\n        )\n        return [\n            'problems/' + path[8:],\n            path[8:],\n        ]\n\n    @property\n    def non_editable_metadata_fields(self):\n        non_editable_fields = super(CapaDescriptor, self).non_editable_metadata_fields\n        non_editable_fields.extend([\n            CapaDescriptor.due,\n            CapaDescriptor.graceperiod,\n            CapaDescriptor.force_save_button,\n            CapaDescriptor.markdown,\n            CapaDescriptor.text_customization,\n            CapaDescriptor.use_latex_compiler,\n        ])\n        return non_editable_fields\n\n    @property\n    def problem_types(self):\n        \"\"\" Low-level problem type introspection for content libraries filtering by problem type \"\"\"\n        tree = etree.XML(self.data)\n        registered_tags = responsetypes.registry.registered_tags()\n        return set([node.tag for node in tree.iter() if node.tag in registered_tags])\n\n    def index_dictionary(self):\n        \"\"\"\n        Return dictionary prepared with module content and type for indexing.\n        \"\"\"\n        xblock_body = super(CapaDescriptor, self).index_dictionary()\n        # Removing solutions and hints, as well as script and style\n        capa_content = re.sub(\n            re.compile(\n                r\"\"\"\n                    <solution>.*?</solution> |\n                    <script>.*?</script> |\n                    <style>.*?</style> |\n                    <[a-z]*hint.*?>.*?</[a-z]*hint>\n                \"\"\",\n                re.DOTALL |\n                re.VERBOSE),\n            \"\",\n            self.data\n        )\n        capa_content = escape_html_characters(capa_content)\n        capa_body = {\n            \"capa_content\": capa_content,\n            \"display_name\": self.display_name,\n        }\n        if \"content\" in xblock_body:\n            xblock_body[\"content\"].update(capa_body)\n        else:\n            xblock_body[\"content\"] = capa_body\n        xblock_body[\"content_type\"] = self.INDEX_CONTENT_TYPE\n        xblock_body[\"problem_types\"] = list(self.problem_types)\n        return xblock_body\n\n    def has_support(self, view, functionality):\n        \"\"\"\n        Override the XBlock.has_support method to return appropriate\n        value for the multi-device functionality.\n        Returns whether the given view has support for the given functionality.\n        \"\"\"\n        if functionality == \"multi_device\":\n            return all(\n                responsetypes.registry.get_class_for_tag(tag).multi_device_support\n                for tag in self.problem_types\n            )\n        return False\n\n    # Proxy to CapaModule for access to any of its attributes\n    answer_available = module_attr('answer_available')\n    check_button_name = module_attr('check_button_name')\n    check_button_checking_name = module_attr('check_button_checking_name')\n    check_problem = module_attr('check_problem')\n    choose_new_seed = module_attr('choose_new_seed')\n    closed = module_attr('closed')\n    get_answer = module_attr('get_answer')\n    get_problem = module_attr('get_problem')\n    get_problem_html = module_attr('get_problem_html')\n    get_state_for_lcp = module_attr('get_state_for_lcp')\n    handle_input_ajax = module_attr('handle_input_ajax')\n    hint_button = module_attr('hint_button')\n    handle_problem_html_error = module_attr('handle_problem_html_error')\n    handle_ungraded_response = module_attr('handle_ungraded_response')\n    is_attempted = module_attr('is_attempted')\n    is_correct = module_attr('is_correct')\n    is_past_due = module_attr('is_past_due')\n    is_submitted = module_attr('is_submitted')\n    lcp = module_attr('lcp')\n    make_dict_of_responses = module_attr('make_dict_of_responses')\n    new_lcp = module_attr('new_lcp')\n    publish_grade = module_attr('publish_grade')\n    rescore_problem = module_attr('rescore_problem')\n    reset_problem = module_attr('reset_problem')\n    save_problem = module_attr('save_problem')\n    set_state_from_lcp = module_attr('set_state_from_lcp')\n    should_show_check_button = module_attr('should_show_check_button')\n    should_show_reset_button = module_attr('should_show_reset_button')\n    should_show_save_button = module_attr('should_show_save_button')\n    update_score = module_attr('update_score')\n",
+      "total_lines": 269
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [],
+      "error": "syntax_error: invalid syntax (<unknown>, line 97)"
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/Edraak/edx-platform/master/README.rst",
+      "content_excerpt": "This is the main edX platform which consists of LMS and Studio (Dogwood release)\n\n\nInstallation\n------------\n\nPlease refer to the following wiki pages in our `configuration repo`_ to\ninstall edX:\n\n-  `edX Developer Stack`_: These instructions are for developers who want\n   to contribute or make changes to the edX source code.\n-  `edX Full Stack`_: Using Vagrant/Virtualbox this will setup all edX\n   services on a single server in a production like configuration.\n-  `edX Ubuntu 12.04 64-bit Installation`_: This will install edX on an\n   existing Ubuntu 12.04 server.\n\n.. _configuration repo: https://github.com/edx/configuration\n.. _edX Developer Stack: https://github.com/edx/configuration/wiki/edX-Developer-Stack\n.. _edX Full Stack: https://github.com/edx/configuration/wiki/edX-Full-Stack\n.. _edX Ubuntu 12.04 64-bit Installation: https://github.com/edx/configuration/wiki/edX-Ubuntu-12.04-64-bit-Installation\n\n\nLicense\n-------\n\nThe code in this repository is licensed under version 3 of the AGPL\nunless otherwise noted. Please see the `LICENSE`_ file for details.\n\n.. _LICENSE: https://github.com/edx/edx-platform/blob/master/LICENSE\n\n\nThe Open edX Portal\n---------------------\n\nSee the `Open edX Portal`_ to learn more about Open edX. You can find\ninformation about the edX roadmap, as well as about hosting, extending, and\ncontributing to Open edX. In addition, the Open edX Portal provides product\nannouncements, the Open edX blog, and other rich community resources.\n\nTo comment on blog posts or the edX roadmap, you must create an account and log\nin. If you do not have an account, foll"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "save_problem test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"save_problem(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "common/lib/xmodule/xmodule",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "common/lib/xmodule/xmodule/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "annotatable_module.py",
+          "path": "common/lib/xmodule/xmodule/annotatable_module.py",
+          "type": "file"
+        },
+        {
+          "name": "annotator_mixin.py",
+          "path": "common/lib/xmodule/xmodule/annotator_mixin.py",
+          "type": "file"
+        },
+        {
+          "name": "annotator_token.py",
+          "path": "common/lib/xmodule/xmodule/annotator_token.py",
+          "type": "file"
+        },
+        {
+          "name": "assetstore",
+          "path": "common/lib/xmodule/xmodule/assetstore",
+          "type": "dir"
+        },
+        {
+          "name": "backcompat_module.py",
+          "path": "common/lib/xmodule/xmodule/backcompat_module.py",
+          "type": "file"
+        },
+        {
+          "name": "capa_base.py",
+          "path": "common/lib/xmodule/xmodule/capa_base.py",
+          "type": "file"
+        },
+        {
+          "name": "capa_base_constants.py",
+          "path": "common/lib/xmodule/xmodule/capa_base_constants.py",
+          "type": "file"
+        },
+        {
+          "name": "capa_module.py",
+          "path": "common/lib/xmodule/xmodule/capa_module.py",
+          "type": "file"
+        },
+        {
+          "name": "conditional_module.py",
+          "path": "common/lib/xmodule/xmodule/conditional_module.py",
+          "type": "file"
+        },
+        {
+          "name": "contentstore",
+          "path": "common/lib/xmodule/xmodule/contentstore",
+          "type": "dir"
+        },
+        {
+          "name": "course_metadata_utils.py",
+          "path": "common/lib/xmodule/xmodule/course_metadata_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "course_module.py",
+          "path": "common/lib/xmodule/xmodule/course_module.py",
+          "type": "file"
+        },
+        {
+          "name": "crowdsource_hinter.py",
+          "path": "common/lib/xmodule/xmodule/crowdsource_hinter.py",
+          "type": "file"
+        },
+        {
+          "name": "css",
+          "path": "common/lib/xmodule/xmodule/css",
+          "type": "dir"
+        },
+        {
+          "name": "discussion_module.py",
+          "path": "common/lib/xmodule/xmodule/discussion_module.py",
+          "type": "file"
+        },
+        {
+          "name": "editing_module.py",
+          "path": "common/lib/xmodule/xmodule/editing_module.py",
+          "type": "file"
+        },
+        {
+          "name": "edxnotes_utils.py",
+          "path": "common/lib/xmodule/xmodule/edxnotes_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "error_module.py",
+          "path": "common/lib/xmodule/xmodule/error_module.py",
+          "type": "file"
+        },
+        {
+          "name": "errortracker.py",
+          "path": "common/lib/xmodule/xmodule/errortracker.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "common/lib/xmodule/xmodule/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "fields.py",
+          "path": "common/lib/xmodule/xmodule/fields.py",
+          "type": "file"
+        },
+        {
+          "name": "graders.py",
+          "path": "common/lib/xmodule/xmodule/graders.py",
+          "type": "file"
+        },
+        {
+          "name": "gst_module.py",
+          "path": "common/lib/xmodule/xmodule/gst_module.py",
+          "type": "file"
+        },
+        {
+          "name": "hidden_module.py",
+          "path": "common/lib/xmodule/xmodule/hidden_module.py",
+          "type": "file"
+        },
+        {
+          "name": "html_checker.py",
+          "path": "common/lib/xmodule/xmodule/html_checker.py",
+          "type": "file"
+        },
+        {
+          "name": "html_module.py",
+          "path": "common/lib/xmodule/xmodule/html_module.py",
+          "type": "file"
+        },
+        {
+          "name": "imageannotation_module.py",
+          "path": "common/lib/xmodule/xmodule/imageannotation_module.py",
+          "type": "file"
+        },
+        {
+          "name": "js",
+          "path": "common/lib/xmodule/xmodule/js",
+          "type": "dir"
+        },
+        {
+          "name": "library_content_module.py",
+          "path": "common/lib/xmodule/xmodule/library_content_module.py",
+          "type": "file"
+        },
+        {
+          "name": "library_root_xblock.py",
+          "path": "common/lib/xmodule/xmodule/library_root_xblock.py",
+          "type": "file"
+        },
+        {
+          "name": "library_tools.py",
+          "path": "common/lib/xmodule/xmodule/library_tools.py",
+          "type": "file"
+        },
+        {
+          "name": "lti_2_util.py",
+          "path": "common/lib/xmodule/xmodule/lti_2_util.py",
+          "type": "file"
+        },
+        {
+          "name": "lti_module.py",
+          "path": "common/lib/xmodule/xmodule/lti_module.py",
+          "type": "file"
+        },
+        {
+          "name": "mako_module.py",
+          "path": "common/lib/xmodule/xmodule/mako_module.py",
+          "type": "file"
+        },
+        {
+          "name": "mixin.py",
+          "path": "common/lib/xmodule/xmodule/mixin.py",
+          "type": "file"
+        },
+        {
+          "name": "modulestore",
+          "path": "common/lib/xmodule/xmodule/modulestore",
+          "type": "dir"
+        },
+        {
+          "name": "mongo_connection.py",
+          "path": "common/lib/xmodule/xmodule/mongo_connection.py",
+          "type": "file"
+        },
+        {
+          "name": "partitions",
+          "path": "common/lib/xmodule/xmodule/partitions",
+          "type": "dir"
+        },
+        {
+          "name": "poll_module.py",
+          "path": "common/lib/xmodule/xmodule/poll_module.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "common/lib/xmodule/xmodule/__init__.py"
+        },
+        {
+          "name": "annotatable_module.py",
+          "path": "common/lib/xmodule/xmodule/annotatable_module.py"
+        },
+        {
+          "name": "annotator_mixin.py",
+          "path": "common/lib/xmodule/xmodule/annotator_mixin.py"
+        },
+        {
+          "name": "annotator_token.py",
+          "path": "common/lib/xmodule/xmodule/annotator_token.py"
+        },
+        {
+          "name": "backcompat_module.py",
+          "path": "common/lib/xmodule/xmodule/backcompat_module.py"
+        },
+        {
+          "name": "capa_base.py",
+          "path": "common/lib/xmodule/xmodule/capa_base.py"
+        },
+        {
+          "name": "capa_base_constants.py",
+          "path": "common/lib/xmodule/xmodule/capa_base_constants.py"
+        },
+        {
+          "name": "conditional_module.py",
+          "path": "common/lib/xmodule/xmodule/conditional_module.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/capa_module.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f5d0f3ff55d264ed4b68a24808b255aef5d8dad2",
+          "html_url": "https://github.com/Edraak/edx-platform/commit/f5d0f3ff55d264ed4b68a24808b255aef5d8dad2",
+          "message": "Remove useless pylint suppressions",
+          "author": "Ned Batchelder",
+          "date": "2015-11-22T01:39:35Z"
+        },
+        {
+          "sha": "069807644022854072938dd3f789cc54543e074c",
+          "html_url": "https://github.com/Edraak/edx-platform/commit/069807644022854072938dd3f789cc54543e074c",
+          "message": "Transformer: StudentViewTransformer",
+          "author": "Nimisha Asthagiri",
+          "date": "2015-10-28T22:43:32Z"
+        },
+        {
+          "sha": "8faff973df6eab54a4466541e9c4866f8e657e3a",
+          "html_url": "https://github.com/Edraak/edx-platform/commit/8faff973df6eab54a4466541e9c4866f8e657e3a",
+          "message": "Quality improvements",
+          "author": "Marko Jevtic",
+          "date": "2015-08-18T08:26:44Z"
+        },
+        {
+          "sha": "63edfc6eb4a901877e5d9a5388ba39d17298378b",
+          "html_url": "https://github.com/Edraak/edx-platform/commit/63edfc6eb4a901877e5d9a5388ba39d17298378b",
+          "message": "Applied suggestion from the 1st review",
+          "author": "Marko Jevtic",
+          "date": "2015-08-17T14:14:17Z"
+        },
+        {
+          "sha": "35e7a7338c12eb3be68efa0d8bb9fd77f38d86e4",
+          "html_url": "https://github.com/Edraak/edx-platform/commit/35e7a7338c12eb3be68efa0d8bb9fd77f38d86e4",
+          "message": "Addresses design review feedback",
+          "author": "Marko Jevtic",
+          "date": "2015-08-13T12:46:48Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "save_problem TODO should this save_problem_fail Looks",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/capa_module.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "f5d0f3ff55d264ed4b68a24808b255aef5d8dad2",
+        "html_url": "https://github.com/Edraak/edx-platform/commit/f5d0f3ff55d264ed4b68a24808b255aef5d8dad2",
+        "message": "Remove useless pylint suppressions",
+        "author": "Ned Batchelder",
+        "date": "2015-11-22T01:39:35Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

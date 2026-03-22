@@ -1,0 +1,417 @@
+{
+  "task_id": "143",
+  "repo_owner": "golemfactory",
+  "repo_name": "clay",
+  "file_path": "golem/task/rpc.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T06:41:24+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T06:41:35+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T06:41:39+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "golem/task/rpc.py",
+    "original_code": "def create_task(self, task_dict, force=False) \\\n        -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:\n    \"\"\"\n    - force: if True will ignore warnings\n    :return: (task_id, None) on success; (task_id or None, error_message)\n             on failure\n    \"\"\"\n\n    # FIXME: Statement only for old DummyTask compatibility #2467\n    task: taskbase.Task\n    if isinstance(task_dict, taskbase.Task):\n        warnings.warn(\n            \"create_task() called with {got_type}\"\n            \" instead of dict #2467\".format(\n                got_type=type(task_dict),\n            ),\n            DeprecationWarning,\n            stacklevel=2,\n        )\n        task = task_dict\n    else:\n        prepare_and_validate_task_dict(self.client, task_dict)\n\n        task = self.task_manager.create_task(task_dict)\n\n    task_id = task.header.task_id\n\n    deferred = enqueue_new_task(self.client, task, force=force)\n    # We want to return quickly from create_task without waiting for\n    # deferred completion.\n    deferred.addErrback(  # pylint: disable=no-member\n        lambda failure: _create_task_error(\n            e=failure.value,\n            _self=self,\n            task_dict=task_dict,\n            force=force\n        ),\n    )\n    return task_id, None",
+    "satd_comment": "# FIXME: Statement only for old DummyTask compatibility #2467",
+    "target_file": {
+      "ok": true,
+      "path": "golem/task/rpc.py",
+      "sha": "ad948978387bb2148b28284eb99ebee8887879c8",
+      "download_url": "https://raw.githubusercontent.com/golemfactory/clay/develop/golem/task/rpc.py",
+      "content_excerpt": "\"\"\"Task related module with procedures exposed by RPC\"\"\"\n\nimport copy\nimport functools\nimport logging\nimport os.path\nimport re\nimport typing\nfrom pathlib import Path\n\nfrom ethereum.utils import denoms\nfrom golem_messages import helpers as msg_helpers\nfrom golem_messages.datastructures import masking\nfrom twisted.internet import defer\n\nfrom apps.core.task import coretask\nfrom apps.rendering.task.renderingtask import RenderingTask\nfrom golem.core import golem_async\nfrom golem.core import common\nfrom golem.core import simpleserializer\nfrom golem.core.deferred import DeferredSeq, deferred_from_future\nfrom golem.ethereum import exceptions as eth_exceptions\nfrom golem.model import Actor\nfrom golem.resource import resource\nfrom golem.rpc import utils as rpc_utils\nfrom golem.task import (\n    taskbase,\n    taskstate,\n    tasktester,\n    requestedtaskmanager,\n    TaskId,\n)\nfrom golem.task.helpers import calculate_subtask_payment\n\nif typing.TYPE_CHECKING:\n    # pylint:disable=unused-import, ungrouped-imports\n    from golem.client import Client\n    from .taskmanager import TaskManager\n\nlogger = logging.getLogger(__name__)\nTASK_NAME_RE = re.compile(r\"(\\w|[\\-\\. ])+$\")\n\n\ndef safe_run(errback):\n    def wrapped(f):\n        @functools.wraps(f)\n        def curry(*args, **kwargs):\n            try:\n                result = f(*args, **kwargs)\n            except Exception as e:  # pylint: disable=broad-except\n                logger.debug('Full traceback', exc_info=e)\n                return errback(e, *args, **kwargs)\n            return result\n        return curry\n    return wrapped\n\n\nclass CreateTaskError(Exception):\n    pass\n\n\ndef _validate_task_dict(client, task_dict) -> None:\n    task_type = task_dict.get('type')\n    known_task_types = list(client.apps_manager.task_types.keys())\n    if task_type not in known_task_types:\n        raise ValueError(\n            f\"Task type '{task_type}' unrecognized, \"\n            f\"must be one of: {known_task_types}\"\n        )\n\n    name = \"\"\n    if 'name' in task_dict:\n        task_dict['name'] = task_dict['name'].strip()\n        name = task_dict['name']\n    if len(name) < 4 or len(name) > 24:\n        raise ValueError(\n            \"Length of task name cannot be less \"\n            \"than 4 or more than 24 characters.\")\n    if not TASK_NAME_RE.match(name):\n        raise ValueError(\n            \"Task name can only contain letters, numbers, \"\n            \"spaces, underline, dash or dot.\")\n    if 'id' in task_dict:\n        logger.warning(\"discarding the UUID from the preset\")\n        del task_dict['id']\n\n    if task_dict['concent_enabled']:\n        if not client.concent_service.enabled:  # `enabled` implies `available`\n            raise CreateTaskError(\n                \"Cannot create task with concent enabled when \"\n                \"Concent Service is \" +\n                (\n                    'switched off' if client.concent_service.available\n                    else 'disabled'\n                ),\n            )\n        if not client.apps_manager.get_app(\n                task_dict['type']\n        ).concent_supported:\n            raise CreateTaskError(\n                f\"Concent is not supported for {task_dict['type']} tasks.\"\n            )\n\n\ndef validate_client(client):\n    if client.config_desc.in_shutdown:\n        raise CreateTaskError(\n            'Can not enqueue task: shutdown is in progress, '\n            'toggle shutdown mode off to create new tasks.')\n    if client.task_server is None:\n        raise CreateTaskError(\"Golem is not ready\")\n\n\ndef prepare_and_validate_task_dict(client, task_dict):\n    task_type_id = task_dict.get('type', '').lower()\n    task_dict['type'] = task_type_id\n    # Set default value for concent_enabled\n    task_dict.setdefault(\n        'concent_enabled',\n        client.concent_service.enabled and\n        client.apps_manager.get_app(task_type_id).concent_supported\n    )\n    _validate_task_dict(client, task_dict)\n\n\n@golem_async.deferred_run()\ndef _run_test_task(client, task_dict):\n\n    def on_success(result, estimated_memory, time_spent, **kwargs):\n        logger.info('Test task succes \"%r\"', task_dict)\n        client.task_tester = None\n        client.task_test_result = {\n            \"status\": taskstate.TaskTestStatus.success,\n            \"result\": result,\n            \"estimated_memory\": estimated_memory,\n            \"time_spent\": time_spent,\n            \"more\": kwargs,\n        }\n\n    def on_error(*args, **kwargs):\n        logger.warning('Test task error \"%r\": %r', task_dict, args)\n        client.task_tester = None\n        client.task_test_result = {\n            \"status\": taskstate.TaskTestStatus.error,\n            \"error\": args,\n            \"more\": kwargs,\n        }\n\n    dictionary = simpleserializer.DictSerializer.load(task_dict)\n    task = client.task_server.task_manager.create_task(\n        dictionary=dictionary, test=True\n    )\n\n    client.task_test_result = {\n        \"status\": taskstate.TaskTestStatus.started,\n        \"error\": None,\n    }\n    client.task_tester = tasktester.TaskTester(\n        task,\n        client.task_server.get_task_computer_root(),\n        on_success,\n        on_error,\n    )\n    client.task_tester.run()\n\n\ndef _create_task(client: 'Client', task_dict: dict) -> taskbase.Task:\n    validate_client(client)\n    prepare_and_validate_task_dict(client, task_dict)\n    return client.task_manager.create_task(task_dict)\n\n\ndef _prepare_task(\n        client: 'Client',\n        task: taskbase.Task,\n        force: bool\n) -> defer.Deferred:\n    logger.debug('_prepare_task(). dict=%r', task.task_definition.to_dict())\n    seq = DeferredSeq()\n    seq.push(client.task_manager.initialize_task, task)\n    seq.push(enqueue_new_task, client, task, force=force)\n    return seq.execute()\n\n\ndef _restart_subtasks(\n        client: 'Client',\n        old_task_id: str,\n        task_dict: dict,\n        subtask_ids_to_copy: typing.Iterable[str],\n        ignore_gas_price: bool = False,\n):\n    new_task = _create_task(client, task_dict)\n\n    def _copy_results(*_):\n        client.task_manager.copy_results(\n            old_task_id=old_task_id,\n            new_task_id=new_task.header.task_id,\n            subtask_ids_to_copy=subtask_ids_to_copy\n        )\n\n    # Fire and forget the next steps after create_task\n    deferred = _prepare_task(\n        client=client,\n        task=new_task,\n        force=ignore_gas_price)\n    deferred.addErrback(\n        lambda failure: _restart_subtasks_error(\n            e=failure.value,\n            _self=None,\n            task_id=new_task.header.task_id,\n            subtask_ids=subtask_ids_to_copy\n        )\n    )\n    deferred.addCallback(_copy_results)\n\n\n@defer.inlineCallbacks\ndef _ensure_task_deposit(client, task, force):\n    if not task.header.concent_enabled:\n        return\n\n    if not client.concent_service.available:\n        return\n\n    task_id = task.header.task_id\n    task_state = client.task_manager.tasks_states[task_id]\n    task_state.status = taskstate.TaskStatus.creatingDeposit\n    min_amount, opt_amount = msg_helpers.requestor_deposit_amount(\n        task.price,\n    )\n    logger.info(\n        \"Ensuring deposit. min=%.8f optimal=%.8f task_id=%r\",\n        min_amount / denoms.ether,\n        opt_amount / denoms.ether,\n        task_id,\n    )\n    # This is a bandaid solution for unlocking funds when task creation\n    # fails. This case is most common but, the better way it to always\n    # unlock them when the task fails regardless of the reason.\n    try:\n        client.transaction_system.validate_concent_deposit_possibility(\n            required=min_amount,\n            tasks_num=task.get_total_tasks(),\n            force=force,\n        )\n        yield client.transaction_system.concent_deposit(\n            required=min_amount,\n            expected=opt_amount,\n        )\n    except eth_exceptions.EthereumError:\n        client.funds_locker.remove_task(task_id)\n        raise\n\n    logger.info(\n        \"Deposit confirmed. task_id=%r\",\n        task_id,\n    )\n\n\n@defer.inlineCallbacks\ndef _create_task_package(client, task):\n    files = resource.get_resources_for_task(\n        resources=task.get_resources()\n    )\n\n    packager_result = yield client.resource_server.create_resource_package(\n        files,\n        task.header.task_id,\n    )\n    return packager_result\n\n\ndef _get_mask_for_task(client, task: coretask.CoreTask) -> masking.Mask:\n    desired_num_workers = max(\n        task.get_total_tasks() * client.config_desc.initial_mask_size_factor,\n        client.config_desc.min_num_workers_for_mask,\n    )\n\n    if client.p2pservice is None:\n        raise RuntimeError('P2PService not ready')\n    if client.task_server is None:\n        raise RuntimeError('TaskServer not ready')\n\n    network_size = client.p2pservice.get_estimated_network_size()\n    min_perf = client.task_server.get_min_performance_for_env(\n        task.header.environment)\n    perf_rank = client.p2pservice.get_performance_percentile_rank(\n        min_perf, task.header.environment)\n    potential_num_workers = int(network_size * (1 - perf_rank))\n\n    mask = masking.Mask.get_mask_for_task(\n        desired_num_workers=desired_num_workers,\n        potential_num_workers=potential_num_workers\n    )\n\n    if mask is None:\n        mask = masking.Mask()\n\n    logger.info(\n        f'Task {task.header.task_id} '\n        f'initial mask size: {mask.num_bits} '\n        f'expected number of providers: {desired_num_workers} '\n        f'potential number of providers: {potential_num_workers}'\n    )\n\n    return mask\n\n\n@defer.inlineCallbacks\ndef add_resources(client, resources, res_id, timeout):\n    files = copy.copy(list(resources))\n\n    packager_result = yield client.resource_server.create_resource_package(\n        files,\n        res_id\n    )\n    package_path, package_sha1 = packager_result\n    resource_size = os.path.getsize(package_path)\n    client_options = client.task_server.get_share_options(timeout=timeout)\n    resource_server_result = yield client.resource_server.add_resources(\n        package_path,\n        res_id,\n        client_options=client_options,\n    )\n\n    logger.info(\"Resource package created. res_id=%r\", res_id)\n    return resource_server_result + (package_sha1, resource_size)\n\n\n@defer.inlineCallbacks\ndef _setup_task_resources(client, task):\n    task_id = task.header.task_id\n\n    if client.config_desc.net_masking_enabled:\n        task.header.mask = _get_mask_for_task(\n            client=client,\n            task=task,\n        )\n    else:\n        task.header.mask = masking.Mask()\n\n    estimated_fee = client.transaction_system.eth_for_batch_payment(\n        task.get_total_tasks())\n    client.task_manager.add_new_task(task, estimated_fee=estimated_fee)\n\n    resource_server_result = yield add_resources(\n        client,\n        task.get_resources(),\n        task_id,\n        common.deadline_to_timeout(task.header.deadline)\n    )\n\n    return resource_server_result\n\n\n@golem_async.deferred_run()\ndef _start_task(client, task, resource_server_result):\n    resource_manager_result, package_path,\\\n        package_hash, package_size = resource_server_result\n\n    task_state = client.task_manager.tasks_states[task.header.task_id]\n    task_state.package_path = package_path\n    task_state.package_hash = package_hash\n    task_state.package_size = package_size\n    task_state.resource_hash = resource_manager_result[0]\n    logger.debug(\n        \"Setting task state - package_path: %s, package_hash: %s, \"\n        \"package_size: %s, resource_hash: %s\",\n        task_state.package_path, task_state.package_hash,\n        task_state.package_size, task_state.resource_hash\n    )\n\n    client.task_manager.start_task(task.header.task_id)\n\n\n@defer.inlineCallbacks\ndef enqueue_new_task(client, task, force=False) \\\n        -> typing.Generator[defer.Deferred, typing.Any, taskbase.Task]:\n    \"\"\"Feed a fresh Task to all golem subsystems\"\"\"\n    validate_client(client)\n    task_id = task.header.task_id\n    client.funds_locker.lock_funds(\n        task_id,\n        task.subtask_price,\n        task.get_total_tasks(),\n    )\n    log",
+      "total_lines": 1209
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "functools",
+        "logging",
+        "os.path",
+        "re",
+        "typing",
+        "pathlib:Path",
+        "ethereum.utils:denoms",
+        "golem_messages:helpers",
+        "golem_messages.datastructures:masking",
+        "twisted.internet:defer",
+        "apps.core.task:coretask",
+        "apps.rendering.task.renderingtask:RenderingTask",
+        "golem.core:golem_async",
+        "golem.core:common",
+        "golem.core:simpleserializer",
+        "golem.core.deferred:DeferredSeq",
+        "golem.core.deferred:deferred_from_future",
+        "golem.ethereum:exceptions",
+        "golem.model:Actor",
+        "golem.resource:resource",
+        "golem.rpc:utils",
+        "golem.task:taskbase",
+        "golem.task:taskstate",
+        "golem.task:tasktester",
+        "golem.task:requestedtaskmanager",
+        "golem.task:TaskId",
+        "golem.task.helpers:calculate_subtask_payment",
+        "golem.client:Client",
+        "taskmanager:TaskManager"
+      ]
+    },
+    "issue_refs": [
+      {
+        "ok": true,
+        "number": 2467,
+        "title": "Make sure that enqueue_new_task accept only one type of arguments",
+        "state": "closed",
+        "html_url": "https://github.com/golemfactory/clay/issues/2467",
+        "body_excerpt": "Right now in old dummy_task that is used for integration tests we are passing task to client.enqueue_new_task. In other places we're adding dictionary that represents task definition and we're buliding the task using task_manager.create_task. \r\ntest_dummy_task runner should be fixed to pass the dictionary.  ",
+        "is_pull_request": false
+      }
+    ],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/golemfactory/clay/develop/README.md",
+      "content_excerpt": "# Discontinuation notice for the Clay Golem\n\n:warning: Clay Golem (ex. Brass Golem) has been discontinued. The current, completely new incarnation of Golem is called [yagna](https://github.com/golemfactory/yagna) and developed within a separate set of repositories.\n\n## Providers\n\nTo become a new Golem provider, please follow the instructions in our [Provider's handbook](https://handbook.golem.network/provider-tutorials/provider-tutorial)\n\n## Requestors\n\nOn the other hand, if you're interested in running or developing applications on Golem, please have a look at:\n\n* [Requestor's handbook](https://handbook.golem.network/requestor-tutorials/)\n* [Python API](https://github.com/golemfactory/yapapi)\n* [JS API](https://github.com/golemfactory/yajsapi/)\n\n----\n\n# Golem\n\nGolem is a decentralized marketplace for computing power. It enables CPUs and GPUs to connect in a peer-to-peer network, enabling both application owners and individual users (\"requestors\") to rent resources from other users’ (\"providers\") machines. These resources can be used to complete tasks requiring any amount of computation time and capacity. Nowadays, centralized cloud providers are in control of these services, these platforms are constrained by closed networks, proprietary payment systems, and hard-coded provisioning operations. Golem proposes an open-source, decentralized and user controlled alternative.\n\nOne core component to Golem’s built-in feature set is an [**Ethereum-based transaction system**](https://docs.golem.network/#/About/Payments), which enables direct payments between requestors, providers, a"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "create_task test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"create_task(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "golem/task",
+      "count": 29,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "golem/task/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "acl.py",
+          "path": "golem/task/acl.py",
+          "type": "file"
+        },
+        {
+          "name": "benchmarkmanager.py",
+          "path": "golem/task/benchmarkmanager.py",
+          "type": "file"
+        },
+        {
+          "name": "envmanager.py",
+          "path": "golem/task/envmanager.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "golem/task/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "helpers.py",
+          "path": "golem/task/helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "localcomputer.py",
+          "path": "golem/task/localcomputer.py",
+          "type": "file"
+        },
+        {
+          "name": "requestedtaskmanager.py",
+          "path": "golem/task/requestedtaskmanager.py",
+          "type": "file"
+        },
+        {
+          "name": "result",
+          "path": "golem/task/result",
+          "type": "dir"
+        },
+        {
+          "name": "rpc.py",
+          "path": "golem/task/rpc.py",
+          "type": "file"
+        },
+        {
+          "name": "server",
+          "path": "golem/task/server",
+          "type": "dir"
+        },
+        {
+          "name": "task_api",
+          "path": "golem/task/task_api",
+          "type": "dir"
+        },
+        {
+          "name": "taskarchiver.py",
+          "path": "golem/task/taskarchiver.py",
+          "type": "file"
+        },
+        {
+          "name": "taskbase.py",
+          "path": "golem/task/taskbase.py",
+          "type": "file"
+        },
+        {
+          "name": "taskclient.py",
+          "path": "golem/task/taskclient.py",
+          "type": "file"
+        },
+        {
+          "name": "taskcomputer.py",
+          "path": "golem/task/taskcomputer.py",
+          "type": "file"
+        },
+        {
+          "name": "taskconnectionshelper.py",
+          "path": "golem/task/taskconnectionshelper.py",
+          "type": "file"
+        },
+        {
+          "name": "taskkeeper.py",
+          "path": "golem/task/taskkeeper.py",
+          "type": "file"
+        },
+        {
+          "name": "taskmanager.py",
+          "path": "golem/task/taskmanager.py",
+          "type": "file"
+        },
+        {
+          "name": "taskpreset.py",
+          "path": "golem/task/taskpreset.py",
+          "type": "file"
+        },
+        {
+          "name": "taskproviderstats.py",
+          "path": "golem/task/taskproviderstats.py",
+          "type": "file"
+        },
+        {
+          "name": "taskrequestorstats.py",
+          "path": "golem/task/taskrequestorstats.py",
+          "type": "file"
+        },
+        {
+          "name": "taskserver.py",
+          "path": "golem/task/taskserver.py",
+          "type": "file"
+        },
+        {
+          "name": "tasksession.py",
+          "path": "golem/task/tasksession.py",
+          "type": "file"
+        },
+        {
+          "name": "taskstate.py",
+          "path": "golem/task/taskstate.py",
+          "type": "file"
+        },
+        {
+          "name": "tasktester.py",
+          "path": "golem/task/tasktester.py",
+          "type": "file"
+        },
+        {
+          "name": "taskthread.py",
+          "path": "golem/task/taskthread.py",
+          "type": "file"
+        },
+        {
+          "name": "timer.py",
+          "path": "golem/task/timer.py",
+          "type": "file"
+        },
+        {
+          "name": "verification",
+          "path": "golem/task/verification",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "golem/task/__init__.py"
+        },
+        {
+          "name": "acl.py",
+          "path": "golem/task/acl.py"
+        },
+        {
+          "name": "benchmarkmanager.py",
+          "path": "golem/task/benchmarkmanager.py"
+        },
+        {
+          "name": "envmanager.py",
+          "path": "golem/task/envmanager.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "golem/task/exceptions.py"
+        },
+        {
+          "name": "helpers.py",
+          "path": "golem/task/helpers.py"
+        },
+        {
+          "name": "localcomputer.py",
+          "path": "golem/task/localcomputer.py"
+        },
+        {
+          "name": "requestedtaskmanager.py",
+          "path": "golem/task/requestedtaskmanager.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "golem/task/rpc.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b738487b72fee91e8f376f3f7b947edc414d597a",
+          "html_url": "https://github.com/golemfactory/clay/commit/b738487b72fee91e8f376f3f7b947edc414d597a",
+          "message": "Set correct state when creating task with no funds (#5137)\n\nWhen task creation fails due to insufficient funds, the task's state is\r\nnow set to errorCreating. This commit also changes that state to be\r\nconsidered final.",
+          "author": "Kuba Mazurek",
+          "date": "2020-03-19T13:50:11Z"
+        },
+        {
+          "sha": "64279474acd2fc5f6a0c4ca79c707d2c2b0712cd",
+          "html_url": "https://github.com/golemfactory/clay/commit/64279474acd2fc5f6a0c4ca79c707d2c2b0712cd",
+          "message": "removed some double log lines (#5067)",
+          "author": "maaktweluit",
+          "date": "2020-01-22T18:06:55Z"
+        },
+        {
+          "sha": "22efdae53177b0283ac4c7811e8d18ee73db9052",
+          "html_url": "https://github.com/golemfactory/clay/commit/22efdae53177b0283ac4c7811e8d18ee73db9052",
+          "message": "Handle task failure during creation (#5060)",
+          "author": "Dariusz Rybi",
+          "date": "2020-01-22T18:03:44Z"
+        },
+        {
+          "sha": "9f292e4c90d5ccb00741489a8bca8eaf815a62c1",
+          "html_url": "https://github.com/golemfactory/clay/commit/9f292e4c90d5ccb00741489a8bca8eaf815a62c1",
+          "message": "Prevent output paths from being nested on task restart (#5017)\n\n* Prevent output paths from being nested on task restart\r\n\r\n* Included the fix in subtask restart RPC\r\n\r\n* Added unit tests",
+          "author": "Kuba Mazurek",
+          "date": "2019-12-23T11:40:54Z"
+        },
+        {
+          "sha": "dd43ca2be5e75eb5fce699891ce4083941a519aa",
+          "html_url": "https://github.com/golemfactory/clay/commit/dd43ca2be5e75eb5fce699891ce4083941a519aa",
+          "message": "Shutdown app client on task creation failure (#4982)",
+          "author": "Marek Franciszkiewicz",
+          "date": "2019-12-11T12:10:56Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "create_task FIXME Statement only DummyTask compatibility",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [
+      {
+        "ok": true,
+        "number": 2467,
+        "count": 4,
+        "comments": [
+          {
+            "user": "jiivan",
+            "created_at": "2018-09-21T11:40:11Z",
+            "body_excerpt": "If this issue is resolved, #3331 won't happen again."
+          },
+          {
+            "user": "PaweuB",
+            "created_at": "2018-10-22T13:43:10Z",
+            "body_excerpt": "Pivotal:\r\nhttps://www.pivotaltracker.com/story/show/161383729"
+          },
+          {
+            "user": "jiivan",
+            "created_at": "2018-10-22T14:24:19Z",
+            "body_excerpt": "Currently this issue is relevant for `golem.task.rpc.ClientProvider.create_task`. `enqueue_new_task` always takes `task` as parameter."
+          },
+          {
+            "user": "dybi",
+            "created_at": "2018-11-28T10:55:42Z",
+            "body_excerpt": "@jiivan, I have scanned the code and haven't found any call to `golem.task.rpc.ClientProvider.create_task` with `Task` as argument (except for a unit test that checks if compatibility fix works). \r\n\r\nI would propose to remove the compatibility fix and the unit test, else you are sure there are some unobvious calls (i.e. via some callbacks, `setattr`s, etc.)."
+          }
+        ]
+      }
+    ],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "golem/task/rpc.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "b738487b72fee91e8f376f3f7b947edc414d597a",
+        "html_url": "https://github.com/golemfactory/clay/commit/b738487b72fee91e8f376f3f7b947edc414d597a",
+        "message": "Set correct state when creating task with no funds (#5137)\n\nWhen task creation fails due to insufficient funds, the task's state is\r\nnow set to errorCreating. This commit also changes that state to be\r\nconsidered final.",
+        "author": "Kuba Mazurek",
+        "date": "2020-03-19T13:50:11Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

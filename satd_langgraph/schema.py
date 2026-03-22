@@ -25,6 +25,7 @@ class SATDRecord:
 class AnalysisResult:
     decision: str
     repairable: bool
+    hard_reject: bool
     repairability_score: float
     intent_clarity: float
     change_locality: float
@@ -47,6 +48,24 @@ class AnalysisResult:
     drop_reason: str | None = None
     historical_snapshot_mismatch: bool = False
     github_evidence_strength: str = "low"
+    expected_fixability_hint: str = ""
+    why_not_hard_reject: str = ""
+
+
+@dataclass
+class ProbeResult:
+    passed: bool
+    probe_fix_plan: str
+    probe_repaired_code: str
+    probe_confidence: float
+    probe_problem_alignment: float
+    probe_minimality: float
+    probe_semantic_risk: float
+    probe_self_consistency: float
+    probe_success_score: float
+    predicted_success_score: float
+    rationale: str
+    filter_reason: str | None = None
 
 
 @dataclass
@@ -86,9 +105,12 @@ class WorkflowTrace:
     status: str
     rounds_used: int
     github_context: dict[str, Any] | None
+    probe_context_used: bool
     repair_context_used: bool
+    full_repair_executed: bool
     review_strict_gate_result: str | None
     analysis: dict[str, Any] | None
+    probe: dict[str, Any] | None
     repairs: list[dict[str, Any]] = field(default_factory=list)
     reviews: list[dict[str, Any]] = field(default_factory=list)
     processed_final_repaired_code: str | None = None
@@ -111,11 +133,15 @@ class GraphState(TypedDict):
     round_id: int
     max_rounds: int
     github_context: dict[str, Any] | None
+    probe_context_used: bool
     repair_context_used: bool
+    full_repair_executed: bool
     review_strict_gate_result: str | None
     analysis: AnalysisResult | None
+    probe: ProbeResult | None
     repairs: list[RepairAttempt]
     reviews: list[ReviewResult]
+    latest_probe: ProbeResult | None
     latest_repair: RepairAttempt | None
     latest_review: ReviewResult | None
     final_repaired_code: str | None
@@ -163,11 +189,15 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         round_id=0,
         max_rounds=max_rounds,
         github_context=None,
+        probe_context_used=False,
         repair_context_used=False,
+        full_repair_executed=False,
         review_strict_gate_result=None,
         analysis=None,
+        probe=None,
         repairs=[],
         reviews=[],
+        latest_probe=None,
         latest_repair=None,
         latest_review=None,
         final_repaired_code=None,
@@ -242,9 +272,12 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         status=state["status"],
         rounds_used=state["round_id"],
         github_context=state["github_context"],
+        probe_context_used=state["probe_context_used"],
         repair_context_used=state["repair_context_used"],
+        full_repair_executed=state["full_repair_executed"],
         review_strict_gate_result=state["review_strict_gate_result"],
         analysis=asdict(state["analysis"]) if state["analysis"] else None,
+        probe=asdict(state["probe"]) if state.get("probe") else None,
         repairs=[asdict(item) for item in state["repairs"]],
         reviews=[asdict(item) for item in state["reviews"]],
         processed_final_repaired_code=processed_final_repaired_code,

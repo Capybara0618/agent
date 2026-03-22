@@ -1,0 +1,255 @@
+{
+  "task_id": "398",
+  "repo_owner": "lightningd",
+  "repo_name": "plugins",
+  "file_path": "feeadjuster/feeadjuster.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T08:20:49+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T08:21:00+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T08:21:07+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "feeadjuster/feeadjuster.py",
+    "original_code": "def maybe_adjust_fees(plugin: Plugin, scids: list):\n    for scid in scids:\n        # FIXME: set a threshold to avoid flooding!\n        if True:\n            our = plugin.adj_balances[scid][\"our\"]\n            total = plugin.adj_balances[scid][\"total\"]\n            ratio = get_ratio(our / total)\n            try:\n                plugin.rpc.setchannelfee(scid, int(plugin.adj_basefee * ratio),\n                                         int(plugin.adj_ppmfee * ratio))\n                plugin.log(\"Adjusted fees of {} with a ratio of {}\"\n                           .format(scid, ratio))\n            except RpcError as e:\n                plugin.log(\"setchannelfee error: \" + str(e), level=\"warn\")",
+    "satd_comment": "# FIXME: set a threshold to avoid flooding!",
+    "target_file": {
+      "ok": true,
+      "path": "feeadjuster/feeadjuster.py",
+      "sha": "dd56f1815cd80887e0d57a4cd20f3c0a7bb922a8",
+      "download_url": "https://raw.githubusercontent.com/lightningd/plugins/master/feeadjuster/feeadjuster.py",
+      "content_excerpt": "#!/usr/bin/env -S uv run --script\n\n# /// script\n# requires-python = \">=3.9.2\"\n# dependencies = [\n#   \"pyln-client>=24.11\"\n# ]\n# ///\n\nimport random\nimport statistics\nimport time\nimport math\nfrom clnutils import cln_parse_rpcversion\nfrom pyln.client import Plugin, Millisatoshi, RpcError\nfrom threading import Lock\n\n\nplugin = Plugin()\n# Our amount and the total amount in each of our channel, indexed by scid\nplugin.adj_balances = {}\n# Cache to avoid loads of RPC calls\nplugin.our_node_id = None\nplugin.peerchannels = None\nplugin.channels = None\nplugin.excludelist = None\n# Users can configure this\nplugin.update_threshold = 0.05\n# forward_event must wait for init\nplugin.mutex = Lock()\nplugin.mutex.acquire()\n\n\ndef read_excludelist():\n    try:\n        with open(\"feeadjuster-exclude.list\") as file:\n            exclude_list = [l.rstrip(\"\\n\") for l in file]\n            print(\"Excluding the channels with the nodes:\", exclude_list)\n    except FileNotFoundError:\n        exclude_list = []\n        print(\n            \"There is no feeadjuster-exclude.list given, applying the options to the channels with all peers.\"\n        )\n    return exclude_list\n\n\ndef get_adjusted_percentage(plugin: Plugin, scid: str):\n    \"\"\"\n    For big channels, there may be a wide range where the liquidity is just okay.\n    Note: if big_enough_liquidity is greater than {total} * 2\n          then percentage is actually {our} / {total}, as it was before\n    \"\"\"\n    channel = plugin.adj_balances[scid]\n    if plugin.big_enough_liquidity == Millisatoshi(0):\n        return channel[\"our\"] / channel[\"total\"]\n    min_liquidity = min(channel[\"total\"] / 2, int(plugin.big_enough_liquidity))\n    theirs = channel[\"total\"] - channel[\"our\"]\n    if channel[\"our\"] >= min_liquidity and theirs >= min_liquidity:\n        # the liquidity is just okay\n        return 0.5\n    if channel[\"our\"] < min_liquidity:\n        # our liquidity is too low\n        return channel[\"our\"] / min_liquidity / 2\n    # their liquidity is too low\n    return (min_liquidity - theirs) / min_liquidity / 2 + 0.5\n\n\ndef get_ratio_soft(our_percentage):\n    \"\"\"\n    Basic algorithm: lesser difference than default\n    \"\"\"\n    return 10 ** (0.5 - our_percentage)\n\n\ndef get_ratio(our_percentage):\n    \"\"\"\n    Basic algorithm: the farther we are from the optimal case, the more we\n    bump/lower.\n    \"\"\"\n    return 50 ** (0.5 - our_percentage)\n\n\ndef get_ratio_hard(our_percentage):\n    \"\"\"\n    Return value is between 0 and 20: 0 -> 20; 0.5 -> 1; 1 -> 0\n    \"\"\"\n    return 100 ** (0.5 - our_percentage) * (1 - our_percentage) * 2\n\n\ndef get_peerchannels(plugin: Plugin):\n    \"\"\"Helper to reconstruct `listpeerchannels` for older CLN versions\"\"\"\n    # first the good case\n    if (\n        plugin.rpcversion[0] > 23\n        or plugin.rpcversion[0] == 23\n        and plugin.rpcversion[1] >= 2\n    ):\n        return plugin.rpc.listpeerchannels()[\"channels\"]\n    # now the workaround\n    channels = []\n    peers = plugin.rpc.listpeers()[\"peers\"]\n    for peer in peers:\n        newchans = peer[\"channels\"]\n        for ch in newchans:\n            ch[\"peer_id\"] = peer[\"id\"]  # all we need is to set the 'peer_id'\n        channels.extend(newchans)\n    return channels\n\n\ndef get_config(plugin: Plugin, config: str):\n    \"\"\"Helper to reconstruct `listconfigs` for older CLN versions\"\"\"\n    # versions >=23.08 return a configs object and value_* fields\n    if (\n        plugin.rpcversion[0] > 23\n        or plugin.rpcversion[0] == 23\n        and plugin.rpcversion[1] >= 8\n    ):\n        result = plugin.rpc.listconfigs(config)[\"configs\"]\n        assert len(result) > 0, \"listconfigs returned no result\"\n        conf_obj = result[config]\n        if \"value_str\" in conf_obj:\n            return conf_obj[\"value_str\"]\n        elif \"value_msat\" in conf_obj:\n            return conf_obj[\"value_msat\"]\n        elif \"value_int\" in conf_obj:\n            return conf_obj[\"value_int\"]\n        elif \"value_bool\" in conf_obj:\n            return conf_obj[\"value_bool\"]\n        else:\n            return None\n\n    # now < 23.08\n    result = plugin.rpc.listconfigs(config)\n    if len(result) == 0:\n        return None\n    return result[config]\n\n\ndef get_peer_id_for_scid(plugin: Plugin, scid: str):\n    for ch in plugin.peerchannels:\n        if ch.get(\"short_channel_id\") == scid:\n            return ch[\"peer_id\"]\n    return None\n\n\ndef get_peerchannel(plugin: Plugin, scid: str):\n    for ch in plugin.peerchannels:\n        if ch.get(\"short_channel_id\") == scid:\n            return ch\n    return None\n\n\ndef get_chan_fees(plugin: Plugin, scid: str):\n    channel = get_peerchannel(plugin, scid)\n    assert channel is not None, f\"channel not found: {scid}\"\n    return {\n        \"base\": channel[\"fee_base_msat\"],\n        \"ppm\": channel[\"fee_proportional_millionths\"],\n    }\n\n\ndef get_fees_global(plugin: Plugin, scid: str):\n    return {\"base\": plugin.adj_basefee, \"ppm\": plugin.adj_ppmfee}\n\n\ndef get_fees_median(plugin: Plugin, scid: str):\n    \"\"\"Median fees from peers or peer.\n\n    The assumption is that our node competes in fees to other peers of a peer.\n    \"\"\"\n    peer_id = get_peer_id_for_scid(plugin, scid)\n    assert peer_id is not None, f\"peer_id not found for {scid}\"\n    if plugin.listchannels_by_dst:\n        plugin.channels = plugin.rpc.call(\"listchannels\", {\"destination\": peer_id})[\n            \"channels\"\n        ]\n    channels_to_peer = [\n        ch\n        for ch in plugin.channels\n        if ch[\"destination\"] == peer_id and ch[\"source\"] != plugin.our_node_id\n    ]\n    if len(channels_to_peer) == 0:\n        return None\n    # fees > ~5000 (base and ppm) are currently about top 2% of network fee extremists\n    fees_ppm = [\n        ch[\"fee_per_millionth\"]\n        for ch in channels_to_peer\n        if 0 < ch[\"fee_per_millionth\"] < 5000\n    ]\n    fees_base = [\n        ch[\"base_fee_millisatoshi\"]\n        for ch in channels_to_peer\n        if 0 < ch[\"base_fee_millisatoshi\"] < 5000\n    ]\n\n    # if lists are emtpy use default values, otherwise statistics.median will fail.\n    if len(fees_ppm) == 0:\n        fees_ppm = [int(plugin.adj_ppmfee / plugin.median_multiplier)]\n    if len(fees_base) == 0:\n        fees_base = [int(plugin.adj_basefee / plugin.median_multiplier)]\n    return {\n        \"base\": statistics.median(fees_base) * plugin.median_multiplier,\n        \"ppm\": statistics.median(fees_ppm) * plugin.median_multiplier,\n    }\n\n\ndef setchannelfee(\n    plugin: Plugin,\n    scid: str,\n    base: int,\n    ppm: int,\n    min_htlc: int = None,\n    max_htlc: int = None,\n):\n    fees = get_chan_fees(plugin, scid)\n    if fees is None or base == fees[\"base\"] and ppm == fees[\"ppm\"]:\n        return False\n    try:\n        plugin.rpc.setchannel(scid, base, ppm, min_htlc, max_htlc)\n        return True\n    except RpcError as e:\n        plugin.log(f\"Could not adjust fees for channel {scid}: '{e}'\", level=\"error\")\n    return False\n\n\ndef significant_update(plugin: Plugin, scid: str):\n    channel = plugin.adj_balances[scid]\n    last_liquidity = channel.get(\"last_liquidity\")\n    if last_liquidity is None:\n        return True\n    # Only update on substantial balance moves to avoid flooding, and add\n    # some pseudo-randomness to avoid too easy channel balance probing\n    update_threshold = plugin.update_threshold\n    update_threshold_abs = int(plugin.update_threshold_abs)\n    if not plugin.deactivate_fuzz:\n        update_threshold += random.uniform(-0.015, 0.015)\n        update_threshold_abs += update_threshold_abs * random.uniform(-0.015, 0.015)\n    last_percentage = last_liquidity / channel[\"total\"]\n    percentage = channel[\"our\"] / channel[\"total\"]\n    if (\n        abs(last_percentage - percentage) > update_threshold\n        or abs(last_liquidity - channel[\"our\"]) > update_threshold_abs\n    ):\n        return True\n    return False\n\n\ndef maybe_adjust_fees(plugin: Plugin, scids: list):\n    channels_adjusted = 0\n    for scid in scids:\n        if (\n            scid in plugin.exclude_list\n            or get_peer_id_for_scid(plugin, scid) in plugin.exclude_list\n        ):\n            continue\n        our = plugin.adj_balances[scid][\"our\"]\n        total = plugin.adj_balances[scid][\"total\"]\n        percentage = our / total\n        base = int(plugin.adj_basefee)\n        ppm = int(plugin.adj_ppmfee)\n\n        # select ideal values per channel\n        fees = plugin.fee_strategy(plugin, scid)\n        if fees is not None:\n            ppm = int(fees[\"ppm\"])\n            if plugin.basefee:\n                base = int(fees[\"base\"])\n\n        # reset to normal fees if imbalance is not high enough\n        if percentage > plugin.imbalance and percentage < 1 - plugin.imbalance:\n            if setchannelfee(plugin, scid, base, ppm):\n                plugin.log(\n                    f\"Set default fees as imbalance is too low for {scid}:   ppm {ppm}   base {base}msat\"\n                )\n                plugin.adj_balances[scid][\"last_liquidity\"] = our\n                channels_adjusted += 1\n            continue\n\n        if not significant_update(plugin, scid):\n            continue\n\n        percentage = get_adjusted_percentage(plugin, scid)\n        assert 0 <= percentage and percentage <= 1, (\n            f\"percentage is out of bounds: balances: {plugin.adj_balances[scid]} big_enough_liquidity: {int(plugin.big_enough_liquidity)}\"\n        )\n        ratio = plugin.get_ratio(percentage)\n        if plugin.max_htlc_steps >= 1:\n            max_htlc = int(\n                total\n                * math.ceil(plugin.max_htlc_steps * percentage)\n                / plugin.max_htlc_steps\n            )\n        else:\n            max_htlc = None\n        if setchannelfee(plugin, scid, base, int(ppm * ratio), None, max_htlc):\n            plugin.log(\n                f\"Adjusted fees of {scid} with a ratio of {ratio}:   ppm {int(ppm * ratio)}   base {base}msat   max_htlc {max_htlc}\"\n            )\n            plugin.adj_balances[scid][\"last_liquidity\"] = our\n            channels_adjusted += 1\n    plugin.log(\"maybe_adjust_fees done\", \"debug\")\n    return channels_adjusted\n\n\ndef get_new_balance(plugin: Plugin, scid: str):\n    i = 0\n    while i < 5:\n        chan = get_peerchannel(plugin, scid)\n        assert chan is not None, f\"channel not found: {scid}\"\n        if scid not in plugin.adj_balances:\n            time.sleep(5)\n            plugin.peerchannels = get_peerchannels(plugin)\n            chan = get_peerchannel(plugin, scid)\n            plugin.adj_balances[scid] = {\n                \"our\": int(chan[\"to_us_msat\"]),\n                \"total\": int(chan[\"total_msat\"]),\n            }\n            return\n        elif (\n            int(chan[\"to_us_msat\"]) != plugin.adj_balances[scid][\"our\"]\n            or int(chan[\"total_msat\"]) != plugin.adj_balances[scid][\"total\"]\n        ):\n            plugin.adj_balances[scid][\"our\"] = int(chan[\"to_us_msat\"])\n            plugin.adj_balances[scid][\"total\"] = int(chan[\"total_msat\"])\n            return\n        else:\n            time.sleep(1)\n            plugin.peerchannels = get_peerchannels(plugin)\n            i += 1\n\n\n@plugin.subscribe(\"forward_event\")\ndef forward_event(plugin: Plugin, forward_event: dict, **kwargs):\n    if not plugin.forward_event_subscription:\n        return\n    if forward_event[\"status\"] == \"settled\":\n        plugin.mutex.acquire(blocking=True)\n        plugin.peerchannels = get_peerchannels(plugin)\n        if plugin.fee_strategy == get_fees_median and not plugin.listchannels_by_dst:\n            plugin.channels = plugin.rpc.listchannels()[\"channels\"]\n        in_scid = forward_event[\"in_channel\"]\n        out_scid = forward_event[\"out_channel\"]\n        get_new_balance(plugin, in_scid)\n        get_new_balance(plugin, out_scid)\n\n        try:\n            # Pseudo-randomly add some hysterisis to the update\n            if not plugin.deactivate_fuzz and random.randint(0, 9) == 9:\n                time.sleep(random.randint(0, 5))\n            maybe_adjust_fees(plugin, [in_scid, out_scid])\n        except Exception as e:\n            plugin.log(\"Adjusting fees: \" + str(e), level=\"error\")\n        plugin.mute",
+      "total_lines": 575
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "random",
+        "statistics",
+        "time",
+        "math",
+        "clnutils:cln_parse_rpcversion",
+        "pyln.client:Plugin",
+        "pyln.client:Millisatoshi",
+        "pyln.client:RpcError",
+        "threading:Lock"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "feeadjuster/README.md",
+      "download_url": "https://raw.githubusercontent.com/lightningd/plugins/master/feeadjuster/README.md",
+      "content_excerpt": "# Fee Adjuster\n\nThis plugin dynamically adjusts fees according to channel balances. The default behaviour is to automatically adjust fees at startup\nand following forwarding events. There is a threshold for balance deltas that must be crossed before an update is triggered.  It can\nalso set the max htlc for channels according to available liquidity. This may reduce transaction failures but it will also reveal\ninformation about what the current channel balance is.\n\n## Installation\n\nYou need [uv](https://docs.astral.sh/uv/getting-started/installation/) to run this\nplugin like a binary. After `uv` is installed you can simply run\n\n```\nlightning-cli plugin start /path/to/feeadjuster.py\n```\n\nIf you use `systemd` to start CLN, you must have `uv` in the `PATH` that `systemd` uses, which is likely different than the `PATH` from your shell. Most `uv` installation methods install `uv` into your user's home directory (`~/.local/bin` or `~/.cargo/bin`), which `systemd` cannot access.\n\nYou can either:\n\n**Option 1: Install `uv` system-wide** (recommended):\n```bash\ncurl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=\"/usr/local/bin\" sh\n```\n\n**Option 2: Copy your existing user installation**:\n```bash\nsudo cp \"$(command -v uv)\" /usr/local/bin/uv\n```\n\n**Option 3: Configure your systemd service** to use a custom `PATH` (see systemd documentation).\n\nTo verify `uv` is accessible to systemd:\n```bash\nsudo systemd-run --user --wait command -v uv\n```\nThis should output `/usr/local/bin/uv`.\n\nFor general plugin installation instructions see the repos main\n[README.md](https://github.com"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "maybe_adjust_fees test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_feeadjuster.py",
+          "path": "feeadjuster/test_feeadjuster.py",
+          "sha": "9d913242078f5b5b252e7a0d8a402dadec5b1114",
+          "html_url": "https://github.com/lightningd/plugins/blob/cb3adabfcb95e802ff27be85a53a353150a4907d/feeadjuster/test_feeadjuster.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"maybe_adjust_fees(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "feeadjuster.py",
+          "path": "feeadjuster/feeadjuster.py",
+          "sha": "dd56f1815cd80887e0d57a4cd20f3c0a7bb922a8",
+          "html_url": "https://github.com/lightningd/plugins/blob/cb3adabfcb95e802ff27be85a53a353150a4907d/feeadjuster/feeadjuster.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "feeadjuster",
+      "count": 7,
+      "entries": [
+        {
+          "name": "README.md",
+          "path": "feeadjuster/README.md",
+          "type": "file"
+        },
+        {
+          "name": "clnutils.py",
+          "path": "feeadjuster/clnutils.py",
+          "type": "file"
+        },
+        {
+          "name": "feeadjuster.py",
+          "path": "feeadjuster/feeadjuster.py",
+          "type": "file"
+        },
+        {
+          "name": "pyproject.toml",
+          "path": "feeadjuster/pyproject.toml",
+          "type": "file"
+        },
+        {
+          "name": "test_clnutils.py",
+          "path": "feeadjuster/test_clnutils.py",
+          "type": "file"
+        },
+        {
+          "name": "test_feeadjuster.py",
+          "path": "feeadjuster/test_feeadjuster.py",
+          "type": "file"
+        },
+        {
+          "name": "uv.lock",
+          "path": "feeadjuster/uv.lock",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "README.md",
+          "path": "feeadjuster/README.md"
+        },
+        {
+          "name": "clnutils.py",
+          "path": "feeadjuster/clnutils.py"
+        },
+        {
+          "name": "pyproject.toml",
+          "path": "feeadjuster/pyproject.toml"
+        },
+        {
+          "name": "test_clnutils.py",
+          "path": "feeadjuster/test_clnutils.py"
+        },
+        {
+          "name": "test_feeadjuster.py",
+          "path": "feeadjuster/test_feeadjuster.py"
+        },
+        {
+          "name": "uv.lock",
+          "path": "feeadjuster/uv.lock"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "feeadjuster/feeadjuster.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "e29dd44247490e98c3fe3b7321c166033a10d6b8",
+          "html_url": "https://github.com/lightningd/plugins/commit/e29dd44247490e98c3fe3b7321c166033a10d6b8",
+          "message": "feeadjuster: add assert error messages",
+          "author": "daywalker90",
+          "date": "2025-12-15T15:17:01Z"
+        },
+        {
+          "sha": "3af9a0a100ba0211716ddd6440a328a103b3b1ce",
+          "html_url": "https://github.com/lightningd/plugins/commit/3af9a0a100ba0211716ddd6440a328a103b3b1ce",
+          "message": "feeadjuster: migrate to uv shebang",
+          "author": "daywalker90",
+          "date": "2025-11-30T15:20:22Z"
+        },
+        {
+          "sha": "1d3356c2e406741e65222da73774d1443e67425a",
+          "html_url": "https://github.com/lightningd/plugins/commit/1d3356c2e406741e65222da73774d1443e67425a",
+          "message": "format python files with ruff",
+          "author": "daywalker90",
+          "date": "2024-07-01T14:34:29Z"
+        },
+        {
+          "sha": "5ea35a4af887713971fb35b046bb9718804b8899",
+          "html_url": "https://github.com/lightningd/plugins/commit/5ea35a4af887713971fb35b046bb9718804b8899",
+          "message": "feeadjuster: always adhere to the excludelist",
+          "author": "daywalker90",
+          "date": "2024-05-08T19:46:28Z"
+        },
+        {
+          "sha": "ce79a3a16ded3163cd64596238b1a63aa26c25b2",
+          "html_url": "https://github.com/lightningd/plugins/commit/ce79a3a16ded3163cd64596238b1a63aa26c25b2",
+          "message": "feeadjuster: make excludelist have PeerIDs and SCIDs",
+          "author": "Michael Schmoock",
+          "date": "2023-07-21T08:57:03Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "maybe_adjust_fees FIXME threshold avoid flooding",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "feeadjuster/feeadjuster.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "e29dd44247490e98c3fe3b7321c166033a10d6b8",
+        "html_url": "https://github.com/lightningd/plugins/commit/e29dd44247490e98c3fe3b7321c166033a10d6b8",
+        "message": "feeadjuster: add assert error messages",
+        "author": "daywalker90",
+        "date": "2025-12-15T15:17:01Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

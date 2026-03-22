@@ -1,0 +1,438 @@
+{
+  "task_id": "90",
+  "repo_owner": "rwightman",
+  "repo_name": "pytorch-image-models",
+  "file_path": "timm/models/beit.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T06:18:19+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T06:18:39+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T06:18:44+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "timm/models/beit.py",
+    "original_code": "def forward(self, x, rel_pos_bias: Optional[torch.Tensor] = None):\n    B, N, C = x.shape\n    qkv_bias = None\n    if self.q_bias is not None:\n        if torch.jit.is_scripting():\n            # FIXME requires_grad breaks w/ torchscript\n            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias), self.v_bias))\n        else:\n            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))\n    qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)\n    qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)\n    q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)\n\n    q = q * self.scale\n    attn = (q @ k.transpose(-2, -1))\n\n    if self.relative_position_bias_table is not None:\n        relative_position_bias = \\\n            self.relative_position_bias_table[self.relative_position_index.view(-1)].view(\n                self.window_size[0] * self.window_size[1] + 1,\n                self.window_size[0] * self.window_size[1] + 1, -1)  # Wh*Ww,Wh*Ww,nH\n        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww\n        attn = attn + relative_position_bias.unsqueeze(0)\n\n    if rel_pos_bias is not None:\n        attn = attn + rel_pos_bias\n\n    attn = attn.softmax(dim=-1)\n    attn = self.attn_drop(attn)\n\n    x = (attn @ v).transpose(1, 2).reshape(B, N, -1)\n    x = self.proj(x)\n    x = self.proj_drop(x)\n    return x",
+    "satd_comment": "# FIXME requires_grad breaks w/ torchscript",
+    "target_file": {
+      "ok": true,
+      "path": "timm/models/beit.py",
+      "sha": "e81fc77e9a8b045939365ec7fe758a73c56d4a3c",
+      "download_url": "https://raw.githubusercontent.com/huggingface/pytorch-image-models/main/timm/models/beit.py",
+      "content_excerpt": "\"\"\" BEiT: BERT Pre-Training of Image Transformers (https://arxiv.org/abs/2106.08254)\n\nModel from official source: https://github.com/microsoft/unilm/tree/master/beit\n\n@inproceedings{beit,\ntitle={{BEiT}: {BERT} Pre-Training of Image Transformers},\nauthor={Hangbo Bao and Li Dong and Songhao Piao and Furu Wei},\nbooktitle={International Conference on Learning Representations},\nyear={2022},\nurl={https://openreview.net/forum?id=p-BhZSz59o4}\n}\n\nBEiT-v2 from https://github.com/microsoft/unilm/tree/master/beit2\n\n@article{beitv2,\ntitle={{BEiT v2}: Masked Image Modeling with Vector-Quantized Visual Tokenizers},\nauthor={Zhiliang Peng and Li Dong and Hangbo Bao and Qixiang Ye and Furu Wei},\nyear={2022},\neprint={2208.06366},\narchivePrefix={arXiv},\nprimaryClass={cs.CV}\n}\n\nAt this point only the 1k fine-tuned classification weights and model configs have been added,\nsee original source above for pre-training models and procedure.\n\nModifications by / Copyright 2021 Ross Wightman, original copyrights below\n\"\"\"\n# --------------------------------------------------------\n# BEIT: BERT Pre-Training of Image Transformers (https://arxiv.org/abs/2106.08254)\n# Github source: https://github.com/microsoft/unilm/tree/master/beit\n# Copyright (c) 2021 Microsoft\n# Licensed under The MIT License [see LICENSE for details]\n# By Hangbo Bao\n# Based on timm and DeiT code bases\n# https://github.com/rwightman/pytorch-image-models/tree/master/timm\n# https://github.com/facebookresearch/deit/\n# https://github.com/facebookresearch/dino\n# --------------------------------------------------------'\n\nimport math\nfrom functools import partial\nfrom typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union\n\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\nfrom timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD\nfrom timm.layers import (\n    PatchEmbed,\n    Mlp,\n    SwiGLU,\n    LayerNorm,\n    DropPath,\n    calculate_drop_path_rates,\n    trunc_normal_,\n    use_fused_attn,\n    resample_patch_embed,\n    resample_abs_pos_embed,\n    resize_rel_pos_bias_table,\n    ndgrid,\n)\n\nfrom ._builder import build_model_with_cfg\nfrom ._features import feature_take_indices\nfrom ._manipulate import checkpoint\nfrom ._registry import generate_default_cfgs, register_model\n\n__all__ = ['Beit']\n\n\ndef gen_relative_position_index(window_size: Tuple[int, int], device=None) -> torch.Tensor:\n    \"\"\"Generate relative position index for window-based attention.\n\n    Creates a lookup table for relative position indices between all pairs of positions\n    within a window, including special handling for cls token interactions.\n\n    Args:\n        window_size: Height and width of the attention window.\n\n    Returns:\n        Relative position index tensor of shape (window_area+1, window_area+1)\n        where +1 accounts for the cls token.\n    \"\"\"\n    num_relative_distance = (2 * window_size[0] - 1) * (2 * window_size[1] - 1) + 3\n    # cls to token & token 2 cls & cls to cls\n    # get pair-wise relative position index for each token inside the window\n    window_area = window_size[0] * window_size[1]\n    coords = torch.stack(ndgrid(\n        torch.arange(window_size[0], device=device, dtype=torch.long),\n        torch.arange(window_size[1], device=device, dtype=torch.long),\n    ))  # 2, Wh, Ww\n    coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww\n    relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww\n    relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2\n    relative_coords[:, :, 0] += window_size[0] - 1  # shift to start from 0\n    relative_coords[:, :, 1] += window_size[1] - 1\n    relative_coords[:, :, 0] *= 2 * window_size[1] - 1\n    relative_position_index = torch.zeros(size=(window_area + 1,) * 2, device=device, dtype=relative_coords.dtype)\n    relative_position_index[1:, 1:] = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww\n    relative_position_index[0, 0:] = num_relative_distance - 3\n    relative_position_index[0:, 0] = num_relative_distance - 2\n    relative_position_index[0, 0] = num_relative_distance - 1\n    return relative_position_index\n\n\nclass Attention(nn.Module):\n    \"\"\"Multi-head attention module with optional relative position bias.\n\n    Implements multi-head self-attention with support for relative position bias\n    and fused attention operations. Can use either standard or custom head dimensions.\n    \"\"\"\n    fused_attn: torch.jit.Final[bool]\n\n    def __init__(\n            self,\n            dim: int,\n            num_heads: int = 8,\n            qkv_bias: bool = False,\n            qkv_bias_separate: bool = False,\n            attn_drop: float = 0.,\n            proj_drop: float = 0.,\n            window_size: Optional[Tuple[int, int]] = None,\n            attn_head_dim: Optional[int] = None,\n            device=None,\n            dtype=None,\n    ):\n        \"\"\"Initialize attention module.\n\n        Args:\n            dim: Input feature dimension.\n            num_heads: Number of attention heads.\n            qkv_bias: If True, add learnable bias to query, key, value projections.\n            qkv_bias_separate: If True, use separate bias for q, k, v projections.\n            attn_drop: Dropout rate for attention weights.\n            proj_drop: Dropout rate for output projection.\n            window_size: Window size for relative position bias. If None, no relative position bias.\n            attn_head_dim: Dimension per attention head. If None, uses dim // num_heads.\n        \"\"\"\n        dd = {'device': device, 'dtype': dtype}\n        super().__init__()\n        self.num_heads = num_heads\n        head_dim = dim // num_heads\n        if attn_head_dim is not None:\n            head_dim = attn_head_dim\n        all_head_dim = head_dim * self.num_heads\n        self.scale = head_dim ** -0.5\n        self.fused_attn = use_fused_attn()\n        self.qkv_bias_separate = qkv_bias_separate\n\n        self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False, **dd)\n        if qkv_bias:\n            self.q_bias = nn.Parameter(torch.empty(all_head_dim, **dd))\n            self.register_buffer('k_bias', torch.empty(all_head_dim, **dd), persistent=False)\n            self.v_bias = nn.Parameter(torch.empty(all_head_dim, **dd))\n        else:\n            self.q_bias = None\n            self.k_bias = None\n            self.v_bias = None\n\n        if window_size:\n            self.window_size = window_size\n            self.num_relative_distance = (2 * window_size[0] - 1) * (2 * window_size[1] - 1) + 3\n            window_area = window_size[0] * window_size[1]\n            self.relative_position_bias_table = nn.Parameter(\n                torch.empty(self.num_relative_distance, num_heads, **dd))  # 2*Wh-1 * 2*Ww-1, nH\n            self.register_buffer(\n                \"relative_position_index\",\n                torch.empty((window_area + 1, window_area + 1), device=device, dtype=torch.long),\n                persistent=False,\n            )\n        else:\n            self.window_size = None\n            self.relative_position_bias_table = None\n            self.relative_position_index = None\n\n        self.attn_drop = nn.Dropout(attn_drop)\n        self.proj = nn.Linear(all_head_dim, dim, **dd)\n        self.proj_drop = nn.Dropout(proj_drop)\n\n        # TODO: skip init when on meta device when safe to do so\n        self.reset_parameters()\n\n    def _get_rel_pos_bias(self) -> torch.Tensor:\n        \"\"\"Get relative position bias for the attention window.\n\n        Returns:\n            Relative position bias tensor of shape (1, num_heads, window_area+1, window_area+1).\n        \"\"\"\n        relative_position_bias = self.relative_position_bias_table[\n            self.relative_position_index.view(-1)].view(\n            self.window_size[0] * self.window_size[1] + 1,\n            self.window_size[0] * self.window_size[1] + 1, -1)  # Wh*Ww,Wh*Ww,nH\n        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww\n        return relative_position_bias.unsqueeze(0)\n\n    def forward(self, x: torch.Tensor, shared_rel_pos_bias: Optional[torch.Tensor] = None) -> torch.Tensor:\n        \"\"\"Forward pass of attention module.\n\n        Args:\n            x: Input tensor of shape (batch_size, num_tokens, dim).\n            shared_rel_pos_bias: Optional shared relative position bias from parent module.\n\n        Returns:\n            Output tensor of shape (batch_size, num_tokens, dim).\n        \"\"\"\n        B, N, C = x.shape\n\n        if self.q_bias is None:\n            qkv = self.qkv(x)\n        else:\n            qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))\n            if self.qkv_bias_separate:\n                qkv = self.qkv(x)\n                qkv += qkv_bias\n            else:\n                qkv = F.linear(x, weight=self.qkv.weight, bias=qkv_bias)\n        qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)\n        q, k, v = qkv.unbind(0)  # B, num_heads, N, head_dim\n\n        if self.fused_attn:\n            rel_pos_bias = None\n            if self.relative_position_bias_table is not None:\n                rel_pos_bias = self._get_rel_pos_bias()\n                if shared_rel_pos_bias is not None:\n                    rel_pos_bias = rel_pos_bias + shared_rel_pos_bias\n            elif shared_rel_pos_bias is not None:\n                rel_pos_bias = shared_rel_pos_bias\n\n            x = F.scaled_dot_product_attention(\n                q, k, v,\n                attn_mask=rel_pos_bias,\n                dropout_p=self.attn_drop.p if self.training else 0.,\n            )\n        else:\n            q = q * self.scale\n            attn = (q @ k.transpose(-2, -1))\n\n            if self.relative_position_bias_table is not None:\n                attn = attn + self._get_rel_pos_bias()\n            if shared_rel_pos_bias is not None:\n                attn = attn + shared_rel_pos_bias\n\n            attn = attn.softmax(dim=-1)\n            attn = self.attn_drop(attn)\n            x = attn @ v\n\n        x = x.transpose(1, 2).reshape(B, N, C)\n        x = self.proj(x)\n        x = self.proj_drop(x)\n        return x\n\n    def reset_parameters(self) -> None:\n        \"\"\"Initialize parameters and buffers.\"\"\"\n        if self.q_bias is not None:\n            nn.init.zeros_(self.q_bias)\n            nn.init.zeros_(self.v_bias)\n        if self.relative_position_bias_table is not None:\n            nn.init.zeros_(self.relative_position_bias_table)\n        self._init_buffers()\n\n    def _init_buffers(self) -> None:\n        \"\"\"Compute and fill non-persistent buffer values.\"\"\"\n        if self.k_bias is not None:\n            self.k_bias.zero_()\n        if self.relative_position_index is not None:\n            self.relative_position_index.copy_(\n                gen_relative_position_index(self.window_size, device=self.relative_position_index.device)\n            )\n\n    def init_non_persistent_buffers(self) -> None:\n        \"\"\"Initialize non-persistent buffers.\"\"\"\n        self._init_buffers()\n\n\nclass Block(nn.Module):\n    \"\"\"Transformer block with attention and MLP.\n\n    Standard transformer block consisting of multi-head self-attention and MLP\n    with residual connections and layer normalization. Supports layer scale and\n    stochastic depth regularization.\n    \"\"\"\n\n    def __init__(\n            self,\n            dim: int,\n            num_heads: int,\n            qkv_bias: bool = False,\n            mlp_ratio: float = 4.,\n            scale_mlp: bool = False,\n            swiglu_mlp: bool = False,\n            proj_drop: float = 0.,\n            attn_drop: float = 0.,\n            drop_path: float = 0.,\n            init_values: Optional[float] = None,\n            act_layer: Type[nn.Module] = nn.GELU,\n            norm_layer: Type[nn.Module] = LayerNorm,\n            window_size: Optional[Tuple[int, int]] = None,\n            attn_head_dim: Optional[int] = None,\n            device=None,\n            dtype=None,\n    ):\n        \"\"\"Initialize transformer block.\n\n        Args:\n            dim: Input feature dimension.\n            num_heads: ",
+      "total_lines": 1062
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "math",
+        "functools:partial",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:List",
+        "typing:Optional",
+        "typing:Set",
+        "typing:Tuple",
+        "typing:Type",
+        "typing:Union",
+        "torch",
+        "torch.nn",
+        "torch.nn.functional",
+        "timm.data:IMAGENET_DEFAULT_MEAN",
+        "timm.data:IMAGENET_DEFAULT_STD",
+        "timm.layers:PatchEmbed",
+        "timm.layers:Mlp",
+        "timm.layers:SwiGLU",
+        "timm.layers:LayerNorm",
+        "timm.layers:DropPath",
+        "timm.layers:calculate_drop_path_rates",
+        "timm.layers:trunc_normal_",
+        "timm.layers:use_fused_attn",
+        "timm.layers:resample_patch_embed",
+        "timm.layers:resample_abs_pos_embed",
+        "timm.layers:resize_rel_pos_bias_table",
+        "timm.layers:ndgrid",
+        "_builder:build_model_with_cfg",
+        "_features:feature_take_indices"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/huggingface/pytorch-image-models/main/README.md",
+      "content_excerpt": "# PyTorch Image Models\n- [What's New](#whats-new)\n- [Introduction](#introduction)\n- [Models](#models)\n- [Features](#features)\n- [Results](#results)\n- [Getting Started (Documentation)](#getting-started-documentation)\n- [Train, Validation, Inference Scripts](#train-validation-inference-scripts)\n- [Awesome PyTorch Resources](#awesome-pytorch-resources)\n- [Licenses](#licenses)\n- [Citing](#citing)\n\n## What's New\n\n## Feb 23, 2026\n* Add token distillation training support to distillation task wrappers\n* Remove some torch.jit usage in prep for official deprecation\n* Caution added to AdamP optimizer\n* Call reset_parameters() even if meta-device init so that buffers get init w/ hacks like init_empty_weights\n* Tweak Muon optimizer to work with DTensor/FSDP2 (clamp_ instead of clamp_min_, alternate NS branch for DTensor)\n* Release 1.0.25\n\n## Jan 21, 2026\n* **Compat Break**: Fix oversight w/ QKV vs MLP bias in `ParallelScalingBlock` (& `DiffParallelScalingBlock`)\n  * Does not impact any trained `timm` models but could impact downstream use.\n\n## Jan 5 & 6, 2026\n* Release 1.0.24\n* Add new benchmark result csv files for inference timing on all models w/ RTX Pro 6000, 5090, and 4090 cards w/ PyTorch 2.9.1\n* Fix moved module error in deprecated timm.models.layers import path that impacts legacy imports\n* Release 1.0.23\n\n## Dec 30, 2025\n* Add better NAdaMuon trained `dpwee`, `dwee`, `dlittle` (differential) ViTs with a small boost over previous runs\n  * https://huggingface.co/timm/vit_dlittle_patch16_reg1_gap_256.sbb_nadamuon_in1k (83.24% top-1)\n  * https://huggingface.co/timm/vit_dwee_patch1"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "forward test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"forward(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "timm/models",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "timm/models/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_builder.py",
+          "path": "timm/models/_builder.py",
+          "type": "file"
+        },
+        {
+          "name": "_efficientnet_blocks.py",
+          "path": "timm/models/_efficientnet_blocks.py",
+          "type": "file"
+        },
+        {
+          "name": "_efficientnet_builder.py",
+          "path": "timm/models/_efficientnet_builder.py",
+          "type": "file"
+        },
+        {
+          "name": "_factory.py",
+          "path": "timm/models/_factory.py",
+          "type": "file"
+        },
+        {
+          "name": "_features.py",
+          "path": "timm/models/_features.py",
+          "type": "file"
+        },
+        {
+          "name": "_features_fx.py",
+          "path": "timm/models/_features_fx.py",
+          "type": "file"
+        },
+        {
+          "name": "_helpers.py",
+          "path": "timm/models/_helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "_hub.py",
+          "path": "timm/models/_hub.py",
+          "type": "file"
+        },
+        {
+          "name": "_manipulate.py",
+          "path": "timm/models/_manipulate.py",
+          "type": "file"
+        },
+        {
+          "name": "_pretrained.py",
+          "path": "timm/models/_pretrained.py",
+          "type": "file"
+        },
+        {
+          "name": "_prune.py",
+          "path": "timm/models/_prune.py",
+          "type": "file"
+        },
+        {
+          "name": "_pruned",
+          "path": "timm/models/_pruned",
+          "type": "dir"
+        },
+        {
+          "name": "_registry.py",
+          "path": "timm/models/_registry.py",
+          "type": "file"
+        },
+        {
+          "name": "beit.py",
+          "path": "timm/models/beit.py",
+          "type": "file"
+        },
+        {
+          "name": "byoanet.py",
+          "path": "timm/models/byoanet.py",
+          "type": "file"
+        },
+        {
+          "name": "byobnet.py",
+          "path": "timm/models/byobnet.py",
+          "type": "file"
+        },
+        {
+          "name": "cait.py",
+          "path": "timm/models/cait.py",
+          "type": "file"
+        },
+        {
+          "name": "coat.py",
+          "path": "timm/models/coat.py",
+          "type": "file"
+        },
+        {
+          "name": "convit.py",
+          "path": "timm/models/convit.py",
+          "type": "file"
+        },
+        {
+          "name": "convmixer.py",
+          "path": "timm/models/convmixer.py",
+          "type": "file"
+        },
+        {
+          "name": "convnext.py",
+          "path": "timm/models/convnext.py",
+          "type": "file"
+        },
+        {
+          "name": "crossvit.py",
+          "path": "timm/models/crossvit.py",
+          "type": "file"
+        },
+        {
+          "name": "csatv2.py",
+          "path": "timm/models/csatv2.py",
+          "type": "file"
+        },
+        {
+          "name": "cspnet.py",
+          "path": "timm/models/cspnet.py",
+          "type": "file"
+        },
+        {
+          "name": "davit.py",
+          "path": "timm/models/davit.py",
+          "type": "file"
+        },
+        {
+          "name": "deit.py",
+          "path": "timm/models/deit.py",
+          "type": "file"
+        },
+        {
+          "name": "densenet.py",
+          "path": "timm/models/densenet.py",
+          "type": "file"
+        },
+        {
+          "name": "dla.py",
+          "path": "timm/models/dla.py",
+          "type": "file"
+        },
+        {
+          "name": "dpn.py",
+          "path": "timm/models/dpn.py",
+          "type": "file"
+        },
+        {
+          "name": "edgenext.py",
+          "path": "timm/models/edgenext.py",
+          "type": "file"
+        },
+        {
+          "name": "efficientformer.py",
+          "path": "timm/models/efficientformer.py",
+          "type": "file"
+        },
+        {
+          "name": "efficientformer_v2.py",
+          "path": "timm/models/efficientformer_v2.py",
+          "type": "file"
+        },
+        {
+          "name": "efficientnet.py",
+          "path": "timm/models/efficientnet.py",
+          "type": "file"
+        },
+        {
+          "name": "efficientvit_mit.py",
+          "path": "timm/models/efficientvit_mit.py",
+          "type": "file"
+        },
+        {
+          "name": "efficientvit_msra.py",
+          "path": "timm/models/efficientvit_msra.py",
+          "type": "file"
+        },
+        {
+          "name": "eva.py",
+          "path": "timm/models/eva.py",
+          "type": "file"
+        },
+        {
+          "name": "factory.py",
+          "path": "timm/models/factory.py",
+          "type": "file"
+        },
+        {
+          "name": "fasternet.py",
+          "path": "timm/models/fasternet.py",
+          "type": "file"
+        },
+        {
+          "name": "fastvit.py",
+          "path": "timm/models/fastvit.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "timm/models/__init__.py"
+        },
+        {
+          "name": "_builder.py",
+          "path": "timm/models/_builder.py"
+        },
+        {
+          "name": "_efficientnet_blocks.py",
+          "path": "timm/models/_efficientnet_blocks.py"
+        },
+        {
+          "name": "_efficientnet_builder.py",
+          "path": "timm/models/_efficientnet_builder.py"
+        },
+        {
+          "name": "_factory.py",
+          "path": "timm/models/_factory.py"
+        },
+        {
+          "name": "_features.py",
+          "path": "timm/models/_features.py"
+        },
+        {
+          "name": "_features_fx.py",
+          "path": "timm/models/_features_fx.py"
+        },
+        {
+          "name": "_helpers.py",
+          "path": "timm/models/_helpers.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "timm/models/beit.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "41754f29d3f35d5921da3e45b02685b3d9408fca",
+          "html_url": "https://github.com/huggingface/pytorch-image-models/commit/41754f29d3f35d5921da3e45b02685b3d9408fca",
+          "message": "Fix #2661 ... don't skip reset_parameters/init when meta device detected as it breaks use of accelerate and similar dispatch override context managers",
+          "author": "Ross Wightman",
+          "date": "2026-02-06T18:44:40Z"
+        },
+        {
+          "sha": "c0e3d24fe66020baae90e1ecaa858781223ffb32",
+          "html_url": "https://github.com/huggingface/pytorch-image-models/commit/c0e3d24fe66020baae90e1ecaa858781223ffb32",
+          "message": "Add .in_chans as an attribute to all models",
+          "author": "Ross Wightman",
+          "date": "2026-01-09T18:06:27Z"
+        },
+        {
+          "sha": "b5ffe5bd99610feb2bb6d10ca7410444ef2d01e8",
+          "html_url": "https://github.com/huggingface/pytorch-image-models/commit/b5ffe5bd99610feb2bb6d10ca7410444ef2d01e8",
+          "message": "Further refine non-persistent buffer init and ensure reasonable overlap with weight init, weight init moving in direction of planned changes for overlapping models",
+          "author": "Ross Wightman",
+          "date": "2025-12-22T23:11:14Z"
+        },
+        {
+          "sha": "d2553fcdff443d56b5df7898068740c27ed3603d",
+          "html_url": "https://github.com/huggingface/pytorch-image-models/commit/d2553fcdff443d56b5df7898068740c27ed3603d",
+          "message": "Initial pass of an 'init_non_persistent_buffers' scheme, WIP.. needs more test and probably missed a few things",
+          "author": "Ross Wightman",
+          "date": "2025-12-19T22:09:10Z"
+        },
+        {
+          "sha": "1e35a5d942aef8425e2d536bd54297f4029415ef",
+          "html_url": "https://github.com/huggingface/pytorch-image-models/commit/1e35a5d942aef8425e2d536bd54297f4029415ef",
+          "message": "Updating licenses",
+          "author": "Alexander Dann",
+          "date": "2025-09-24T20:53:37Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "forward FIXME requires_grad breaks torchscript",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "timm/models/beit.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "41754f29d3f35d5921da3e45b02685b3d9408fca",
+        "html_url": "https://github.com/huggingface/pytorch-image-models/commit/41754f29d3f35d5921da3e45b02685b3d9408fca",
+        "message": "Fix #2661 ... don't skip reset_parameters/init when meta device detected as it breaks use of accelerate and similar dispatch override context managers",
+        "author": "Ross Wightman",
+        "date": "2026-02-06T18:44:40Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear SATD comment specifying the problem",
+        "localized code snippet in forward method",
+        "torch.jit.is_scripting() conditional branch",
+        "existing code handles requires_grad differently for torchscript",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

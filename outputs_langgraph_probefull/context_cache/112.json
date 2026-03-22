@@ -1,0 +1,280 @@
+{
+  "task_id": "112",
+  "repo_owner": "matrix-org",
+  "repo_name": "synapse",
+  "file_path": "synapse/federation/federation_server.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T06:27:39+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "process_pdus_for_room",
+    "satd_line": 491,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T06:27:53+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T06:27:58+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "synapse/federation/federation_server.py",
+    "original_code": "def _get_event_ids_for_partial_state_join(\n    join_event: EventBase,\n    prev_state_ids: StateMap[str],\n) -> Collection[str]:\n    \"\"\"Calculate state to be retuned in a partial_state send_join\n\n    Args:\n        join_event: the join event being send_joined\n        prev_state_ids: the event ids of the state before the join\n\n    Returns:\n        the event ids to be returned\n    \"\"\"\n\n    # return all non-member events\n    state_event_ids = {\n        event_id\n        for (event_type, state_key), event_id in prev_state_ids.items()\n        if event_type != EventTypes.Member\n    }\n\n    # we also need the current state of the current user (it's going to\n    # be an auth event for the new join, so we may as well return it)\n    current_membership_event_id = prev_state_ids.get(\n        (EventTypes.Member, join_event.state_key)\n    )\n    if current_membership_event_id is not None:\n        state_event_ids.add(current_membership_event_id)\n\n    # TODO: return a few more members:\n    #   - those with invites\n    #   - those that are kicked? / banned\n\n    return state_event_ids",
+    "satd_comment": "# TODO: return a few more members:\n#   - those with invites\n#   - those that are kicked? / banned",
+    "target_file": {
+      "ok": true,
+      "path": "synapse/federation/federation_server.py",
+      "sha": "2bb2c64ebe4281a0fc52840d83791f81604c0edd",
+      "download_url": "https://raw.githubusercontent.com/matrix-org/synapse/develop/synapse/federation/federation_server.py",
+      "content_excerpt": "# Copyright 2015, 2016 OpenMarket Ltd\n# Copyright 2018 New Vector Ltd\n# Copyright 2019-2021 Matrix.org Federation C.I.C\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\nimport logging\nimport random\nfrom typing import (\n    TYPE_CHECKING,\n    Any,\n    Awaitable,\n    Callable,\n    Collection,\n    Dict,\n    List,\n    Mapping,\n    Optional,\n    Tuple,\n    Union,\n)\n\nfrom prometheus_client import Counter, Gauge, Histogram\n\nfrom twisted.python import failure\n\nfrom synapse.api.constants import (\n    Direction,\n    EduTypes,\n    EventContentFields,\n    EventTypes,\n    Membership,\n)\nfrom synapse.api.errors import (\n    AuthError,\n    Codes,\n    FederationError,\n    IncompatibleRoomVersionError,\n    NotFoundError,\n    PartialStateConflictError,\n    SynapseError,\n    UnsupportedRoomVersionError,\n)\nfrom synapse.api.room_versions import KNOWN_ROOM_VERSIONS, RoomVersion\nfrom synapse.crypto.event_signing import compute_event_signature\nfrom synapse.events import EventBase\nfrom synapse.events.snapshot import EventContext\nfrom synapse.federation.federation_base import (\n    FederationBase,\n    InvalidEventSignatureError,\n    event_from_pdu_json,\n)\nfrom synapse.federation.persistence import TransactionActions\nfrom synapse.federation.units import Edu, Transaction\nfrom synapse.handlers.worker_lock import NEW_EVENT_DURING_PURGE_LOCK_NAME\nfrom synapse.http.servlet import assert_params_in_dict\nfrom synapse.logging.context import (\n    make_deferred_yieldable,\n    nested_logging_context,\n    run_in_background,\n)\nfrom synapse.logging.opentracing import (\n    SynapseTags,\n    log_kv,\n    set_tag,\n    start_active_span_from_edu,\n    tag_args,\n    trace,\n)\nfrom synapse.metrics.background_process_metrics import wrap_as_background_process\nfrom synapse.replication.http.federation import (\n    ReplicationFederationSendEduRestServlet,\n    ReplicationGetQueryRestServlet,\n)\nfrom synapse.storage.databases.main.lock import Lock\nfrom synapse.storage.databases.main.roommember import extract_heroes_from_room_summary\nfrom synapse.storage.roommember import MemberSummary\nfrom synapse.types import JsonDict, StateMap, UserID, get_domain_from_id\nfrom synapse.util import unwrapFirstError\nfrom synapse.util.async_helpers import Linearizer, concurrently_execute, gather_results\nfrom synapse.util.caches.response_cache import ResponseCache\nfrom synapse.util.stringutils import parse_server_name\n\nif TYPE_CHECKING:\n    from synapse.server import HomeServer\n\n# when processing incoming transactions, we try to handle multiple rooms in\n# parallel, up to this limit.\nTRANSACTION_CONCURRENCY_LIMIT = 10\n\nlogger = logging.getLogger(__name__)\n\nreceived_pdus_counter = Counter(\"synapse_federation_server_received_pdus\", \"\")\n\nreceived_edus_counter = Counter(\"synapse_federation_server_received_edus\", \"\")\n\nreceived_queries_counter = Counter(\n    \"synapse_federation_server_received_queries\", \"\", [\"type\"]\n)\n\npdu_process_time = Histogram(\n    \"synapse_federation_server_pdu_process_time\",\n    \"Time taken to process an event\",\n)\n\nlast_pdu_ts_metric = Gauge(\n    \"synapse_federation_last_received_pdu_time\",\n    \"The timestamp of the last PDU which was successfully received from the given domain\",\n    labelnames=(\"server_name\",),\n)\n\n\n# The name of the lock to use when process events in a room received over\n# federation.\n_INBOUND_EVENT_HANDLING_LOCK_NAME = \"federation_inbound_pdu\"\n\n\nclass FederationServer(FederationBase):\n    def __init__(self, hs: \"HomeServer\"):\n        super().__init__(hs)\n\n        self.server_name = hs.hostname\n        self.handler = hs.get_federation_handler()\n        self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker\n        self._federation_event_handler = hs.get_federation_event_handler()\n        self.state = hs.get_state_handler()\n        self._event_auth_handler = hs.get_event_auth_handler()\n        self._room_member_handler = hs.get_room_member_handler()\n        self._e2e_keys_handler = hs.get_e2e_keys_handler()\n        self._worker_lock_handler = hs.get_worker_locks_handler()\n\n        self._state_storage_controller = hs.get_storage_controllers().state\n\n        self.device_handler = hs.get_device_handler()\n\n        # Ensure the following handlers are loaded since they register callbacks\n        # with FederationHandlerRegistry.\n        hs.get_directory_handler()\n\n        self._server_linearizer = Linearizer(\"fed_server\")\n\n        # origins that we are currently processing a transaction from.\n        # a dict from origin to txn id.\n        self._active_transactions: Dict[str, str] = {}\n\n        # We cache results for transaction with the same ID\n        self._transaction_resp_cache: ResponseCache[Tuple[str, str]] = ResponseCache(\n            hs.get_clock(), \"fed_txn_handler\", timeout_ms=30000\n        )\n\n        self.transaction_actions = TransactionActions(self.store)\n\n        self.registry = hs.get_federation_registry()\n\n        # We cache responses to state queries, as they take a while and often\n        # come in waves.\n        self._state_resp_cache: ResponseCache[\n            Tuple[str, Optional[str]]\n        ] = ResponseCache(hs.get_clock(), \"state_resp\", timeout_ms=30000)\n        self._state_ids_resp_cache: ResponseCache[Tuple[str, str]] = ResponseCache(\n            hs.get_clock(), \"state_ids_resp\", timeout_ms=30000\n        )\n\n        self._federation_metrics_domains = (\n            hs.config.federation.federation_metrics_domains\n        )\n\n        self._room_prejoin_state_types = hs.config.api.room_prejoin_state\n\n        # Whether we have started handling old events in the staging area.\n        self._started_handling_of_staged_events = False\n\n    @wrap_as_background_process(\"_handle_old_staged_events\")\n    async def _handle_old_staged_events(self) -> None:\n        \"\"\"Handle old staged events by fetching all rooms that have staged\n        events and start the processing of each of those rooms.\n        \"\"\"\n\n        # Get all the rooms IDs with staged events.\n        room_ids = await self.store.get_all_rooms_with_staged_incoming_events()\n\n        # We then shuffle them so that if there are multiple instances doing\n        # this work they're less likely to collide.\n        random.shuffle(room_ids)\n\n        for room_id in room_ids:\n            room_version = await self.store.get_room_version(room_id)\n\n            # Try and acquire the processing lock for the room, if we get it start a\n            # background process for handling the events in the room.\n            lock = await self.store.try_acquire_lock(\n                _INBOUND_EVENT_HANDLING_LOCK_NAME, room_id\n            )\n            if lock:\n                logger.info(\"Handling old staged inbound events in %s\", room_id)\n                self._process_incoming_pdus_in_room_inner(\n                    room_id,\n                    room_version,\n                    lock,\n                )\n\n            # We pause a bit so that we don't start handling all rooms at once.\n            await self._clock.sleep(random.uniform(0, 0.1))\n\n    async def on_backfill_request(\n        self, origin: str, room_id: str, versions: List[str], limit: int\n    ) -> Tuple[int, Dict[str, Any]]:\n        async with self._server_linearizer.queue((origin, room_id)):\n            origin_host, _ = parse_server_name(origin)\n            await self.check_server_matches_acl(origin_host, room_id)\n\n            pdus = await self.handler.on_backfill_request(\n                origin, room_id, versions, limit\n            )\n\n            res = self._transaction_dict_from_pdus(pdus)\n\n        return 200, res\n\n    async def on_timestamp_to_event_request(\n        self, origin: str, room_id: str, timestamp: int, direction: Direction\n    ) -> Tuple[int, Dict[str, Any]]:\n        \"\"\"When we receive a federated `/timestamp_to_event` request,\n        handle all of the logic for validating and fetching the event.\n\n        Args:\n            origin: The server we received the event from\n            room_id: Room to fetch the event from\n            timestamp: The point in time (inclusive) we should navigate from in\n                the given direction to find the closest event.\n            direction: indicates whether we should navigate forward\n                or backward from the given timestamp to find the closest event.\n\n        Returns:\n            Tuple indicating the response status code and dictionary response\n            body including `event_id`.\n        \"\"\"\n        async with self._server_linearizer.queue((origin, room_id)):\n            origin_host, _ = parse_server_name(origin)\n            await self.check_server_matches_acl(origin_host, room_id)\n\n            # We only try to fetch data from the local database\n            event_id = await self.store.get_event_id_for_timestamp(\n                room_id, timestamp, direction\n            )\n            if event_id:\n                event = await self.store.get_event(\n                    event_id, allow_none=False, allow_rejected=False\n                )\n\n                return 200, {\n                    \"event_id\": event_id,\n                    \"origin_server_ts\": event.origin_server_ts,\n                }\n\n        raise SynapseError(\n            404,\n            \"Unable to find event from %s in direction %s\" % (timestamp, direction),\n            errcode=Codes.NOT_FOUND,\n        )\n\n    async def on_incoming_transaction(\n        self,\n        origin: str,\n        transaction_id: str,\n        destination: str,\n        transaction_data: JsonDict,\n    ) -> Tuple[int, JsonDict]:\n        # If we receive a transaction we should make sure that kick off handling\n        # any old events in the staging area.\n        if not self._started_handling_of_staged_events:\n            self._started_handling_of_staged_events = True\n            self._handle_old_staged_events()\n\n            # Start a periodic check for old staged events. This is to handle\n            # the case where locks time out, e.g. if another process gets killed\n            # without dropping its locks.\n            self._clock.looping_call(self._handle_old_staged_events, 60 * 1000)\n\n        # keep this as early as possible to make the calculated origin ts as\n        # accurate as possible.\n        request_time = self._clock.time_msec()\n\n        transaction = Transaction(\n            transaction_id=transaction_id,\n            destination=destination,\n            origin=origin,\n            origin_server_ts=transaction_data.get(\"origin_server_ts\"),  # type: ignore[arg-type]\n            pdus=transaction_data.get(\"pdus\"),\n            edus=transaction_data.get(\"edus\"),\n        )\n\n        if not transaction_id:\n            raise Exception(\"Transaction missing transaction_id\")\n\n        logger.debug(\"[%s] Got transaction\", transaction_id)\n\n        # Reject malformed transactions early: reject if too many PDUs/EDUs\n        if len(transaction.pdus) > 50 or len(transaction.edus) > 100:\n            logger.info(\"Transaction PDU or EDU count too large. Returning 400\")\n            return 400, {}\n\n        # we only process one transaction from each origin at a time. We need to do\n        # this check here, rather than in _on_incoming_transaction_inner so that we\n        # don't cache the rejection in _transaction_resp_cache (so that if the txn\n        # arrives again later, we can process it).\n        current_transaction = self._active_transactions.get(origin)\n        if current_transaction and current_transaction != transaction_id:\n            logger.warning(\n                \"Received another txn %s from %s while still proce",
+      "total_lines": 1501
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 491,
+      "start_line": 471,
+      "end_line": 511,
+      "matched_line": "                    return",
+      "excerpt": "471: \n472:         pdu_results = {}\n473: \n474:         # we can process different rooms in parallel (which is useful if they\n475:         # require callouts to other servers to fetch missing events), but\n476:         # impose a limit to avoid going too crazy with ram/cpu.\n477: \n478:         async def process_pdus_for_room(room_id: str) -> None:\n479:             with nested_logging_context(room_id):\n480:                 logger.debug(\"Processing PDUs for %s\", room_id)\n481: \n482:                 try:\n483:                     await self.check_server_matches_acl(origin_host, room_id)\n484:                 except AuthError as e:\n485:                     logger.warning(\n486:                         \"Ignoring PDUs for room %s from banned server\", room_id\n487:                     )\n488:                     for pdu in pdus_by_room[room_id]:\n489:                         event_id = pdu.event_id\n490:                         pdu_results[event_id] = e.error_dict(self.hs.config)\n491:                     return\n492: \n493:                 for pdu in pdus_by_room[room_id]:\n494:                     pdu_results[pdu.event_id] = await process_pdu(pdu)\n495: \n496:         async def process_pdu(pdu: EventBase) -> JsonDict:\n497:             \"\"\"\n498:             Processes a pushed PDU sent to us via a `/send` transaction\n499: \n500:             Returns:\n501:                 JsonDict representing a \"PDU Processing Result\" that will be bundled up\n502:                 with the other processed PDU's in the `/send` transaction and sent back\n503:                 to remote homeserver.\n504:             \"\"\"\n505:             event_id = pdu.event_id\n506:             with nested_logging_context(event_id):\n507:                 try:\n508:                     await self._handle_received_pdu(origin, pdu)\n509:                     return {}\n510:                 except FederationError as e:\n511:                     logger.warning(\"Error handling PDU %s: %s\", event_id, e)"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "AsyncFunctionDef",
+      "symbol_name": "process_pdus_for_room",
+      "start_line": 478,
+      "end_line": 494,
+      "source": "        async def process_pdus_for_room(room_id: str) -> None:\n            with nested_logging_context(room_id):\n                logger.debug(\"Processing PDUs for %s\", room_id)\n\n                try:\n                    await self.check_server_matches_acl(origin_host, room_id)\n                except AuthError as e:\n                    logger.warning(\n                        \"Ignoring PDUs for room %s from banned server\", room_id\n                    )\n                    for pdu in pdus_by_room[room_id]:\n                        event_id = pdu.event_id\n                        pdu_results[event_id] = e.error_dict(self.hs.config)\n                    return\n\n                for pdu in pdus_by_room[room_id]:\n                    pdu_results[pdu.event_id] = await process_pdu(pdu)"
+    },
+    "imports": {
+      "imports": [
+        "logging",
+        "random",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Awaitable",
+        "typing:Callable",
+        "typing:Collection",
+        "typing:Dict",
+        "typing:List",
+        "typing:Mapping",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:Union",
+        "prometheus_client:Counter",
+        "prometheus_client:Gauge",
+        "prometheus_client:Histogram",
+        "twisted.python:failure",
+        "synapse.api.constants:Direction",
+        "synapse.api.constants:EduTypes",
+        "synapse.api.constants:EventContentFields",
+        "synapse.api.constants:EventTypes",
+        "synapse.api.constants:Membership",
+        "synapse.api.errors:AuthError",
+        "synapse.api.errors:Codes",
+        "synapse.api.errors:FederationError",
+        "synapse.api.errors:IncompatibleRoomVersionError",
+        "synapse.api.errors:NotFoundError",
+        "synapse.api.errors:PartialStateConflictError",
+        "synapse.api.errors:SynapseError",
+        "synapse.api.errors:UnsupportedRoomVersionError"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/matrix-org/synapse/develop/README.rst",
+      "content_excerpt": "=========================================================================\nSynapse |support| |development| |documentation| |license| |pypi| |python|\n=========================================================================\n\nSynapse is now actively maintained at `element-hq/synapse <https://github.com/element-hq/synapse>`_\n=================================================================================================\n\nSynapse is an open-source `Matrix <https://matrix.org/>`_ homeserver developed\nfrom 2019 through 2023 as part of the Matrix.org Foundation. The Matrix.org\nFoundation is not able to resource maintenance of Synapse and it\n`continues to be developed by Element <https://github.com/element-hq/synapse>`_;\nadditionally you have the choice of `other Matrix homeservers <https://matrix.org/ecosystem/servers/>`_.\n\nSee `The future of Synapse and Dendrite <https://matrix.org/blog/2023/11/06/future-of-synapse-dendrite/>`_\nblog post for more information.\n\n=========================================================================\n\nBriefly, Matrix is an open standard for communications on the internet, supporting\nfederation, encryption and VoIP. Matrix.org has more to say about the `goals of the\nMatrix project <https://matrix.org/docs/guides/introduction>`_, and the `formal specification\n<https://spec.matrix.org/>`_ describes the technical details.\n\n.. contents::\n\nInstalling and configuration\n============================\n\nThe Synapse documentation describes `how to install Synapse <https://matrix-org.github.io/synapse/latest/setup/installation.html>`_. We recommend using\n`Docke"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "process_pdus_for_room test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"process_pdus_for_room(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "synapse/federation",
+      "count": 9,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "synapse/federation/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "federation_base.py",
+          "path": "synapse/federation/federation_base.py",
+          "type": "file"
+        },
+        {
+          "name": "federation_client.py",
+          "path": "synapse/federation/federation_client.py",
+          "type": "file"
+        },
+        {
+          "name": "federation_server.py",
+          "path": "synapse/federation/federation_server.py",
+          "type": "file"
+        },
+        {
+          "name": "persistence.py",
+          "path": "synapse/federation/persistence.py",
+          "type": "file"
+        },
+        {
+          "name": "send_queue.py",
+          "path": "synapse/federation/send_queue.py",
+          "type": "file"
+        },
+        {
+          "name": "sender",
+          "path": "synapse/federation/sender",
+          "type": "dir"
+        },
+        {
+          "name": "transport",
+          "path": "synapse/federation/transport",
+          "type": "dir"
+        },
+        {
+          "name": "units.py",
+          "path": "synapse/federation/units.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "synapse/federation/__init__.py"
+        },
+        {
+          "name": "federation_base.py",
+          "path": "synapse/federation/federation_base.py"
+        },
+        {
+          "name": "federation_client.py",
+          "path": "synapse/federation/federation_client.py"
+        },
+        {
+          "name": "persistence.py",
+          "path": "synapse/federation/persistence.py"
+        },
+        {
+          "name": "send_queue.py",
+          "path": "synapse/federation/send_queue.py"
+        },
+        {
+          "name": "units.py",
+          "path": "synapse/federation/units.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "synapse/federation/federation_server.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "70b503f1449a99ee9735e9d30d6a2404e00901fa",
+          "html_url": "https://github.com/matrix-org/synapse/commit/70b503f1449a99ee9735e9d30d6a2404e00901fa",
+          "message": "Fix import ordering issue introduced in 7a3a55ac98847d7adb0e200378abe07ef8d0c645.",
+          "author": "Patrick Cloke",
+          "date": "2023-10-31T14:32:35Z"
+        },
+        {
+          "sha": "7a3a55ac98847d7adb0e200378abe07ef8d0c645",
+          "html_url": "https://github.com/matrix-org/synapse/commit/7a3a55ac98847d7adb0e200378abe07ef8d0c645",
+          "message": "Merge pull request from GHSA-mp92-3jfm-3575",
+          "author": "Patrick Cloke",
+          "date": "2023-10-31T13:58:30Z"
+        },
+        {
+          "sha": "85e5f2dc252b866d67c8da2ddbfdb84974db1807",
+          "html_url": "https://github.com/matrix-org/synapse/commit/85e5f2dc252b866d67c8da2ddbfdb84974db1807",
+          "message": "Add a new module API to update user presence state. (#16544)\n\nThis adds a module API which allows a module to update a user's\r\npresence state/status message. This is useful for controlling presence\r\nfrom an external system.\r\n\r\nTo fully control presence from the module the presence.enabled config\r\npa",
+          "author": "Patrick Cloke",
+          "date": "2023-10-26T19:11:24Z"
+        },
+        {
+          "sha": "fc31b495b3a7f170019591c2e40e699b61c067a1",
+          "html_url": "https://github.com/matrix-org/synapse/commit/fc31b495b3a7f170019591c2e40e699b61c067a1",
+          "message": "Stop sending incorrect knock_state_events. (#16403)\n\nSynapse was incorrectly implemented with a knock_state_events\r\nproperty on some APIs (instead of knock_room_state). This was\r\ncorrect in Synapse 1.70.0, but *both* fields were sent to also be\r\ncompatible with Synapse versions expecting the wrong f",
+          "author": "Patrick Cloke",
+          "date": "2023-10-06T11:27:35Z"
+        },
+        {
+          "sha": "f84da3c32ec74cf054e2fd6d10618aa4997cffaa",
+          "html_url": "https://github.com/matrix-org/synapse/commit/f84da3c32ec74cf054e2fd6d10618aa4997cffaa",
+          "message": "Add a cache around server ACL checking (#16360)\n\n* Pre-compiles the server ACLs onto an object per room and\r\n  invalidates them when new events come in.\r\n* Converts the server ACL checking into Rust.",
+          "author": "Patrick Cloke",
+          "date": "2023-09-26T15:57:50Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "process_pdus_for_room TODO return more members those",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "synapse/federation/federation_server.py",
+      "satd_line": 491,
+      "last_commit": {
+        "sha": "70b503f1449a99ee9735e9d30d6a2404e00901fa",
+        "html_url": "https://github.com/matrix-org/synapse/commit/70b503f1449a99ee9735e9d30d6a2404e00901fa",
+        "message": "Fix import ordering issue introduced in 7a3a55ac98847d7adb0e200378abe07ef8d0c645.",
+        "author": "Patrick Cloke",
+        "date": "2023-10-31T14:32:35Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying exact additions",
+        "function is self-contained and returns event IDs",
+        "no related tests found but function is small and logic is straightforward"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "process_pdus_for_room",
+      "symbol_type": "AsyncFunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

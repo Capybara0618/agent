@@ -12,7 +12,7 @@ from openai import OpenAI
 from .github_tools import GitHubToolbox
 from .local_settings import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
 from .local_settings import OPENAI_BASE_URL as LOCAL_OPENAI_BASE_URL
-from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult
+from .schema import AnalysisResult, GraphState, ProbeResult, RepairAttempt, ReviewResult
 
 
 VALID_DECISIONS = {"repairable", "drop", "needs_more_context"}
@@ -636,9 +636,17 @@ class OpenAIAnalyzer:
             if not drop_reason:
                 drop_reason = "insufficient_context"
 
+        hard_reject = decision == "drop" and drop_reason in {"intent_too_vague", "architecture_level_change", "high_behavioral_risk", "external_dependency_blocked"}
+        repairable = not hard_reject
+        if not hard_reject and decision == "drop":
+            decision = "needs_more_context"
+        expected_fixability_hint = self._expected_fixability_hint(analyze_score, change_locality, semantic_risk, verifiability)
+        why_not_hard_reject = "hard_reject" if hard_reject else self._why_not_hard_reject(analyze_score, intent_clarity, change_locality, semantic_risk)
+
         return AnalysisResult(
             decision=decision,
-            repairable=decision == "repairable",
+            repairable=repairable,
+            hard_reject=hard_reject,
             repairability_score=repairability_score,
             intent_clarity=intent_clarity,
             change_locality=change_locality,
@@ -661,6 +669,8 @@ class OpenAIAnalyzer:
             drop_reason=drop_reason,
             historical_snapshot_mismatch=historical_snapshot_mismatch,
             github_evidence_strength=github_evidence_strength,
+            expected_fixability_hint=expected_fixability_hint,
+            why_not_hard_reject=why_not_hard_reject,
         )
 
     def _primary_evidence_clear(
@@ -728,6 +738,21 @@ class OpenAIAnalyzer:
         )
         return max(0.0, min(1.0, score))
 
+
+    def _expected_fixability_hint(self, analyze_score: float, change_locality: float, semantic_risk: float, verifiability: float) -> str:
+        if analyze_score >= 0.78 and change_locality >= 0.75 and semantic_risk <= 0.35:
+            return "high_potential_local_fix"
+        if analyze_score >= 0.62 and verifiability >= 0.55 and semantic_risk <= 0.65:
+            return "worth_probe"
+        return "borderline_candidate"
+
+    def _why_not_hard_reject(self, analyze_score: float, intent_clarity: float, change_locality: float, semantic_risk: float) -> str:
+        if analyze_score >= 0.72:
+            return "clear_and_local_enough_for_probe"
+        if intent_clarity >= 0.58 and change_locality >= 0.58 and semantic_risk <= 0.7:
+            return "local_candidate_despite_uncertainty"
+        return "not_hard_negative"
+
     def _normalize_decision(self, value: Any) -> str:
         text = str(value or "").strip().lower()
         if text in VALID_DECISIONS:
@@ -774,6 +799,103 @@ class OpenAIAnalyzer:
             pieces = re.split(r"[\n,;|]", value)
             return [piece.strip() for piece in pieces if piece.strip()]
         return [str(value).strip()]
+
+    def _clamp_float(self, value: Any, default: float) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return default
+
+
+class OpenAIRepairProbe:
+    def __init__(self, client: OpenAICompatClient) -> None:
+        self.client = client
+
+    def run(self, state: GraphState) -> ProbeResult:
+        analysis = state["analysis"]
+        assert analysis is not None
+
+        github_context = self.client.compact_context_for_stage(state.get("github_context"), "probe")
+        system_prompt = (
+            "You are the repair probe agent in a SATD repair workflow. "
+            "You do not perform a full repair. Instead, you estimate whether this SATD is likely to be repaired accurately by a downstream fixer. "
+            "Use SATD comment, original code, analyzer evidence, and lightweight base context. "
+            "Produce a minimal repair sketch and score whether the task looks like a high-probability successful repair candidate. Return JSON only."
+        )
+        user_prompt = (
+            "Return a JSON object with keys: probe_fix_plan (string), probe_repaired_code (string), probe_confidence (float 0-1), "
+            "probe_problem_alignment (float 0-1), probe_minimality (float 0-1), probe_semantic_risk (float 0-1), probe_self_consistency (float 0-1), "
+            "probe_success_score (float 0-1), rationale (string), filter_reason (string or null).\n"
+            "The probe_repaired_code can be partial or sketch-like, but it should reflect the most likely minimal repair direction.\n\n"
+            f"Repository owner: {state['user']}\n"
+            f"Repository name: {state['project']}\n"
+            f"File path: {state['file_path']}\n"
+            f"SATD comment: {state['satd_comment']}\n"
+            f"Analyzer decision: {analysis.decision}\n"
+            f"Analyzer hard reject: {analysis.hard_reject}\n"
+            f"Analyzer score: {analysis.analyze_score}\n"
+            f"Analyzer intent clarity: {analysis.intent_clarity}\n"
+            f"Analyzer change locality: {analysis.change_locality}\n"
+            f"Analyzer semantic risk: {analysis.semantic_risk}\n"
+            f"Analyzer context sufficiency: {analysis.context_sufficiency}\n"
+            f"Analyzer verifiability: {analysis.verifiability}\n"
+            f"Expected fixability hint: {analysis.expected_fixability_hint}\n"
+            f"Why not hard reject: {analysis.why_not_hard_reject}\n"
+            f"Original code block:\n{state['original_code']}\n\n"
+            f"Base context:\n{github_context}\n"
+        )
+        payload = self.client.generate_json(system_prompt, user_prompt)
+        probe_confidence = self._clamp_float(payload.get("probe_confidence"), analysis.confidence)
+        probe_problem_alignment = self._clamp_float(payload.get("probe_problem_alignment"), 0.0)
+        probe_minimality = self._clamp_float(payload.get("probe_minimality"), 0.0)
+        probe_semantic_risk = self._clamp_float(payload.get("probe_semantic_risk"), analysis.semantic_risk)
+        probe_self_consistency = self._clamp_float(payload.get("probe_self_consistency"), 0.0)
+        probe_success_score = self._clamp_float(payload.get("probe_success_score"), 0.0)
+        predicted_success_score = self._weighted_probe_score(
+            probe_confidence,
+            probe_problem_alignment,
+            probe_minimality,
+            probe_semantic_risk,
+            probe_self_consistency,
+        )
+        passed = (
+            predicted_success_score >= 0.68
+            and probe_problem_alignment >= 0.65
+            and probe_minimality >= 0.58
+            and probe_semantic_risk <= 0.72
+        )
+        filter_reason = None if passed else str(payload.get("filter_reason") or "low_predicted_success")
+        return ProbeResult(
+            passed=passed,
+            probe_fix_plan=str(payload.get("probe_fix_plan") or analysis.repair_strategy or "Probe minimal local fix"),
+            probe_repaired_code=str(payload.get("probe_repaired_code") or state["original_code"]),
+            probe_confidence=probe_confidence,
+            probe_problem_alignment=probe_problem_alignment,
+            probe_minimality=probe_minimality,
+            probe_semantic_risk=probe_semantic_risk,
+            probe_self_consistency=probe_self_consistency,
+            probe_success_score=probe_success_score,
+            predicted_success_score=predicted_success_score,
+            rationale=str(payload.get("rationale") or ""),
+            filter_reason=filter_reason,
+        )
+
+    def _weighted_probe_score(
+        self,
+        probe_confidence: float,
+        probe_problem_alignment: float,
+        probe_minimality: float,
+        probe_semantic_risk: float,
+        probe_self_consistency: float,
+    ) -> float:
+        score = (
+            0.35 * probe_problem_alignment
+            + 0.25 * probe_minimality
+            + 0.15 * (1.0 - probe_semantic_risk)
+            + 0.15 * probe_self_consistency
+            + 0.10 * probe_confidence
+        )
+        return max(0.0, min(1.0, score))
 
     def _clamp_float(self, value: Any, default: float) -> float:
         try:

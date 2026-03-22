@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -59,7 +59,12 @@ def main() -> None:
     print(f"Model: {summary['model']}")
     print(f"Max rounds: {summary['max_rounds']}")
     print(f"Input SATD count: {summary['input_satd_count']}")
-    print(f"Analyze filtered count: {summary['analyze_filtered_count']}")
+    print(f"Analyze hard filtered count: {summary['analyze_hard_filtered_count']}")
+    print(f"Probe filtered count: {summary['probe_filtered_count']}")
+    print(f"Probe passed count: {summary['probe_passed_count']}")
+    print(f"Full repair executed count: {summary['full_repair_executed_count']}")
+    print(f"Probe filtered EM=1 count: {summary['probe_filtered_em_yes_count']}")
+    print(f"Probe passed EM=1 count: {summary['probe_passed_em_yes_count']}")
     print(f"Review rejected count: {summary['review_rejected_count']}")
     print(f"Workflow output count: {summary['workflow_output_count']}")
     print(f"Successful repair count: {summary['successful_repair_count']}")

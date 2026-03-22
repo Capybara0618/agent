@@ -1,0 +1,447 @@
+{
+  "task_id": "75",
+  "repo_owner": "delmic",
+  "repo_name": "odemis",
+  "file_path": "src/odemis/driver/powerctrl.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T04:01:12+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T04:01:22+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T04:01:27+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/odemis/driver/powerctrl.py",
+    "original_code": "def _processMessage(self, msg):\n    \"\"\"\n    process the msg, and put the result in the output buffer\n    msg (str): raw message (including header)\n    \"\"\"\n    res = None\n    wspaces = msg.count(' ')\n    qmarks = msg.count('?')\n    tokens = msg.split()\n    if ((wspaces > 1) and (qmarks > 0)) or (wspaces > 2) or (qmarks > 1):\n        res = \"ERROR: Cannot parse this command\\n\"\n    elif qmarks:\n        if tokens[0] == \"*IDN?\":\n            res = IDN + '\\n'\n        elif tokens[0] == \"PWR?\":\n            pin = int(tokens[1])\n            if (pin < 0) or (pin > 7):\n                res = \"ERROR: Out of range pin number\\n\"\n            else:\n                ans = (self._i2crcv >> pin) & MASK\n                res = str(ans) + '\\n'\n        else:\n            res = \"ERROR: Cannot parse this command\\n\"\n    elif wspaces:\n        pin = int(tokens[1])\n        val = int(tokens[2])\n        if tokens[0] == \"PWR\":\n            if (pin < 0) or (pin > 7):\n                res = \"ERROR: Out of range pin number\\n\"\n            else:\n                self._i2crcv = (self._i2crcv & ~(1 << pin)) | ((val << pin) & (1 << pin))\n                res = '\\n'\n        # TODO: add support for WMEM and RMEM\n        else:\n            res = \"ERROR: Cannot parse this command\\n\"\n    else:\n        res = \"ERROR: Cannot parse this command\\n\"\n\n    # add the response end\n    if res is not None:\n        self._output_buf += res",
+    "satd_comment": "# TODO: add support for WMEM and RMEM",
+    "target_file": {
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "sha": "dc35053a311e72f312649868b05398aafb004fc5",
+      "download_url": "https://raw.githubusercontent.com/delmic/odemis/master/src/odemis/driver/powerctrl.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n'''\nCreated on 1 Sep 2015\n\n@author: Kimon Tsitsikas\n\nCopyright © 2015 Kimon Tsitsikas, Delmic\n\nThis file is part of Odemis.\n\nOdemis is free software: you can redistribute it and/or modify it under the terms\nof the GNU General Public License version 2 as published by the Free Software\nFoundation.\n\nOdemis is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;\nwithout even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR\nPURPOSE. See the GNU General Public License for more details.\n\nYou should have received a copy of the GNU General Public License along with\nOdemis. If not, see http://www.gnu.org/licenses/.\n'''\nimport fcntl\nimport glob\nimport logging\nfrom typing import Optional, List, Tuple, Dict\n\nimport numpy\nfrom odemis import model\nfrom odemis.model import isasync, CancellableThreadPoolExecutor, HwError\nfrom odemis.util import driver, to_str_escape\nimport os\nimport serial\nimport sys\nimport tempfile\nimport threading\nimport yaml\nimport time\n\n# FIXME: figure out when reaching memory end\nEEPROM_CAPACITY = 512  # Memory space 0h-1ffh\n\nclass PowerControlUnit(model.PowerSupplier):\n    '''\n    Implements the PowerSupplier class to regulate the power supply of the\n    components connected to the Power Control Unit board. It also takes care of\n    communication with the PCU firmware.\n    '''\n\n    def __init__(self, name, role,\n                 port: str,\n                 pin_map: Optional[Dict[str, int]] = None,\n                 delay: Optional[Dict[str, float]] = None,\n                 init: Optional[Dict[str, bool]] = None,\n                 termination: Optional[Dict[str, Optional[bool]]] = None,\n                 ids: Optional[List[str]] = None,\n                 excluded_ids: Optional[List[str]] = None,\n                 check_power: bool = True,\n                 **kwargs):\n        \"\"\"\n        :param port: port name\n        :param pin_map: names of the components and the pin where the component is connected.\n        :param delay (dict str -> float): time to wait for each component after it is turned on.\n        :param init: turn on/off the corresponding component upon initialization.\n        :param termination: indicate for every component whether it should be turned off on\n        termination (False), turned on (True) or left as-is (None).\n        :param ids: EEPROM ids expected to be detected during initialization.\n        All the IDs must be found. If not, another device is search for.\n        :param excluded_ids: EEPROM ids which must not be detected during initialization.\n        If any ID listed is detected, it will stop connection with the PCU, and look for another PCU...\n        until a PCU with none of these IDs is found.\n        :param check_power (bool): normally the power is checked by verifying that the\n        EEPROM IDs can be read. To disable this check, ids must be empty, and\n        check_power set to False. This allows to use hardware which is not\n        physically connected to EEPROMs.\n        :raise:\n        * ValueError if an argument is invalid\n        * HwError if the device cannot be opened\n        \"\"\"\n        model.PowerSupplier.__init__(self, name, role, **kwargs)\n\n        if pin_map:\n            self._powered = list(pin_map.keys())\n        else:\n            self._powered = []\n\n        if not check_power and ids:\n            raise ValueError(f\"check_power can only be disabled if no ids are specified, but got {ids}\")\n\n        self._check_power = check_power\n\n        required_ids = ids or []\n        if not all(isinstance(eid, str) and len(eid) >= 8 for eid in required_ids):\n            raise ValueError(f\"ids must be a list of strings (of at least 8 chars), but got '{ids}'\")\n\n        excluded_ids = excluded_ids or []\n        if not all(isinstance(eid, str) and len(eid) >= 8 for eid in excluded_ids):\n            raise ValueError(f\"excluded_ids must be a list of strings (of at least 8 chars), but got '{excluded_ids}'\")\n\n        self._ser_access = threading.Lock()\n\n        self._file = None\n        self._serial = None\n        self._port, self._idn = self._findDevice(port, required_ids, excluded_ids)  # sets ._serial and ._file\n        logging.info(\"Found Power Control device on port %s\", self._port)\n        if check_power:\n            self._getIdentities()  # Will fail with HwError if no power is provided\n\n        driver_name = driver.getSerialDriver(self._port)\n        self._swVersion = \"serial driver: %s\" % (driver_name,)\n        self._hwVersion = \"%s\" % (self._idn,)\n\n        pin_map = pin_map or {}\n        self._pin_map = pin_map\n\n        delay = delay or {}\n        # fill the missing pairs with 0 values\n        self._delay = dict.fromkeys(pin_map, 0)\n        self._delay.update(delay)\n        self._last_start = dict.fromkeys(self._delay, time.time())\n\n        # only keep components that should be changed on termination\n        termination = termination or {}\n        self._termination = {k: v for k, v in termination.items() if v is not None}\n        for comp in self._termination:\n            if comp not in pin_map:\n                raise ValueError(\"Component %s in termination not found in pin_map.\" % comp)\n\n        # will take care of executing switch asynchronously\n        self._executor = CancellableThreadPoolExecutor(max_workers=1)  # one task at a time\n\n        self._supplied = {}\n        self.supplied = model.VigilantAttribute(self._supplied, readonly=True)\n        self._updateSupplied()\n\n        init = init or {}\n        # Remove all None's from the dict, so it can be passed as-is to _doSupply()\n        init = {k: v for k, v in init.items() if v is not None}\n        for comp in init:\n            if comp not in pin_map:\n                raise ValueError(\"Component %s in init not found in pin_map.\" % comp)\n        try:\n            self._doSupply(init, apply_delay=False)\n        except IOError as ex:\n            # This is in particular to handle some cases where the device resets\n            # when turning on the power. One or more trials and the\n            logging.exception(\"Failure during turning on initial power.\")\n            raise HwError(\"Device error when initializing power: %s. \"\n                          \"Try again or contact support if the problem persists.\" %\n                          (ex,))\n\n        self.memoryIDs = model.VigilantAttribute(None, readonly=True, getter=self._getIdentities)\n\n    @isasync\n    def supply(self, sup):\n        \"\"\"\n        Change the power supply to the defined state for each component given.\n        This is an asynchronous method.\n        sup dict(string-> boolean): name of the component and new state\n        returns (Future): object to control the supply request\n        \"\"\"\n        if not sup:\n            return model.InstantaneousFuture()\n        self._checkSupply(sup)\n\n        return self._executor.submit(self._doSupply, sup)\n\n    def _doSupply(self, sup, apply_delay=True):\n        \"\"\"\n        supply power\n        apply_delay (bool): If true, wait the amount of time requested in delay\n          after turning on the power\n        \"\"\"\n        for comp, val in sup.items():\n            # find pin and values corresponding to component\n            pin = self._pin_map[comp]\n            # should always be able to get the value, default values just to be\n            # on the safe side\n            if apply_delay:\n                delay = self._delay.get(comp, 0)\n            else:\n                # We still wait a little, to avoid starting all components\n                # _exactly_ at the same time, which could cause a power peak.\n                delay = 1\n\n            if val:\n                self._sendCommand(\"PWR \" + str(pin) + \" 1\")\n                state = self.supplied.value[comp]\n                if state:\n                    # Already on, wait the time remaining\n                    remaining = (self._last_start[comp] + delay) - time.time()\n                    time.sleep(max(0, remaining))\n                else:\n                    # wait full time\n                    self._last_start[comp] = time.time()\n                    time.sleep(delay)\n\n                # Check it really worked\n                ans = self._sendCommand(\"PWR? \" + str(pin))\n                if ans != \"1\":\n                    logging.warning(\"Failed to turn on component %s\", comp)\n            else:\n                self._sendCommand(\"PWR \" + str(pin) + \" 0\")\n\n        self._updateSupplied()\n\n    def _updateSupplied(self):\n        \"\"\"\n        update the supplied VA\n        \"\"\"\n        pins_updated = set(self._pin_map.values())  # to avoid asking for the same pin multiple times\n        for pin in pins_updated:\n            ans = self._sendCommand(\"PWR? \" + str(pin))\n            # Update all components that are connected to the same pin\n            to_update = [c for c in self._powered if pin == self._pin_map[c]]\n            for c_update in to_update:\n                self._supplied[c_update] = (ans == \"1\")\n\n        # it's read-only, so we change it via _value\n        self.supplied._value = self._supplied\n        self.supplied.notify(self.supplied.value)\n\n    def terminate(self):\n        if self._executor:\n            self._executor.cancel()\n            self._executor.shutdown()\n            self._executor = None\n\n        # Power components on/off according to ._termination\n        # If nothing is specified, leave it as-is.\n        logging.debug(\"Changing power supply on termination: %s\", self._termination)\n        self._doSupply(self._termination)\n\n        if self._serial:\n            with self._ser_access:\n                self._serial.close()\n                self._serial = None\n\n        if self._file:\n            self._file.close()\n            self._file = None\n\n        super(PowerControlUnit, self).terminate()\n\n    def _getIdentification(self):\n        return self._sendCommand(\"*IDN?\")\n\n    def writeMemory(self, id, address, data):\n        \"\"\"\n        Write data to EEPROM.\n        id (str): EEPROM registration number #hex (little-endian format)\n        address (str): starting address #hex\n        data (str): data to be written #hex (little-endian format)\n        \"\"\"\n        self._sendCommand(\"WMEM %s %s %s\" % (id, address, data))\n\n    def readMemory(self, id, address, length):\n        \"\"\"\n        Read data from EEPROM.\n        id (str): EEPROM registration number #hex (little-endian format)\n        address (str): starting address #hex\n        length (int): number of bytes to be read\n        returns (str): data read back #hex (little-endian format)\n        \"\"\"\n        ans = self._sendCommand(\"RMEM %s %s %s\" % (id, address, length))\n        return ans\n\n    def readEEPROM(self, id):\n        \"\"\"\n        We use this method to get a dict that contains all the data written in\n        the EEPROM with the given id.\n        id (str): EEPROM registration number #hex (little-endian format)\n        \"\"\"\n        if id not in self.memoryIDs.value:\n            raise KeyError(\"There was no EEPROM with the given id found\")\n        mem_cont = self.readMemory(id, \"00\", EEPROM_CAPACITY)\n        mem_yaml = \"\"\n        while mem_cont != \"\":\n            if mem_cont[:2] != \"00\":\n                mem_yaml += chr(int(mem_cont[:2], 16))\n            mem_cont = mem_cont[2:]\n        dct = yaml.load(mem_yaml)\n        return dct\n\n    def _getIdentities(self):\n        \"\"\"\n        Return the ids of connected EEPROMs\n        \"\"\"\n        try:\n            ans = self._sendCommand(\"SID\")\n        except PowerControlError as e:\n            # Often means there is no power provided\n            if self._check_power:\n                raise HwError(\"There is no power provided to the Power Control Unit. \"\n                              \"Please make sure the board is turned on.\")\n            else:\n                logging.warning(\"Failed to read EEPROM IDs: %s\", e)\n                ans = \"\"\n        return [x for x in ans.split(',') if x != '']\n\n    def _sendCommand(self, cmd):\n        \"\"\"\n        cmd (str): command to be sent to Power Control unit.\n  ",
+      "total_lines": 624
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "fcntl",
+        "glob",
+        "logging",
+        "typing:Optional",
+        "typing:List",
+        "typing:Tuple",
+        "typing:Dict",
+        "numpy",
+        "odemis:model",
+        "odemis.model:isasync",
+        "odemis.model:CancellableThreadPoolExecutor",
+        "odemis.model:HwError",
+        "odemis.util:driver",
+        "odemis.util:to_str_escape",
+        "os",
+        "serial",
+        "sys",
+        "tempfile",
+        "threading",
+        "yaml",
+        "time"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/delmic/odemis/master/README.md",
+      "content_excerpt": "<p align=\"right\">\r\n  <img  src=\"./src/odemis/gui/img/logo_h30.png\">\r\n</p>\r\n\r\n# Odemis\r\nOdemis (_Open Delmic Microscope Software_) is the open-source microscopy software of [Delmic B.V.](https://www.delmic.com). Odemis is used for controlling microscopes of Delmic and the Odemis viewer allows to load previous experimental data for visualization, analysis and export.\r\nDelmic's mission is to empower companies and researchers by helping them achieve results that can be trusted implicitly with powerful and user-friendly solutions.\r\n\r\n## Requirements\r\n* Linux (tested on Ubuntu 20.04, 22.04, 24.04 x86)\r\n* Python (v3.8+)\r\n* Special (forked) version of Pyro4 from Delmic\r\n\r\nNote: the viewer part is also tested to run on Windows (10+).\r\n\r\nFor the complete list of dependencies, see the file `environment.yml`.\r\n\r\n## Installation\r\nSee the `doc/INSTALL.txt` document for the complete installation procedure.\r\n\r\n## Basic usage\r\nLaunch the \"Odemis\" program, or type on a terminal:\r\n`odemis-start`\r\nEventually the GUI (Graphical User Interface) will appear.\r\nAs an argument it can take the name of the microscope file corresponding to the back-end.\r\nSuch as: `odemis-start install/linux/usr/share/odemis/sim/meteor-sim.odm.yaml`\r\n\r\nIt is not usually necessary, but if you want, to fully stop odemis (GUI and back-end), type:\r\n`odemis-stop`\r\n\r\nTo run just the viewer, you can type:\r\n`odemis-gui --standalone`\r\n\r\n## Advanced usage\r\n`odemisd` is the command line interface to start and manage the Odemis backend. It should be started first.\r\n\r\nRun as `odemisd ...`, with ... replaced by the correct arguments."
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_processMessage test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_processMessage(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "tlaptmf.py",
+          "path": "src/odemis/driver/tlaptmf.py",
+          "sha": "839363897f97b1cdf25664495889016d3d18d0aa",
+          "html_url": "https://github.com/delmic/odemis/blob/5128a947766c7e0753e7e8cdb973a77d716303f7/src/odemis/driver/tlaptmf.py",
+          "score": 1.0
+        },
+        {
+          "name": "pmtctrl.py",
+          "path": "src/odemis/driver/pmtctrl.py",
+          "sha": "055e6b86a77ecc6cb2f13fb74383cd9f987d9c9c",
+          "html_url": "https://github.com/delmic/odemis/blob/5128a947766c7e0753e7e8cdb973a77d716303f7/src/odemis/driver/pmtctrl.py",
+          "score": 1.0
+        },
+        {
+          "name": "powerctrl.py",
+          "path": "src/odemis/driver/powerctrl.py",
+          "sha": "dc35053a311e72f312649868b05398aafb004fc5",
+          "html_url": "https://github.com/delmic/odemis/blob/5128a947766c7e0753e7e8cdb973a77d716303f7/src/odemis/driver/powerctrl.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/odemis/driver",
+      "count": 40,
+      "entries": [
+        {
+          "name": "FocusTracker.eds",
+          "path": "src/odemis/driver/FocusTracker.eds",
+          "type": "file"
+        },
+        {
+          "name": "TMCM-1240_CANopen_V322.dcf",
+          "path": "src/odemis/driver/TMCM-1240_CANopen_V322.dcf",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/odemis/driver/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_mccdaq.py",
+          "path": "src/odemis/driver/_mccdaq.py",
+          "type": "file"
+        },
+        {
+          "name": "actuator.py",
+          "path": "src/odemis/driver/actuator.py",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2-fake-clara.tiff",
+          "path": "src/odemis/driver/andorcam2-fake-clara.tiff",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2-fake-spots-4x4.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots-4x4.h5",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2-fake-spots.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots.h5",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2.py",
+          "path": "src/odemis/driver/andorcam2.py",
+          "type": "file"
+        },
+        {
+          "name": "andorcam3.py",
+          "path": "src/odemis/driver/andorcam3.py",
+          "type": "file"
+        },
+        {
+          "name": "andorshrk.py",
+          "path": "src/odemis/driver/andorshrk.py",
+          "type": "file"
+        },
+        {
+          "name": "autoscript_client.py",
+          "path": "src/odemis/driver/autoscript_client.py",
+          "type": "file"
+        },
+        {
+          "name": "avantes.py",
+          "path": "src/odemis/driver/avantes.py",
+          "type": "file"
+        },
+        {
+          "name": "blinkstick.py",
+          "path": "src/odemis/driver/blinkstick.py",
+          "type": "file"
+        },
+        {
+          "name": "ccd-ek.h5",
+          "path": "src/odemis/driver/ccd-ek.h5",
+          "type": "file"
+        },
+        {
+          "name": "cobolt.py",
+          "path": "src/odemis/driver/cobolt.py",
+          "type": "file"
+        },
+        {
+          "name": "comedi_simple.py",
+          "path": "src/odemis/driver/comedi_simple.py",
+          "type": "file"
+        },
+        {
+          "name": "compositer.py",
+          "path": "src/odemis/driver/compositer.py",
+          "type": "file"
+        },
+        {
+          "name": "emitter.py",
+          "path": "src/odemis/driver/emitter.py",
+          "type": "file"
+        },
+        {
+          "name": "ephemeron.py",
+          "path": "src/odemis/driver/ephemeron.py",
+          "type": "file"
+        },
+        {
+          "name": "focustracker.py",
+          "path": "src/odemis/driver/focustracker.py",
+          "type": "file"
+        },
+        {
+          "name": "hamamatsurx.py",
+          "path": "src/odemis/driver/hamamatsurx.py",
+          "type": "file"
+        },
+        {
+          "name": "keysight.py",
+          "path": "src/odemis/driver/keysight.py",
+          "type": "file"
+        },
+        {
+          "name": "lakeshore.py",
+          "path": "src/odemis/driver/lakeshore.py",
+          "type": "file"
+        },
+        {
+          "name": "light.py",
+          "path": "src/odemis/driver/light.py",
+          "type": "file"
+        },
+        {
+          "name": "lle.py",
+          "path": "src/odemis/driver/lle.py",
+          "type": "file"
+        },
+        {
+          "name": "nfpm.py",
+          "path": "src/odemis/driver/nfpm.py",
+          "type": "file"
+        },
+        {
+          "name": "nfpm_netscan.py",
+          "path": "src/odemis/driver/nfpm_netscan.py",
+          "type": "file"
+        },
+        {
+          "name": "npmc.py",
+          "path": "src/odemis/driver/npmc.py",
+          "type": "file"
+        },
+        {
+          "name": "omicronxx.py",
+          "path": "src/odemis/driver/omicronxx.py",
+          "type": "file"
+        },
+        {
+          "name": "orsay.py",
+          "path": "src/odemis/driver/orsay.py",
+          "type": "file"
+        },
+        {
+          "name": "phenom.py",
+          "path": "src/odemis/driver/phenom.py",
+          "type": "file"
+        },
+        {
+          "name": "pi.py",
+          "path": "src/odemis/driver/pi.py",
+          "type": "file"
+        },
+        {
+          "name": "picoquant.py",
+          "path": "src/odemis/driver/picoquant.py",
+          "type": "file"
+        },
+        {
+          "name": "piezomotor.py",
+          "path": "src/odemis/driver/piezomotor.py",
+          "type": "file"
+        },
+        {
+          "name": "pigcs.py",
+          "path": "src/odemis/driver/pigcs.py",
+          "type": "file"
+        },
+        {
+          "name": "pmtctrl.py",
+          "path": "src/odemis/driver/pmtctrl.py",
+          "type": "file"
+        },
+        {
+          "name": "powerctrl.py",
+          "path": "src/odemis/driver/powerctrl.py",
+          "type": "file"
+        },
+        {
+          "name": "pvcam.py",
+          "path": "src/odemis/driver/pvcam.py",
+          "type": "file"
+        },
+        {
+          "name": "pvcam_h.py",
+          "path": "src/odemis/driver/pvcam_h.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "FocusTracker.eds",
+          "path": "src/odemis/driver/FocusTracker.eds"
+        },
+        {
+          "name": "TMCM-1240_CANopen_V322.dcf",
+          "path": "src/odemis/driver/TMCM-1240_CANopen_V322.dcf"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/odemis/driver/__init__.py"
+        },
+        {
+          "name": "_mccdaq.py",
+          "path": "src/odemis/driver/_mccdaq.py"
+        },
+        {
+          "name": "actuator.py",
+          "path": "src/odemis/driver/actuator.py"
+        },
+        {
+          "name": "andorcam2-fake-clara.tiff",
+          "path": "src/odemis/driver/andorcam2-fake-clara.tiff"
+        },
+        {
+          "name": "andorcam2-fake-spots-4x4.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots-4x4.h5"
+        },
+        {
+          "name": "andorcam2-fake-spots.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots.h5"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+          "html_url": "https://github.com/delmic/odemis/commit/c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+          "message": "[feature] extend PCU driver to handle several PCUs connected\n\nSo far, the Power Control Unit (PCU) driver assumed only one PCU at most was connected\nto the computer. To support systems with multiple PCUs,\nwe need to be able to distinguish them. Still, each instance of the\ndriver will control just on",
+          "author": "Éric Piel",
+          "date": "2024-06-07T14:58:07Z"
+        },
+        {
+          "sha": "056a3b311f2036fa101d3496322772c205ff6f61",
+          "html_url": "https://github.com/delmic/odemis/commit/056a3b311f2036fa101d3496322772c205ff6f61",
+          "message": "driver powerctrl: add check_power option\n\nAllows to disable the check for power on hardware not connected to any\nEEPROM.",
+          "author": "Éric Piel",
+          "date": "2022-09-20T14:35:06Z"
+        },
+        {
+          "sha": "b4483ed61c60bd8dbc44d113d362f2a687de2652",
+          "html_url": "https://github.com/delmic/odemis/commit/b4483ed61c60bd8dbc44d113d362f2a687de2652",
+          "message": "Removed all __future__ imports because python2.7 is no longer supported.",
+          "author": "BasHolweg",
+          "date": "2022-08-23T08:32:33Z"
+        },
+        {
+          "sha": "91495bc289eeb1b229952ab2d979a62578328d88",
+          "html_url": "https://github.com/delmic/odemis/commit/91495bc289eeb1b229952ab2d979a62578328d88",
+          "message": "driver: add call to super in .terminate()\n\nThe Component class actually does some useful things on .terminate(),\nbut it can only do it if we call it. Admitedly, typically it all happens\nat the backend termination, so it's not a big loss, but let's do it\nproperly.\n\nNote that there are other drivers t",
+          "author": "Éric Piel",
+          "date": "2020-10-06T07:32:03Z"
+        },
+        {
+          "sha": "ddce4800cc3c3f3fa68a2e5d4f641c3d615324d3",
+          "html_url": "https://github.com/delmic/odemis/commit/ddce4800cc3c3f3fa68a2e5d4f641c3d615324d3",
+          "message": "driver: Add missing b's\n\nWe didn't get enough honey, so adding extra b's.\n\nThe migration to Python 3 missed a couple of places where the string\nshould now be bytes.\nThat happened mostly in the serial port opening functions because these\nare different in the simulator and the actual hardware.\n\nSevera",
+          "author": "Éric Piel",
+          "date": "2020-01-16T13:37:49Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_processMessage TODO support WMEM RMEM",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+        "html_url": "https://github.com/delmic/odemis/commit/c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+        "message": "[feature] extend PCU driver to handle several PCUs connected\n\nSo far, the Power Control Unit (PCU) driver assumed only one PCU at most was connected\nto the computer. To support systems with multiple PCUs,\nwe need to be able to distinguish them. Still, each instance of the\ndriver will control just on",
+        "author": "Éric Piel",
+        "date": "2024-06-07T14:58:07Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

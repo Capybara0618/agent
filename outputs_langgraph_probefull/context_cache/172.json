@@ -1,0 +1,307 @@
+{
+  "task_id": "172",
+  "repo_owner": "maas",
+  "repo_name": "maas",
+  "file_path": "src/provisioningserver/rpc/clusterservice.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T06:52:48+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T06:53:02+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T06:53:06+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/provisioningserver/rpc/clusterservice.py",
+    "original_code": "def list_supported_architectures(self):\n    # XXX jtv 2014-03-06: Hardcoded for now.  Might get this from e.g.\n    # simplestreams upstream.\n    return {\n        'architectures': [\n            {'name': 'i386/generic', 'description': 'i386'},\n            {'name': 'amd64/generic', 'description': 'amd64'},\n            {'name': 'armhf/highbank', 'description': 'armhf/highbank'},\n            ],\n        }",
+    "satd_comment": "# XXX jtv 2014-03-06: Hardcoded for now.  Might get this from e.g.\n# simplestreams upstream.",
+    "target_file": {
+      "ok": true,
+      "path": "src/provisioningserver/rpc/clusterservice.py",
+      "sha": "80998705302f426e93ef3b95346defb6bb838d00",
+      "download_url": "https://raw.githubusercontent.com/canonical/maas/master/src/provisioningserver/rpc/clusterservice.py",
+      "content_excerpt": "# Copyright 2014-2025 Canonical Ltd.  This software is licensed under the\n# GNU Affero General Public License version 3 (see the file LICENSE).\n\n\"\"\"RPC implementation for clusters.\"\"\"\n\nfrom functools import partial\nimport json\nfrom operator import itemgetter\nimport os\nfrom os import urandom\nfrom socket import AF_INET, AF_INET6, gethostname\nimport sys\nfrom urllib.parse import urlparse\n\nfrom netaddr import IPAddress\nfrom twisted.application.internet import TimerService\nfrom twisted.internet import reactor\nfrom twisted.internet.defer import (\n    DeferredList,\n    inlineCallbacks,\n    maybeDeferred,\n    returnValue,\n)\nfrom twisted.internet.error import ConnectError, ConnectionClosed, ProcessDone\nfrom twisted.internet.threads import deferToThread\nfrom twisted.python.reflect import fullyQualifiedName\nfrom twisted.web.client import Agent, readBody\nfrom twisted.web.http_headers import Headers\nfrom zope.interface import implementer\n\nfrom apiclient.utils import ascii_url\nfrom provisioningserver.certificates import (\n    Certificate,\n    get_maas_agent_cert_paths,\n    store_maas_agent_cert_tuple,\n    store_maas_cluster_cert_tuple,\n)\nfrom provisioningserver.config import ClusterConfiguration, is_dev_environment\nfrom provisioningserver.drivers.hardware.seamicro import (\n    probe_seamicro15k_and_enlist,\n)\nfrom provisioningserver.drivers.hardware.ucsm import probe_and_enlist_ucsm\nfrom provisioningserver.drivers.hardware.virsh import probe_virsh_and_enlist\nfrom provisioningserver.drivers.hardware.vmware import probe_vmware_and_enlist\nfrom provisioningserver.drivers.power.hmcz import probe_hmcz_and_enlist\nfrom provisioningserver.drivers.power.mscm import probe_and_enlist_mscm\nfrom provisioningserver.drivers.power.msftocs import probe_and_enlist_msftocs\nfrom provisioningserver.drivers.power.proxmox import probe_proxmox_and_enlist\nfrom provisioningserver.drivers.power.recs import probe_and_enlist_recs\nfrom provisioningserver.drivers.power.registry import PowerDriverRegistry\nfrom provisioningserver.logger import get_maas_logger, LegacyLogger\nfrom provisioningserver.path import get_maas_data_path\nfrom provisioningserver.prometheus.metrics import set_global_labels\nfrom provisioningserver.rpc import cluster, common, exceptions, pods, region\nfrom provisioningserver.rpc.common import (\n    ConnectionAuthStatus,\n    Ping,\n    SecuredRPCProtocol,\n)\nfrom provisioningserver.rpc.connectionpool import ConnectionPool\nfrom provisioningserver.rpc.interfaces import IConnectionToRegion\nfrom provisioningserver.rpc.power import get_power_state\nfrom provisioningserver.security import calculate_digest, fernet_decrypt_psk\nfrom provisioningserver.utils import sudo\nfrom provisioningserver.utils.env import (\n    MAAS_AGENT_UUID,\n    MAAS_ID,\n    MAAS_SECRET,\n    MAAS_SHARED_SECRET,\n    MAAS_UUID,\n)\nfrom provisioningserver.utils.fs import get_maas_common_command, NamedLock\nfrom provisioningserver.utils.network import (\n    convert_host_to_uri_str,\n    find_mac_via_arp,\n    get_all_interfaces_definition,\n    resolve_host_to_addrinfo,\n)\nfrom provisioningserver.utils.shell import (\n    call_and_check,\n    ExternalProcessError,\n    get_env_with_bytes_locale,\n)\nfrom provisioningserver.utils.snap import running_in_snap\nfrom provisioningserver.utils.twisted import (\n    call,\n    callOut,\n    deferred,\n    DeferredValue,\n    makeDeferredWithProcessProtocol,\n    suppress,\n)\nfrom provisioningserver.utils.url import get_domain\nfrom provisioningserver.utils.version import get_running_version\n\nmaaslog = get_maas_logger(\"rpc.cluster\")\nlog = LegacyLogger()\n\n# Number of seconds before a DHCP configure command will timeout.\nDHCP_TIMEOUT = 30  # 30 seconds.\n\n\ndef catch_probe_and_enlist_error(name, failure):\n    \"\"\"Logs any errors when trying to probe and enlist a chassis.\"\"\"\n    maaslog.error(\n        \"Failed to probe and enlist %s nodes: %s\",\n        name,\n        failure.getErrorMessage(),\n    )\n    return None\n\n\ndef get_scan_all_networks_args(\n    scan_all=False,\n    force_ping=False,\n    threads=None,\n    cidrs=None,\n    slow=False,\n    interface=None,\n):\n    \"\"\"Return the arguments needed to perform a scan of all networks.\n\n    The output of this function is suitable for passing into a call\n    to `subprocess.Popen()`.\n\n    :param cidrs: an iterable of CIDR strings\n    \"\"\"\n    args = [get_maas_common_command(), \"scan-network\"]\n    if not is_dev_environment():\n        args = sudo(args)\n    if threads is not None:\n        args.extend([\"--threads\", str(threads)])\n    if force_ping:\n        args.append(\"--ping\")\n    if slow:\n        args.append(\"--slow\")\n    # None of these parameters are relevant if we are scanning everything...\n    if not scan_all:\n        # ... but force the caller to be explicit about scanning all networks.\n        # Keep track of the original length of `args` to make sure we add at\n        # least one argument.\n        original_args_length = len(args)\n        if interface is not None:\n            args.append(interface)\n        if cidrs is not None:\n            args.extend(str(cidr) for cidr in cidrs)\n        assert original_args_length != len(args), (\n            \"Invalid scan parameters. Must specify cidrs or interface if not \"\n            \"using scan_all.\"\n        )\n    binary_args = [arg.encode(sys.getfilesystemencoding()) for arg in args]\n    return binary_args\n\n\ndef spawnProcessAndNullifyStdout(protocol, args):\n    \"\"\" \"Utility function to spawn a process and redirect stdout to /dev/null.\n\n    Spawns the process with the specified `protocol` in the reactor, with the\n    specified list of binary `args`.\n    \"\"\"\n    # Using childFDs we arrange for the child's stdout to go to /dev/null\n    # and for stderr to be read asynchronously by the reactor.\n    with open(os.devnull, \"r+b\") as devnull:\n        # This file descriptor to /dev/null will be closed before the\n        # spawned process finishes, but will remain open in the spawned\n        # process; that's the Magic Of UNIX™.\n        reactor.spawnProcess(\n            protocol,\n            args[0],\n            args,\n            childFDs={0: devnull.fileno(), 1: devnull.fileno(), 2: \"r\"},\n            env=get_env_with_bytes_locale(),\n        )\n\n\ndef executeScanNetworksSubprocess(\n    scan_all=False,\n    force_ping=False,\n    slow=False,\n    threads=None,\n    cidrs=None,\n    interface=None,\n):\n    \"\"\"Runs the network scanning subprocess.\n\n    Redirects stdout and stderr in the subprocess to /dev/null. Leaves\n    stderr intact, so that we might pass useful logging through.\n\n    Returns the `reason` (see `ProcessProtocol.processEnded`) from the\n    scan process after waiting for it to complete.\n\n    :param cidrs: A list of CIDR strings to run neighbour scans on.\n    \"\"\"\n    done, protocol = makeDeferredWithProcessProtocol()\n    # Technically this is not guaranteed to be a string containing just\n    # one line of text. But reality in this case is both atomic and\n    # concise. (And if it isn't, we can fix it, since we're calling our\n    # own command.)\n    protocol.errReceived = lambda data: (\n        log.msg(\"Scan all networks: \" + data.decode(\"utf-8\"))\n    )\n    args = get_scan_all_networks_args(\n        scan_all=scan_all,\n        force_ping=force_ping,\n        slow=slow,\n        threads=threads,\n        cidrs=cidrs,\n        interface=interface,\n    )\n    spawnProcessAndNullifyStdout(protocol, args)\n    return done\n\n\ndef check_ip_address(request):\n    \"\"\"Perform's the actual IP address checking using `ping`.\n\n    Redirects stdout and stderr in the subprocess to /dev/null. Leaves\n    stderr intact, so that we might pass useful logging through.\n\n    Returns the `reason` (see `ProcessProtocol.processEnded`) from the\n    scan process after waiting for it to complete.\n\n    :param request: An individual request from the\n        :py:class:`~provisioningserver.rpc.cluster.CheckIPs`.\n    \"\"\"\n    args = [\"ping\", \"-c\", \"1\"]\n    if request.get(\"interface\"):\n        args += [\"-I\", request[\"interface\"]]\n    args += [request[\"ip_address\"]]\n    done = deferToThread(call_and_check, args)\n\n    # This will only occur if the ping was successful and now the MAC address\n    # for that IP address will now be in the ARP cache.\n    done.addCallback(\n        lambda _: deferToThread(find_mac_via_arp, request[\"ip_address\"])\n    )\n\n    return done\n\n\nclass Cluster(SecuredRPCProtocol):\n    \"\"\"The RPC protocol supported by a cluster controller.\n\n    This can be used on the client or server end of a connection; once a\n    connection is established, AMP is symmetric.\n    \"\"\"\n\n    def __init__(\n        self,\n        auth_status: ConnectionAuthStatus = ConnectionAuthStatus(),  # noqa: B008\n    ):\n        super().__init__(\n            unauthenticated_commands=[cluster.Authenticate.commandName],\n            auth_status=auth_status,\n        )\n\n    @cluster.Identify.responder\n    def identify(self):\n        \"\"\"identify()\n\n        Implementation of\n        :py:class:`~provisioningserver.rpc.cluster.Identify`.\n        \"\"\"\n        ident = MAAS_ID.get() or \"\"\n        return {\"ident\": ident}\n\n    @cluster.Authenticate.responder\n    def authenticate(self, message):\n        salt = urandom(16)  # 16 bytes of high grade noise.\n        digest = calculate_digest(MAAS_SECRET.get(), message, salt)\n        return {\"digest\": digest, \"salt\": salt}\n\n    @cluster.DescribePowerTypes.responder\n    def describe_power_types(self):\n        \"\"\"describe_power_types()\n\n        Implementation of\n        :py:class:`~provisioningserver.rpc.cluster.DescribePowerTypes`.\n        \"\"\"\n        # Detection of missing packages is now done reactively instead of\n        # proactively. When a power check is performed it will raise an error\n        # if their are any missing packages.\n        return {\n            \"power_types\": list(\n                PowerDriverRegistry.get_schema(detect_missing_packages=False)\n            )\n        }\n\n    @cluster.PowerQuery.responder\n    def power_query(self, system_id, hostname, power_type, context):\n        d = get_power_state(system_id, hostname, power_type, context=context)\n        d.addCallback(lambda x: {\"state\": x})\n        d.addErrback(\n            lambda f: {\"state\": \"error\", \"error_msg\": f.getErrorMessage()}\n        )\n        return d\n\n    @cluster.PowerDriverCheck.responder\n    def power_driver_check(self, power_type):\n        \"\"\"Return a list of missing power driver packages, if any.\"\"\"\n        driver = PowerDriverRegistry.get_item(power_type)\n        if driver is None:\n            raise exceptions.UnknownPowerType(\n                \"No driver found for power type '%s'\" % power_type\n            )\n        return {\"missing_packages\": driver.detect_missing_packages()}\n\n    @cluster.SetBootOrder.responder\n    def set_boot_order(self, system_id, hostname, power_type, context, order):\n        driver = PowerDriverRegistry.get_item(power_type)\n        if driver is None:\n            raise exceptions.UnknownPowerType(\n                f\"No driver found for power type '{power_type}'\"\n            )\n        elif not driver.can_set_boot_order:\n            # Don't raise NotImplementedError because most boot drivers can\n            # provide a boot config to boot the proper device.\n            log.debug(\n                f\"{power_type} does not support configuring the boot order!\"\n            )\n            return {}\n        else:\n            d = driver.set_boot_order(system_id, context, order)\n            d.addCallback(lambda _: {})\n            return d\n\n    @cluster.AddChassis.responder\n    def add_chassis(\n        self,\n        user,\n        chassis_type,\n        hostname,\n        username=None,\n        password=None,\n        accept_all=False,\n        domain=None,\n        prefix_filter=None,\n        power_control=None,\n        port=None,\n        protocol=None,\n        token_name=None,\n        token_secret=None,\n        verify_ssl=False,\n    ):\n        \"\"\"AddChassis()\n\n        Implementation of\n        :py:class:`~provisioningserver.rpc.cluster.AddChassis`.\n        \"\"\"\n        if chassis_type in (\"virsh\", \"pow",
+      "total_lines": 1519
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "functools:partial",
+        "json",
+        "operator:itemgetter",
+        "os",
+        "os:urandom",
+        "socket:AF_INET",
+        "socket:AF_INET6",
+        "socket:gethostname",
+        "sys",
+        "urllib.parse:urlparse",
+        "netaddr:IPAddress",
+        "twisted.application.internet:TimerService",
+        "twisted.internet:reactor",
+        "twisted.internet.defer:DeferredList",
+        "twisted.internet.defer:inlineCallbacks",
+        "twisted.internet.defer:maybeDeferred",
+        "twisted.internet.defer:returnValue",
+        "twisted.internet.error:ConnectError",
+        "twisted.internet.error:ConnectionClosed",
+        "twisted.internet.error:ProcessDone",
+        "twisted.internet.threads:deferToThread",
+        "twisted.python.reflect:fullyQualifiedName",
+        "twisted.web.client:Agent",
+        "twisted.web.client:readBody",
+        "twisted.web.http_headers:Headers",
+        "zope.interface:implementer",
+        "apiclient.utils:ascii_url",
+        "provisioningserver.certificates:Certificate",
+        "provisioningserver.certificates:get_maas_agent_cert_paths",
+        "provisioningserver.certificates:store_maas_agent_cert_tuple"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/canonical/maas/master/README.rst",
+      "content_excerpt": "************************\nMAAS: Metal as a Service\n************************\nMetal as a Service -- MAAS -- lets you treat physical servers like virtual machines in the cloud.\nRather than having to manage each server individually, MAAS turns your bare metal into an elastic\ncloud-like resource.\n\nWhat does that mean in practice? Tell MAAS about the machines you want it to manage and it will\nboot them, check the hardware's okay, and have them waiting for when you need them. You can then\npull nodes up, tear them down and redeploy them at will; just as you can with virtual\nmachines in the cloud.\n\nWhen you're ready to deploy a service, MAAS gives your tool of choice (e.g. Ansible, Chef, Puppet,\nSALT, Juju) the nodes it needs to power that service. It's as simple as that: no need to manually\nprovision, check and, afterwards, clean-up. As your needs change, you can easily scale services up\nor down. Need more power for your Hadoop cluster for a few hours? Simply tear down one of your\nNova compute nodes and redeploy it to Hadoop. When you're done, it's just as easy to give the node\nback to Nova.\n\nMAAS is ideal where you want the flexibility of the cloud, and the hassle-free power of Juju\ncharms, but you need to deploy to bare metal.\n\nFor more information see the `MAAS guide`_.\n\n.. _MAAS guide: https://maas.io/\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "list_supported_architectures test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"list_supported_architectures(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/provisioningserver/rpc",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/provisioningserver/rpc/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "arguments.py",
+          "path": "src/provisioningserver/rpc/arguments.py",
+          "type": "file"
+        },
+        {
+          "name": "cluster.py",
+          "path": "src/provisioningserver/rpc/cluster.py",
+          "type": "file"
+        },
+        {
+          "name": "clusterservice.py",
+          "path": "src/provisioningserver/rpc/clusterservice.py",
+          "type": "file"
+        },
+        {
+          "name": "common.py",
+          "path": "src/provisioningserver/rpc/common.py",
+          "type": "file"
+        },
+        {
+          "name": "connectionpool.py",
+          "path": "src/provisioningserver/rpc/connectionpool.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "src/provisioningserver/rpc/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "src/provisioningserver/rpc/interfaces.py",
+          "type": "file"
+        },
+        {
+          "name": "pods.py",
+          "path": "src/provisioningserver/rpc/pods.py",
+          "type": "file"
+        },
+        {
+          "name": "power.py",
+          "path": "src/provisioningserver/rpc/power.py",
+          "type": "file"
+        },
+        {
+          "name": "region.py",
+          "path": "src/provisioningserver/rpc/region.py",
+          "type": "file"
+        },
+        {
+          "name": "testing",
+          "path": "src/provisioningserver/rpc/testing",
+          "type": "dir"
+        },
+        {
+          "name": "tests",
+          "path": "src/provisioningserver/rpc/tests",
+          "type": "dir"
+        },
+        {
+          "name": "utils.py",
+          "path": "src/provisioningserver/rpc/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/provisioningserver/rpc/__init__.py"
+        },
+        {
+          "name": "arguments.py",
+          "path": "src/provisioningserver/rpc/arguments.py"
+        },
+        {
+          "name": "cluster.py",
+          "path": "src/provisioningserver/rpc/cluster.py"
+        },
+        {
+          "name": "common.py",
+          "path": "src/provisioningserver/rpc/common.py"
+        },
+        {
+          "name": "connectionpool.py",
+          "path": "src/provisioningserver/rpc/connectionpool.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "src/provisioningserver/rpc/exceptions.py"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "src/provisioningserver/rpc/interfaces.py"
+        },
+        {
+          "name": "pods.py",
+          "path": "src/provisioningserver/rpc/pods.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/provisioningserver/rpc/clusterservice.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "c3324eb3f4364d26bcade49026227e69dcac0b63",
+          "html_url": "https://github.com/canonical/maas/commit/c3324eb3f4364d26bcade49026227e69dcac0b63",
+          "message": "feat(agent): start agent via new CLI\n\nUse new daemon logic and dedicated certificates for maas-agent.\n\nCommunication with MAAS internal API of regiond requires client\ncertificates. During the transition period the maas-agent may be started\nvia rackd, in which case it reuses the existing certificates",
+          "author": "Anton Troyanov",
+          "date": "2026-03-18T12:08:12Z"
+        },
+        {
+          "sha": "d36ffcc7cb9d668a7d0d1b6df7d25e7d53e7e0b4",
+          "html_url": "https://github.com/canonical/maas/commit/d36ffcc7cb9d668a7d0d1b6df7d25e7d53e7e0b4",
+          "message": "fix(workflows): ensure dhcp configuration runs without conflict",
+          "author": "Christian Grabowski",
+          "date": "2025-03-04T15:37:18Z"
+        },
+        {
+          "sha": "3140eda3b56312588c97f32b12c2e0e8bbf31256",
+          "html_url": "https://github.com/canonical/maas/commit/3140eda3b56312588c97f32b12c2e0e8bbf31256",
+          "message": "chore: remove ConfigureDHCP RPC calls",
+          "author": "Jacopo Rota",
+          "date": "2025-02-19T06:32:52Z"
+        },
+        {
+          "sha": "728c4c40ac0b1cf732227bb380b9bdeadae30a5e",
+          "html_url": "https://github.com/canonical/maas/commit/728c4c40ac0b1cf732227bb380b9bdeadae30a5e",
+          "message": "chore: migrate to ruff",
+          "author": "Alessandro Marcolini",
+          "date": "2025-02-09T18:39:00Z"
+        },
+        {
+          "sha": "a97ac0f2ac9cd00370930d1d482e42570552e1f9",
+          "html_url": "https://github.com/canonical/maas/commit/a97ac0f2ac9cd00370930d1d482e42570552e1f9",
+          "message": "refactor: remove prometheus node metrics",
+          "author": "Alessandro Marcolini",
+          "date": "2024-10-31T23:53:31Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "list_supported_architectures 2014 Hardcoded Might this from",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/provisioningserver/rpc/clusterservice.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "c3324eb3f4364d26bcade49026227e69dcac0b63",
+        "html_url": "https://github.com/canonical/maas/commit/c3324eb3f4364d26bcade49026227e69dcac0b63",
+        "message": "feat(agent): start agent via new CLI\n\nUse new daemon logic and dedicated certificates for maas-agent.\n\nCommunication with MAAS internal API of regiond requires client\ncertificates. During the transition period the maas-agent may be started\nvia rackd, in which case it reuses the existing certificates",
+        "author": "Anton Troyanov",
+        "date": "2026-03-18T12:08:12Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear SATD comment indicating intent",
+        "function is self-contained and returns static data",
+        "no complex dependencies or side effects observed",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

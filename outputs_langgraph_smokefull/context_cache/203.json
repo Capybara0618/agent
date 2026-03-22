@@ -1,0 +1,446 @@
+{
+  "task_id": "203",
+  "repo_owner": "edunext",
+  "repo_name": "edunext-platform",
+  "file_path": "common/lib/xmodule/xmodule/seq_module.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T16:49:30+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 35,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T16:49:43+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T16:49:52+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "common/lib/xmodule/xmodule/seq_module.py",
+    "original_code": "def _render_student_view_for_items(self, context, display_items, fragment, view=STUDENT_VIEW):\n    \"\"\"\n    Updates the given fragment with rendered student views of the given\n    display_items.  Returns a list of dict objects with information about\n    the given display_items.\n    \"\"\"\n    render_items = not context.get('exclude_units', False)\n    is_user_authenticated = self.is_user_authenticated(context)\n    completion_service = self.runtime.service(self, 'completion')\n    try:\n        bookmarks_service = self.runtime.service(self, 'bookmarks')\n    except NoSuchServiceError:\n        bookmarks_service = None\n    user = self.runtime.service(self, 'user').get_current_user()\n    context['username'] = user.opt_attrs.get(\n        'edx-platform.username')\n    display_names = [\n        self.get_parent().display_name_with_default,\n        self.display_name_with_default\n    ]\n    contents = []\n    for item in display_items:\n        # NOTE (CCB): This seems like a hack, but I don't see a better method of determining the type/category.\n        item_type = item.get_icon_class()\n        usage_id = item.scope_ids.usage_id\n\n        show_bookmark_button = False\n        is_bookmarked = False\n\n        if is_user_authenticated and bookmarks_service:\n            show_bookmark_button = True\n            is_bookmarked = bookmarks_service.is_bookmarked(usage_key=usage_id)\n\n        context['show_bookmark_button'] = show_bookmark_button\n        context['bookmarked'] = is_bookmarked\n        context['format'] = getattr(self, 'format', '')\n\n        if render_items:\n            rendered_item = item.render(view, context)\n            fragment.add_fragment_resources(rendered_item)\n            content = rendered_item.content\n        else:\n            content = ''\n\n        content_type_gating_service = self.runtime.service(self, 'content_type_gating')\n        contains_content_type_gated_content = False\n        if content_type_gating_service:\n            contains_content_type_gated_content = content_type_gating_service.check_children_for_content_type_gating_paywall(  # pylint:disable=line-too-long\n                item, self.course_id\n            ) is not None\n        iteminfo = {\n            'content': content,\n            'page_title': getattr(item, 'tooltip_title', ''),\n            'type': item_type,\n            'id': str(usage_id),\n            'bookmarked': is_bookmarked,\n            'path': \" > \".join(display_names + [item.display_name_with_default]),\n            'graded': item.graded,\n            'contains_content_type_gated_content': contains_content_type_gated_content,\n        }\n        if not render_items:\n            # The item url format can be defined in the template context like so:\n            # context['item_url'] = '/my/item/path/{usage_key}/whatever'\n            iteminfo['href'] = context.get('item_url', '').format(usage_key=usage_id)\n        if is_user_authenticated:\n            if item.location.block_type == 'vertical' and completion_service:\n                iteminfo['complete'] = completion_service.vertical_is_complete(item)\n\n        contents.append(iteminfo)\n\n    return contents",
+    "satd_comment": "# NOTE (CCB): This seems like a hack, but I don't see a better method of determining the type/category.",
+    "target_file": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/seq_module.py",
+      "sha": "618eefe62f474e13b7da05ccb1320c2f40f6f91e",
+      "download_url": "https://raw.githubusercontent.com/eduNEXT/edunext-platform/master/common/lib/xmodule/xmodule/seq_module.py",
+      "content_excerpt": "\"\"\"\nxModule implementation of a learning sequence\n\"\"\"\n\n# pylint: disable=abstract-method\n\n\nimport collections\nimport json\nimport logging\nfrom datetime import datetime\nfrom functools import reduce\n\nfrom lxml import etree\nfrom opaque_keys.edx.keys import UsageKey\nfrom pkg_resources import resource_string\nfrom pytz import UTC\nfrom web_fragments.fragment import Fragment\nfrom xblock.completable import XBlockCompletionMode\nfrom xblock.core import XBlock\nfrom xblock.exceptions import NoSuchServiceError\nfrom xblock.fields import Boolean, Integer, List, Scope, String\n\nfrom edx_toggles.toggles import LegacyWaffleFlag\nfrom lms.djangoapps.courseware.toggles import COURSEWARE_PROCTORING_IMPROVEMENTS\nfrom xmodule.util.xmodule_django import add_webpack_to_fragment\nfrom xmodule.x_module import (\n    HTMLSnippet,\n    ResourceTemplates,\n    shim_xmodule_js,\n    STUDENT_VIEW,\n    XModuleDescriptorToXBlockMixin,\n    XModuleMixin,\n    XModuleToXBlockMixin,\n)\n\nfrom .exceptions import NotFoundError\nfrom .fields import Date\nfrom .mako_module import MakoTemplateBlockBase\nfrom .progress import Progress\nfrom .x_module import AUTHOR_VIEW, PUBLIC_VIEW, STUDENT_VIEW, XModule  # pylint: disable=unused-import\nfrom .xml_module import XmlMixin\n\n\nlog = logging.getLogger(__name__)\n\ntry:\n    import newrelic.agent\nexcept ImportError:\n    newrelic = None  # pylint: disable=invalid-name\n\n# HACK: This shouldn't be hard-coded to two types\n# OBSOLETE: This obsoletes 'type'\nclass_priority = ['video', 'problem']\n\n# Make '_' a no-op so we can scrape strings. Using lambda instead of\n#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file\n_ = lambda text: text\n\nTIMED_EXAM_GATING_WAFFLE_FLAG = LegacyWaffleFlag(\n    waffle_namespace=\"xmodule\",\n    flag_name='rev_1377_rollout',\n    module_name=__name__,\n)\n\n\nclass SequenceFields:  # lint-amnesty, pylint: disable=missing-class-docstring\n    has_children = True\n    completion_mode = XBlockCompletionMode.AGGREGATOR\n\n    # NOTE: Position is 1-indexed.  This is silly, but there are now student\n    # positions saved on prod, so it's not easy to fix.\n    position = Integer(help=\"Last tab viewed in this sequence\", scope=Scope.user_state)\n\n    due = Date(\n        display_name=_(\"Due Date\"),\n        help=_(\"Enter the date by which problems are due.\"),\n        scope=Scope.settings,\n    )\n\n    hide_after_due = Boolean(\n        display_name=_(\"Hide sequence content After Due Date\"),\n        help=_(\n            \"If set, the sequence content is hidden for non-staff users after the due date has passed.\"\n        ),\n        default=False,\n        scope=Scope.settings,\n    )\n\n    is_entrance_exam = Boolean(\n        display_name=_(\"Is Entrance Exam\"),\n        help=_(\n            \"Tag this course module as an Entrance Exam. \"\n            \"Note, you must enable Entrance Exams for this course setting to take effect.\"\n        ),\n        default=False,\n        scope=Scope.settings,\n    )\n\n\nclass SequenceMixin(SequenceFields):\n    \"\"\"\n    A mixin of shared code between the SequenceBlock and other XBlocks.\n    \"\"\"\n    @classmethod\n    def definition_from_xml(cls, xml_object, system):  # pylint: disable=missing-function-docstring\n        children = []\n        for child in xml_object:\n            try:\n                child_block = system.process_xml(etree.tostring(child, encoding='unicode'))\n                children.append(child_block.scope_ids.usage_id)\n            except Exception as e:  # pylint: disable=broad-except\n                log.exception(\"Unable to load child when parsing Sequence. Continuing...\")\n                if system.error_tracker is not None:\n                    system.error_tracker(u\"ERROR: {0}\".format(e))\n                continue\n        return {}, children\n\n    def index_dictionary(self):\n        \"\"\"\n        Return dictionary prepared with module content and type for indexing.\n        \"\"\"\n        # return key/value fields in a Python dict object\n        # values may be numeric / string or dict\n        # default implementation is an empty dict\n        xblock_body = super().index_dictionary()\n        html_body = {\n            \"display_name\": self.display_name,\n        }\n        if \"content\" in xblock_body:\n            xblock_body[\"content\"].update(html_body)\n        else:\n            xblock_body[\"content\"] = html_body\n        xblock_body[\"content_type\"] = \"Sequence\"\n\n        return xblock_body\n\n\nclass ProctoringFields:\n    \"\"\"\n    Fields that are specific to Proctored or Timed Exams\n    \"\"\"\n    is_time_limited = Boolean(\n        display_name=_(\"Is Time Limited\"),\n        help=_(\n            \"This setting indicates whether students have a limited time\"\n            \" to view or interact with this courseware component.\"\n        ),\n        default=False,\n        scope=Scope.settings,\n    )\n\n    default_time_limit_minutes = Integer(\n        display_name=_(\"Time Limit in Minutes\"),\n        help=_(\n            \"The number of minutes available to students for viewing or interacting with this courseware component.\"\n        ),\n        default=None,\n        scope=Scope.settings,\n    )\n\n    is_proctored_enabled = Boolean(\n        display_name=_(\"Is Proctoring Enabled\"),\n        help=_(\n            \"This setting indicates whether this exam is a proctored exam.\"\n        ),\n        default=False,\n        scope=Scope.settings,\n    )\n\n    exam_review_rules = String(\n        display_name=_(\"Software Secure Review Rules\"),\n        help=_(\n            \"This setting indicates what rules the proctoring team should follow when viewing the videos.\"\n        ),\n        default='',\n        scope=Scope.settings,\n    )\n\n    is_practice_exam = Boolean(\n        display_name=_(\"Is Practice Exam\"),\n        help=_(\n            \"This setting indicates whether this exam is for testing purposes only. Practice exams are not verified.\"\n        ),\n        default=False,\n        scope=Scope.settings,\n    )\n\n    is_onboarding_exam = Boolean(\n        display_name=_(\"Is Onboarding Exam\"),\n        help=_(\n            \"This setting indicates whether this exam is an onboarding exam.\"\n        ),\n        default=False,\n        scope=Scope.settings,\n    )\n\n    def _get_course(self):\n        \"\"\"\n        Return course by course id.\n        \"\"\"\n        return self.runtime.modulestore.get_course(self.course_id)  # pylint: disable=no-member\n\n    @property\n    def is_timed_exam(self):\n        \"\"\"\n        Alias the permutation of above fields that corresponds to un-proctored timed exams\n        to the more clearly-named is_timed_exam\n        \"\"\"\n        return not self.is_proctored_enabled and not self.is_practice_exam and self.is_time_limited\n\n    @property\n    def is_proctored_exam(self):\n        \"\"\" Alias the is_proctored_enabled field to the more legible is_proctored_exam \"\"\"\n        return self.is_proctored_enabled\n\n    @property\n    def allow_proctoring_opt_out(self):\n        \"\"\"\n        Returns true if the learner should be given the option to choose between\n        taking a proctored exam, or opting out to take the exam without proctoring.\n        \"\"\"\n        return self._get_course().allow_proctoring_opt_out\n\n    @is_proctored_exam.setter\n    def is_proctored_exam(self, value):\n        \"\"\" Alias the is_proctored_enabled field to the more legible is_proctored_exam \"\"\"\n        self.is_proctored_enabled = value\n\n\n@XBlock.wants('proctoring')\n@XBlock.wants('verification')\n@XBlock.wants('gating')\n@XBlock.wants('credit')\n@XBlock.wants('completion')\n@XBlock.needs('user')\n@XBlock.needs('bookmarks')\n@XBlock.needs('i18n')\n@XBlock.wants('content_type_gating')\nclass SequenceBlock(\n    SequenceMixin,\n    SequenceFields,\n    ProctoringFields,\n    MakoTemplateBlockBase,\n    XmlMixin,\n    XModuleDescriptorToXBlockMixin,\n    XModuleToXBlockMixin,\n    HTMLSnippet,\n    ResourceTemplates,\n    XModuleMixin,\n):\n    \"\"\"\n    Layout module which lays out content in a temporal sequence\n    \"\"\"\n    resources_dir = None\n    has_author_view = True\n\n    show_in_read_only_mode = True\n    uses_xmodule_styles_setup = True\n\n    preview_view_js = {\n        'js': [\n            resource_string(__name__, 'js/src/sequence/display.js'),\n        ],\n        'xmodule_js': resource_string(__name__, 'js/src/xmodule.js')\n    }\n\n    preview_view_css = {\n        'scss': [\n            resource_string(__name__, 'css/sequence/display.scss'),\n        ],\n    }\n\n    # There is no studio_view() for this XBlock but this is needed to make the\n    # the static_content command happy.\n    studio_view_js = {\n        'js': [],\n        'xmodule_js': resource_string(__name__, 'js/src/xmodule.js')\n    }\n\n    studio_view_css = {\n        'scss': []\n    }\n\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n\n        self.gated_sequence_paywall = None\n\n    def bind_for_student(self, xmodule_runtime, user_id, wrappers=None):\n        # The position of the child XBlock to select can also be passed in via the URL.\n        # In such cases the value is set on the ModuleSystem in get_module_system_for_user()\n        # and needs to be read here after the ModuleSystem has been set on the XBlock.\n        super().bind_for_student(xmodule_runtime, user_id, wrappers)\n        # If position is specified in system, then use that instead.\n        position = getattr(self.system, 'position', None)\n        if position is not None:\n            assert isinstance(position, int)\n            self.position = self.system.position\n\n    def get_progress(self):\n        ''' Return the total progress, adding total done and total available.\n        (assumes that each submodule uses the same \"units\" for progress.)\n        '''\n        # TODO: Cache progress or children array?\n        children = self.get_children()\n        progresses = [child.get_progress() for child in children]\n        progress = reduce(Progress.add_counts, progresses, None)\n        return progress\n\n    def handle_ajax(self, dispatch, data, view=STUDENT_VIEW):  # TODO: bounds checking  # lint-amnesty, pylint: disable=arguments-differ\n        ''' get = request.POST instance '''\n        if dispatch == 'goto_position':\n            # set position to default value if either 'position' argument not\n            # found in request or it is a non-positive integer\n            position = data.get('position', '1')\n            if position.isdigit() and int(position) > 0:\n                self.position = int(position)\n            else:\n                self.position = 1\n            return json.dumps({'success': True})\n\n        if dispatch == 'get_completion':\n            completion_service = self.runtime.service(self, 'completion')\n\n            usage_key = data.get('usage_key', None)\n            if not usage_key:\n                return None\n            item = self.get_child(UsageKey.from_string(usage_key))\n            if not item:\n                return None\n\n            complete = completion_service.vertical_is_complete(item)\n            return json.dumps({\n                'complete': complete\n            })\n        elif dispatch == 'metadata':\n            context = {'exclude_units': True}\n            prereq_met = True\n            prereq_meta_info = {}\n            banner_text = None\n            display_items = self.get_display_items()\n\n            if self._required_prereq():\n                if self.runtime.user_is_staff:\n                    banner_text = _('This subsection is unlocked for learners when they meet the prerequisite requirements.')  # lint-amnesty, pylint: disable=line-too-long\n                else:\n                    # check if prerequisite has been met\n                    prereq_met, prereq_meta_info = self._compute_is_prereq_met(True)\n            meta = self._get_render_metadata(context, display_items, prereq_met, prereq_meta_info, banner_text, view)\n            meta['display_name'] = self.display_name_with_default\n            meta['format'] = getattr(self, 'format', '')\n            return json.dumps(meta)\n        raise NotFoundError('Unexpected dispatch type')\n\n    @classmethod\n    def verify_c",
+      "total_lines": 944
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 35,
+      "start_line": 15,
+      "end_line": 55,
+      "matched_line": ")",
+      "excerpt": "15: from opaque_keys.edx.keys import UsageKey\n16: from pkg_resources import resource_string\n17: from pytz import UTC\n18: from web_fragments.fragment import Fragment\n19: from xblock.completable import XBlockCompletionMode\n20: from xblock.core import XBlock\n21: from xblock.exceptions import NoSuchServiceError\n22: from xblock.fields import Boolean, Integer, List, Scope, String\n23: \n24: from edx_toggles.toggles import LegacyWaffleFlag\n25: from lms.djangoapps.courseware.toggles import COURSEWARE_PROCTORING_IMPROVEMENTS\n26: from xmodule.util.xmodule_django import add_webpack_to_fragment\n27: from xmodule.x_module import (\n28:     HTMLSnippet,\n29:     ResourceTemplates,\n30:     shim_xmodule_js,\n31:     STUDENT_VIEW,\n32:     XModuleDescriptorToXBlockMixin,\n33:     XModuleMixin,\n34:     XModuleToXBlockMixin,\n35: )\n36: \n37: from .exceptions import NotFoundError\n38: from .fields import Date\n39: from .mako_module import MakoTemplateBlockBase\n40: from .progress import Progress\n41: from .x_module import AUTHOR_VIEW, PUBLIC_VIEW, STUDENT_VIEW, XModule  # pylint: disable=unused-import\n42: from .xml_module import XmlMixin\n43: \n44: \n45: log = logging.getLogger(__name__)\n46: \n47: try:\n48:     import newrelic.agent\n49: except ImportError:\n50:     newrelic = None  # pylint: disable=invalid-name\n51: \n52: # HACK: This shouldn't be hard-coded to two types\n53: # OBSOLETE: This obsoletes 'type'\n54: class_priority = ['video', 'problem']\n55: "
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "imports": {
+      "imports": [
+        "collections",
+        "json",
+        "logging",
+        "datetime:datetime",
+        "functools:reduce",
+        "lxml:etree",
+        "opaque_keys.edx.keys:UsageKey",
+        "pkg_resources:resource_string",
+        "pytz:UTC",
+        "web_fragments.fragment:Fragment",
+        "xblock.completable:XBlockCompletionMode",
+        "xblock.core:XBlock",
+        "xblock.exceptions:NoSuchServiceError",
+        "xblock.fields:Boolean",
+        "xblock.fields:Integer",
+        "xblock.fields:List",
+        "xblock.fields:Scope",
+        "xblock.fields:String",
+        "edx_toggles.toggles:LegacyWaffleFlag",
+        "lms.djangoapps.courseware.toggles:COURSEWARE_PROCTORING_IMPROVEMENTS",
+        "xmodule.util.xmodule_django:add_webpack_to_fragment",
+        "xmodule.x_module:HTMLSnippet",
+        "xmodule.x_module:ResourceTemplates",
+        "xmodule.x_module:shim_xmodule_js",
+        "xmodule.x_module:STUDENT_VIEW",
+        "xmodule.x_module:XModuleDescriptorToXBlockMixin",
+        "xmodule.x_module:XModuleMixin",
+        "xmodule.x_module:XModuleToXBlockMixin",
+        "exceptions:NotFoundError",
+        "fields:Date"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/README.rst",
+      "download_url": "https://raw.githubusercontent.com/eduNEXT/edunext-platform/master/common/lib/xmodule/xmodule/README.rst",
+      "content_excerpt": "Status: Deprecated (DEPR-24)\n\nResponsibilities\n================\nXModules render specific course run content types to users for both authoring and learning. For instance, there is an XModule for Videos, another for HTML snippets, and another for Sequences. This package provides both the implementations of these XModules as well as some supporting utilities.\n\nDirection: Convert and Extract\n==============================\nXModule exists today as a complex set of compatibility shims on top of XBlock (all XModules currently inherit from XBlock). The goal is for all XModules to either be converted into pure XBlocks or be deleted altogether. Extracting them into separate repositories would be ideal, but even just converting them to pure XBlocks would significantly simplify the runtime.\n\nGlossary\n========\n\nMore Documentation\n==================\n\n`DEPR-24 <https://openedx.atlassian.net/browse/DEPR-24>`_\n\n`Example conversion of Capa <https://github.com/edx/edx-platform/pull/20023/>`_\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_render_student_view_for_items test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_render_student_view_for_items(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "seq_module.py",
+          "path": "common/lib/xmodule/xmodule/seq_module.py",
+          "sha": "618eefe62f474e13b7da05ccb1320c2f40f6f91e",
+          "html_url": "https://github.com/eduNEXT/edunext-platform/blob/176422e11b77015a6308f4a0986b43e67571aeb9/common/lib/xmodule/xmodule/seq_module.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "common/lib/xmodule/xmodule",
+      "count": 40,
+      "entries": [
+        {
+          "name": "README.rst",
+          "path": "common/lib/xmodule/xmodule/README.rst",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "common/lib/xmodule/xmodule/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "annotatable_module.py",
+          "path": "common/lib/xmodule/xmodule/annotatable_module.py",
+          "type": "file"
+        },
+        {
+          "name": "annotator_mixin.py",
+          "path": "common/lib/xmodule/xmodule/annotator_mixin.py",
+          "type": "file"
+        },
+        {
+          "name": "assets",
+          "path": "common/lib/xmodule/xmodule/assets",
+          "type": "dir"
+        },
+        {
+          "name": "assetstore",
+          "path": "common/lib/xmodule/xmodule/assetstore",
+          "type": "dir"
+        },
+        {
+          "name": "block_metadata_utils.py",
+          "path": "common/lib/xmodule/xmodule/block_metadata_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "capa_base.py",
+          "path": "common/lib/xmodule/xmodule/capa_base.py",
+          "type": "file"
+        },
+        {
+          "name": "capa_module.py",
+          "path": "common/lib/xmodule/xmodule/capa_module.py",
+          "type": "file"
+        },
+        {
+          "name": "conditional_module.py",
+          "path": "common/lib/xmodule/xmodule/conditional_module.py",
+          "type": "file"
+        },
+        {
+          "name": "contentstore",
+          "path": "common/lib/xmodule/xmodule/contentstore",
+          "type": "dir"
+        },
+        {
+          "name": "course_metadata_utils.py",
+          "path": "common/lib/xmodule/xmodule/course_metadata_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "course_module.py",
+          "path": "common/lib/xmodule/xmodule/course_module.py",
+          "type": "file"
+        },
+        {
+          "name": "css",
+          "path": "common/lib/xmodule/xmodule/css",
+          "type": "dir"
+        },
+        {
+          "name": "docs",
+          "path": "common/lib/xmodule/xmodule/docs",
+          "type": "dir"
+        },
+        {
+          "name": "editing_module.py",
+          "path": "common/lib/xmodule/xmodule/editing_module.py",
+          "type": "file"
+        },
+        {
+          "name": "edxnotes_utils.py",
+          "path": "common/lib/xmodule/xmodule/edxnotes_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "error_module.py",
+          "path": "common/lib/xmodule/xmodule/error_module.py",
+          "type": "file"
+        },
+        {
+          "name": "errortracker.py",
+          "path": "common/lib/xmodule/xmodule/errortracker.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "common/lib/xmodule/xmodule/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "fields.py",
+          "path": "common/lib/xmodule/xmodule/fields.py",
+          "type": "file"
+        },
+        {
+          "name": "graders.py",
+          "path": "common/lib/xmodule/xmodule/graders.py",
+          "type": "file"
+        },
+        {
+          "name": "hidden_module.py",
+          "path": "common/lib/xmodule/xmodule/hidden_module.py",
+          "type": "file"
+        },
+        {
+          "name": "html_checker.py",
+          "path": "common/lib/xmodule/xmodule/html_checker.py",
+          "type": "file"
+        },
+        {
+          "name": "html_module.py",
+          "path": "common/lib/xmodule/xmodule/html_module.py",
+          "type": "file"
+        },
+        {
+          "name": "js",
+          "path": "common/lib/xmodule/xmodule/js",
+          "type": "dir"
+        },
+        {
+          "name": "library_content_module.py",
+          "path": "common/lib/xmodule/xmodule/library_content_module.py",
+          "type": "file"
+        },
+        {
+          "name": "library_root_xblock.py",
+          "path": "common/lib/xmodule/xmodule/library_root_xblock.py",
+          "type": "file"
+        },
+        {
+          "name": "library_sourced_block.py",
+          "path": "common/lib/xmodule/xmodule/library_sourced_block.py",
+          "type": "file"
+        },
+        {
+          "name": "library_tools.py",
+          "path": "common/lib/xmodule/xmodule/library_tools.py",
+          "type": "file"
+        },
+        {
+          "name": "lti_2_util.py",
+          "path": "common/lib/xmodule/xmodule/lti_2_util.py",
+          "type": "file"
+        },
+        {
+          "name": "lti_module.py",
+          "path": "common/lib/xmodule/xmodule/lti_module.py",
+          "type": "file"
+        },
+        {
+          "name": "mako_module.py",
+          "path": "common/lib/xmodule/xmodule/mako_module.py",
+          "type": "file"
+        },
+        {
+          "name": "modulestore",
+          "path": "common/lib/xmodule/xmodule/modulestore",
+          "type": "dir"
+        },
+        {
+          "name": "mongo_utils.py",
+          "path": "common/lib/xmodule/xmodule/mongo_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "partitions",
+          "path": "common/lib/xmodule/xmodule/partitions",
+          "type": "dir"
+        },
+        {
+          "name": "poll_module.py",
+          "path": "common/lib/xmodule/xmodule/poll_module.py",
+          "type": "file"
+        },
+        {
+          "name": "progress.py",
+          "path": "common/lib/xmodule/xmodule/progress.py",
+          "type": "file"
+        },
+        {
+          "name": "randomize_module.py",
+          "path": "common/lib/xmodule/xmodule/randomize_module.py",
+          "type": "file"
+        },
+        {
+          "name": "raw_module.py",
+          "path": "common/lib/xmodule/xmodule/raw_module.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "README.rst",
+          "path": "common/lib/xmodule/xmodule/README.rst"
+        },
+        {
+          "name": "__init__.py",
+          "path": "common/lib/xmodule/xmodule/__init__.py"
+        },
+        {
+          "name": "annotatable_module.py",
+          "path": "common/lib/xmodule/xmodule/annotatable_module.py"
+        },
+        {
+          "name": "annotator_mixin.py",
+          "path": "common/lib/xmodule/xmodule/annotator_mixin.py"
+        },
+        {
+          "name": "block_metadata_utils.py",
+          "path": "common/lib/xmodule/xmodule/block_metadata_utils.py"
+        },
+        {
+          "name": "capa_base.py",
+          "path": "common/lib/xmodule/xmodule/capa_base.py"
+        },
+        {
+          "name": "capa_module.py",
+          "path": "common/lib/xmodule/xmodule/capa_module.py"
+        },
+        {
+          "name": "conditional_module.py",
+          "path": "common/lib/xmodule/xmodule/conditional_module.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/seq_module.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "bc1e9afe4bcfeeb97ebf77bbecf59580298366f5",
+          "html_url": "https://github.com/eduNEXT/edunext-platform/commit/bc1e9afe4bcfeeb97ebf77bbecf59580298366f5",
+          "message": "feat: allow overriding unit icons (#21433)\n\nThis:\r\n1. Introduces a new override using the `pluggable_override` decorator.\r\nIt is now possible to specify a custom way of getting XBlock's icon\r\nby defining `GET_UNIT_ICON_IMPL` in settings.\r\n2. Introduces a way to add custom `XBLOCK_MIXINS` by defining",
+          "author": "Piotr Surowiec",
+          "date": "2021-04-07T13:42:12Z"
+        },
+        {
+          "sha": "3e6b3e41f858011a49e926b455743b6b6c86fb38",
+          "html_url": "https://github.com/eduNEXT/edunext-platform/commit/3e6b3e41f858011a49e926b455743b6b6c86fb38",
+          "message": "refactor: remove unused imports (#27084)",
+          "author": "Usama Sadiq",
+          "date": "2021-03-24T12:55:04Z"
+        },
+        {
+          "sha": "deb7f5b0263b019b359be435182b8237afc71cd1",
+          "html_url": "https://github.com/eduNEXT/edunext-platform/commit/deb7f5b0263b019b359be435182b8237afc71cd1",
+          "message": "refactor: pyupgrade in common/lib/xmodule (#26780)",
+          "author": "M. Zulqarnain",
+          "date": "2021-03-10T12:56:07Z"
+        },
+        {
+          "sha": "c5e5b307b5f8f56867b3e243e313296b600363d3",
+          "html_url": "https://github.com/eduNEXT/edunext-platform/commit/c5e5b307b5f8f56867b3e243e313296b600363d3",
+          "message": "Merge pull request #26507 from edx/jawayria/bom-2351-6\n\nBOM-2351: Removed unused imports from common/lib/xmodule",
+          "author": "Jawayria",
+          "date": "2021-03-04T15:36:46Z"
+        },
+        {
+          "sha": "097613e8b9cbc0dfd8ebb4c0b9ac0a72095c715e",
+          "html_url": "https://github.com/eduNEXT/edunext-platform/commit/097613e8b9cbc0dfd8ebb4c0b9ac0a72095c715e",
+          "message": "BOM-2351: Removed unused imports from common/lib/xmodule",
+          "author": "Jawayria",
+          "date": "2021-02-12T14:17:17Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_render_student_view_for_items NOTE This seems like hack",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "common/lib/xmodule/xmodule/seq_module.py",
+      "satd_line": 35,
+      "last_commit": {
+        "sha": "bc1e9afe4bcfeeb97ebf77bbecf59580298366f5",
+        "html_url": "https://github.com/eduNEXT/edunext-platform/commit/bc1e9afe4bcfeeb97ebf77bbecf59580298366f5",
+        "message": "feat: allow overriding unit icons (#21433)\n\nThis:\r\n1. Introduces a new override using the `pluggable_override` decorator.\r\nIt is now possible to specify a custom way of getting XBlock's icon\r\nby defining `GET_UNIT_ICON_IMPL` in settings.\r\n2. Introduces a way to add custom `XBLOCK_MIXINS` by defining",
+        "author": "Piotr Surowiec",
+        "date": "2021-04-07T13:42:12Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

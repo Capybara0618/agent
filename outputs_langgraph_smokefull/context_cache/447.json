@@ -1,0 +1,311 @@
+{
+  "task_id": "447",
+  "repo_owner": "openaddresses",
+  "repo_name": "machine",
+  "file_path": "openaddr/conform.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T18:34:33+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T18:34:43+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T18:34:56+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "openaddr/conform.py",
+    "original_code": "def excerpt(self, source_paths, workdir, conform):\n    '''\n\n        Tested version from openaddr.excerpt() on master branch:\n\n        if ext == '.zip':\n            _L.debug('Downloading all of {cache}'.format(**extras))\n\n            with open(cachefile, 'w') as file:\n                for chunk in got.iter_content(1024**2):\n                    file.write(chunk)\n\n            zf = ZipFile(cachefile, 'r')\n\n            for name in zf.namelist():\n                _, ext = splitext(name)\n\n                if ext in ('.shp', '.shx', '.dbf'):\n                    with open(join(workdir, 'cache'+ext), 'w') as file:\n                        file.write(zf.read(name))\n\n            if exists(join(workdir, 'cache.shp')):\n                ds = ogr.Open(join(workdir, 'cache.shp'))\n            else:\n                ds = None\n\n        elif ext == '.json':\n            _L.debug('Downloading part of {cache}'.format(**extras))\n\n            scheme, host, path, query, _, _ = urlparse(got.url)\n\n            if scheme in ('http', 'https'):\n                conn = HTTPConnection(host, 80)\n                conn.request('GET', path + ('?' if query else '') + query)\n                resp = conn.getresponse()\n            elif scheme == 'file':\n                with open(path) as rawfile:\n                    resp = StringIO(rawfile.read(1024*1024))\n            else:\n                raise RuntimeError('Unsure what to do with {}'.format(got.url))\n\n            with open(cachefile, 'w') as file:\n                file.write(sample_geojson(resp, 10))\n\n            ds = ogr.Open(cachefile)\n\n        else:\n            ds = None\n    '''\n    encoding = conform.get('encoding')\n    csvsplit = conform.get('csvsplit', ',')\n\n    known_paths = ExcerptDataTask._get_known_paths(source_paths, workdir, conform, self.known_types)\n\n    if not known_paths:\n        # we know nothing.\n        return None, None\n\n    data_path = known_paths[0]\n    _, data_ext = os.path.splitext(data_path.lower())\n\n    # Sample a few GeoJSON features to save on memory for large datasets.\n    if data_ext in ('.geojson', '.json'):\n        data_path = ExcerptDataTask._sample_geojson_file(data_path)\n\n    # TODO: \"type\" is a deprecated tag\n    format_string = conform.get('format') or conform.get('type')\n\n    # GDAL has issues with weird input CSV data, so use Python instead.\n    if format_string == 'csv':\n        return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n    ogr_data_path = normalize_ogr_filename_case(data_path)\n    datasource = ogr.Open(ogr_data_path, 0)\n    layer = datasource.GetLayer()\n\n    if not encoding:\n        encoding = guess_source_encoding(datasource, layer)\n\n    # GDAL has issues with non-UTF8 input CSV data, so use Python instead.\n    if data_ext == '.csv' and encoding not in ('utf8', 'utf-8'):\n        return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n    layer_defn = layer.GetLayerDefn()\n    fieldcount = layer_defn.GetFieldCount()\n    fieldnames = [layer_defn.GetFieldDefn(i).GetName() for i in range(fieldcount)]\n    fieldnames = [f.decode(encoding) if hasattr(f, 'decode') else f for f in fieldnames]\n\n    data_sample = [fieldnames]\n\n    for (feature, _) in zip(layer, range(5)):\n        row = [feature.GetField(i) for i in range(fieldcount)]\n        row = [v.decode(encoding) if hasattr(v, 'decode') else v for v in row]\n        data_sample.append(row)\n\n    if len(data_sample) < 2:\n        raise ValueError('Not enough rows in data source')\n\n    # Determine geometry_type from layer, sample, or give up.\n    if layer_defn.GetGeomType() in geometry_types:\n        geometry_type = geometry_types.get(layer_defn.GetGeomType(), None)\n    elif fieldnames[-3:] == [X_FIELDNAME, Y_FIELDNAME, GEOM_FIELDNAME]:\n        geometry = ogr.CreateGeometryFromWkt(data_sample[1][-1])\n        geometry_type = geometry_types.get(geometry.GetGeometryType(), None)\n    else:\n        geometry_type = None\n\n    return data_sample, geometry_type",
+    "satd_comment": "# TODO: \"type\" is a deprecated tag",
+    "target_file": {
+      "ok": true,
+      "path": "openaddr/conform.py",
+      "sha": "5b48649ea6e0a3b721e715ba79ae6d8b196c808e",
+      "download_url": "https://raw.githubusercontent.com/openaddresses/machine/master/openaddr/conform.py",
+      "content_excerpt": "# coding=ascii\n\nfrom __future__ import absolute_import, division, print_function\nimport logging; _L = logging.getLogger('openaddr.conform')\n\nimport os\nimport errno\nimport tempfile\nimport mimetypes\nimport json\nimport copy\nimport csv\nimport re\n\nfrom zipfile import ZipFile\nfrom locale import getpreferredencoding\nfrom os.path import splitext\nfrom hashlib import sha1\nfrom uuid import uuid4\n\nfrom .sample import sample_geojson, stream_geojson\n\nfrom osgeo import ogr, osr, gdal\nogr.UseExceptions()\n\n\ndef gdal_error_handler(err_class, err_num, err_msg):\n    errtype = {\n            gdal.CE_None:'None',\n            gdal.CE_Debug:'Debug',\n            gdal.CE_Warning:'Warning',\n            gdal.CE_Failure:'Failure',\n            gdal.CE_Fatal:'Fatal'\n    }\n    err_msg = err_msg.replace('\\n',' ')\n    err_class = errtype.get(err_class, 'None')\n    _L.error(\"GDAL gave %s %s: %s\", err_class, err_num, err_msg)\ngdal.PushErrorHandler(gdal_error_handler)\n\n\n# The canonical output schema for conform\nOPENADDR_CSV_SCHEMA = ['LON', 'LAT', 'NUMBER', 'STREET', 'UNIT', 'CITY',\n                       'DISTRICT', 'REGION', 'POSTCODE', 'ID', 'HASH']\n\n# Field names for use in cached CSV files.\n# We add columns to the extracted CSV with our own data with these names.\nGEOM_FIELDNAME = 'OA:geom'\nX_FIELDNAME, Y_FIELDNAME = 'OA:x', 'OA:y'\nattrib_types = {\n    'street':   'OA:street',\n    'number':   'OA:number',\n    'unit':     'OA:unit',\n    'city':     'OA:city',\n    'postcode': 'OA:postcode',\n    'district': 'OA:district',\n    'region':   'OA:region',\n    'id':       'OA:id'\n}\n\nvar_types = attrib_types.copy()\n\nUNZIPPED_DIRNAME = 'unzipped'\n\ngeometry_types = {\n    ogr.wkbPoint: 'Point',\n    ogr.wkbPoint25D: 'Point 2.5D',\n    ogr.wkbLineString: 'LineString',\n    ogr.wkbLineString25D: 'LineString 2.5D',\n    ogr.wkbLinearRing: 'LinearRing',\n    ogr.wkbPolygon: 'Polygon',\n    ogr.wkbPolygon25D: 'Polygon 2.5D',\n    ogr.wkbMultiPoint: 'MultiPoint',\n    ogr.wkbMultiPoint25D: 'MultiPoint 2.5D',\n    ogr.wkbMultiLineString: 'MultiLineString',\n    ogr.wkbMultiLineString25D: 'MultiLineString 2.5D',\n    ogr.wkbMultiPolygon: 'MultiPolygon',\n    ogr.wkbMultiPolygon25D: 'MultiPolygon 2.5D',\n    ogr.wkbGeometryCollection: 'GeometryCollection',\n    ogr.wkbGeometryCollection25D: 'GeometryCollection 2.5D',\n    ogr.wkbUnknown: 'Unknown'\n    }\n\n# extracts:\n# - '123' from '123 Main St'\n# - '123 1/2' from '123 1/2 Main St'\n# - '123-1/2' from '123-1/2 Main St'\n# - '123-1' from '123-1 Main St'\n# - '123a' from '123a Main St'\n# - '123-a' from '123-a Main St'\n# - '' from '3rd St' (the 3 belongs to the street, it's not a house number)\n#\n# this regex can be optimized but number scenarios are much cleaner this way:\n# - just digits with optional fractional\n# - two groups of digits separated by a hyphen (for queens-style addresses, eg - 69-15 51st Ave)\n# - digits and a letter, optionally separated by a hyphen\nprefixed_number_pattern = re.compile(\"^\\s*(\\d+(?:[ -]\\d/\\d)?|\\d+-\\d+|\\d+-?[A-Z])\\s+\", re.IGNORECASE)\n\n# extracts:\n# - 'Main St' from '123 Main St'\n# - 'Main St' from '123 1/2 Main St'\n# - 'Main St' from '123-1/2 Main St'\n# - 'Main St' from '123-1 Main St'\n# - 'Main St' from '123a Main St'\n# - 'Main St' from '123-a Main St'\n# - 'Main St' from 'Main St'\n#\n# like prefixed_number_pattern, this regex can be optimized but this is cleaner\npostfixed_street_pattern = re.compile(\"^(?:\\s*(?:\\d+(?:[ -]\\d/\\d)?|\\d+-\\d+|\\d+-?[A-Z])\\s+)?(.*)\", re.IGNORECASE)\n\n# extracts:\n# - 'Main Street' from '123 Main Street Unit 3'\n# - 'Main Street' from '123 Main Street Apartment 3'\n# - 'Main Street' from '123 Main Street Apt 3'\n# - 'Main Street' from '123 Main Street Apt. 3'\n# - 'Main Street' from '123 Main Street Suite 3'\n# - 'Main Street' from '123 Main Street Ste 3'\n# - 'Main Street' from '123 Main Street Ste. 3'\n# - 'Main Street' from '123 Main Street Building 3'\n# - 'Main Street' from '123 Main Street Bldg 3'\n# - 'Main Street' from '123 Main Street Bldg. 3'\n# - 'Main Street' from '123 Main Street Lot 3'\n# - 'Main Street' from '123 Main Street #3'\n# - 'Main Street' from '123 Main Street # 3'\n# This regex contains 3 groups: optional house number, street, optional unit\n# only street is a matching group, house number and unit are non-matching\npostfixed_street_with_units_pattern = re.compile(\"^(?:\\s*(?:\\d+(?:[ -]\\d/\\d)?|\\d+-\\d+|\\d+-?[A-Z])\\s+)?(.+?)(?:\\s+(?:(?:UNIT|APARTMENT|APT\\.?|SUITE|STE\\.?|BUILDING|BLDG\\.?|LOT)\\s+|#).+)?$\", re.IGNORECASE)\n\n# extracts:\n# - 'Unit 3' from 'Main Street Unit 3'\n# - 'Apartment 3' from 'Main Street Apartment 3'\n# - 'Apt 3' from 'Main Street Apt 3'\n# - 'Apt. 3' from 'Main Street Apt. 3'\n# - 'Suite 3' from 'Main Street Suite 3'\n# - 'Ste 3' from 'Main Street Ste 3'\n# - 'Ste. 3' from 'Main Street Ste. 3'\n# - 'Building 3' from 'Main Street Building 3'\n# - 'Bldg 3' from 'Main Street Bldg 3'\n# - 'Bldg. 3' from 'Main Street Bldg. 3'\n# - 'Lot 3' from 'Main Street Lot 3'\n# - '#3' from 'Main Street #3'\n# - '# 3' from 'Main Street # 3'\npostfixed_unit_pattern = re.compile(\"\\s((?:(?:UNIT|APARTMENT|APT\\.?|SUITE|STE\\.?|BUILDING|BLDG\\.?|LOT)\\s+|#).+)$\", re.IGNORECASE)\n\ndef mkdirsp(path):\n    try:\n        os.makedirs(path)\n    except OSError as exc:\n        if exc.errno == errno.EEXIST and os.path.isdir(path):\n            pass\n        else:\n            raise\n\n\nclass ConformResult:\n    processed = None\n    sample = None\n    license = None\n    geometry_type = None\n    address_count = None\n    path = None\n    elapsed = None\n    sharealike_flag = None\n    attribution_flag = None\n    attribution_name = None\n\n    def __init__(self, processed, sample, website, license, geometry_type,\n                 address_count, path, elapsed, sharealike_flag,\n                 attribution_flag, attribution_name):\n        self.processed = processed\n        self.sample = sample\n        self.website = website\n        self.license = license\n        self.geometry_type = geometry_type\n        self.address_count = address_count\n        self.path = path\n        self.elapsed = elapsed\n        self.sharealike_flag = sharealike_flag\n        self.attribution_flag = attribution_flag\n        self.attribution_name = attribution_name\n\n    @staticmethod\n    def empty():\n        return ConformResult(None, None, None, None, None, None, None, None, None, None, None)\n\n    def todict(self):\n        return dict(processed=self.processed, sample=self.sample)\n\n\nclass DecompressionError(Exception):\n    pass\n\nclass DecompressionTask(object):\n    @classmethod\n    def from_format_string(clz, format_string):\n        if format_string == None:\n            return GuessDecompressTask()\n        elif format_string.lower() == 'zip':\n            return ZipDecompressTask()\n        else:\n            raise KeyError(\"I don't know how to decompress for format {}\".format(format_string))\n\n    def decompress(self, source_paths):\n        raise NotImplementedError()\n\n\nclass GuessDecompressTask(DecompressionTask):\n    ''' Decompression task that tries to guess compression from file names.\n    '''\n    def decompress(self, source_paths, workdir, filenames):\n        types = {type for (type, _) in map(mimetypes.guess_type, source_paths)}\n\n        if types == {'application/zip'}:\n            substitute_task = ZipDecompressTask()\n            _L.info('Guessing zip compression based on file names')\n            return substitute_task.decompress(source_paths, workdir, filenames)\n\n        _L.warning('Could not guess a single compression from file names')\n        return source_paths\n\ndef is_in(path, names):\n    '''\n    '''\n    if path.lower() in names:\n        # Found it!\n        return True\n\n    for name in names:\n        # Maybe one of the names is an enclosing directory?\n        if not os.path.relpath(path.lower(), name).startswith('..'):\n            # Yes, that's it.\n            return True\n\n    return False\n\nclass ZipDecompressTask(DecompressionTask):\n    def decompress(self, source_paths, workdir, filenames):\n        output_files = []\n        expand_path = os.path.join(workdir, UNZIPPED_DIRNAME)\n        mkdirsp(expand_path)\n\n        # Extract contents of zip file into expand_path directory.\n        for source_path in source_paths:\n            with ZipFile(source_path, 'r') as z:\n                for name in z.namelist():\n                    if len(filenames) and not is_in(name, filenames):\n                        # Download only the named file, if any.\n                        _L.debug(\"Skipped file {}\".format(name))\n                        continue\n\n                    z.extract(name, expand_path)\n\n        # Collect names of directories and files in expand_path directory.\n        for (dirpath, dirnames, filenames) in os.walk(expand_path):\n            for dirname in dirnames:\n                if os.path.splitext(dirname)[-1].lower() == '.gdb':\n                    output_files.append(os.path.join(dirpath, dirname))\n                    _L.debug(\"Expanded directory {}\".format(output_files[-1]))\n            for filename in filenames:\n                output_files.append(os.path.join(dirpath, filename))\n                _L.debug(\"Expanded file {}\".format(output_files[-1]))\n\n        return output_files\n\nclass ExcerptDataTask(object):\n    ''' Task for sampling three rows of data from datasource.\n    '''\n    known_types = ('.shp', '.json', '.geojson', '.csv', '.kml', '.gml', '.gdb')\n\n    def excerpt(self, source_paths, workdir, conform):\n        '''\n\n            Tested version from openaddr.excerpt() on master branch:\n\n            if ext == '.zip':\n                _L.debug('Downloading all of {cache}'.format(**extras))\n\n                with open(cachefile, 'w') as file:\n                    for chunk in got.iter_content(1024**2):\n                        file.write(chunk)\n\n                zf = ZipFile(cachefile, 'r')\n\n                for name in zf.namelist():\n                    _, ext = splitext(name)\n\n                    if ext in ('.shp', '.shx', '.dbf'):\n                        with open(join(workdir, 'cache'+ext), 'w') as file:\n                            file.write(zf.read(name))\n\n                if exists(join(workdir, 'cache.shp')):\n                    ds = ogr.Open(join(workdir, 'cache.shp'))\n                else:\n                    ds = None\n\n            elif ext == '.json':\n                _L.debug('Downloading part of {cache}'.format(**extras))\n\n                scheme, host, path, query, _, _ = urlparse(got.url)\n\n                if scheme in ('http', 'https'):\n                    conn = HTTPConnection(host, 80)\n                    conn.request('GET', path + ('?' if query else '') + query)\n                    resp = conn.getresponse()\n                elif scheme == 'file':\n                    with open(path) as rawfile:\n                        resp = StringIO(rawfile.read(1024*1024))\n                else:\n                    raise RuntimeError('Unsure what to do with {}'.format(got.url))\n\n                with open(cachefile, 'w') as file:\n                    file.write(sample_geojson(resp, 10))\n\n                ds = ogr.Open(cachefile)\n\n            else:\n                ds = None\n        '''\n        encoding = conform.get('encoding')\n        csvsplit = conform.get('csvsplit', ',')\n\n        known_paths = ExcerptDataTask._get_known_paths(source_paths, workdir, conform, self.known_types)\n\n        if not known_paths:\n            # we know nothing.\n            return None, None\n\n        data_path = known_paths[0]\n        _, data_ext = os.path.splitext(data_path.lower())\n\n        # Sample a few GeoJSON features to save on memory for large datasets.\n        if data_ext in ('.geojson', '.json'):\n            data_path = ExcerptDataTask._sample_geojson_file(data_path)\n\n        format_string = conform.get('format')\n\n        # GDAL has issues with weird input CSV data, so use Python instead.\n        if format_string == 'csv':\n            return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n        ogr_data_path = normalize_ogr_filename_case(data_path)\n        datasource = ogr.Open(ogr_data_path, 0)\n        layer = datas",
+      "total_lines": 1473
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "__future__:division",
+        "__future__:print_function",
+        "logging",
+        "os",
+        "errno",
+        "tempfile",
+        "mimetypes",
+        "json",
+        "copy",
+        "csv",
+        "re",
+        "zipfile:ZipFile",
+        "locale:getpreferredencoding",
+        "os.path:splitext",
+        "hashlib:sha1",
+        "uuid:uuid4",
+        "sample:sample_geojson",
+        "sample:stream_geojson",
+        "osgeo:ogr",
+        "osgeo:osr",
+        "osgeo:gdal"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/openaddresses/machine/master/README.md",
+      "content_excerpt": "<h1 align=\"center\">OA Machine [Deprecated]</h1>\n\n\nLegacy scripts for running OpenAddresses on a complete data set and publishing\nthe results. Uses [OpenAddresses](https://github.com/openaddresses/openaddresses)\ndata sources to work.\n\nStatus\n------\n\nREADME: This code powers the legacy https://results.openaddresses.io/ site. Current development efforts should be focused on the batch service\nat https://batch.openaddresses.io/data. This service is powered by a fork of the machine code found https://github.com/openaddresses/batch-machine. Changes made to this code **will not** affect the newer, batch service.\n\nThis code is being used to process the complete OA dataset on a weekly and on-demand\nbasis, with output visible at [results.openaddresses.io](https://results.openaddresses.io).\n\n[![Build Status](https://travis-ci.org/openaddresses/machine.svg?branch=master)](https://travis-ci.org/openaddresses/machine/branches)\n\nUsage\n-----\nNOTE: machine's use for CI has been deprecated and it is currenty serving a static version of sources processed up to August, 2020.\nAll CI and weekly source functionality is disabled. For current data please see the [batch service](https://batch.openaddresses.io)\n\nMachine is an integral of the OpenAddresses project. When new sources\n[are added in Github](https://github.com/openaddresses/openaddresses#contributing-addresses),\nthey are automatically processed and status output is displayed in Github’s\npull request UI. A successful set of checks looks like this:\n\n![Github status display](docs/github-status.png)\n\nMore information about Machine’s output can "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "excerpt test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"excerpt(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "openaddr",
+      "count": 17,
+      "entries": [
+        {
+          "name": "VERSION",
+          "path": "openaddr/VERSION",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "openaddr/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "cache.py",
+          "path": "openaddr/cache.py",
+          "type": "file"
+        },
+        {
+          "name": "ci",
+          "path": "openaddr/ci",
+          "type": "dir"
+        },
+        {
+          "name": "conform.py",
+          "path": "openaddr/conform.py",
+          "type": "file"
+        },
+        {
+          "name": "dotmap.py",
+          "path": "openaddr/dotmap.py",
+          "type": "file"
+        },
+        {
+          "name": "geodata",
+          "path": "openaddr/geodata",
+          "type": "dir"
+        },
+        {
+          "name": "jobs.py",
+          "path": "openaddr/jobs.py",
+          "type": "file"
+        },
+        {
+          "name": "parcels",
+          "path": "openaddr/parcels",
+          "type": "dir"
+        },
+        {
+          "name": "preview.py",
+          "path": "openaddr/preview.py",
+          "type": "file"
+        },
+        {
+          "name": "process_one.py",
+          "path": "openaddr/process_one.py",
+          "type": "file"
+        },
+        {
+          "name": "render.py",
+          "path": "openaddr/render.py",
+          "type": "file"
+        },
+        {
+          "name": "sample.py",
+          "path": "openaddr/sample.py",
+          "type": "file"
+        },
+        {
+          "name": "slippymap.py",
+          "path": "openaddr/slippymap.py",
+          "type": "file"
+        },
+        {
+          "name": "summarize.py",
+          "path": "openaddr/summarize.py",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "openaddr/tests",
+          "type": "dir"
+        },
+        {
+          "name": "util",
+          "path": "openaddr/util",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "VERSION",
+          "path": "openaddr/VERSION"
+        },
+        {
+          "name": "__init__.py",
+          "path": "openaddr/__init__.py"
+        },
+        {
+          "name": "cache.py",
+          "path": "openaddr/cache.py"
+        },
+        {
+          "name": "dotmap.py",
+          "path": "openaddr/dotmap.py"
+        },
+        {
+          "name": "jobs.py",
+          "path": "openaddr/jobs.py"
+        },
+        {
+          "name": "preview.py",
+          "path": "openaddr/preview.py"
+        },
+        {
+          "name": "process_one.py",
+          "path": "openaddr/process_one.py"
+        },
+        {
+          "name": "render.py",
+          "path": "openaddr/render.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "openaddr/conform.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "921e3f42af7ef6c19cd1d2da11fe4dc62cc048a4",
+          "html_url": "https://github.com/openaddresses/machine/commit/921e3f42af7ef6c19cd1d2da11fe4dc62cc048a4",
+          "message": "Changed mistaken key value for get function",
+          "author": "Maciej Andrearczyk",
+          "date": "2020-11-10T20:05:48Z"
+        },
+        {
+          "sha": "4cfa37ead6e4c6f33905a679188b283658c52c5a",
+          "html_url": "https://github.com/openaddresses/machine/commit/4cfa37ead6e4c6f33905a679188b283658c52c5a",
+          "message": "Reformatting",
+          "author": "Ian Dees",
+          "date": "2020-05-13T14:10:54Z"
+        },
+        {
+          "sha": "ee63cd5a80f6dc363ead7d4f11bae7f70e1a39db",
+          "html_url": "https://github.com/openaddresses/machine/commit/ee63cd5a80f6dc363ead7d4f11bae7f70e1a39db",
+          "message": "Fixed get array from string code",
+          "author": "Macieg",
+          "date": "2020-05-11T16:46:14Z"
+        },
+        {
+          "sha": "fa72f7f6d284963513063863e142860250130535",
+          "html_url": "https://github.com/openaddresses/machine/commit/fa72f7f6d284963513063863e142860250130535",
+          "message": "Renamed method",
+          "author": "macieg",
+          "date": "2020-04-26T08:39:52Z"
+        },
+        {
+          "sha": "5ff2a31a14e24b2f09212fcb3c26818abffca099",
+          "html_url": "https://github.com/openaddresses/machine/commit/5ff2a31a14e24b2f09212fcb3c26818abffca099",
+          "message": "Fixed get method",
+          "author": "Maciej Andrearczyk",
+          "date": "2020-04-25T18:14:42Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "excerpt TODO type deprecated",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "openaddr/conform.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "921e3f42af7ef6c19cd1d2da11fe4dc62cc048a4",
+        "html_url": "https://github.com/openaddresses/machine/commit/921e3f42af7ef6c19cd1d2da11fe4dc62cc048a4",
+        "message": "Changed mistaken key value for get function",
+        "author": "Maciej Andrearczyk",
+        "date": "2020-11-10T20:05:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "excerpt",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

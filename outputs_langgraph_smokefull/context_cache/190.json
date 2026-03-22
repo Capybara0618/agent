@@ -1,0 +1,381 @@
+{
+  "task_id": "190",
+  "repo_owner": "mitodl",
+  "repo_name": "micromasters",
+  "file_path": "dashboard/api.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T16:42:50+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T16:43:03+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T16:43:11+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "dashboard/api.py",
+    "original_code": "def format_courserun_for_dashboard(course_run, status_for_user, certificate=None, position=1):\n    \"\"\"\n    Helper function that formats a course run adding informations to the fields coming from the DB\n\n    Args:\n        course_run (CourseRun): a course run\n        status_for_user (str): a string representing the status of a course for the user\n        certificate (Certificate): an object representing the\n            certificate of the user for this run\n        position (int): The position of the course run within the list\n\n    Returns:\n        dict: a dictionary containing information about the course\n    \"\"\"\n    if course_run is None:\n        return\n    formatted_run = {\n        'id': course_run.id,\n        'course_id': course_run.edx_course_key,\n        'title': course_run.title,\n        'status': status_for_user,\n        'position': position,\n        'course_start_date': course_run.start_date,\n        'course_end_date': course_run.end_date,\n        'fuzzy_start_date': course_run.fuzzy_start_date\n    }\n\n    # check if there are extra fields to pull in\n    extra_fields = CourseFormatConditionalFields.get_assoc_field(status_for_user)\n    for extra_field in extra_fields:\n        formatted_run[extra_field['format_field']] = getattr(course_run, extra_field['course_run_field'])\n\n    if status_for_user == CourseStatus.PASSED:\n        if certificate is not None:\n            # if the status is passed, pull the grade and the certificate url\n            formatted_run['grade'] = certificate.grade\n            formatted_run['certificate_url'] = certificate.download_url\n        else:\n            # this should never happen, but just in case\n            log.error('A valid certificate was expected')\n\n    if status_for_user == CourseStatus.CURRENTLY_ENROLLED:\n        # TODO: here goes the logic to pull the current grade  # pylint: disable=fixme\n        pass\n\n    if status_for_user == CourseStatus.OFFERED or status_for_user == CourseStatus.CAN_UPGRADE:\n        try:\n            course_price = CoursePrice.objects.get(course_run=course_run, is_valid=True)\n            formatted_run['price'] = course_price.price\n        except CoursePrice.DoesNotExist:\n            pass\n\n    return formatted_run",
+    "satd_comment": "# TODO: here goes the logic to pull the current grade  # pylint: disable=fixme",
+    "target_file": {
+      "ok": true,
+      "path": "dashboard/api.py",
+      "sha": "ec349b66cf7774261b11798f4dfa101921e2af00",
+      "download_url": "https://raw.githubusercontent.com/mitodl/micromasters/master/dashboard/api.py",
+      "content_excerpt": "\"\"\"\nApis for the dashboard\n\"\"\"\nimport datetime\nimport logging\nfrom urllib.parse import urljoin\n\nimport pytz\nfrom django.conf import settings\nfrom django.contrib.auth import get_user_model\nfrom django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist\nfrom django.db import transaction\nfrom django.db.models import Prefetch\nfrom django.urls import reverse\nfrom django_redis import get_redis_connection\nfrom edx_api.client import EdxApi\n\nfrom backends import utils\nfrom backends.constants import (BACKEND_EDX_ORG, BACKEND_MITX_ONLINE,\n                                COURSEWARE_BACKEND_URL, COURSEWARE_BACKENDS)\nfrom backends.exceptions import InvalidCredentialStored\nfrom backends.utils import has_social_auth\nfrom courses.models import CourseRun, ElectiveCourse, Program\nfrom courses.utils import format_season_year_for_course_run\nfrom exams.models import ExamAuthorization, ExamRun\nfrom dashboard.api_edx_cache import CachedEdxDataApi\nfrom dashboard.constants import DEDP_PROGRAM_TITLE\nfrom dashboard.models import ProgramEnrollment\nfrom dashboard.utils import get_mmtrack\nfrom grades import api\nfrom grades.models import FinalGrade\nfrom grades.serializers import ProctoredExamGradeSerializer\nfrom micromasters.utils import now_in_utc\n# key that stores user_key and number of failures in a hash\nfrom profiles.api import get_social_auth\n\nUser = get_user_model()\n\nCACHE_KEY_FAILURE_NUMS_BY_USER = \"update_cache_401_failure_numbers\"\n# key that stores user ids to exclude from cache update\nCACHE_KEY_FAILED_USERS_NOT_TO_UPDATE = \"failed_cache_update_users_not_to_update\"\nFIELD_USER_ID_BASE_STR = \"user_{0}\"\n\nlog = logging.getLogger(__name__)\n\n# pylint: disable=too-many-branches\n\n\nclass CourseStatus:\n    \"\"\"\n    Possible statuses for a course for a user. These are the course run statuses used in the dashboard API.\n    \"\"\"\n    PASSED = 'passed'\n    NOT_PASSED = 'not-passed'\n    CURRENTLY_ENROLLED = 'currently-enrolled'\n    WILL_ATTEND = 'will-attend'\n    CAN_UPGRADE = 'can-upgrade'\n    MISSED_DEADLINE = 'missed-deadline'\n    OFFERED = 'offered'\n\n    @classmethod\n    def all_statuses(cls):\n        \"\"\"Helper to get all the statuses\"\"\"\n        return [cls.PASSED, cls.NOT_PASSED, cls.CURRENTLY_ENROLLED,\n                cls.CAN_UPGRADE, cls.OFFERED, cls.WILL_ATTEND, cls.MISSED_DEADLINE, ]\n\n\nclass CourseRunStatus:\n    \"\"\"\n    Possible statuses for a course run for a user. These are used internally.\n    \"\"\"\n    NOT_ENROLLED = 'not-enrolled'\n    CURRENTLY_ENROLLED = 'currently-enrolled'\n    CHECK_IF_PASSED = 'check-if-passed'\n    WILL_ATTEND = 'will-attend'\n    CAN_UPGRADE = 'can-upgrade'\n    MISSED_DEADLINE = 'missed-deadline'\n    NOT_PASSED = 'not-passed'\n\n\nclass CourseFormatConditionalFields:\n    \"\"\"\n    The formatting of a course run is dependent\n    on the CourseStatus status passed on the function.\n    There are some fields that are common and others\n    that depend on the status. Also the name of the fields changes.\n\n    This class contains the association between the CourseStatus status\n    that need specific fields, the field associated correspondent\n    to a course run and the new name they need to have.\n    \"\"\"\n    ASSOCIATED_FIELDS = {\n        CourseStatus.OFFERED: [\n            {\n                'course_run_field': 'enrollment_start',\n                'format_field': 'enrollment_start_date'\n            },\n            {\n                'course_run_field': 'fuzzy_enrollment_start_date',\n                'format_field': 'fuzzy_enrollment_start_date'\n            },\n        ]\n    }\n\n    @classmethod\n    def get_assoc_field(cls, course_status):\n        \"\"\"\n        Method to get from the ASSOCIATED_FIELDS dict\n        \"\"\"\n        if course_status not in CourseStatus.all_statuses():\n            log.error('%s not defined in Courses.api.CourseStatus', course_status)\n            raise ImproperlyConfigured(\n                f'{course_status} not defined in Courses.api.CourseStatus')\n        return cls.ASSOCIATED_FIELDS.get(course_status, [])\n\n\nclass CourseRunUserStatus:\n    \"\"\"\n    Representation of a course run status for a specific user\n    \"\"\"\n    def __init__(self, status, course_run=None):\n        self.status = status\n        self.course_run = course_run\n\n    def __repr__(self):\n        course = self.course_run.title if self.course_run is not None else '\"None\"'\n        return f\"<CourseRunUserStatus for course {course} status {self.status} at {hex(id(self))}>\"\n\n\ndef get_user_program_info(user, *, update_cache=True):\n    \"\"\"\n    Provides a detailed serialization all of a User's enrolled Programs with enrollment/grade info\n\n    Args:\n        user (User): A User\n        update_cache (bool): if True, update the cache for the backends\n\n    Returns:\n        list: Enrolled Program information\n    \"\"\"\n    invalid_backend_credentials = []\n    if update_cache:\n        for backend in COURSEWARE_BACKENDS:\n            try:\n                update_cache_for_backend(user, backend)\n            except InvalidCredentialStored:\n                log.info(\"Invalid credentials token for user: %s, provider: %s\", user, backend)\n                invalid_backend_credentials.append(backend)\n            except:  # pylint: disable=bare-except\n                log.exception(\"Unexpected error refreshing user dashboard\")\n\n    response_data = {\n        \"programs\": [],\n        \"is_edx_data_fresh\": CachedEdxDataApi.are_all_caches_fresh(user),\n        \"invalid_backend_credentials\": invalid_backend_credentials,\n    }\n    all_programs = (\n        Program.objects.filter(live=True, programenrollment__user=user).prefetch_related(\n            Prefetch(\n                'course_set__courserun_set',\n                queryset=CourseRun.objects.not_discontinued()\n            )\n        )\n    )\n    for program in all_programs:\n        mmtrack_info = get_mmtrack(user, program)\n        response_data['programs'].append(get_info_for_program(mmtrack_info))\n    return response_data\n\n\ndef get_info_for_program(mmtrack):\n    \"\"\"\n    Helper function that formats a program with all the courses and runs\n\n    Args:\n        mmtrack (dashboard.utils.MMTrack): a instance of all user information about a program\n\n    Returns:\n        dict: a dictionary containing information about the program\n    \"\"\"\n    # basic data for the program\n    backend = BACKEND_MITX_ONLINE if mmtrack.program.has_mitxonline_courses else BACKEND_EDX_ORG\n    print(has_social_auth(mmtrack.user, backend))\n    data = {\n        \"id\": mmtrack.program.pk,\n        \"description\": mmtrack.program.description,\n        \"title\": mmtrack.program.title,\n        \"has_exams\": mmtrack.has_exams,\n        \"courses\": [],\n        \"exam_card_status\": mmtrack.get_exam_card_status(),\n        \"grade_average\": mmtrack.calculate_final_grade_average(),\n        \"certificate\": mmtrack.get_program_certificate_url(),\n        \"number_courses_required\": (\n            mmtrack.program.num_required_courses\n            if mmtrack.program.electives_set.exists()\n            else mmtrack.program.course_set.count()\n        ),\n        \"number_courses_passed\": mmtrack.get_number_of_passed_courses_for_completion(),\n        \"has_mitxonline_courses\": mmtrack.program.has_mitxonline_courses,\n        \"has_socialauth_for_backend\": has_social_auth(mmtrack.user, backend)\n    }\n\n    if mmtrack.has_exams:\n        data[\"grade_records_url\"] = reverse('grade_records', args=[mmtrack.get_program_enrollment().id])\n\n    program_letter_url = mmtrack.get_program_letter_url()\n    if program_letter_url:\n        data[\"program_letter_url\"] = program_letter_url\n    for course in mmtrack.program.course_set.all():\n        data['courses'].append(\n            get_info_for_course(course, mmtrack)\n        )\n    return data\n\n\ndef get_info_for_course(course, mmtrack):\n    \"\"\"\n    Checks the status of a course given the status of all its runs\n\n    Args:\n        course (Course): a course object\n        mmtrack (dashboard.utils.MMTrack): a instance of all user information about a program\n\n    Returns:\n        dict: dictionary representing the course status for the user\n    \"\"\"\n    # pylint: disable=too-many-statements\n\n    # data about the course to be returned anyway\n    course_data = {\n        \"id\": course.pk,\n        \"title\": course.title,\n        \"position_in_program\": course.position_in_program,\n        \"description\": course.description,\n        \"prerequisites\": course.prerequisites,\n        \"has_contact_email\": bool(course.contact_email),\n        \"can_schedule_exam\": is_exam_schedulable(mmtrack.user, course),\n        \"exam_register_end_date\": get_exam_register_end_date(course),\n        \"exam_course_key\": get_edx_exam_course_key(mmtrack.user, course),\n        \"exams_schedulable_in_future\": get_future_exam_runs(course),\n        \"exam_date_next_semester\": get_exam_date_next_semester(course),\n        \"current_exam_dates\": get_current_exam_run_dates(course),\n        \"runs\": [],\n        \"proctorate_exams_grades\": ProctoredExamGradeSerializer(\n            mmtrack.get_course_proctorate_exam_results(course), many=True\n        ).data,\n        \"is_elective\": ElectiveCourse.objects.filter(course=course).exists(),\n        \"has_exam\": course.has_exam,\n        \"certificate_url\": get_certificate_url(mmtrack, course),\n        \"overall_grade\": mmtrack.get_overall_final_grade_for_course(course),\n        \"is_passed\": mmtrack.has_passed_course(course)\n    }\n\n    def _add_run(run, mmtrack_, status):\n        \"\"\"Helper function to add a course run to the status dictionary\"\"\"\n        formatted_run = format_courserun_for_dashboard(\n            run,\n            status,\n            mmtrack=mmtrack_,\n            position=len(course_data['runs']) + 1\n        )\n        if run.is_current and mmtrack_.is_enrolled_mmtrack(formatted_run['course_id']):\n            # Prepend current run on the top because user can pay and enroll for current run as well as\n            # future run and the dashboard UI picks first run to display. User should be able to\n            # see current run progress on dashboard UI.\n            course_data['runs'] = [formatted_run] + course_data['runs']\n        else:\n            course_data['runs'].append(formatted_run)\n\n    with transaction.atomic():\n        runs_qs = course.courserun_set.not_discontinued()\n        if not runs_qs.count():\n            return course_data\n        # get all the run statuses\n        run_statuses = [get_status_for_courserun(course_run, mmtrack)\n                        for course_run in runs_qs]\n    # sort them by end date\n    run_statuses.sort(key=lambda x: x.course_run.end_date or\n                      datetime.datetime(datetime.MAXYEAR, 1, 1, tzinfo=pytz.utc), reverse=True)\n    # pick the first `not enrolled` or the first\n    for run_status in run_statuses:\n        if run_status.status != CourseRunStatus.NOT_ENROLLED:\n            break\n    else:\n        run_status = run_statuses[0]\n    # remove the picked run_status from the list\n    run_statuses.remove(run_status)\n\n    if run_status.status == CourseRunStatus.NOT_ENROLLED:\n        next_run = course.first_unexpired_run()\n        if next_run is not None:\n            _add_run(next_run, mmtrack, CourseStatus.OFFERED)\n    elif run_status.status == CourseRunStatus.NOT_PASSED:\n        _add_run(run_status.course_run, mmtrack, CourseRunStatus.NOT_PASSED)\n        next_run = course.first_unexpired_run()\n        if next_run is not None:\n            _add_run(next_run, mmtrack, CourseStatus.OFFERED)\n    elif run_status.status == CourseRunStatus.MISSED_DEADLINE:\n        _add_run(run_status.course_run, mmtrack, CourseStatus.MISSED_DEADLINE)\n        next_run = course.first_unexpired_run()\n        if next_run is not None:\n            _add_run(next_run, mmtrack, CourseStatus.OFFERED)\n    elif run_status.status == CourseRunStatus.CURRENTLY_ENROLLED:\n        _add_run(run_status.course_run, mmtrack, CourseStatus.CURRENTLY_ENROLLED)\n    # check if we need to check the certificate\n    elif run_status.status == CourseRunStatus.CHECK_IF_PASSED:\n        if not mmtrack.has_passed_course_run(run_status.course_run.edx_course_ke",
+      "total_lines": 793
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "datetime",
+        "logging",
+        "urllib.parse:urljoin",
+        "pytz",
+        "django.conf:settings",
+        "django.contrib.auth:get_user_model",
+        "django.core.exceptions:ImproperlyConfigured",
+        "django.core.exceptions:ObjectDoesNotExist",
+        "django.db:transaction",
+        "django.db.models:Prefetch",
+        "django.urls:reverse",
+        "django_redis:get_redis_connection",
+        "edx_api.client:EdxApi",
+        "backends:utils",
+        "backends.constants:BACKEND_EDX_ORG",
+        "backends.constants:BACKEND_MITX_ONLINE",
+        "backends.constants:COURSEWARE_BACKEND_URL",
+        "backends.constants:COURSEWARE_BACKENDS",
+        "backends.exceptions:InvalidCredentialStored",
+        "backends.utils:has_social_auth",
+        "courses.models:CourseRun",
+        "courses.models:ElectiveCourse",
+        "courses.models:Program",
+        "courses.utils:format_season_year_for_course_run",
+        "exams.models:ExamAuthorization",
+        "exams.models:ExamRun",
+        "dashboard.api_edx_cache:CachedEdxDataApi",
+        "dashboard.constants:DEDP_PROGRAM_TITLE",
+        "dashboard.models:ProgramEnrollment",
+        "dashboard.utils:get_mmtrack"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/mitodl/micromasters/master/README.md",
+      "content_excerpt": "[![Build Status](https://travis-ci.org/mitodl/micromasters.svg?branch=master)](https://travis-ci.org/mitodl/micromasters) [![codecov](https://codecov.io/gh/mitodl/micromasters/branch/master/graph/badge.svg)](https://codecov.io/gh/mitodl/micromasters)\n\n# MicroMasters\nPortal for learners and course teams to access MITx MicroMasters programs.\n\n# Initial setup\n\nMicroMasters mostly follows the same [initial setup steps outlined in the common ODL web app guide](https://mitodl.github.io/handbook/how-to/common-web-app-guide.html).\nRun through those steps in order with the following changes:\n\n1. After [creating the database models](https://github.com/mitodl/handbook/blob/master/common-web-app-guide.md#3-create-database-tables-from-the-django-models), you should create the Opensearch indices via management command:\n\n   ```\n   docker-compose run web ./manage.py recreate_index\n   ```\n\n1. **Do not run the `createsuperuser` command.** When you log into this app via edX, a MicroMasters\nDjango user is created for you automatically. See the section below for instructions on how to run edX locally.\n\n\n### Running edX devstack locally _(optional, but recommended)_\n\nMicroMasters can work with a deployed instance of edX, but it's recommended that\nyou get it running locally. It's obviously more configurable that way, and you'll\nlikely need to run it locally for other projects in the future.\n\n#### 1) Install edX\nInstall edX following this guide https://github.com/mitodl/micromasters/blob/master/docs/configure_open_edx.md\n\n\n#### 2) Copy relevant values to use in the MicroMasters .env file\n\nThe Micr"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "format_courserun_for_dashboard test",
+      "count": 1,
+      "items": [
+        {
+          "name": "api_test.py",
+          "path": "dashboard/api_test.py",
+          "sha": "0ee1172fd79f09db062587d3a8e1c051cfac9771",
+          "html_url": "https://github.com/mitodl/micromasters/blob/a0a827b927317daf82397bae3abbe79a642d52d6/dashboard/api_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"format_courserun_for_dashboard(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "api.py",
+          "path": "dashboard/api.py",
+          "sha": "ec349b66cf7774261b11798f4dfa101921e2af00",
+          "html_url": "https://github.com/mitodl/micromasters/blob/a0a827b927317daf82397bae3abbe79a642d52d6/dashboard/api.py",
+          "score": 1.0
+        },
+        {
+          "name": "api_test.py",
+          "path": "dashboard/api_test.py",
+          "sha": "0ee1172fd79f09db062587d3a8e1c051cfac9771",
+          "html_url": "https://github.com/mitodl/micromasters/blob/a0a827b927317daf82397bae3abbe79a642d52d6/dashboard/api_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "dashboard",
+      "count": 25,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "dashboard/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "admin.py",
+          "path": "dashboard/admin.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "dashboard/api.py",
+          "type": "file"
+        },
+        {
+          "name": "api_edx_cache.py",
+          "path": "dashboard/api_edx_cache.py",
+          "type": "file"
+        },
+        {
+          "name": "api_edx_cache_test.py",
+          "path": "dashboard/api_edx_cache_test.py",
+          "type": "file"
+        },
+        {
+          "name": "api_test.py",
+          "path": "dashboard/api_test.py",
+          "type": "file"
+        },
+        {
+          "name": "apps.py",
+          "path": "dashboard/apps.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "dashboard/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "factories.py",
+          "path": "dashboard/factories.py",
+          "type": "file"
+        },
+        {
+          "name": "fixtures",
+          "path": "dashboard/fixtures",
+          "type": "dir"
+        },
+        {
+          "name": "migrations",
+          "path": "dashboard/migrations",
+          "type": "dir"
+        },
+        {
+          "name": "models.py",
+          "path": "dashboard/models.py",
+          "type": "file"
+        },
+        {
+          "name": "permissions.py",
+          "path": "dashboard/permissions.py",
+          "type": "file"
+        },
+        {
+          "name": "permissions_test.py",
+          "path": "dashboard/permissions_test.py",
+          "type": "file"
+        },
+        {
+          "name": "serializers.py",
+          "path": "dashboard/serializers.py",
+          "type": "file"
+        },
+        {
+          "name": "serializers_test.py",
+          "path": "dashboard/serializers_test.py",
+          "type": "file"
+        },
+        {
+          "name": "signals.py",
+          "path": "dashboard/signals.py",
+          "type": "file"
+        },
+        {
+          "name": "signals_test.py",
+          "path": "dashboard/signals_test.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks.py",
+          "path": "dashboard/tasks.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks_test.py",
+          "path": "dashboard/tasks_test.py",
+          "type": "file"
+        },
+        {
+          "name": "urls.py",
+          "path": "dashboard/urls.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "dashboard/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "utils_test.py",
+          "path": "dashboard/utils_test.py",
+          "type": "file"
+        },
+        {
+          "name": "views.py",
+          "path": "dashboard/views.py",
+          "type": "file"
+        },
+        {
+          "name": "views_test.py",
+          "path": "dashboard/views_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "dashboard/__init__.py"
+        },
+        {
+          "name": "admin.py",
+          "path": "dashboard/admin.py"
+        },
+        {
+          "name": "api_edx_cache.py",
+          "path": "dashboard/api_edx_cache.py"
+        },
+        {
+          "name": "api_edx_cache_test.py",
+          "path": "dashboard/api_edx_cache_test.py"
+        },
+        {
+          "name": "api_test.py",
+          "path": "dashboard/api_test.py"
+        },
+        {
+          "name": "apps.py",
+          "path": "dashboard/apps.py"
+        },
+        {
+          "name": "constants.py",
+          "path": "dashboard/constants.py"
+        },
+        {
+          "name": "factories.py",
+          "path": "dashboard/factories.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "dashboard/api.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "c96eba4487a46eee2e4f6a1a8b99af4b9223e68a",
+          "html_url": "https://github.com/mitodl/micromasters/commit/c96eba4487a46eee2e4f6a1a8b99af4b9223e68a",
+          "message": "Remove ecommerce and Cybersource payment processing code (#5447)\n\n* Initial plan\n\nRemove ecommerce backend integrations from settings, URLs, and dependent modules\n\nCo-authored-by: pdpinch <430126+pdpinch@users.noreply.github.com>\n\nRemove ecommerce frontend code and checkout functionality\n\nCo-authore",
+          "author": "Copilot",
+          "date": "2026-02-24T05:02:31Z"
+        },
+        {
+          "sha": "4772ce89077bdbce992d4524a01a3664854542c4",
+          "html_url": "https://github.com/mitodl/micromasters/commit/4772ce89077bdbce992d4524a01a3664854542c4",
+          "message": "chore: upgrade django to v52 and wagtail to v7 (#5443)\n\n* temp: WIP\n\ntemp: empty commit\n\ntemp: Django 3.2 working\n\ntemp: django upgraded 3.2\n\ntemp: incomplete django4\n\ntemp: before running django-upgrade\n\nchore: django42 done\n\nchore: django52 working\n\nchore: upgrade python version in CI\n\nchore: run ",
+          "author": "Muhammad Anas",
+          "date": "2026-01-15T06:42:26Z"
+        },
+        {
+          "sha": "dcf2fdab0918de8cb2f35d93299ddf60802d30bf",
+          "html_url": "https://github.com/mitodl/micromasters/commit/dcf2fdab0918de8cb2f35d93299ddf60802d30bf",
+          "message": "Just log info when user has no social auth (#5411)",
+          "author": "annagav",
+          "date": "2024-12-09T22:10:21Z"
+        },
+        {
+          "sha": "7fdf7d4f69a58e2b16cd8a6d657d3126fa2c451f",
+          "html_url": "https://github.com/mitodl/micromasters/commit/7fdf7d4f69a58e2b16cd8a6d657d3126fa2c451f",
+          "message": "Add warning message to DEDP dashboard (#5399)",
+          "author": "annagav",
+          "date": "2024-10-03T12:44:53Z"
+        },
+        {
+          "sha": "8876d404bbd8982137edbca68e5c566c67fce0d3",
+          "html_url": "https://github.com/mitodl/micromasters/commit/8876d404bbd8982137edbca68e5c566c67fce0d3",
+          "message": "Prompt learners to reauthenticate",
+          "author": "Nathan Levesque",
+          "date": "2023-04-14T20:37:00Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "format_courserun_for_dashboard TODO here goes logic pull",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "dashboard/api.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "c96eba4487a46eee2e4f6a1a8b99af4b9223e68a",
+        "html_url": "https://github.com/mitodl/micromasters/commit/c96eba4487a46eee2e4f6a1a8b99af4b9223e68a",
+        "message": "Remove ecommerce and Cybersource payment processing code (#5447)\n\n* Initial plan\n\nRemove ecommerce backend integrations from settings, URLs, and dependent modules\n\nCo-authored-by: pdpinch <430126+pdpinch@users.noreply.github.com>\n\nRemove ecommerce frontend code and checkout functionality\n\nCo-authore",
+        "author": "Copilot",
+        "date": "2026-02-24T05:02:31Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

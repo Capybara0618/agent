@@ -1,0 +1,262 @@
+{
+  "task_id": "64",
+  "repo_owner": "iterative",
+  "repo_name": "dvc",
+  "file_path": "dvc/repo/experiments/queue/tasks.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T12:32:40+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T12:32:53+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T12:33:01+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "dvc/repo/experiments/queue/tasks.py",
+    "original_code": "def collect_exp(\n    proc_dict: Dict[str, Any],\n    entry_dict: Dict[str, Any],\n) -> str:\n    \"\"\"Collect results for an experiment.\n\n    Arguments:\n        proc_dict: Serialized ProcessInfo for experiment executor process.\n        entry_dict: Serialized QueueEntry for this experiment.\n\n    Returns:\n        Directory to be cleaned up after this experiment.\n    \"\"\"\n    from dvc.repo import Repo\n    from dvc_task.proc.process import ProcessInfo\n\n    proc_info = ProcessInfo.from_dict(proc_dict)\n    if proc_info.returncode != 0:\n        # TODO: handle errors, track failed exps separately\n        pass\n\n    entry = QueueEntry.from_dict(entry_dict)\n    repo = Repo(entry.dvc_root)\n    infofile = repo.experiments.celery_queue.get_infofile_path(entry.stash_rev)\n    executor_info = ExecutorInfo.load_json(infofile)\n    logger.debug(\"Collecting experiment info '%s'\", str(executor_info))\n    executor = TempDirExecutor.from_info(executor_info)\n    exec_result = executor_info.result\n    try:\n        if exec_result is not None:\n            results = BaseStashQueue.collect_executor(\n                repo.experiments, executor, exec_result\n            )\n            for rev in results:\n                logger.debug(\"Collected experiment '%s'\", rev[:7])\n        else:\n            logger.debug(\"Exec result was None\")\n    except Exception:  # pylint: disable=broad-except\n        # Log exceptions but do not re-raise so that task chain execution\n        # continues\n        logger.exception(\"Failed to collect experiment\")\n    return executor.root_dir",
+    "satd_comment": "# TODO: handle errors, track failed exps separately",
+    "target_file": {
+      "ok": true,
+      "path": "dvc/repo/experiments/queue/tasks.py",
+      "sha": "deb250f82d63826d5b8842c327a96c9221e58f3f",
+      "download_url": "https://raw.githubusercontent.com/treeverse/dvc/main/dvc/repo/experiments/queue/tasks.py",
+      "content_excerpt": "from typing import TYPE_CHECKING, Any, Optional\n\nfrom celery import shared_task\nfrom celery.utils.log import get_task_logger\n\nfrom dvc.repo.experiments.executor.base import ExecutorInfo\nfrom dvc.repo.experiments.executor.local import TempDirExecutor\n\nfrom .base import BaseStashQueue, QueueEntry\n\nif TYPE_CHECKING:\n    from dvc.repo.experiments.executor.base import BaseExecutor\n\n\nlogger = get_task_logger(__name__)\n\n\n@shared_task\ndef setup_exp(entry_dict: dict[str, Any]) -> \"BaseExecutor\":\n    \"\"\"Setup an experiment.\n\n    Arguments:\n        entry_dict: Serialized QueueEntry for this experiment.\n\n    Returns:\n        Root executor (temp) directory for this experiment.\n    \"\"\"\n    from dvc.repo import Repo\n\n    entry = QueueEntry.from_dict(entry_dict)\n    with Repo(entry.dvc_root) as repo:\n        # TODO: split executor.init_cache into separate subtask - we can release\n        # exp.scm_lock before DVC push\n        executor = BaseStashQueue.init_executor(\n            repo.experiments,\n            entry,\n            TempDirExecutor,\n            location=\"dvc-task\",\n        )\n        infofile = repo.experiments.celery_queue.get_infofile_path(entry.stash_rev)\n        executor.info.dump_json(infofile)\n    return executor\n\n\n@shared_task\ndef collect_exp(\n    proc_dict: dict[str, Any],  # noqa: ARG001\n    entry_dict: dict[str, Any],\n) -> str:\n    \"\"\"Collect results for an experiment.\n\n    Arguments:\n        proc_dict: Serialized ProcessInfo for experiment executor process.\n        entry_dict: Serialized QueueEntry for this experiment.\n\n    Returns:\n        Directory to be cleaned up after this experiment.\n    \"\"\"\n    from dvc.repo import Repo\n\n    entry = QueueEntry.from_dict(entry_dict)\n    with Repo(entry.dvc_root) as repo:\n        celery_queue = repo.experiments.celery_queue\n        infofile = celery_queue.get_infofile_path(entry.stash_rev)\n        executor_info = ExecutorInfo.load_json(infofile)\n        logger.debug(\"Collecting experiment info '%s'\", str(executor_info))\n        executor = TempDirExecutor.from_info(executor_info)\n        exec_result = executor_info.result\n        try:\n            if exec_result is not None:\n                BaseStashQueue.collect_executor(repo.experiments, executor, exec_result)\n            else:\n                logger.debug(\"Experiment failed (Exec result was None)\")\n                celery_queue.stash_failed(entry)\n        except Exception:\n            # Log exceptions but do not re-raise so that task chain execution\n            # continues\n            logger.exception(\"Failed to collect experiment\")\n    return executor.root_dir\n\n\n@shared_task\ndef cleanup_exp(executor: TempDirExecutor, infofile: str) -> None:\n    \"\"\"Cleanup after an experiment.\n\n    Arguments:\n        tmp_dir: Temp directory to be removed.\n        entry_dict: Serialized QueueEntry for this experiment.\n    \"\"\"\n    executor.cleanup(infofile)\n\n\n@shared_task\ndef run_exp(\n    entry_dict: dict[str, Any],\n    copy_paths: Optional[list[str]] = None,\n    message: Optional[str] = None,\n) -> None:\n    \"\"\"Run a full experiment.\n\n    Experiment subtasks are executed inline as one atomic operation.\n\n    Arguments:\n        entry_dict: Serialized QueueEntry for this experiment.\n    \"\"\"\n    from dvc.repo import Repo\n\n    entry = QueueEntry.from_dict(entry_dict)\n    with Repo(entry.dvc_root) as repo:\n        queue = repo.experiments.celery_queue\n        infofile = queue.get_infofile_path(entry.stash_rev)\n    executor = setup_exp.s(entry_dict)()\n    try:\n        cmd = [\"dvc\", \"exp\", \"exec-run\", \"--infofile\", infofile]\n        if copy_paths:\n            for path in copy_paths:\n                cmd.extend([\"--copy-paths\", path])\n        if message:\n            cmd.extend([\"--message\", message])\n        proc_dict = queue.proc.run_signature(cmd, name=entry.stash_rev)()\n        collect_exp.s(proc_dict, entry_dict)()\n    finally:\n        cleanup_exp.s(executor, infofile)()\n",
+      "total_lines": 123
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Optional",
+        "celery:shared_task",
+        "celery.utils.log:get_task_logger",
+        "dvc.repo.experiments.executor.base:ExecutorInfo",
+        "dvc.repo.experiments.executor.local:TempDirExecutor",
+        "base:BaseStashQueue",
+        "base:QueueEntry",
+        "dvc.repo.experiments.executor.base:BaseExecutor",
+        "dvc.repo:Repo",
+        "dvc.repo:Repo",
+        "dvc.repo:Repo"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/treeverse/dvc/main/README.rst",
+      "content_excerpt": "|Banner|\n\n`Website <https://dvc.org>`_\n• `Docs <https://dvc.org/doc>`_\n• `Blog <http://blog.dataversioncontrol.com>`_\n• `Tutorial <https://dvc.org/doc/get-started>`_\n• `Related Technologies <https://dvc.org/doc/user-guide/related-technologies>`_\n• `How DVC works`_\n• `VS Code Extension`_\n• `Installation`_\n• `Contributing`_\n• `Community and Support`_\n\n|CI| |Python Version| |Coverage| |VS Code| |DOI|\n\n|PyPI| |PyPI Downloads| |Packages| |Brew| |Conda| |Choco| |Snap|\n\n|\n\n**Data Version Control** or **DVC** is a command line tool and `VS Code Extension`_ to help you develop reproducible machine learning projects:\n\n#. **Version** your data and models.\n   Store them in your cloud storage but keep their version info in your Git repo.\n\n#. **Iterate** fast with lightweight pipelines.\n   When you make changes, only run the steps impacted by those changes.\n\n#. **Track** experiments in your local Git repo (no servers needed).\n\n#. **Compare** any data, code, parameters, model, or performance plots.\n\n#. **Share** experiments and automatically reproduce anyone's experiment.\n\nQuick start\n===========\n\n    Please read our `Command Reference <https://dvc.org/doc/command-reference>`_ for a complete list.\n\nA common CLI workflow includes:\n\n\n+-----------------------------------+----------------------------------------------------------------------------------------------------+\n| Task                              | Terminal                                                                                           |\n+===================================+================================================"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "collect_exp test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"collect_exp(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "dvc/repo/experiments/queue",
+      "count": 9,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "dvc/repo/experiments/queue/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "dvc/repo/experiments/queue/base.py",
+          "type": "file"
+        },
+        {
+          "name": "celery.py",
+          "path": "dvc/repo/experiments/queue/celery.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "dvc/repo/experiments/queue/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "remove.py",
+          "path": "dvc/repo/experiments/queue/remove.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks.py",
+          "path": "dvc/repo/experiments/queue/tasks.py",
+          "type": "file"
+        },
+        {
+          "name": "tempdir.py",
+          "path": "dvc/repo/experiments/queue/tempdir.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "dvc/repo/experiments/queue/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "workspace.py",
+          "path": "dvc/repo/experiments/queue/workspace.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "dvc/repo/experiments/queue/__init__.py"
+        },
+        {
+          "name": "base.py",
+          "path": "dvc/repo/experiments/queue/base.py"
+        },
+        {
+          "name": "celery.py",
+          "path": "dvc/repo/experiments/queue/celery.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "dvc/repo/experiments/queue/exceptions.py"
+        },
+        {
+          "name": "remove.py",
+          "path": "dvc/repo/experiments/queue/remove.py"
+        },
+        {
+          "name": "tempdir.py",
+          "path": "dvc/repo/experiments/queue/tempdir.py"
+        },
+        {
+          "name": "utils.py",
+          "path": "dvc/repo/experiments/queue/utils.py"
+        },
+        {
+          "name": "workspace.py",
+          "path": "dvc/repo/experiments/queue/workspace.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "dvc/repo/experiments/queue/tasks.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b647475a642d0ff31540453af5ffc25eb1f70c66",
+          "html_url": "https://github.com/treeverse/dvc/commit/b647475a642d0ff31540453af5ffc25eb1f70c66",
+          "message": "drop Python 3.8 support (#10265)\n\n* drop Python 3.8\r\n\r\nNote that this PR only makes typing related changes.\r\nOther changes can be done once this gets merged, they\r\nare relatively few in numbers.\r\n\r\n* bump build python version\r\n\r\n* add typing_extensions to lint group",
+          "author": "skshetry",
+          "date": "2024-01-30T09:33:25Z"
+        },
+        {
+          "sha": "d678773b53a22d96ace4c1cafc69703ca5893ded",
+          "html_url": "https://github.com/treeverse/dvc/commit/d678773b53a22d96ace4c1cafc69703ca5893ded",
+          "message": "remove more pylint suppression comments (#10084)",
+          "author": "skshetry",
+          "date": "2023-11-10T09:34:52Z"
+        },
+        {
+          "sha": "06565e18b44e2bf27bd837491f8c46c540453459",
+          "html_url": "https://github.com/treeverse/dvc/commit/06565e18b44e2bf27bd837491f8c46c540453459",
+          "message": "remove pylint suppression comments (#10080)",
+          "author": "skshetry",
+          "date": "2023-11-09T14:46:50Z"
+        },
+        {
+          "sha": "c74dc20b97de7c74a50250845c2617af61e717a4",
+          "html_url": "https://github.com/treeverse/dvc/commit/c74dc20b97de7c74a50250845c2617af61e717a4",
+          "message": "exp run: Support `--message`.\n\nCustom commit message to use when committing the experiment.\n\nPart of #8870",
+          "author": "David de la Iglesia Castro",
+          "date": "2023-05-04T14:51:03Z"
+        },
+        {
+          "sha": "3312a90949879b219f1433b6018894753fdc4d53",
+          "html_url": "https://github.com/treeverse/dvc/commit/3312a90949879b219f1433b6018894753fdc4d53",
+          "message": "exp run: Add `--copy-paths` arg.\n\nList of paths to copy inside the temp directory. Only used if `--temp` or `--queue` is specified.\n\nCloses #5800",
+          "author": "David de la Iglesia Castro",
+          "date": "2023-04-05T17:07:42Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "collect_exp TODO handle errors track failed",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "dvc/repo/experiments/queue/tasks.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "b647475a642d0ff31540453af5ffc25eb1f70c66",
+        "html_url": "https://github.com/treeverse/dvc/commit/b647475a642d0ff31540453af5ffc25eb1f70c66",
+        "message": "drop Python 3.8 support (#10265)\n\n* drop Python 3.8\r\n\r\nNote that this PR only makes typing related changes.\r\nOther changes can be done once this gets merged, they\r\nare relatively few in numbers.\r\n\r\n* bump build python version\r\n\r\n* add typing_extensions to lint group",
+        "author": "skshetry",
+        "date": "2024-01-30T09:33:25Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function collect_exp",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

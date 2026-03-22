@@ -1,0 +1,451 @@
+{
+  "task_id": "128",
+  "repo_owner": "windelbouwman",
+  "repo_name": "ppci",
+  "file_path": "ppci/arch/stack.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T16:11:20+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "alloc",
+    "satd_line": 76,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 5,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T16:11:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T16:11:52+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "ppci/arch/stack.py",
+    "original_code": "def alloc(self, size, alignment):\n    \"\"\" Allocate space on the stack frame and return the offset \"\"\"\n    # determine alignment of whole stack frame as maximum alignment\n    self.alignment = max(self.alignment, alignment)\n    # TODO: grow down or up?\n    if size:\n        misalign = self.stacksize % alignment\n        if misalign:\n            self.stacksize = self.stacksize - misalign + size\n    l = StackLocation(self.stacksize, size)\n    self.stacksize += size\n    return l",
+    "satd_comment": "# TODO: grow down or up?",
+    "target_file": {
+      "ok": true,
+      "path": "ppci/arch/stack.py",
+      "sha": "02bb0ed83b9e503673c645af85458b67233a052f",
+      "download_url": "https://raw.githubusercontent.com/windelbouwman/ppci/master/ppci/arch/stack.py",
+      "content_excerpt": "\"\"\"This module contains all kind of classes to describe the stack\"\"\"\n\nimport enum\n\nfrom .encoding import Instruction\nfrom .generic_instructions import Label\nfrom .registers import Register\n\n\nclass FramePointerLocation(enum.Enum):\n    \"\"\"Define where the frame pointer is pointing to\"\"\"\n\n    TOP = 1\n    BOTTOM = 2\n\n\nclass StackLocation:\n    \"\"\"A stack location can store data just like a register\"\"\"\n\n    def __init__(self, offset: int, size: int):\n        # self.frame = frame  # The frame in which this location lives\n        self.offset = offset\n        self.size = size\n\n    def __repr__(self):\n        return f\"Stack[{self.size} bytes at {self.offset}]\"\n\n\ndef generate_temps():\n    n = 0\n    while True:\n        yield f\"vreg{n}\"\n        n = n + 1\n\n\nclass Frame:\n    \"\"\"\n    Activation record abstraction. This class contains a flattened\n    function. Instructions are selected and scheduled at this stage.\n    Frames differ per machine. The only thing left to do for a frame\n    is register allocation.\n    \"\"\"\n\n    def __init__(\n        self, name, debug_db=None, fp_location=FramePointerLocation.TOP\n    ):\n        self.name = name\n        self.debug_db = debug_db  # Eventual debug information\n        self.fp_location = fp_location\n        self.instructions = []\n        self.used_regs = set()\n        self.is_leaf = False  # TODO: detect leaf functions\n        self.out_calls = []\n        self.temps = generate_temps()\n\n        # Local stack:\n        self.stacksize = 0\n        self.alignment = 1\n\n        # Literal pool:\n        self.constants = []\n        self.literal_number = 0\n\n    def __repr__(self):\n        return f\"Frame {self.name}\"\n\n    def alloc(self, size: int, alignment: int):\n        \"\"\"Allocate space on the stack frame and return a stacklocation\"\"\"\n        # determine alignment of whole stack frame as maximum alignment\n        self.alignment = max(self.alignment, alignment)\n\n        # Calling alloc with 0 indicates a problem somewhere.\n        if size == 0:\n            raise ValueError(\"Trying to allocate 0 bytes\")\n\n        # grow down or up?\n        if self.fp_location == FramePointerLocation.TOP:\n            # Create a negative offset from framepointer:\n            self.stacksize += size\n            misalign = self.stacksize % alignment\n            if misalign:\n                self.stacksize = self.stacksize - misalign + alignment\n            # When frame pointer is located at top of the stackframe,\n            # the offset is negative:\n            offset = -self.stacksize\n        else:\n            misalign = self.stacksize % alignment\n            if misalign:\n                self.stacksize += size - misalign\n            offset = self.stacksize\n            self.stacksize += size\n        location = StackLocation(offset, size)\n        return location\n\n    def add_out_call(self, size):\n        \"\"\"Record that we made a call out of this function.\n\n        The size parameter determines how much bytes we needed to reserve\n        on the stack to pass the arguments.\n        \"\"\"\n        self.out_calls.append(size)\n\n    def new_name(self, salt):\n        \"\"\"Generate a new unique name\"\"\"\n        name = f\"{self.name}_{salt}_{self.literal_number}\"\n        self.literal_number += 1\n        return name\n\n    def add_constant(self, value):\n        \"\"\"Add constant literal to constant pool\"\"\"\n        for lab_name, val in self.constants:\n            if value == val:\n                return lab_name\n        assert isinstance(value, (str, int, bytes)), str(value)\n        lab_name = self.new_name(\"literal\")\n        self.constants.append((lab_name, value))\n        return lab_name\n\n    def is_used(self, register, alias):\n        \"\"\"Check if a register or one of its aliases is used by this frame.\"\"\"\n        # assert register in alias\n        return any(r in self.used_regs for r in alias[register.get_real()])\n\n    def live_ranges(self, vreg):\n        \"\"\"Determine the live range of some register\"\"\"\n        return self.cfg._live_ranges[vreg]\n\n    def new_reg(self, cls, twain=\"\"):\n        \"\"\"Retrieve a new virtual register\"\"\"\n        tmp_name = self.temps.__next__() + twain\n        assert issubclass(cls, Register)\n        tmp = cls(tmp_name)\n        return tmp\n\n    def new_label(self):\n        \"\"\"Generate a unique new label\"\"\"\n        return Label(self.new_name(\"label\"))\n\n    def emit(self, ins):\n        \"\"\"Append an abstract instruction to the end of this frame\"\"\"\n        assert isinstance(ins, Instruction)\n        self.instructions.append(ins)\n        return ins\n\n    def insert_code_before(self, instruction, code):\n        \"\"\"Insert a code sequence before an instruction\"\"\"\n        pt = self.instructions.index(instruction)\n        for idx, ins in enumerate(code):\n            self.instructions.insert(idx + pt, ins)\n\n    def insert_code_after(self, instruction, code):\n        \"\"\"Insert a code sequence after an instruction\"\"\"\n        pt = self.instructions.index(instruction) + 1\n        for idx, ins in enumerate(code):\n            self.instructions.insert(idx + pt, ins)\n",
+      "total_lines": 155
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 76,
+      "start_line": 56,
+      "end_line": 96,
+      "matched_line": "        # grow down or up?",
+      "excerpt": "56:         # Local stack:\n57:         self.stacksize = 0\n58:         self.alignment = 1\n59: \n60:         # Literal pool:\n61:         self.constants = []\n62:         self.literal_number = 0\n63: \n64:     def __repr__(self):\n65:         return f\"Frame {self.name}\"\n66: \n67:     def alloc(self, size: int, alignment: int):\n68:         \"\"\"Allocate space on the stack frame and return a stacklocation\"\"\"\n69:         # determine alignment of whole stack frame as maximum alignment\n70:         self.alignment = max(self.alignment, alignment)\n71: \n72:         # Calling alloc with 0 indicates a problem somewhere.\n73:         if size == 0:\n74:             raise ValueError(\"Trying to allocate 0 bytes\")\n75: \n76:         # grow down or up?\n77:         if self.fp_location == FramePointerLocation.TOP:\n78:             # Create a negative offset from framepointer:\n79:             self.stacksize += size\n80:             misalign = self.stacksize % alignment\n81:             if misalign:\n82:                 self.stacksize = self.stacksize - misalign + alignment\n83:             # When frame pointer is located at top of the stackframe,\n84:             # the offset is negative:\n85:             offset = -self.stacksize\n86:         else:\n87:             misalign = self.stacksize % alignment\n88:             if misalign:\n89:                 self.stacksize += size - misalign\n90:             offset = self.stacksize\n91:             self.stacksize += size\n92:         location = StackLocation(offset, size)\n93:         return location\n94: \n95:     def add_out_call(self, size):\n96:         \"\"\"Record that we made a call out of this function."
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "alloc",
+      "start_line": 67,
+      "end_line": 93,
+      "source": "    def alloc(self, size: int, alignment: int):\n        \"\"\"Allocate space on the stack frame and return a stacklocation\"\"\"\n        # determine alignment of whole stack frame as maximum alignment\n        self.alignment = max(self.alignment, alignment)\n\n        # Calling alloc with 0 indicates a problem somewhere.\n        if size == 0:\n            raise ValueError(\"Trying to allocate 0 bytes\")\n\n        # grow down or up?\n        if self.fp_location == FramePointerLocation.TOP:\n            # Create a negative offset from framepointer:\n            self.stacksize += size\n            misalign = self.stacksize % alignment\n            if misalign:\n                self.stacksize = self.stacksize - misalign + alignment\n            # When frame pointer is located at top of the stackframe,\n            # the offset is negative:\n            offset = -self.stacksize\n        else:\n            misalign = self.stacksize % alignment\n            if misalign:\n                self.stacksize += size - misalign\n            offset = self.stacksize\n            self.stacksize += size\n        location = StackLocation(offset, size)\n        return location"
+    },
+    "imports": {
+      "imports": [
+        "enum",
+        "encoding:Instruction",
+        "generic_instructions:Label",
+        "registers:Register"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "readme.rst",
+      "download_url": "https://raw.githubusercontent.com/windelbouwman/ppci/master/readme.rst",
+      "content_excerpt": "\nIntroduction\n============\n\nThe PPCI (Pure Python Compiler Infrastructure) project is a compiler\nwritten entirely in the `Python <https://www.python.org/>`_ programming\nlanguage. It contains front-ends for various programming languages as\nwell as machine code generation functionality. With this library you can\ngenerate (working!) machine code using Python (and thus very easy to\nexplore, extend, etc.)!\n\nThe project contains:\n\n- Language frontends for C, Python, Pascal, Basic and Brainfuck\n- Code generation for several architectures: 6500, arm, avr, m68k, microblaze, msp430, openrisc, risc-v, stm8, x86_64, xtensa\n- Command line utilities, such as ppci-cc, ppci-ld and ppci-opt\n- WebAssembly, JVM, OCaml support\n- Support for ELF, EXE, S-record and hexfile formats\n- An intermediate representation (IR) which can be serialized in json\n- The project can be used as a library so you can script the compilation process\n\nInstallation\n------------\n\nSince the compiler is a python package, you can install it with pip:\n\n.. code:: bash\n\n    $ pip install ppci\n\nUsage\n-----\n\nAn example of commandline usage:\n\n.. code:: bash\n\n    $ cd examples/linux64/hello-make\n    $ ppci-cc -c -O1 -o hello.o hello.c\n    ...\n    $ ppci-ld --entry main --layout linux64.ld hello.o -o hello\n    ...\n    $ ./hello\n    Hello, World!\n\nAPI example to compile C code:\n\n.. code-block:: python\n\n    >>> import io\n    >>> from ppci.api import cc, link\n    >>> source_file = io.StringIO(\"\"\"\n    ...  int printf(char* fmt) { }\n    ...  \n    ...  void main() {\n    ...     printf(\"Hello world!\\n\");\n    ...  }\n    ... \"\"\")\n    >>> "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "alloc test",
+      "count": 5,
+      "items": [
+        {
+          "name": "test_register_allocator.py",
+          "path": "test/codegen/test_register_allocator.py",
+          "sha": "41376522a66b4d4f9c90f6d5755b798ad4aa6b83",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/codegen/test_register_allocator.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_opt.py",
+          "path": "test/test_opt.py",
+          "sha": "f6be1e57502afae49f1dc007e07c4743e7a833a2",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/test_opt.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_arch.py",
+          "path": "test/arch/test_arch.py",
+          "sha": "2f9e0cde274a8298bb25a3c4875d2883530aac31",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/arch/test_arch.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_c.py",
+          "path": "test/lang/c/test_c.py",
+          "sha": "100fdb1245d2d29897621ecaf0f8f11ee0aa12c5",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/lang/c/test_c.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_various.py",
+          "path": "test/wasm/test_various.py",
+          "sha": "0bd58745133c011fe9a5bcaf64a7c112cb4160b3",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/wasm/test_various.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"alloc(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "bf.py",
+          "path": "ppci/lang/bf.py",
+          "sha": "6d221627b114d40b5241238d0707463670ea47e8",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/bf.py",
+          "score": 1.0
+        },
+        {
+          "name": "ff.c",
+          "path": "tools/fatfs/ff.c",
+          "sha": "3c3ade999172d0c1bb0dbd0847efea9531745a03",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/tools/fatfs/ff.c",
+          "score": 1.0
+        },
+        {
+          "name": "class2ir.py",
+          "path": "ppci/arch/jvm/class2ir.py",
+          "sha": "1a94306932b3bba31308dbc6b6e66aad2630744b",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/arch/jvm/class2ir.py",
+          "score": 1.0
+        },
+        {
+          "name": "wasm2ppci.py",
+          "path": "ppci/wasm/wasm2ppci.py",
+          "sha": "fe3ea60571de7b632d11dc167cbe1b74fdc7dab8",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/wasm/wasm2ppci.py",
+          "score": 1.0
+        },
+        {
+          "name": "codegenerator.py",
+          "path": "ppci/lang/c/codegenerator.py",
+          "sha": "ebe00b737e957cb7ce015ef82e246900b11c2812",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/c/codegenerator.py",
+          "score": 1.0
+        },
+        {
+          "name": "malloc.c",
+          "path": "examples/riscvmurax/csrc/string/malloc.c",
+          "sha": "35c625d3c56db957d494b23d05d723ecafc09a28",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/examples/riscvmurax/csrc/string/malloc.c",
+          "score": 1.0
+        },
+        {
+          "name": "stack.py",
+          "path": "ppci/arch/stack.py",
+          "sha": "02bb0ed83b9e503673c645af85458b67233a052f",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/arch/stack.py",
+          "score": 1.0
+        },
+        {
+          "name": "ffconf.h",
+          "path": "tools/fatfs/ffconf.h",
+          "sha": "47fc0b2bf0e16447b4a1afcc83a55ccc26f65a27",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/tools/fatfs/ffconf.h",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "ppci/arch",
+      "count": 29,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "ppci/arch/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "arch.py",
+          "path": "ppci/arch/arch.py",
+          "type": "file"
+        },
+        {
+          "name": "arch_info.py",
+          "path": "ppci/arch/arch_info.py",
+          "type": "file"
+        },
+        {
+          "name": "arm",
+          "path": "ppci/arch/arm",
+          "type": "dir"
+        },
+        {
+          "name": "asm_printer.py",
+          "path": "ppci/arch/asm_printer.py",
+          "type": "file"
+        },
+        {
+          "name": "avr",
+          "path": "ppci/arch/avr",
+          "type": "dir"
+        },
+        {
+          "name": "cc.py",
+          "path": "ppci/arch/cc.py",
+          "type": "file"
+        },
+        {
+          "name": "data_instructions.py",
+          "path": "ppci/arch/data_instructions.py",
+          "type": "file"
+        },
+        {
+          "name": "effects.py",
+          "path": "ppci/arch/effects.py",
+          "type": "file"
+        },
+        {
+          "name": "encoding.py",
+          "path": "ppci/arch/encoding.py",
+          "type": "file"
+        },
+        {
+          "name": "example.py",
+          "path": "ppci/arch/example.py",
+          "type": "file"
+        },
+        {
+          "name": "generic_instructions.py",
+          "path": "ppci/arch/generic_instructions.py",
+          "type": "file"
+        },
+        {
+          "name": "isa.py",
+          "path": "ppci/arch/isa.py",
+          "type": "file"
+        },
+        {
+          "name": "jvm",
+          "path": "ppci/arch/jvm",
+          "type": "dir"
+        },
+        {
+          "name": "m68k",
+          "path": "ppci/arch/m68k",
+          "type": "dir"
+        },
+        {
+          "name": "mcs6500",
+          "path": "ppci/arch/mcs6500",
+          "type": "dir"
+        },
+        {
+          "name": "microblaze",
+          "path": "ppci/arch/microblaze",
+          "type": "dir"
+        },
+        {
+          "name": "mips",
+          "path": "ppci/arch/mips",
+          "type": "dir"
+        },
+        {
+          "name": "msp430",
+          "path": "ppci/arch/msp430",
+          "type": "dir"
+        },
+        {
+          "name": "or1k",
+          "path": "ppci/arch/or1k",
+          "type": "dir"
+        },
+        {
+          "name": "registers.py",
+          "path": "ppci/arch/registers.py",
+          "type": "file"
+        },
+        {
+          "name": "riscv",
+          "path": "ppci/arch/riscv",
+          "type": "dir"
+        },
+        {
+          "name": "runtime.py",
+          "path": "ppci/arch/runtime.py",
+          "type": "file"
+        },
+        {
+          "name": "stack.py",
+          "path": "ppci/arch/stack.py",
+          "type": "file"
+        },
+        {
+          "name": "stm8",
+          "path": "ppci/arch/stm8",
+          "type": "dir"
+        },
+        {
+          "name": "target_list.py",
+          "path": "ppci/arch/target_list.py",
+          "type": "file"
+        },
+        {
+          "name": "token.py",
+          "path": "ppci/arch/token.py",
+          "type": "file"
+        },
+        {
+          "name": "x86_64",
+          "path": "ppci/arch/x86_64",
+          "type": "dir"
+        },
+        {
+          "name": "xtensa",
+          "path": "ppci/arch/xtensa",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "ppci/arch/__init__.py"
+        },
+        {
+          "name": "arch.py",
+          "path": "ppci/arch/arch.py"
+        },
+        {
+          "name": "arch_info.py",
+          "path": "ppci/arch/arch_info.py"
+        },
+        {
+          "name": "asm_printer.py",
+          "path": "ppci/arch/asm_printer.py"
+        },
+        {
+          "name": "cc.py",
+          "path": "ppci/arch/cc.py"
+        },
+        {
+          "name": "data_instructions.py",
+          "path": "ppci/arch/data_instructions.py"
+        },
+        {
+          "name": "effects.py",
+          "path": "ppci/arch/effects.py"
+        },
+        {
+          "name": "encoding.py",
+          "path": "ppci/arch/encoding.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "ppci/arch/stack.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "c37be94c262b3af27e3d57f0ebf7b8a41283887f",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/c37be94c262b3af27e3d57f0ebf7b8a41283887f",
+          "message": "Apply isort",
+          "author": "Windel Bouwman",
+          "date": "2025-08-18T17:00:37Z"
+        },
+        {
+          "sha": "806bad6a1da56ebe9b596a7b3d0f2ef92afec003",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/806bad6a1da56ebe9b596a7b3d0f2ef92afec003",
+          "message": "Convert to f-strings.",
+          "author": "Windel Bouwman",
+          "date": "2025-08-15T19:23:58Z"
+        },
+        {
+          "sha": "36ad3cfd768b77ba6c4cbd90a8b979fe087f4065",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/36ad3cfd768b77ba6c4cbd90a8b979fe087f4065",
+          "message": "Format library code with new formatting rules.",
+          "author": "Windel Bouwman",
+          "date": "2025-07-24T20:30:53Z"
+        },
+        {
+          "sha": "aeda64dcc4c2043870bf23f941c63eb3cb7f4313",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/aeda64dcc4c2043870bf23f941c63eb3cb7f4313",
+          "message": "Code style updates.",
+          "author": "Windel Bouwman",
+          "date": "2020-09-06T13:05:13Z"
+        },
+        {
+          "sha": "89d1b7ea03b2d307e7a473f980460158875c08dd",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/89d1b7ea03b2d307e7a473f980460158875c08dd",
+          "message": "Update handling of colored registers.",
+          "author": "Windel Bouwman",
+          "date": "2020-05-31T20:28:53Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "alloc TODO grow down",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "ppci/arch/stack.py",
+      "satd_line": 76,
+      "last_commit": {
+        "sha": "c37be94c262b3af27e3d57f0ebf7b8a41283887f",
+        "html_url": "https://github.com/windelbouwman/ppci/commit/c37be94c262b3af27e3d57f0ebf7b8a41283887f",
+        "message": "Apply isort",
+        "author": "Windel Bouwman",
+        "date": "2025-08-18T17:00:37Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 5,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "alloc",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

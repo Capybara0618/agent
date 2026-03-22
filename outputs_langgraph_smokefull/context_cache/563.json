@@ -1,0 +1,304 @@
+{
+  "task_id": "563",
+  "repo_owner": "tulir",
+  "repo_name": "mautrix-python",
+  "file_path": "mautrix/bridge/e2ee.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T19:16:50+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T19:17:01+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T19:17:05+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "mautrix/bridge/e2ee.py",
+    "original_code": "async def encrypt(self, room_id: RoomID, event_type: EventType,\n                  content: Union[Serializable, JSON]\n                  ) -> Tuple[EventType, EncryptedMegolmEventContent]:\n    try:\n        encrypted = await self.crypto.encrypt_megolm_event(room_id, event_type, content)\n    except EncryptionError:\n        self.log.debug(\"Got EncryptionError, sharing group session and trying again\")\n        if not self.crypto.is_sharing_group_session(room_id):\n            # TODO if this becomes async, this should be locked separately\n            #      instead of only relying on crypto.wait_group_session\n            users = UserProfile.all_in_room(room_id, self._id_prefix, self._id_suffix,\n                                            self.bot_mxid)\n            await self.crypto.share_group_session(room_id, [profile.user_id\n                                                            for profile in users])\n        else:\n            await self.crypto.wait_group_session(room_id)\n        encrypted = await self.crypto.encrypt_megolm_event(room_id, event_type, content)\n    return EventType.ROOM_ENCRYPTED, encrypted",
+    "satd_comment": "# TODO if this becomes async, this should be locked separately\n#      instead of only relying on crypto.wait_group_session",
+    "target_file": {
+      "ok": true,
+      "path": "mautrix/bridge/e2ee.py",
+      "sha": "1525b388d50ba6fec2f35cfa0468ee5df28b5a9e",
+      "download_url": "https://raw.githubusercontent.com/mautrix/python/master/mautrix/bridge/e2ee.py",
+      "content_excerpt": "# Copyright (c) 2022 Tulir Asokan\n#\n# This Source Code Form is subject to the terms of the Mozilla Public\n# License, v. 2.0. If a copy of the MPL was not distributed with this\n# file, You can obtain one at http://mozilla.org/MPL/2.0/.\nfrom __future__ import annotations\n\nimport asyncio\nimport logging\nimport sys\n\nfrom mautrix import __optional_imports__\nfrom mautrix.appservice import AppService\nfrom mautrix.client import Client, InternalEventType, SyncStore\nfrom mautrix.crypto import CryptoStore, OlmMachine, PgCryptoStore, RejectKeyShare, StateStore\nfrom mautrix.errors import EncryptionError, MForbidden, MNotFound, SessionNotFound\nfrom mautrix.types import (\n    JSON,\n    DeviceIdentity,\n    EncryptedEvent,\n    EncryptedMegolmEventContent,\n    EventFilter,\n    EventType,\n    Filter,\n    LoginType,\n    MessageEvent,\n    RequestedKeyInfo,\n    RoomEventFilter,\n    RoomFilter,\n    RoomID,\n    RoomKeyWithheldCode,\n    Serializable,\n    StateEvent,\n    StateFilter,\n    TrustState,\n)\nfrom mautrix.util import background_task\nfrom mautrix.util.async_db import Database\nfrom mautrix.util.logging import TraceLogger\n\nfrom .. import bridge as br\nfrom .crypto_state_store import PgCryptoStateStore\n\n\nclass EncryptionManager:\n    loop: asyncio.AbstractEventLoop\n    log: TraceLogger = logging.getLogger(\"mau.bridge.e2ee\")\n\n    client: Client\n    crypto: OlmMachine\n    crypto_store: CryptoStore | SyncStore\n    crypto_db: Database | None\n    state_store: StateStore\n\n    min_send_trust: TrustState\n    key_sharing_enabled: bool\n    appservice_mode: bool\n    periodically_delete_expired_keys: bool\n    delete_outdated_inbound: bool\n    msc4190: bool\n    self_sign: bool\n\n    bridge: br.Bridge\n    az: AppService\n    _id_prefix: str\n    _id_suffix: str\n\n    _share_session_events: dict[RoomID, asyncio.Event]\n    _key_delete_task: asyncio.Task | None\n\n    def __init__(\n        self,\n        bridge: br.Bridge,\n        homeserver_address: str,\n        user_id_prefix: str,\n        user_id_suffix: str,\n        db_url: str,\n    ) -> None:\n        self.loop = bridge.loop or asyncio.get_event_loop()\n        self.bridge = bridge\n        self.az = bridge.az\n        self.device_name = bridge.name\n        self._id_prefix = user_id_prefix\n        self._id_suffix = user_id_suffix\n        self._share_session_events = {}\n        pickle_key = \"mautrix.bridge.e2ee\"\n        self.crypto_db = Database.create(\n            url=db_url,\n            upgrade_table=PgCryptoStore.upgrade_table,\n            log=logging.getLogger(\"mau.crypto.db\"),\n        )\n        self.crypto_store = PgCryptoStore(\"\", pickle_key, self.crypto_db)\n        self.state_store = PgCryptoStateStore(self.crypto_db, bridge.get_portal)\n        default_http_retry_count = bridge.config.get(\"homeserver.http_retry_count\", None)\n        self.client = Client(\n            base_url=homeserver_address,\n            mxid=self.az.bot_mxid,\n            loop=self.loop,\n            sync_store=self.crypto_store,\n            log=self.log.getChild(\"client\"),\n            default_retry_count=default_http_retry_count,\n            state_store=self.bridge.state_store,\n        )\n        self.crypto = OlmMachine(self.client, self.crypto_store, self.state_store)\n        self.client.add_event_handler(InternalEventType.SYNC_STOPPED, self._exit_on_sync_fail)\n        self.crypto.allow_key_share = self.allow_key_share\n        verification_levels = bridge.config[\"bridge.encryption.verification_levels\"]\n        self.min_send_trust = TrustState.parse(verification_levels[\"send\"])\n        self.crypto.share_keys_min_trust = TrustState.parse(verification_levels[\"share\"])\n        self.crypto.send_keys_min_trust = TrustState.parse(verification_levels[\"receive\"])\n        self.key_sharing_enabled = bridge.config[\"bridge.encryption.allow_key_sharing\"]\n        self.appservice_mode = bridge.config[\"bridge.encryption.appservice\"]\n        self.msc4190 = bridge.config[\"bridge.encryption.msc4190\"]\n        self.self_sign = bridge.config[\"bridge.encryption.self_sign\"]\n        if self.appservice_mode:\n            self.az.otk_handler = self.crypto.handle_as_otk_counts\n            self.az.device_list_handler = self.crypto.handle_as_device_lists\n            self.az.to_device_handler = self.crypto.handle_as_to_device_event\n\n        self.periodically_delete_expired_keys = False\n        self.delete_outdated_inbound = False\n        self._key_delete_task = None\n        del_cfg = bridge.config[\"bridge.encryption.delete_keys\"]\n        if del_cfg:\n            self.crypto.delete_outbound_keys_on_ack = del_cfg[\"delete_outbound_on_ack\"]\n            self.crypto.dont_store_outbound_keys = del_cfg[\"dont_store_outbound\"]\n            self.crypto.delete_previous_keys_on_receive = del_cfg[\"delete_prev_on_new_session\"]\n            self.crypto.ratchet_keys_on_decrypt = del_cfg[\"ratchet_on_decrypt\"]\n            self.crypto.delete_fully_used_keys_on_decrypt = del_cfg[\"delete_fully_used_on_decrypt\"]\n            self.crypto.delete_keys_on_device_delete = del_cfg[\"delete_on_device_delete\"]\n            self.periodically_delete_expired_keys = del_cfg[\"periodically_delete_expired\"]\n            self.delete_outdated_inbound = del_cfg[\"delete_outdated_inbound\"]\n        self.crypto.disable_device_change_key_rotation = bridge.config[\n            \"bridge.encryption.rotation.disable_device_change_key_rotation\"\n        ]\n\n    async def _exit_on_sync_fail(self, data) -> None:\n        if data[\"error\"]:\n            self.log.critical(\"Exiting due to crypto sync error\")\n            sys.exit(32)\n\n    async def allow_key_share(self, device: DeviceIdentity, request: RequestedKeyInfo) -> bool:\n        if not self.key_sharing_enabled:\n            self.log.debug(\n                f\"Key sharing not enabled, ignoring key request from \"\n                f\"{device.user_id}/{device.device_id}\"\n            )\n            return False\n        elif device.trust == TrustState.BLACKLISTED:\n            raise RejectKeyShare(\n                f\"Rejecting key request from blacklisted device \"\n                f\"{device.user_id}/{device.device_id}\",\n                code=RoomKeyWithheldCode.BLACKLISTED,\n                reason=\"Your device has been blacklisted by the bridge\",\n            )\n        elif await self.crypto.resolve_trust(device) >= self.crypto.share_keys_min_trust:\n            portal = await self.bridge.get_portal(request.room_id)\n            if portal is None:\n                raise RejectKeyShare(\n                    f\"Rejecting key request for {request.session_id} from \"\n                    f\"{device.user_id}/{device.device_id}: room is not a portal\",\n                    code=RoomKeyWithheldCode.UNAVAILABLE,\n                    reason=\"Requested room is not a portal\",\n                )\n            user = await self.bridge.get_user(device.user_id)\n            if not await user.is_in_portal(portal):\n                raise RejectKeyShare(\n                    f\"Rejecting key request for {request.session_id} from \"\n                    f\"{device.user_id}/{device.device_id}: user is not in portal\",\n                    code=RoomKeyWithheldCode.UNAUTHORIZED,\n                    reason=\"You're not in that portal\",\n                )\n            self.log.debug(\n                f\"Accepting key request for {request.session_id} from \"\n                f\"{device.user_id}/{device.device_id}\"\n            )\n            return True\n        else:\n            raise RejectKeyShare(\n                f\"Rejecting key request from unverified device \"\n                f\"{device.user_id}/{device.device_id}\",\n                code=RoomKeyWithheldCode.UNVERIFIED,\n                reason=\"Your device is not trusted by the bridge\",\n            )\n\n    def _ignore_user(self, user_id: str) -> bool:\n        return (\n            user_id.startswith(self._id_prefix)\n            and user_id.endswith(self._id_suffix)\n            and user_id != self.az.bot_mxid\n        )\n\n    async def handle_member_event(self, evt: StateEvent) -> None:\n        if self._ignore_user(evt.state_key):\n            # We don't want to invalidate group sessions because a ghost left or joined\n            return\n        await self.crypto.handle_member_event(evt)\n\n    async def _share_session_lock(self, room_id: RoomID) -> bool:\n        try:\n            event = self._share_session_events[room_id]\n        except KeyError:\n            self._share_session_events[room_id] = asyncio.Event()\n            return True\n        else:\n            await event.wait()\n            return False\n\n    async def encrypt(\n        self, room_id: RoomID, event_type: EventType, content: Serializable | JSON\n    ) -> tuple[EventType, EncryptedMegolmEventContent]:\n        try:\n            encrypted = await self.crypto.encrypt_megolm_event(room_id, event_type, content)\n        except EncryptionError:\n            self.log.debug(\"Got EncryptionError, sharing group session and trying again\")\n            if await self._share_session_lock(room_id):\n                try:\n                    users = await self.az.state_store.get_members_filtered(\n                        room_id, self._id_prefix, self._id_suffix, self.az.bot_mxid\n                    )\n                    await self.crypto.share_group_session(room_id, users)\n                finally:\n                    self._share_session_events.pop(room_id).set()\n            encrypted = await self.crypto.encrypt_megolm_event(room_id, event_type, content)\n        return EventType.ROOM_ENCRYPTED, encrypted\n\n    async def decrypt(self, evt: EncryptedEvent, wait_session_timeout: int = 5) -> MessageEvent:\n        try:\n            decrypted = await self.crypto.decrypt_megolm_event(evt)\n        except SessionNotFound as e:\n            if not wait_session_timeout:\n                raise\n            self.log.debug(\n                f\"Couldn't find session {e.session_id} trying to decrypt {evt.event_id},\"\n                f\" waiting {wait_session_timeout} seconds...\"\n            )\n            got_keys = await self.crypto.wait_for_session(\n                evt.room_id, e.session_id, timeout=wait_session_timeout\n            )\n            if got_keys:\n                self.log.debug(\n                    f\"Got session {e.session_id} after waiting, \"\n                    f\"trying to decrypt {evt.event_id} again\"\n                )\n                decrypted = await self.crypto.decrypt_megolm_event(evt)\n            else:\n                raise\n        self.log.trace(\"Decrypted event %s: %s\", evt.event_id, decrypted)\n        return decrypted\n\n    async def start(self) -> None:\n        if not self.msc4190:\n            flows = await self.client.get_login_flows()\n            if not flows.supports_type(LoginType.APPSERVICE):\n                self.log.critical(\n                    \"Encryption enabled in config, but homeserver does not support appservice login\"\n                )\n                sys.exit(30)\n        self.log.debug(\"Logging in with bridge bot user\")\n        if self.crypto_db:\n            try:\n                await self.crypto_db.start()\n            except Exception as e:\n                self.bridge._log_db_error(e)\n        await self.crypto_store.open()\n        device_id = await self.crypto_store.get_device_id()\n        if device_id:\n            self.log.debug(f\"Found device ID in database: {device_id}\")\n\n        if self.msc4190:\n            if not device_id:\n                self.log.debug(\"Creating bot device with MSC4190\")\n            self.client.api.token = self.az.as_token\n            await self.client.create_device_msc4190(\n                device_id=device_id, initial_display_name=self.device_name\n            )\n        else:\n            # We set the API token to the AS token here to authenticate the appservice login\n            # It'll get overridden after the login\n            self.client.api.token = self.az.as_token\n            await self.client.login(\n                login_type=LoginType.APPSERVICE,\n                device_name=self.device_name,\n                device_id=device_id,\n                store_access_token=True,\n                ",
+      "total_lines": 399
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "asyncio",
+        "logging",
+        "sys",
+        "mautrix:__optional_imports__",
+        "mautrix.appservice:AppService",
+        "mautrix.client:Client",
+        "mautrix.client:InternalEventType",
+        "mautrix.client:SyncStore",
+        "mautrix.crypto:CryptoStore",
+        "mautrix.crypto:OlmMachine",
+        "mautrix.crypto:PgCryptoStore",
+        "mautrix.crypto:RejectKeyShare",
+        "mautrix.crypto:StateStore",
+        "mautrix.errors:EncryptionError",
+        "mautrix.errors:MForbidden",
+        "mautrix.errors:MNotFound",
+        "mautrix.errors:SessionNotFound",
+        "mautrix.types:JSON",
+        "mautrix.types:DeviceIdentity",
+        "mautrix.types:EncryptedEvent",
+        "mautrix.types:EncryptedMegolmEventContent",
+        "mautrix.types:EventFilter",
+        "mautrix.types:EventType",
+        "mautrix.types:Filter",
+        "mautrix.types:LoginType",
+        "mautrix.types:MessageEvent",
+        "mautrix.types:RequestedKeyInfo",
+        "mautrix.types:RoomEventFilter",
+        "mautrix.types:RoomFilter"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/mautrix/python/master/README.rst",
+      "content_excerpt": "mautrix-python\n==============\n\n|PyPI| |Python versions| |License| |Docs| |Code style| |Imports|\n\nA Python 3.10+ asyncio Matrix framework.\n\nMatrix room: `#maunium:maunium.net`_\n\n\nComponents\n----------\n\n* Basic HTTP request sender (mautrix.api_)\n\n* `Client API`_ endpoints as functions (mautrix.client.api_)\n\n* Medium-level application service framework (mautrix.appservice_)\n\n  * Basic transaction and user/alias query support (based on Cadair's python-appservice-framework_)\n  * Basic room state storage\n  * Intent wrapper around the client API functions (design based on matrix-appservice-bridge)\n\n* Medium-level end-to-end encryption framework (mautrix.crypto_)\n\n  * Handles all the complicated e2ee key exchange\n  * Uses libolm through python-olm for the low-level crypto\n\n* High-level bridging utility framework (mautrix.bridge_)\n\n  * Base class for bridges\n  * Common bridge configuration and appservice registration generation things\n  * Double-puppeting helper\n  * End-to-bridge encryption helper\n\n* High-level client framework (mautrix.client_)\n\n  * Syncing and event handling helper.\n  * End-to-end encryption helper.\n\n* Utilities (mautrix.util_)\n\n  * Matrix HTML parsing and generating utilities\n  * Manhole system (get a python shell in a running process)\n  * YAML config helpers\n  * Database helpers (new: asyncpg, legacy: SQLAlchemy)\n  * Color logging utility\n  * Very simple HMAC-SHA256 utility for signing tokens (like JWT, but hardcoded to use a single good algorithm)\n\n.. _#maunium:maunium.net: https://matrix.to/#/#maunium:maunium.net\n.. _python-appservice-framework: https://github"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "encrypt test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"encrypt(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "mautrix/bridge",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "mautrix/bridge/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "bridge.py",
+          "path": "mautrix/bridge/bridge.py",
+          "type": "file"
+        },
+        {
+          "name": "commands",
+          "path": "mautrix/bridge/commands",
+          "type": "dir"
+        },
+        {
+          "name": "config.py",
+          "path": "mautrix/bridge/config.py",
+          "type": "file"
+        },
+        {
+          "name": "crypto_state_store.py",
+          "path": "mautrix/bridge/crypto_state_store.py",
+          "type": "file"
+        },
+        {
+          "name": "custom_puppet.py",
+          "path": "mautrix/bridge/custom_puppet.py",
+          "type": "file"
+        },
+        {
+          "name": "disappearing_message.py",
+          "path": "mautrix/bridge/disappearing_message.py",
+          "type": "file"
+        },
+        {
+          "name": "e2ee.py",
+          "path": "mautrix/bridge/e2ee.py",
+          "type": "file"
+        },
+        {
+          "name": "matrix.py",
+          "path": "mautrix/bridge/matrix.py",
+          "type": "file"
+        },
+        {
+          "name": "notification_disabler.py",
+          "path": "mautrix/bridge/notification_disabler.py",
+          "type": "file"
+        },
+        {
+          "name": "portal.py",
+          "path": "mautrix/bridge/portal.py",
+          "type": "file"
+        },
+        {
+          "name": "puppet.py",
+          "path": "mautrix/bridge/puppet.py",
+          "type": "file"
+        },
+        {
+          "name": "state_store",
+          "path": "mautrix/bridge/state_store",
+          "type": "dir"
+        },
+        {
+          "name": "user.py",
+          "path": "mautrix/bridge/user.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "mautrix/bridge/__init__.py"
+        },
+        {
+          "name": "bridge.py",
+          "path": "mautrix/bridge/bridge.py"
+        },
+        {
+          "name": "config.py",
+          "path": "mautrix/bridge/config.py"
+        },
+        {
+          "name": "crypto_state_store.py",
+          "path": "mautrix/bridge/crypto_state_store.py"
+        },
+        {
+          "name": "custom_puppet.py",
+          "path": "mautrix/bridge/custom_puppet.py"
+        },
+        {
+          "name": "disappearing_message.py",
+          "path": "mautrix/bridge/disappearing_message.py"
+        },
+        {
+          "name": "matrix.py",
+          "path": "mautrix/bridge/matrix.py"
+        },
+        {
+          "name": "notification_disabler.py",
+          "path": "mautrix/bridge/notification_disabler.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "mautrix/bridge/e2ee.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "1443f53ef58ee3dc5b50d377d31b845aee989c41",
+          "html_url": "https://github.com/mautrix/python/commit/1443f53ef58ee3dc5b50d377d31b845aee989c41",
+          "message": "Add option to self-sign bridge bot device",
+          "author": "Tulir Asokan",
+          "date": "2025-09-23T20:58:50Z"
+        },
+        {
+          "sha": "0349445bd6992ac8f294582e85c3f61ce5c863b3",
+          "html_url": "https://github.com/mautrix/python/commit/0349445bd6992ac8f294582e85c3f61ce5c863b3",
+          "message": "Check login flows only if MSC4190 is not enabled (#178)\n\nCurrently, the homeserver login flows are checked even if MSC4190 is\nenabled. However, the `flows` variable is unused when MSC4190 is\nenabled.\n\nThis is an unnecessary network call, and also e.g. requires a\nreverse proxy soley for this purpose ",
+          "author": "Christopher Johnstone",
+          "date": "2025-08-11T17:07:44Z"
+        },
+        {
+          "sha": "33a034a95260286c1ce75cc7c381d997d1a2bb1f",
+          "html_url": "https://github.com/mautrix/python/commit/33a034a95260286c1ce75cc7c381d997d1a2bb1f",
+          "message": "Add support for MSC4190 (#175)",
+          "author": "Marco Antonio Alvarez",
+          "date": "2025-01-15T16:19:02Z"
+        },
+        {
+          "sha": "ad42ba80605ff257ef7d490e1e7bdcfedaa9a320",
+          "html_url": "https://github.com/mautrix/python/commit/ad42ba80605ff257ef7d490e1e7bdcfedaa9a320",
+          "message": "Add option to delete outdated inbound keys\n(keys which lack the metadata about when they're safe to delete)",
+          "author": "Max Sandholm",
+          "date": "2023-06-22T06:47:15Z"
+        },
+        {
+          "sha": "6c58b51461c3134fec04b823f4d0a89469cf18ed",
+          "html_url": "https://github.com/mautrix/python/commit/6c58b51461c3134fec04b823f4d0a89469cf18ed",
+          "message": "Add option to not rotate keys when devices change",
+          "author": "Tulir Asokan",
+          "date": "2023-06-13T10:51:28Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "encrypt TODO this becomes async this",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "mautrix/bridge/e2ee.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "1443f53ef58ee3dc5b50d377d31b845aee989c41",
+        "html_url": "https://github.com/mautrix/python/commit/1443f53ef58ee3dc5b50d377d31b845aee989c41",
+        "message": "Add option to self-sign bridge bot device",
+        "author": "Tulir Asokan",
+        "date": "2025-09-23T20:58:50Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

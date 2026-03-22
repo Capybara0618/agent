@@ -1,0 +1,88 @@
+{
+  "task_id": "161",
+  "repo_owner": "kde",
+  "repo_name": "kajongg",
+  "file_path": "src/scoring.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T16:28:40+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": false,
+    "review_cached": false
+  },
+  "base_context": {
+    "file_path": "src/scoring.py",
+    "original_code": "def _newKey(self):\n    \"\"\"returns a new key for a copy of self\"\"\"\n    newId = self.newId() # TODO: Copy2 of like rule copying\n    newName = m18n('Copy of %1', m18n(self.name))\n    self.assertNameUnused(newName)\n    return newId, newName",
+    "satd_comment": "# TODO: Copy2 of like rule copying",
+    "target_file": {
+      "ok": true,
+      "path": "src/scoring.py",
+      "sha": "581c2b0f8d6cb3ebd3c4499fb3725c9e9b93d397",
+      "download_url": "https://raw.githubusercontent.com/KDE/kajongg/master/src/scoring.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n\n\"\"\"\nCopyright (C) 2008-2016 Wolfgang Rohdewald <wolfgang@rohdewald.de>\n\nSPDX-License-Identifier: GPL-2.0-only\n\n\"\"\"\n\nimport datetime\nfrom typing import Tuple, Optional, TYPE_CHECKING, List, cast, Any\n\nfrom qt import QPointF, QRectF, QDialogButtonBox\nfrom qt import QGraphicsRectItem, QGraphicsSimpleTextItem\nfrom qt import QPushButton, QMessageBox, QComboBox\n\n\nfrom common import Internal, isAlive, Debug\nfrom tile import MeldList\nfrom wind import Wind\nfrom tilesource import TileSource\nfrom animation import animate\nfrom log import logException, logDebug, logWarning, i18n\nfrom query import Query\nfrom uitile import UITile, UIMeld\nfrom board import WindLabel\nfrom game import Game\nfrom games import Games\nfrom hand import Hand\nfrom handboard import HandBoard, TileAttr\nfrom player import Player, Players\nfrom visible import VisiblePlayer\nfrom tables import SelectRuleset\nfrom uiwall import UIWall, SideText\nfrom guiutil import decorateWindow, BlockSignals, rotateCenter, sceneRotation\nfrom mi18n import i18nc\nfrom util import callers\n\nif TYPE_CHECKING:\n    from qt import QWidget, QEvent, QGraphicsSceneDragDropEvent, QGraphicsItem, QGraphicsItemGroup, QObject\n    from tile import Tile, Meld\n    from board import MimeData, SelectorBoard\n    from scoringdialog import RuleBox\n    from scene import ScoringScene\n    from rule import Score, UsedRule, Ruleset, Rule\n    from client import Client\n\ndef scoringScene() ->'ScoringScene':\n    \"\"\"shortcut\"\"\"\n    result = cast('ScoringScene', Internal.scene)\n    assert result\n    return result\n\nclass SwapDialog(QMessageBox):\n\n    \"\"\"ask the user if two players should change seats\"\"\"\n\n    def __init__(self, swappers:List[Player], parent:Optional['QWidget']=None) ->None:\n        super().__init__(parent)\n        decorateWindow(self, i18nc(\"@title:window\", \"Swap Seats\"))\n        self.setText(\n            i18n(\"By the rules, %1 and %2 should now exchange their seats. \",\n                 swappers[0].name, swappers[1].name))\n        self.yesAnswer = QPushButton(i18n(\"&Exchange\"))\n        self.addButton(self.yesAnswer, QMessageBox.ButtonRole.YesRole)\n        self.noAnswer = QPushButton(i18n(\"&Keep seat\"))\n        self.addButton(self.noAnswer, QMessageBox.ButtonRole.NoRole)\n\n\nclass ScoringComboBox(QComboBox):\n\n    \"\"\"with flag manualSelect\"\"\"\n\n    def __init__(self, parent:Optional['QWidget']=None):\n        super().__init__(parent)\n        self.manualSelect = False\n\nclass SelectPlayers(SelectRuleset):\n\n    \"\"\"a dialog for selecting four players. Used only for scoring game.\"\"\"\n\n    def __init__(self) ->None:\n        super().__init__()\n        Players.load()\n        decorateWindow(self, i18nc(\"@title:window\", \"Select four players\"))\n        self.names:List[str]\n        self.nameWidgets:List[ScoringComboBox] = []\n        for idx, wind in enumerate(Wind.all4):\n            cbName = ScoringComboBox()\n            # increase width, we want to see the full window title\n            cbName.setMinimumWidth(350)  # is this good for all platforms?\n            cbName.addItems(list(Players.humanNames.values()))\n            self.grid.addWidget(cbName, idx + 1, 1)\n            self.nameWidgets.append(cbName)\n            self.grid.addWidget(WindLabel(wind), idx + 1, 0)\n            cbName.currentIndexChanged.connect(self.slotValidate)\n\n        # scoring games have seed 0\n        # a scoring game which only just started or threw an exception might have p0,p1,p2,p3 = null\n        query = Query(\n            \"select id,p0,p1,p2,p3 from game where seed=0 and p0 is not null order by id desc limit 1\")\n        if query.records:\n            record = query.record()\n            max_game_id = record[0]\n            with BlockSignals(self.nameWidgets):\n                for cbName, playerId in zip(self.nameWidgets, record[1:]):\n                    if playerId not in Players.humanNames:\n                        logException(f'database {Internal.db.path} is inconsistent: '\n                                     f'game {max_game_id}: player with id {playerId} '\n                                     f'is in game but not in player')\n                    playerName = Players.humanNames[playerId]\n                    playerIdx = cbName.findText(playerName)\n                    if playerIdx >= 0:\n                        cbName.setCurrentIndex(playerIdx)\n        self.slotValidate()\n\n    def showEvent(self, unusedEvent:Optional['QEvent']) ->None:\n        \"\"\"start with player 0\"\"\"\n        self.nameWidgets[0].setFocus()\n\n    def __selectedNames(self) ->set[str]:\n        \"\"\"A set with the currently selected names\"\"\"\n        return {cbName.currentText() for cbName in self.nameWidgets}\n\n    def slotValidate(self) ->None:\n        \"\"\"try to find 4 different players and update status of the Ok button\"\"\"\n        changedCombo = self.sender()\n        if not isinstance(changedCombo, ScoringComboBox):\n            changedCombo = self.nameWidgets[0]\n        changedCombo.manualSelect = True\n        allNames = set(Players.humanNames.values())\n        unusedNames = allNames - self.__selectedNames()\n        with BlockSignals(self.nameWidgets):\n            used = {x.currentText() for x in self.nameWidgets if x.manualSelect}\n            for combo in self.nameWidgets:\n                if not combo.manualSelect:\n                    if combo.currentText() in used:\n                        comboName = unusedNames.pop()\n                        combo.clear()\n                        combo.addItems([comboName])\n                        used.add(combo.currentText())\n            for combo in self.nameWidgets:\n                comboName = combo.currentText()\n                combo.clear()\n                combo.addItems([comboName])\n                combo.addItems(sorted(\n                    allNames - self.__selectedNames() - {comboName}))\n                combo.setCurrentIndex(0)\n        ok_button = self.buttonBox.button(QDialogButtonBox.StandardButton.Ok)\n        if ok_button:\n            ok_button.setEnabled(len(self.__selectedNames()) == 4)\n        self.names = [cbName.currentText() for cbName in self.nameWidgets]\n\n\nclass ScoringTileAttr(TileAttr):\n\n    \"\"\"Tile appearance is different in a ScoringHandBoard\"\"\"\n\n    def _setDark(self) ->bool:\n        \"\"\"should the tile appear darker?\"\"\"\n        return bool(self.yoffset) or self.tile.isConcealed\n\n    def _setFocusable(self, hand:'HandBoard', meld:'Meld', idx:Optional[int]) ->bool:\n        \"\"\"in a scoring handboard, only the first tile of a meld is focusable\"\"\"\n        return idx == 0\n\n\nclass ScoringHandBoard(HandBoard):\n\n    \"\"\"a board showing the tiles a player holds\"\"\"\n    tileAttrClass = ScoringTileAttr\n\n    def __init__(self, player:'ScoringPlayer') ->None:\n        self.__moveHelper:Optional['QGraphicsItemGroup'] = None\n        self.uiMelds:List[UIMeld] = []  # uiMelds and uiTiles are administered independently\n        super().__init__(player)\n        self.player:'ScoringPlayer'\n\n    def meldVariants(self, tile:UITile, forLowerHalf:bool) ->MeldList:\n        \"\"\"Kong might have variants\"\"\"\n        result = MeldList()\n        uimeld = self.uiMeldWithTile(tile)\n        if not uimeld:\n            logWarning(f'ScoringHandBoard.meldVariants: no meld found for {tile}')\n            return result\n        meld = uimeld.meld\n        result.append(meld.concealed if forLowerHalf else meld.exposed)\n        if len(meld) == 4:\n            if forLowerHalf:\n                result.append(meld.declared)\n            else:\n                result.append(meld.exposedClaimed)\n        return result\n\n    def mapMouseTile(self, uiTile:UITile) ->UITile:\n        \"\"\"map the pressed tile to the wanted tile. For melds, this would\n        be the first tile no matter which one is pressed\"\"\"\n        uiMeld = self.uiMeldWithTile(uiTile)\n        assert uiMeld\n        return uiMeld[0]\n\n    def uiMeldWithTile(self, uiTile:UITile, remove:bool=False) ->UIMeld:\n        \"\"\"return the meld with uiTile, optionally removing it\"\"\"\n        for idx, myMeld in enumerate(self.uiMelds):\n            if uiTile in myMeld:\n                uiMeld = self.uiMelds[idx]\n                if remove:\n                    if Debug.uitiles:\n                        logDebug(f'{callers()}.{self.debug_name()}.uiMeldWithTile({uiTile}) removes {uiMeld}')\n                    del self.uiMelds[idx]\n                    self.player.removeMeld(uiMeld.meld)\n                    if Debug.uitiles:\n                        logDebug(f'{self.debug_name()}.loseMeld({uiTile}) removed {uiMeld.meld} from {self.player}')\n                    self.sync()\n                return myMeld\n        return UIMeld(uiTile)\n\n    def findUIMeld(self, meld:Optional['Meld']) ->UIMeld:\n        \"\"\"find the first UIMeld matching the logical meld\"\"\"\n        for result in self.uiMelds:\n            if result.meld == meld:\n                return result\n        logWarning(f'Scoring game: cannot find UIMeld for {meld}')\n        if self.uiMelds:\n            # when could this happen?\n            logWarning(f'XXXXXXXXXXXXXX findUIMeld returning uiMelds[1]: {self.uiMelds[1]}')\n            return self.uiMelds[1] # FIXME why not 0 ?\n        raise ValueError('Scoring Game: findUIMeld() in absence of any uiMelds')\n\n    def loseMeld(self, uiTile:UITile, meld:'Meld') ->UIMeld:  # pylint: disable=unused-argument\n        \"\"\"loses a UIMeld. Only first uiTile is given\"\"\"\n        assert isinstance(uiTile, UITile), uiTile\n        uiMeld = self.uiMeldWithTile(uiTile, remove=True)\n        scoringScene().handSelectorChanged(self)\n        return uiMeld\n\n    def sync(self, adding:Optional[List[UITile]]=None) ->None:\n        \"\"\"place all tiles in ScoringHandBoard\"\"\"\n        col = [0.0, 0.0]\n        boni:List[UITile] = []\n        for uiMeld in self.uiMelds:\n            if uiMeld[0].tile.isBonus:\n                boni.append(uiMeld[0])\n                continue\n            row = 0 if uiMeld.meld[0].isExposed else 1\n            for idx, tile in enumerate(uiMeld):\n                tile.level = 0\n                tile.setBoard(self, col[row], row)\n                # FIXME Folgendes UIMeld sollte sich selber so einstellen\n                tile.focusable = idx == 0\n                tile.dark = bool(row) or tile.tile.isConcealed\n                col[row] += 1\n            col[row] += self.exposedMeldDistance\n        self._placeBonusTiles(col, boni)\n        # self.checkTiles() does not work here\n\n    def dragMoveEvent(self, event:Optional['QGraphicsSceneDragDropEvent']) ->None:\n        \"\"\"allow dropping of uiTile from ourself only to other state (open/concealed)\"\"\"\n        if not event:\n            return\n        uiTile = cast('MimeData', event.mimeData()).uiTile\n        localY = self.mapFromScene(QPointF(event.scenePos())).y()\n        centerY = self.rect().height() / 2.0\n        newLowerHalf = localY >= centerY\n        noMansLand = centerY / 6\n        if -noMansLand < localY - centerY < noMansLand and not uiTile.isBonus:\n            doAccept = False\n        elif uiTile.board != self:\n            doAccept = True\n        elif uiTile.isBonus:\n            doAccept = False\n        else:\n            oldLowerHalf = False\n            if uiTile.board.isHandBoard:\n                oldLowerHalf = uiTile in cast('HandBoard', uiTile.board).lowerHalfTiles()\n            doAccept = oldLowerHalf != newLowerHalf\n        event.setAccepted(doAccept)\n\n    def dropEvent(self, event:Optional['QGraphicsSceneDragDropEvent']) ->None:\n        \"\"\"drop into this handboard\"\"\"\n        if not event:\n            return\n        uiTile = cast('MimeData', event.mimeData()).uiTile\n        forLowerHalf = self.mapFromScene(\n            QPointF(event.scenePos())).y() >= self.rect().height() / 2.0\n        if self.dropMeld(uiTile, forLowerHalf):\n            event.accept()\n        else:\n            event.ignore()\n        self._noPen()\n\n    def dropMeld(self, uiTile:UITile, forLowerHalf:bool) ->bool:\n        \"\"\"drop UIMeld containing uiTile into lower or upper half of our hand\"\"\"\n        senderBoard = cast('SelectorBoard', uiTile.board)\n        assert senderBoard\n        ",
+      "total_lines": 686
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "datetime",
+        "typing:Tuple",
+        "typing:Optional",
+        "typing:TYPE_CHECKING",
+        "typing:List",
+        "typing:cast",
+        "typing:Any",
+        "qt:QPointF",
+        "qt:QRectF",
+        "qt:QDialogButtonBox",
+        "qt:QGraphicsRectItem",
+        "qt:QGraphicsSimpleTextItem",
+        "qt:QPushButton",
+        "qt:QMessageBox",
+        "qt:QComboBox",
+        "common:Internal",
+        "common:isAlive",
+        "common:Debug",
+        "tile:MeldList",
+        "wind:Wind",
+        "tilesource:TileSource",
+        "animation:animate",
+        "log:logException",
+        "log:logDebug",
+        "log:logWarning",
+        "log:i18n",
+        "query:Query",
+        "uitile:UITile",
+        "uitile:UIMeld",
+        "board:WindLabel"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README",
+      "download_url": "https://raw.githubusercontent.com/KDE/kajongg/master/README",
+      "content_excerpt": "Kajongg - the classical Mah Jongg for four players. If you are looking for the Mah Jongg solitaire please use the application KMahjongg.\n\n[b][u]Installing Kajongg on Windows[/b][/u]\n\nDownload the installer from the link below.\n\nKajongg needs the Microsoft Visual C++ Redistributable Package.\nI believe I am not allowed to include a copy in the installer.\nChances are good that you already have this installed. Otherwise\nyou should see a corresponding error message. You can get that\npackage from Microsoft here: [url]http://www.microsoft.com/en-us/download/details.aspx?id=29[/url]\n\nSupport for Windows is very new, there might be a few things missing. Still to be done:\n\n- toolbar, statusbar, keyboard shortcuts everywhere\n\n- application language selection. For now, the language of the installed Windows\n  is used. If Kajongg is not translated into that language, it is english. If you really\n  need to, you can edit a configuration file and select any of the available languages.\n\n\n[b][u]Installing Kajongg on Linux[/b][/u]\n\nKajongg is part of the KDE games, your Linux distribution should bring it to you.\n\n\n[b][u]More[/b][/u]\n\nKajongg is covered by the GNU GPL2 license - see COPYING.\n\nKajongg can be used in two different ways: Scoring a manual\ngame where you play as always and use Kajongg for the computation\nof scores and for bookkeeping. Or you can use Kajongg to play\nagainst any combination of other human players or computer players.\n\nKajongg currently comes with two rulesets for classical chinese, one\nfor rules in Germany and one for rules in England.\nYou can change many things in th"
+    }
+  },
+  "repair_context": {},
+  "review_context": {}
+}

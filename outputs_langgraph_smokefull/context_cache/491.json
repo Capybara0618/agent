@@ -1,0 +1,409 @@
+{
+  "task_id": "491",
+  "repo_owner": "zzzeek",
+  "repo_name": "sqlalchemy",
+  "file_path": "lib/sqlalchemy/orm/dependency.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T18:51:03+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T18:51:14+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T18:51:21+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lib/sqlalchemy/orm/dependency.py",
+    "original_code": "def process_dependencies(self, task, deplist, uowcommit, delete = False):\n    #print self.mapper.mapped_table.name + \" \" + self.key + \" \" + repr(len(deplist)) + \" process_dep isdelete \" + repr(delete) + \" direction \" + repr(self.direction)\n    if delete:\n        # head object is being deleted, and we manage its list of child objects\n        # the child objects have to have their foreign key to the parent set to NULL\n\n        # TODO: this cascade should be \"delete\" cascade\n        if not self.cascade.delete_orphan or self.post_update:\n            for obj in deplist:\n                childlist = self.get_object_dependencies(obj, uowcommit, passive=self.passive_deletes)\n                if childlist is not None:\n                    for child in childlist.deleted_items():\n                        if child is not None and childlist.hasparent(child) is False:\n                            self._synchronize(obj, child, None, True, uowcommit)\n                            self._conditional_post_update(child, uowcommit, [obj])\n                    for child in childlist.unchanged_items():\n                        if child is not None:\n                            self._synchronize(obj, child, None, True, uowcommit)\n                            self._conditional_post_update(child, uowcommit, [obj])\n    else:\n        for obj in deplist:\n            childlist = self.get_object_dependencies(obj, uowcommit, passive=True)\n            if childlist is not None:\n                for child in childlist.added_items():\n                    self._synchronize(obj, child, None, False, uowcommit)\n                    self._conditional_post_update(child, uowcommit, [obj])\n                for child in childlist.deleted_items():\n                    if not self.cascade.delete_orphan and not self._get_instrumented_attribute().hasparent(child):\n                        self._synchronize(obj, child, None, True, uowcommit)",
+    "satd_comment": "# TODO: this cascade should be \"delete\" cascade",
+    "target_file": {
+      "ok": true,
+      "path": "lib/sqlalchemy/orm/dependency.py",
+      "sha": "2c6158dd3fc257f39e4e8425a4de3bb6fbe8b679",
+      "download_url": "https://raw.githubusercontent.com/zzzeek/sqlalchemy/main/lib/sqlalchemy/orm/dependency.py",
+      "content_excerpt": "# orm/dependency.py\n# Copyright (C) 2005-2026 the SQLAlchemy authors and contributors\n# <see AUTHORS file>\n#\n# This module is part of SQLAlchemy and is released under\n# the MIT License: https://www.opensource.org/licenses/mit-license.php\n# mypy: ignore-errors\n\n\n\"\"\"Relationship dependencies.\"\"\"\n\nfrom __future__ import annotations\n\nfrom . import attributes\nfrom . import exc\nfrom . import sync\nfrom . import unitofwork\nfrom . import util as mapperutil\nfrom .interfaces import MANYTOMANY\nfrom .interfaces import MANYTOONE\nfrom .interfaces import ONETOMANY\nfrom .. import exc as sa_exc\nfrom .. import sql\nfrom .. import util\n\n\nclass _DependencyProcessor:\n    def __init__(self, prop):\n        self.prop = prop\n        self.cascade = prop.cascade\n        self.mapper = prop.mapper\n        self.parent = prop.parent\n        self.secondary = prop.secondary\n        self.direction = prop.direction\n        self.post_update = prop.post_update\n        self.passive_deletes = prop.passive_deletes\n        self.passive_updates = prop.passive_updates\n        self.enable_typechecks = prop.enable_typechecks\n        if self.passive_deletes:\n            self._passive_delete_flag = attributes.PASSIVE_NO_INITIALIZE\n        else:\n            self._passive_delete_flag = attributes.PASSIVE_OFF\n        if self.passive_updates:\n            self._passive_update_flag = attributes.PASSIVE_NO_INITIALIZE\n        else:\n            self._passive_update_flag = attributes.PASSIVE_OFF\n\n        self.sort_key = \"%s_%s\" % (self.parent._sort_key, prop.key)\n        self.key = prop.key\n        if not self.prop.synchronize_pairs:\n            raise sa_exc.ArgumentError(\n                \"Can't build a DependencyProcessor for relationship %s. \"\n                \"No target attributes to populate between parent and \"\n                \"child are present\" % self.prop\n            )\n\n    @classmethod\n    def from_relationship(cls, prop):\n        return _direction_to_processor[prop.direction](prop)\n\n    def hasparent(self, state):\n        \"\"\"return True if the given object instance has a parent,\n        according to the ``InstrumentedAttribute`` handled by this\n        ``DependencyProcessor``.\n\n        \"\"\"\n        return self.parent.class_manager.get_impl(self.key).hasparent(state)\n\n    def per_property_preprocessors(self, uow):\n        \"\"\"establish actions and dependencies related to a flush.\n\n        These actions will operate on all relevant states in\n        the aggregate.\n\n        \"\"\"\n        uow.register_preprocessor(self, True)\n\n    def per_property_flush_actions(self, uow):\n        after_save = unitofwork._ProcessAll(uow, self, False, True)\n        before_delete = unitofwork._ProcessAll(uow, self, True, True)\n\n        parent_saves = unitofwork._SaveUpdateAll(\n            uow, self.parent.primary_base_mapper\n        )\n        child_saves = unitofwork._SaveUpdateAll(\n            uow, self.mapper.primary_base_mapper\n        )\n\n        parent_deletes = unitofwork._DeleteAll(\n            uow, self.parent.primary_base_mapper\n        )\n        child_deletes = unitofwork._DeleteAll(\n            uow, self.mapper.primary_base_mapper\n        )\n\n        self.per_property_dependencies(\n            uow,\n            parent_saves,\n            child_saves,\n            parent_deletes,\n            child_deletes,\n            after_save,\n            before_delete,\n        )\n\n    def per_state_flush_actions(self, uow, states, isdelete):\n        \"\"\"establish actions and dependencies related to a flush.\n\n        These actions will operate on all relevant states\n        individually.    This occurs only if there are cycles\n        in the 'aggregated' version of events.\n\n        \"\"\"\n\n        child_base_mapper = self.mapper.primary_base_mapper\n        child_saves = unitofwork._SaveUpdateAll(uow, child_base_mapper)\n        child_deletes = unitofwork._DeleteAll(uow, child_base_mapper)\n\n        # locate and disable the aggregate processors\n        # for this dependency\n\n        if isdelete:\n            before_delete = unitofwork._ProcessAll(uow, self, True, True)\n            before_delete.disabled = True\n        else:\n            after_save = unitofwork._ProcessAll(uow, self, False, True)\n            after_save.disabled = True\n\n        # check if the \"child\" side is part of the cycle\n\n        if child_saves not in uow.cycles:\n            # based on the current dependencies we use, the saves/\n            # deletes should always be in the 'cycles' collection\n            # together.   if this changes, we will have to break up\n            # this method a bit more.\n            assert child_deletes not in uow.cycles\n\n            # child side is not part of the cycle, so we will link per-state\n            # actions to the aggregate \"saves\", \"deletes\" actions\n            child_actions = [(child_saves, False), (child_deletes, True)]\n            child_in_cycles = False\n        else:\n            child_in_cycles = True\n\n        # check if the \"parent\" side is part of the cycle\n        if not isdelete:\n            parent_saves = unitofwork._SaveUpdateAll(\n                uow, self.parent.base_mapper\n            )\n            parent_deletes = before_delete = None\n            if parent_saves in uow.cycles:\n                parent_in_cycles = True\n        else:\n            parent_deletes = unitofwork._DeleteAll(\n                uow, self.parent.base_mapper\n            )\n            parent_saves = after_save = None\n            if parent_deletes in uow.cycles:\n                parent_in_cycles = True\n\n        # now create actions /dependencies for each state.\n\n        for state in states:\n            # detect if there's anything changed or loaded\n            # by a preprocessor on this state/attribute.   In the\n            # case of deletes we may try to load missing items here as well.\n            sum_ = state.manager[self.key].impl.get_all_pending(\n                state,\n                state.dict,\n                (\n                    self._passive_delete_flag\n                    if isdelete\n                    else attributes.PASSIVE_NO_INITIALIZE\n                ),\n            )\n\n            if not sum_:\n                continue\n\n            if isdelete:\n                before_delete = unitofwork._ProcessState(\n                    uow, self, True, state\n                )\n                if parent_in_cycles:\n                    parent_deletes = unitofwork._DeleteState(uow, state)\n            else:\n                after_save = unitofwork._ProcessState(uow, self, False, state)\n                if parent_in_cycles:\n                    parent_saves = unitofwork._SaveUpdateState(uow, state)\n\n            if child_in_cycles:\n                child_actions = []\n                for child_state, child in sum_:\n                    if child_state not in uow.states:\n                        child_action = (None, None)\n                    else:\n                        (deleted, listonly) = uow.states[child_state]\n                        if deleted:\n                            child_action = (\n                                unitofwork._DeleteState(uow, child_state),\n                                True,\n                            )\n                        else:\n                            child_action = (\n                                unitofwork._SaveUpdateState(uow, child_state),\n                                False,\n                            )\n                    child_actions.append(child_action)\n\n            # establish dependencies between our possibly per-state\n            # parent action and our possibly per-state child action.\n            for child_action, childisdelete in child_actions:\n                self.per_state_dependencies(\n                    uow,\n                    parent_saves,\n                    parent_deletes,\n                    child_action,\n                    after_save,\n                    before_delete,\n                    isdelete,\n                    childisdelete,\n                )\n\n    def presort_deletes(self, uowcommit, states):\n        return False\n\n    def presort_saves(self, uowcommit, states):\n        return False\n\n    def process_deletes(self, uowcommit, states):\n        pass\n\n    def process_saves(self, uowcommit, states):\n        pass\n\n    def prop_has_changes(self, uowcommit, states, isdelete):\n        if not isdelete or self.passive_deletes:\n            passive = (\n                attributes.PASSIVE_NO_INITIALIZE\n                | attributes.INCLUDE_PENDING_MUTATIONS\n            )\n        elif self.direction is MANYTOONE:\n            # here, we were hoping to optimize having to fetch many-to-one\n            # for history and ignore it, if there's no further cascades\n            # to take place.  however there are too many less common conditions\n            # that still take place and tests in test_relationships /\n            # test_cascade etc. will still fail.\n            passive = attributes.PASSIVE_NO_FETCH_RELATED\n        else:\n            passive = (\n                attributes.PASSIVE_OFF | attributes.INCLUDE_PENDING_MUTATIONS\n            )\n\n        for s in states:\n            # TODO: add a high speed method\n            # to InstanceState which returns:  attribute\n            # has a non-None value, or had one\n            history = uowcommit.get_attribute_history(s, self.key, passive)\n            if history and not history.empty():\n                return True\n        else:\n            return (\n                states\n                and not self.prop._is_self_referential\n                and self.mapper in uowcommit.mappers\n            )\n\n    def _verify_canload(self, state):\n        if self.prop.uselist and state is None:\n            raise exc.FlushError(\n                \"Can't flush None value found in \"\n                \"collection %s\" % (self.prop,)\n            )\n        elif state is not None and not self.mapper._canload(\n            state, allow_subtypes=not self.enable_typechecks\n        ):\n            if self.mapper._canload(state, allow_subtypes=True):\n                raise exc.FlushError(\n                    \"Attempting to flush an item of type \"\n                    \"%(x)s as a member of collection \"\n                    '\"%(y)s\". Expected an object of type '\n                    \"%(z)s or a polymorphic subclass of \"\n                    \"this type. If %(x)s is a subclass of \"\n                    '%(z)s, configure mapper \"%(zm)s\" to '\n                    \"load this subtype polymorphically, or \"\n                    \"set enable_typechecks=False to allow \"\n                    \"any subtype to be accepted for flush. \"\n                    % {\n                        \"x\": state.class_,\n                        \"y\": self.prop,\n                        \"z\": self.mapper.class_,\n                        \"zm\": self.mapper,\n                    }\n                )\n            else:\n                raise exc.FlushError(\n                    \"Attempting to flush an item of type \"\n                    \"%(x)s as a member of collection \"\n                    '\"%(y)s\". Expected an object of type '\n                    \"%(z)s or a polymorphic subclass of \"\n                    \"this type.\"\n                    % {\n                        \"x\": state.class_,\n                        \"y\": self.prop,\n                        \"z\": self.mapper.class_,\n                    }\n                )\n\n    def _synchronize(self, state, child, associationrow, clearkeys, uowcommit):\n        raise NotImplementedError()\n\n    def _get_reversed_processed_set(self, uow):\n        if not self.prop._reverse_property:\n            return None\n\n        process_key = tuple(\n            sorted([self.key] + [p.key for p in self.prop._reverse_property])\n        )\n        return uow.memo((\"reverse_key\", process_key), set)\n\n    def _post_update(self, state, uowcommit, related, is_m2o_delete=False):\n        for x in related:\n            if not is_m2o_delete or x is not None:\n                uowcommit.register_post_update(\n                    state, [r for l, r in self.prop.synchronize_pairs]\n      ",
+      "total_lines": 1306
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        ":attributes",
+        ":exc",
+        ":sync",
+        ":unitofwork",
+        ":util",
+        "interfaces:MANYTOMANY",
+        "interfaces:MANYTOONE",
+        "interfaces:ONETOMANY",
+        ":exc",
+        ":sql",
+        ":util"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/zzzeek/sqlalchemy/main/README.rst",
+      "content_excerpt": "SQLAlchemy\n==========\n\n|PyPI| |Python| |Downloads|\n\n.. |PyPI| image:: https://img.shields.io/pypi/v/sqlalchemy\n    :target: https://pypi.org/project/sqlalchemy\n    :alt: PyPI\n\n.. |Python| image:: https://img.shields.io/pypi/pyversions/sqlalchemy\n    :target: https://pypi.org/project/sqlalchemy\n    :alt: PyPI - Python Version\n\n.. |Downloads| image:: https://static.pepy.tech/badge/sqlalchemy/month\n    :target: https://pepy.tech/project/sqlalchemy\n    :alt: PyPI - Downloads\n\n\nThe Python SQL Toolkit and Object Relational Mapper\n\nIntroduction\n-------------\n\nSQLAlchemy is the Python SQL toolkit and Object Relational Mapper\nthat gives application developers the full power and\nflexibility of SQL. SQLAlchemy provides a full suite\nof well known enterprise-level persistence patterns,\ndesigned for efficient and high-performing database\naccess, adapted into a simple and Pythonic domain\nlanguage.\n\nMajor SQLAlchemy features include:\n\n* An industrial strength ORM, built\n  from the core on the identity map, unit of work,\n  and data mapper patterns.   These patterns\n  allow transparent persistence of objects\n  using a declarative configuration system.\n  Domain models\n  can be constructed and manipulated naturally,\n  and changes are synchronized with the\n  current transaction automatically.\n* A relationally-oriented query system, exposing\n  the full range of SQL's capabilities\n  explicitly, including joins, subqueries,\n  correlation, and most everything else,\n  in terms of the object model.\n  Writing queries with the ORM uses the same\n  techniques of relational composition you use\n  when writ"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "process_dependencies test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"process_dependencies(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lib/sqlalchemy/orm",
+      "count": 38,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "lib/sqlalchemy/orm/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_orm_constructors.py",
+          "path": "lib/sqlalchemy/orm/_orm_constructors.py",
+          "type": "file"
+        },
+        {
+          "name": "_typing.py",
+          "path": "lib/sqlalchemy/orm/_typing.py",
+          "type": "file"
+        },
+        {
+          "name": "attributes.py",
+          "path": "lib/sqlalchemy/orm/attributes.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "lib/sqlalchemy/orm/base.py",
+          "type": "file"
+        },
+        {
+          "name": "bulk_persistence.py",
+          "path": "lib/sqlalchemy/orm/bulk_persistence.py",
+          "type": "file"
+        },
+        {
+          "name": "clsregistry.py",
+          "path": "lib/sqlalchemy/orm/clsregistry.py",
+          "type": "file"
+        },
+        {
+          "name": "collections.py",
+          "path": "lib/sqlalchemy/orm/collections.py",
+          "type": "file"
+        },
+        {
+          "name": "context.py",
+          "path": "lib/sqlalchemy/orm/context.py",
+          "type": "file"
+        },
+        {
+          "name": "decl_api.py",
+          "path": "lib/sqlalchemy/orm/decl_api.py",
+          "type": "file"
+        },
+        {
+          "name": "decl_base.py",
+          "path": "lib/sqlalchemy/orm/decl_base.py",
+          "type": "file"
+        },
+        {
+          "name": "dependency.py",
+          "path": "lib/sqlalchemy/orm/dependency.py",
+          "type": "file"
+        },
+        {
+          "name": "descriptor_props.py",
+          "path": "lib/sqlalchemy/orm/descriptor_props.py",
+          "type": "file"
+        },
+        {
+          "name": "dynamic.py",
+          "path": "lib/sqlalchemy/orm/dynamic.py",
+          "type": "file"
+        },
+        {
+          "name": "evaluator.py",
+          "path": "lib/sqlalchemy/orm/evaluator.py",
+          "type": "file"
+        },
+        {
+          "name": "events.py",
+          "path": "lib/sqlalchemy/orm/events.py",
+          "type": "file"
+        },
+        {
+          "name": "exc.py",
+          "path": "lib/sqlalchemy/orm/exc.py",
+          "type": "file"
+        },
+        {
+          "name": "identity.py",
+          "path": "lib/sqlalchemy/orm/identity.py",
+          "type": "file"
+        },
+        {
+          "name": "instrumentation.py",
+          "path": "lib/sqlalchemy/orm/instrumentation.py",
+          "type": "file"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "lib/sqlalchemy/orm/interfaces.py",
+          "type": "file"
+        },
+        {
+          "name": "loading.py",
+          "path": "lib/sqlalchemy/orm/loading.py",
+          "type": "file"
+        },
+        {
+          "name": "mapped_collection.py",
+          "path": "lib/sqlalchemy/orm/mapped_collection.py",
+          "type": "file"
+        },
+        {
+          "name": "mapper.py",
+          "path": "lib/sqlalchemy/orm/mapper.py",
+          "type": "file"
+        },
+        {
+          "name": "path_registry.py",
+          "path": "lib/sqlalchemy/orm/path_registry.py",
+          "type": "file"
+        },
+        {
+          "name": "persistence.py",
+          "path": "lib/sqlalchemy/orm/persistence.py",
+          "type": "file"
+        },
+        {
+          "name": "properties.py",
+          "path": "lib/sqlalchemy/orm/properties.py",
+          "type": "file"
+        },
+        {
+          "name": "query.py",
+          "path": "lib/sqlalchemy/orm/query.py",
+          "type": "file"
+        },
+        {
+          "name": "relationships.py",
+          "path": "lib/sqlalchemy/orm/relationships.py",
+          "type": "file"
+        },
+        {
+          "name": "scoping.py",
+          "path": "lib/sqlalchemy/orm/scoping.py",
+          "type": "file"
+        },
+        {
+          "name": "session.py",
+          "path": "lib/sqlalchemy/orm/session.py",
+          "type": "file"
+        },
+        {
+          "name": "state.py",
+          "path": "lib/sqlalchemy/orm/state.py",
+          "type": "file"
+        },
+        {
+          "name": "state_changes.py",
+          "path": "lib/sqlalchemy/orm/state_changes.py",
+          "type": "file"
+        },
+        {
+          "name": "strategies.py",
+          "path": "lib/sqlalchemy/orm/strategies.py",
+          "type": "file"
+        },
+        {
+          "name": "strategy_options.py",
+          "path": "lib/sqlalchemy/orm/strategy_options.py",
+          "type": "file"
+        },
+        {
+          "name": "sync.py",
+          "path": "lib/sqlalchemy/orm/sync.py",
+          "type": "file"
+        },
+        {
+          "name": "unitofwork.py",
+          "path": "lib/sqlalchemy/orm/unitofwork.py",
+          "type": "file"
+        },
+        {
+          "name": "util.py",
+          "path": "lib/sqlalchemy/orm/util.py",
+          "type": "file"
+        },
+        {
+          "name": "writeonly.py",
+          "path": "lib/sqlalchemy/orm/writeonly.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lib/sqlalchemy/orm/__init__.py"
+        },
+        {
+          "name": "_orm_constructors.py",
+          "path": "lib/sqlalchemy/orm/_orm_constructors.py"
+        },
+        {
+          "name": "_typing.py",
+          "path": "lib/sqlalchemy/orm/_typing.py"
+        },
+        {
+          "name": "attributes.py",
+          "path": "lib/sqlalchemy/orm/attributes.py"
+        },
+        {
+          "name": "base.py",
+          "path": "lib/sqlalchemy/orm/base.py"
+        },
+        {
+          "name": "bulk_persistence.py",
+          "path": "lib/sqlalchemy/orm/bulk_persistence.py"
+        },
+        {
+          "name": "clsregistry.py",
+          "path": "lib/sqlalchemy/orm/clsregistry.py"
+        },
+        {
+          "name": "collections.py",
+          "path": "lib/sqlalchemy/orm/collections.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lib/sqlalchemy/orm/dependency.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "997cdf9cadafd0ed54943f35f1add195ab2b31b7",
+          "html_url": "https://github.com/zzzeek/sqlalchemy/commit/997cdf9cadafd0ed54943f35f1add195ab2b31b7",
+          "message": "happy new year\n\nChange-Id: Ia4a184f6a0d4a069e36b1b68be99a3e948c11125",
+          "author": "Mike Bayer",
+          "date": "2026-01-14T17:55:08Z"
+        },
+        {
+          "sha": "2a85938fe76935e90d9e7ae0db580806c0a06c6a",
+          "html_url": "https://github.com/zzzeek/sqlalchemy/commit/2a85938fe76935e90d9e7ae0db580806c0a06c6a",
+          "message": "update black to 25.1.0 to align it with alembic\n\nChange-Id: I2ac332237f18bbc44155eadee35c64f62adc2867",
+          "author": "Federico Caselli",
+          "date": "2025-05-20T20:15:06Z"
+        },
+        {
+          "sha": "29895487915b8858deb2f8ac4a88d92917641c55",
+          "html_url": "https://github.com/zzzeek/sqlalchemy/commit/29895487915b8858deb2f8ac4a88d92917641c55",
+          "message": "refactor (orm): remove unused variables and simplify key lookups\n\nRedundant variables and unnecessary conditions were removed across several modules. Improved readability and reduced code complexity without changing functionality.\n\nCloses: #12537\nPull-request: https://github.com/sqlalchemy/sqlalchem",
+          "author": "Federico Caselli",
+          "date": "2025-04-24T22:02:32Z"
+        },
+        {
+          "sha": "05b2442132d5ae31cfcc7a1fe95e0f6b739aa995",
+          "html_url": "https://github.com/zzzeek/sqlalchemy/commit/05b2442132d5ae31cfcc7a1fe95e0f6b739aa995",
+          "message": "2025\n\nChange-Id: Ifb33b8df2f838851f329415fa70f494acb4ccde5",
+          "author": "Mike Bayer",
+          "date": "2025-01-02T21:37:27Z"
+        },
+        {
+          "sha": "f7e2b1a6e5a2188ecc6937a565b93937581a2d97",
+          "html_url": "https://github.com/zzzeek/sqlalchemy/commit/f7e2b1a6e5a2188ecc6937a565b93937581a2d97",
+          "message": "apply underscores to ORM class and def names\n\ncriteria used here is:\n\n* The class or def should definitely not be used directly by\n  a third party\n* The class would never be the subject of an `isinstance()` check\n* The class is not exposed as the type of a return value for a public\n  function\n\nA swe",
+          "author": "Mike Bayer",
+          "date": "2024-11-18T18:43:08Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "process_dependencies TODO this cascade should delete",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lib/sqlalchemy/orm/dependency.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "997cdf9cadafd0ed54943f35f1add195ab2b31b7",
+        "html_url": "https://github.com/zzzeek/sqlalchemy/commit/997cdf9cadafd0ed54943f35f1add195ab2b31b7",
+        "message": "happy new year\n\nChange-Id: Ia4a184f6a0d4a069e36b1b68be99a3e948c11125",
+        "author": "Mike Bayer",
+        "date": "2026-01-14T17:55:08Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying cascade change",
+        "localized code in process_dependencies function",
+        "medium strength repository context",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

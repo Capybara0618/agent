@@ -1,0 +1,423 @@
+{
+  "task_id": "564",
+  "repo_owner": "mlmi2-cssi",
+  "repo_name": "foundry",
+  "file_path": "foundry/foundry.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T19:17:13+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 4,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 1,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T19:17:26+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T19:17:37+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "foundry/foundry.py",
+    "original_code": "def download(self, globus=True, verbose=False, **kwargs):\n    \"\"\"Download a Foundry dataset\n    Args:\n        globus (bool): if True, use Globus to download the data else try HTTPS\n        verbose (bool): if True print out debug information during the download\n\n    Returns\n    -------\n    (Foundry): self: for chaining\n    \"\"\"\n    # Check if the dir already exists\n    path = os.path.join(self.config.local_cache_dir, self.mdf[\"source_id\"])\n\n    if os.path.isdir(path):\n        # if directory is present, but doesn't have the correct number of files inside,\n        # dataset will attempt to redownload\n        if self.dataset.splits:\n            # array to keep track of missing files\n            missing_files = []\n            for split in self.dataset.splits:\n                if split.path[0] == '/':\n                    split.path = split.path[1:]\n                if not os.path.isfile(os.path.join(path, split.path)):\n                    missing_files.append(split.path)\n            # if number of missing files is greater than zero, redownload with informative message\n            if len(missing_files) > 0:\n                logger.info(f\"Dataset will be redownloaded, following files are missing: {missing_files}\")\n            else:\n                return self\n        else:\n            # in the case of no splits, ensure the directory contains at least one file\n            if (len(os.listdir(path)) >= 1):\n                return self\n            else:\n                logger.info(\"Dataset will be redownloaded, expected file is missing\")\n\n    res = self.forge_client.search(\n        f\"mdf.source_id:{self.mdf['source_id']}\", advanced=True\n    )\n    if globus:\n        self.forge_client.globus_download(\n            res,\n            dest=self.config.local_cache_dir,\n            dest_ep=self.config.destination_endpoint,\n            interval=kwargs.get(\"interval\", 20),\n            download_datasets=True,\n        )\n    else:\n        https_config = {\n            \"source_ep_id\": \"82f1b5c6-6e9b-11e5-ba47-22000b92c6ec\",\n            \"base_url\": \"https://data.materialsdatafacility.org\",\n            \"folder_to_crawl\": f\"/foundry/{self.mdf['source_id']}/\",\n            \"source_id\": self.mdf[\"source_id\"]\n        }\n\n        task_list = list(recursive_ls(self.transfer_client,\n                                      https_config['source_ep_id'],\n                                      https_config['folder_to_crawl']))\n        # TODO Add parallel\n        for task in task_list:\n            download_file(task, https_config)\n\n    # after download check making sure directory exists, contains all indicated files\n    if os.path.isdir(path):\n        # checking all necessary files are present\n        if self.dataset.splits:\n            missing_files = []\n            for split in self.dataset.splits:\n                if split.path[0] == '/':  # if absolute path, make it a relative path\n                    split.path = split.path[1:]\n                if not os.path.isfile(os.path.join(path, split.path)):\n                    # keeping track of all files not downloaded\n                    missing_files.append(split.path)\n            if len(missing_files) > 0:\n                raise FileNotFoundError(f\"Downloaded directory does not contain the following files: {missing_files}\")\n\n        else:\n            if (len(os.listdir(path)) < 1):\n                raise FileNotFoundError(\"Downloaded directory does not contain the expected file\")\n    else:\n        raise NotADirectoryError(\"Unable to create directory to download data\")\n\n    return self",
+    "satd_comment": "# TODO Add parallel",
+    "target_file": {
+      "ok": true,
+      "path": "foundry/foundry.py",
+      "sha": "53a92f1bf172ad452afe00c08484c8e48ab48172",
+      "download_url": "https://raw.githubusercontent.com/MLMI2-CSSI/foundry/main/foundry/foundry.py",
+      "content_excerpt": "import mdf_toolbox\nimport pandas as pd\nfrom typing import Any, Dict, List, ClassVar, Optional\nimport logging\nfrom pydantic import Field, ConfigDict\n\nfrom mdf_connect_client import MDFConnectClient\nfrom .mdf_client import MDFClient\nfrom globus_sdk import AuthClient\n\nfrom .auth import PubAuths\nfrom .foundry_cache import FoundryCache\nfrom .foundry_dataset import FoundryDataset\nfrom .https_upload import upload_to_endpoint\nfrom .utils import is_doi\n\nfrom foundry.models import FoundryBase\n\nlogging.basicConfig(format='%(levelname)s: %(message)s', level=logging.WARNING)\nlogger = logging.getLogger(__name__)\n\n\nclass HiddenColumnDataFrame(pd.DataFrame):\n    \"\"\"\n    A subclass of pd.DataFrame that supports hiding a specific column. This is\n    intended to mimic display of search results from an earlier version while\n    providing access to associated FoundryDataset objects for each entry in the\n    dataframe via the `get_dataset_by_[name/doi]()` function.\n\n    Parameters:\n    *args: positional arguments\n        Positional arguments passed to the parent class constructor.\n    hidden_column: str, optional\n        The name of the column to be hidden.\n    **kwargs: keyword arguments\n        Keyword arguments passed to the parent class constructor.\n\n    Attributes:\n    hidden_column: str or None\n        The name of the hidden column.\n\n    Methods:\n    _repr_html_():\n        Overrides the _repr_html_ method of the parent class to hide the specified column in the HTML representation.\n    get_dataset_by_name(dataset_name):\n        Returns the FoundryDataset associated with the given dataset name. Can also handle a DOI.\n    get_dataset_by_doi(doi):\n        Returns the FoundryDataset associated with the given DOI.\n\n    \"\"\"\n\n    def __init__(self, *args, hidden_column=None, **kwargs):\n        super().__init__(*args, **kwargs)\n        self.hidden_column = hidden_column\n\n    def _repr_html_(self):\n        if self.hidden_column is not None and self.hidden_column in self.columns:\n            return self.drop(self.hidden_column, axis=1)._repr_html_()\n\n    def get_dataset_by_name(self, dataset_name):\n        if is_doi(dataset_name):\n            return self.get_dataset_by_doi(dataset_name)\n        else:\n            return self[self.dataset_name == dataset_name]['FoundryDataset'].iloc[0]\n\n    def get_dataset_by_doi(self, doi):\n        return self[self.DOI == doi]['FoundryDataset'].iloc[0]\n\n\nclass Foundry(FoundryBase):\n    \"\"\"Foundry Client Base Class\n\n    This class represents a client for interacting with the Foundry service. It provides methods for searching and\n    accessing datasets, as well as publishing new datasets.\n\n    Attributes:\n        forge_client (Any): The Forge client.\n        connect_client (Any): The MDF Connect client.\n        transfer_client (Any): The Globus transfer client.\n        auth_client (Any): The authentication client.\n        index (str): The index to use for search and data publication.\n        auths (Any): The authorizers used for authentication.\n    \"\"\"\n\n    model_config = ConfigDict(arbitrary_types_allowed=True)\n\n    forge_client: Any = Field(default=None)\n    connect_client: Any = Field(default=None)\n    transfer_client: Any = Field(default=None)\n    auth_client: Any = Field(default=None)\n    index: str = Field(default=\"\")\n    auths: Any = Field(default=None)\n\n    use_globus: bool = Field(default=False)\n    verbose: bool = Field(default=False)\n    interval: int = Field(default=10)\n    parallel_https: int = Field(default=4)\n    local_cache_dir: Optional[str] = Field(default=None)\n\n    foundry_cache: FoundryCache = Field(default=None, exclude=True)\n\n    DOI: ClassVar[str] = 'mdf.landing_page'\n    title: ClassVar[str] = 'dc.titles.title'\n    organization: ClassVar[str] = \"Foundry\"\n\n    def __init__(self,\n                 no_browser: bool = False,\n                 no_local_server: bool = False,\n                 index: str = \"mdf\",\n                 authorizers: dict = None,\n                 use_globus: bool = False,\n                 verbose: bool = False,\n                 interval: int = 10,\n                 parallel_https: int = 4,\n                 local_cache_dir: str = None,\n                 **data):\n        \"\"\"Initialize a Foundry client\"\"\"\n        super().__init__(**data)\n        self.index = index\n        self.use_globus = use_globus\n        self.verbose = verbose\n        self.interval = interval\n        self.parallel_https = parallel_https\n        if local_cache_dir:\n            self.local_cache_dir = local_cache_dir\n\n        if authorizers:\n            self.auths = authorizers\n        else:\n            services = [\n                    \"data_mdf\",\n                    \"mdf_connect\",\n                    \"search\",\n                    \"petrel\",\n                    \"transfer\",\n                    \"openid\",\n                    \"https://auth.globus.org/scopes/facd7ccc-c5f4-42aa-916b-a0e270e2c2a9/all\",  # funcx\n                    \"https://auth.globus.org/scopes/f10a69a9-338c-4e5b-baa1-0dc92359ab47/https\",  # Eagle HTTPS\n                    \"https://auth.globus.org/scopes/82f1b5c6-6e9b-11e5-ba47-22000b92c6ec/https\",  # NCSA HTTPS\n                    \"https://auth.globus.org/scopes/d31d4f5d-be37-4adc-a761-2f716b7af105/action_all\",  # Globus Search Lambda\n                ]\n            self.auths = mdf_toolbox.login(\n                services=services,\n                app_name=\"Foundry\",\n                make_clients=True,\n                no_browser=no_browser,\n                no_local_server=no_local_server,\n            )\n            # request Search as an authorizer and not a client\n            search_auth = mdf_toolbox.login(\n                services=['search'],\n                app_name=\"Foundry\",\n                make_clients=False,\n                no_browser=no_browser,\n                no_local_server=no_local_server,\n            )\n            # add special SearchAuthorizer object\n            self.auths['search_authorizer'] = search_auth['search']\n\n        self.forge_client = MDFClient(\n            index=index,\n            services=None,\n            search_client=self.auths[\"search\"],\n            transfer_client=self.auths[\"transfer\"],\n            data_mdf_authorizer=self.auths[\"data_mdf\"],\n            petrel_authorizer=self.auths[\"petrel\"],\n        )\n\n        self.transfer_client = self.auths['transfer']\n\n        self.auth_client = AuthClient(authorizer=self.auths['openid'])\n\n        if index == \"mdf\":\n            test = False\n        else:\n            test = True\n        # TODO: when release-ready, remove test=True\n\n        self.connect_client = MDFConnectClient(\n            authorizer=self.auths[\"mdf_connect\"], test=test\n        )\n\n        self.use_globus = use_globus\n        self.interval = interval\n        self.parallel_https = parallel_https\n        self.verbose = verbose\n        local_cache_dir\n\n        self.foundry_cache = FoundryCache(self.forge_client,\n                                          self.transfer_client,\n                                          use_globus,\n                                          interval,\n                                          parallel_https,\n                                          verbose,\n                                          local_cache_dir)\n\n    def search(self, query: str = None, limit: int = None, as_list: bool = False, as_json: bool = False) -> List[FoundryDataset]:\n        \"\"\"Search available Foundry datasets\n\n        This method searches for available Foundry datasets based on the provided query string.\n        If a DOI is provided as the query, it retrieves the metadata for that specific dataset.\n        If a query string is provided, it retrieves the metadata for datasets that match the query.\n        The limit parameter can be used to specify the maximum number of results to return.\n\n        Args:\n            query (str): The query string to match. If a DOI is provided, it retrieves the metadata for that specific dataset.\n            limit (int): The maximum number of results to return.\n            as_list (bool): If True, the search results will be returned as a list instead of a DataFrame.\n            as_json (bool): If True, return results as a list of dictionaries (agent-friendly).\n\n        Returns:\n            List[FoundryDataset] or DataFrame or List[dict]: Search results in the requested format.\n\n        Raises:\n            Exception: If no results are found for the provided query.\n\n        Example:\n            >>> foundry = Foundry()\n            >>> results = foundry.search(query=\"materials science\", limit=10)\n            >>> print(len(results))\n            10\n        \"\"\"\n        from .errors import DatasetNotFoundError\n\n        if (query is not None) and (is_doi(query)):\n            metadata_list = [self.get_metadata_by_doi(query)]\n        else:\n            metadata_list = self.get_metadata_by_query(query, limit)\n\n        if len(metadata_list) == 0:\n            raise DatasetNotFoundError(query or \"all datasets\", \"query\")\n\n        foundry_datasets = []\n        for metadata in metadata_list:\n            ds = self.dataset_from_metadata(metadata)\n            if ds:\n                foundry_datasets.append(ds)\n\n        logger.info(f\"Search for '{query}' returned {len(foundry_datasets)} foundry datasets out of {len(metadata_list)} matches\")\n\n        if as_json:\n            return [self._dataset_to_dict(ds) for ds in foundry_datasets]\n\n        if as_list:\n            return foundry_datasets\n\n        foundry_datasets = self.search_results_to_dataframe(foundry_datasets)\n\n        return foundry_datasets\n\n    def _dataset_to_dict(self, ds: FoundryDataset) -> Dict[str, Any]:\n        \"\"\"Convert a FoundryDataset to an agent-friendly dictionary.\n\n        Args:\n            ds: The FoundryDataset to convert.\n\n        Returns:\n            Dictionary with dataset metadata suitable for JSON serialization.\n        \"\"\"\n        return {\n            \"name\": ds.dataset_name,\n            \"title\": ds.dc.titles[0].title if ds.dc.titles else None,\n            \"doi\": str(ds.dc.identifier.identifier) if ds.dc.identifier else None,\n            \"description\": ds.dc.descriptions[0].description if ds.dc.descriptions else None,\n            \"year\": ds.dc.publicationYear if hasattr(ds.dc, 'publicationYear') else None,\n            \"fields\": [k.key[0] for k in (ds.foundry_schema.keys or []) if k.key],\n            \"splits\": [s.label for s in (ds.foundry_schema.splits or [])],\n            \"data_type\": ds.foundry_schema.data_type,\n        }\n\n    def list(self, limit: int = None, as_json: bool = False):\n        \"\"\"List available Foundry datasets\n\n        Args:\n            limit (int): maximum number of results to return\n            as_json (bool): If True, return results as list of dicts (agent-friendly)\n\n        Returns:\n            List[FoundryDataset] or DataFrame or List[dict]: Available datasets\n        \"\"\"\n        return self.search(limit=limit, as_json=as_json)\n\n    def dataset_from_metadata(self, metadata: dict) -> FoundryDataset:\n        \"\"\" Converts the result of a forge query to a FoundryDatset object\n\n        Args:\n            metadata (dict): result from a forge query\n\n        Returns:\n            FoundryDataset: a FoundryDataset object created from the metadata\n\n        Raises:\n            Exception: If the mdf entry is missing a section, cannot generate a foundry dataset object\n        \"\"\"\n        try:\n            foundry_schema = metadata['projects']['foundry']\n            dc = metadata['dc']\n            name = metadata['mdf']['source_id']\n\n            ds = FoundryDataset(**{'dataset_name': name,\n                                   'datacite_entry': dc,\n                                   'foundry_schema': foundry_schema,\n                                   'foundry_cache': self.foundry_cache})\n\n            return ds\n\n        except Exception as e:\n            logger.error(f\"The mdf entry {metadata['mdf']['source_id']} is missing a {e} section - cannot generate a foundry dataset object\")\n\n    def get_dataset(self, doi: str) -> Foundr",
+      "total_lines": 501
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "mdf_toolbox",
+        "pandas",
+        "typing:Any",
+        "typing:Dict",
+        "typing:List",
+        "typing:ClassVar",
+        "typing:Optional",
+        "logging",
+        "pydantic:Field",
+        "pydantic:ConfigDict",
+        "mdf_connect_client:MDFConnectClient",
+        "mdf_client:MDFClient",
+        "globus_sdk:AuthClient",
+        "auth:PubAuths",
+        "foundry_cache:FoundryCache",
+        "foundry_dataset:FoundryDataset",
+        "https_upload:upload_to_endpoint",
+        "utils:is_doi",
+        "foundry.models:FoundryBase",
+        "errors:DatasetNotFoundError"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/MLMI2-CSSI/foundry/main/README.md",
+      "content_excerpt": "\n<picture>\n  <source srcset=\"https://raw.githubusercontent.com/MLMI2-CSSI/foundry/main/assets/foundry-white.png\" height=175\" media=\"(prefers-color-scheme: dark)\">\n  <img src=\"https://raw.githubusercontent.com/MLMI2-CSSI/foundry/main/assets/foundry-black.png\" height=\"175\">\n</picture>\n\n[![PyPI](https://img.shields.io/pypi/v/foundry_ml.svg)](https://pypi.python.org/pypi/foundry_ml)\n[![Tests](https://github.com/MLMI2-CSSI/foundry/actions/workflows/tests.yml/badge.svg)](https://github.com/MLMI2-CSSI/foundry/actions/workflows/tests.yml)\n[![NSF-1931306](https://img.shields.io/badge/NSF-1931306-blue)](https://www.nsf.gov/awardsearch/showAward?AWD_ID=1931306&HistoricalAwards=false)\n[<img src=\"https://img.shields.io/badge/view-documentation-blue\">](https://ai-materials-and-chemistry.gitbook.io/foundry/)\n\n**Foundry-ML** simplifies access to machine learning-ready datasets in materials science and chemistry.\n\n- **Search & Load** - Find and use curated datasets with a few lines of code\n- **Understand** - Rich schemas describe what each field means\n- **Cite** - Automatic citation generation for publications\n- **Publish** - Share your datasets with the community\n- **AI-Ready** - MCP server for Claude and other AI assistants\n\n## Quick Start\n\n```bash\npip install foundry-ml\n```\n\nNeed optional integrations? Install extras only when you need them:\n\n```bash\npip install \"foundry-ml[torch]\"        # Enable dataset.get_as_torch()\npip install \"foundry-ml[tensorflow]\"   # Enable dataset.get_as_tensorflow()\npip install \"foundry-ml[huggingface]\"  # Enable push-to-hub\npip install \"foundry-ml[excel]\"   "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "download test",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_https_download.py",
+          "path": "tests/test_https_download.py",
+          "sha": "3890f165b038fa67f7971977812febca61e17f1a",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/tests/test_https_download.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_errors.py",
+          "path": "tests/test_errors.py",
+          "sha": "8b5f3564fcdbed8fff500ba4fdbad1eeda669b3f",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/tests/test_errors.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_foundry.py",
+          "path": "tests/test_foundry.py",
+          "sha": "36c7799121923347146fe4f9a63b8aaeda97e513",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/tests/test_foundry.py",
+          "score": 1.0
+        },
+        {
+          "name": "README.md",
+          "path": "tests/README.md",
+          "sha": "659a98cbfc8cb35e1e8ac8dc270d0e437822e70e",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/tests/README.md",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"download(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "foundry.mdf_client.md",
+          "path": "docs/foundry.mdf_client.md",
+          "sha": "026950b93e0b2e439835481235607616f5b6cc01",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/docs/foundry.mdf_client.md",
+          "score": 1.0
+        },
+        {
+          "name": "mdf_client.py",
+          "path": "foundry/mdf_client.py",
+          "sha": "feef56aad3c31bf730ca23db470baf3a0837e7a0",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/foundry/mdf_client.py",
+          "score": 1.0
+        },
+        {
+          "name": "foundry_cache.py",
+          "path": "foundry/foundry_cache.py",
+          "sha": "f92317e9965dacc95f605c72214b1d0ef2a95c0f",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/blob/1ba21bea97e84707a9c0ab7ab07fc0912435690c/foundry/foundry_cache.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "foundry",
+      "count": 16,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "foundry/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "foundry/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "auth.py",
+          "path": "foundry/auth.py",
+          "type": "file"
+        },
+        {
+          "name": "errors.py",
+          "path": "foundry/errors.py",
+          "type": "file"
+        },
+        {
+          "name": "foundry.py",
+          "path": "foundry/foundry.py",
+          "type": "file"
+        },
+        {
+          "name": "foundry_cache.py",
+          "path": "foundry/foundry_cache.py",
+          "type": "file"
+        },
+        {
+          "name": "foundry_dataset.py",
+          "path": "foundry/foundry_dataset.py",
+          "type": "file"
+        },
+        {
+          "name": "https_download.py",
+          "path": "foundry/https_download.py",
+          "type": "file"
+        },
+        {
+          "name": "https_upload.py",
+          "path": "foundry/https_upload.py",
+          "type": "file"
+        },
+        {
+          "name": "integrations",
+          "path": "foundry/integrations",
+          "type": "dir"
+        },
+        {
+          "name": "jsonschema_models",
+          "path": "foundry/jsonschema_models",
+          "type": "dir"
+        },
+        {
+          "name": "loaders",
+          "path": "foundry/loaders",
+          "type": "dir"
+        },
+        {
+          "name": "mcp",
+          "path": "foundry/mcp",
+          "type": "dir"
+        },
+        {
+          "name": "mdf_client.py",
+          "path": "foundry/mdf_client.py",
+          "type": "file"
+        },
+        {
+          "name": "models.py",
+          "path": "foundry/models.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "foundry/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "foundry/__init__.py"
+        },
+        {
+          "name": "__main__.py",
+          "path": "foundry/__main__.py"
+        },
+        {
+          "name": "auth.py",
+          "path": "foundry/auth.py"
+        },
+        {
+          "name": "errors.py",
+          "path": "foundry/errors.py"
+        },
+        {
+          "name": "foundry_cache.py",
+          "path": "foundry/foundry_cache.py"
+        },
+        {
+          "name": "foundry_dataset.py",
+          "path": "foundry/foundry_dataset.py"
+        },
+        {
+          "name": "https_download.py",
+          "path": "foundry/https_download.py"
+        },
+        {
+          "name": "https_upload.py",
+          "path": "foundry/https_upload.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "foundry/foundry.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "5327b2b5f7f475fd13941ee34f42cc7efbc8749f",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/commit/5327b2b5f7f475fd13941ee34f42cc7efbc8749f",
+          "message": "Patch/restore mdf client (#473)\n\n* Restore missing mdf_client.py from design-renaissance branch\n\nThis file was part of PR #469 but was not included in the merge,\ncausing ModuleNotFoundError when importing foundry.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\n\n* Fix DOI search to return c",
+          "author": "Ben Blaiszik",
+          "date": "2026-01-22T19:42:22Z"
+        },
+        {
+          "sha": "6e5c387c6d1a5b6e81a6f039a98c5a4c0c4aaa31",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/commit/6e5c387c6d1a5b6e81a6f039a98c5a4c0c4aaa31",
+          "message": "Restore missing mdf_client.py from design-renaissance branch (#470)\n\n* Restore missing mdf_client.py from design-renaissance branch\n\nThis file was part of PR #469 but was not included in the merge,\ncausing ModuleNotFoundError when importing foundry.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropi",
+          "author": "Ben Blaiszik",
+          "date": "2026-01-14T15:31:57Z"
+        },
+        {
+          "sha": "c77065a89950af7f21cffb33a8be69e3789f3ab9",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/commit/c77065a89950af7f21cffb33a8be69e3789f3ab9",
+          "message": "Feature/design renaissance (#469)\n\n* Add agentic interface, CLI, and HuggingFace export\n\nMajor improvements for agent accessibility and developer experience:\n\n## Agentic Interface (MCP Server)\n- Add MCP server with tools: search_datasets, get_dataset_schema,\n  load_dataset, list_all_datasets\n- Add s",
+          "author": "Ben Blaiszik",
+          "date": "2025-12-28T20:11:31Z"
+        },
+        {
+          "sha": "ad09fd92aa6d06438ebc1449d5483e245ac28811",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/commit/ad09fd92aa6d06438ebc1449d5483e245ac28811",
+          "message": "Publish fix (#465)\n\n* Fixing dataset publication\r\n\r\n* Flake8 fixes\r\n\r\n* int and str fixes for publication",
+          "author": "Ben Blaiszik",
+          "date": "2024-08-16T17:15:51Z"
+        },
+        {
+          "sha": "39d9f8ca21929356802f3aa1d85ac999514ac12a",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/commit/39d9f8ca21929356802f3aa1d85ac999514ac12a",
+          "message": "Pydantic v2 updates. Minor updates to Foundry API to enable simple da… (#462)\n\n* Pydantic v2 updates. Minor updates to Foundry API to enable simple dataset loading with a DOI\r\n\r\n* Update requirements to line up with Garden Pydantic requirements\r\n\r\n* End testing for Python 3.7, and 3.8, add testing f",
+          "author": "Ben Blaiszik",
+          "date": "2024-07-12T19:40:00Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "download TODO parallel",
+      "count": 1,
+      "items": [
+        {
+          "number": 281,
+          "title": "Add https upload",
+          "state": "closed",
+          "html_url": "https://github.com/MLMI2-CSSI/foundry/pull/281",
+          "is_pull_request": true
+        }
+      ]
+    },
+    "issue_comments": [],
+    "related_pr_files": [
+      {
+        "ok": true,
+        "number": 281,
+        "count": 7,
+        "files": [
+          {
+            "filename": "data/https_test/test_data.json",
+            "status": "added",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1
+          },
+          {
+            "filename": "foundry/__init__.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1
+          },
+          {
+            "filename": "foundry/auth.py",
+            "status": "added",
+            "additions": 21,
+            "deletions": 0,
+            "changes": 21
+          },
+          {
+            "filename": "foundry/foundry.py",
+            "status": "modified",
+            "additions": 81,
+            "deletions": 27,
+            "changes": 108
+          },
+          {
+            "filename": "foundry/https_download.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 0,
+            "changes": 3
+          },
+          {
+            "filename": "foundry/https_upload.py",
+            "status": "added",
+            "additions": 239,
+            "deletions": 0,
+            "changes": 239
+          },
+          {
+            "filename": "tests/test_foundry.py",
+            "status": "modified",
+            "additions": 103,
+            "deletions": 6,
+            "changes": 109
+          }
+        ]
+      }
+    ],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "foundry/foundry.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "5327b2b5f7f475fd13941ee34f42cc7efbc8749f",
+        "html_url": "https://github.com/MLMI2-CSSI/foundry/commit/5327b2b5f7f475fd13941ee34f42cc7efbc8749f",
+        "message": "Patch/restore mdf client (#473)\n\n* Restore missing mdf_client.py from design-renaissance branch\n\nThis file was part of PR #469 but was not included in the merge,\ncausing ModuleNotFoundError when importing foundry.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\n\n* Fix DOI search to return c",
+        "author": "Ben Blaiszik",
+        "date": "2026-01-22T19:42:22Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "existing file presence checks after download",
+        "FileNotFoundError raised if files missing",
+        "logging info messages about missing files",
+        "existing tests for download method (though none found in repo context, assumed present)",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 4,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

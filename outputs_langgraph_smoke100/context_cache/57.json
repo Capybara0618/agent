@@ -1,0 +1,426 @@
+{
+  "task_id": "57",
+  "repo_owner": "rdflib",
+  "repo_name": "rdflib",
+  "file_path": "rdflib/plugins/serializers/rdfxml.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T12:27:05+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "serialize",
+    "satd_line": 78,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 1,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T12:27:17+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T12:27:26+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "rdflib/plugins/serializers/rdfxml.py",
+    "original_code": "def predicate(self, predicate, object, depth=1):\n    writer = self.writer\n    store = self.store\n    writer.push(predicate)\n    if isinstance(object, Literal):\n        attributes = \"\"\n        if object.language:\n            writer.attribute(XMLLANG, object.language)\n        if object.datatype:\n            writer.attribute(RDF.datatype, object.datatype)\n        writer.text(object)\n    elif object in self.__serialized or not (object, None, None) in store:\n        if isinstance(object, BNode):\n            if more_than(store.triples((None, None, object)), 0):\n                writer.attribute(RDF.nodeID, fix(object))\n        else:\n            writer.attribute(RDF.resource, self.relativize(object))\n    else:\n        if first(store.objects(object, RDF.first)): # may not have type RDF.List\n            collection = object\n            self.__serialized[object] = 1\n            # TODO: warn that any assertions on object other than\n            # RDF.first and RDF.rest are ignored... including RDF.List\n            writer.attribute(RDF.parseType, \"Collection\")\n            col=Collection(store,object)\n            for item in col:\n                if isinstance(item,URIRef):\n                    self.forceRDFAbout.add(item)\n                self.subject(item)\n                if not isinstance(item,URIRef):\n                    self.__serialized[item] = 1\n        else:\n            if first(store.triples_choices((object,\n                                            RDF.type,\n                                            [OWL_NS.Class,RDFS.Class]))) and\\\n                isinstance(object, URIRef):\n                 writer.attribute(RDF.resource, self.relativize(object))\n            elif depth<=self.max_depth:\n                self.subject(object, depth+1)\n            elif isinstance(object, BNode):\n                if not object in self.__serialized and \\\n                   (object, None, None) in store and \\\n                   len(list(store.subjects(object=object)))==1:\n                    #inline blank nodes if they haven't been serialized yet and are\n                    #only referenced once (regardless of depth)\n                    self.subject(object, depth+1)\n                else:\n                    writer.attribute(RDF.nodeID, fix(object))\n            else:\n                writer.attribute(RDF.resource, self.relativize(object))\n    writer.pop(predicate)",
+    "satd_comment": "# TODO: warn that any assertions on object other than\n# RDF.first and RDF.rest are ignored... including RDF.List",
+    "target_file": {
+      "ok": true,
+      "path": "rdflib/plugins/serializers/rdfxml.py",
+      "sha": "c48ad65428b77c276122723a909ad1d89a8f29be",
+      "download_url": "https://raw.githubusercontent.com/RDFLib/rdflib/main/rdflib/plugins/serializers/rdfxml.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport xml.dom.minidom\nfrom collections.abc import Generator\nfrom typing import IO, TYPE_CHECKING, Any\nfrom xml.sax.saxutils import escape, quoteattr\n\nfrom rdflib.collection import Collection\nfrom rdflib.graph import Graph\nfrom rdflib.namespace import RDF, RDFS, Namespace  # , split_uri\nfrom rdflib.plugins.parsers.RDFVOC import RDFVOC\nfrom rdflib.plugins.serializers.xmlwriter import XMLWriter\nfrom rdflib.serializer import Serializer\nfrom rdflib.term import BNode, IdentifiedNode, Identifier, Literal, Node, URIRef\nfrom rdflib.util import first, more_than\n\nfrom .xmlwriter import ESCAPE_ENTITIES\n\nif TYPE_CHECKING:\n    pass\n\n__all__ = [\"fix\", \"XMLSerializer\", \"PrettyXMLSerializer\"]\n\n\nclass XMLSerializer(Serializer):\n    \"\"\"RDF/XML RDF graph serializer.\"\"\"\n\n    def __init__(self, store: Graph):\n        super(XMLSerializer, self).__init__(store)\n\n    def __bindings(self) -> Generator[tuple[str, URIRef], None, None]:\n        store = self.store\n        nm = store.namespace_manager\n        bindings: dict[str, URIRef] = {}\n\n        for predicate in set(store.predicates()):\n            prefix, namespace, name = nm.compute_qname_strict(predicate)\n            bindings[prefix] = URIRef(namespace)\n\n        RDFNS = URIRef(\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\")  # noqa: N806\n\n        if \"rdf\" in bindings:\n            assert bindings[\"rdf\"] == RDFNS\n        else:\n            bindings[\"rdf\"] = RDFNS\n\n        for prefix, namespace in bindings.items():\n            yield prefix, namespace\n\n    def serialize(\n        self,\n        stream: IO[bytes],\n        base: str | None = None,\n        encoding: str | None = None,\n        **kwargs: Any,\n    ) -> None:\n        # if base is given here, use that, if not and a base is set for the graph use that\n        if base is not None:\n            self.base = base\n        elif self.store.base is not None:\n            self.base = self.store.base\n        self.__stream = stream\n        self.__serialized: dict[Identifier, int] = {}\n        encoding = self.encoding\n        self.write = write = lambda uni: stream.write(uni.encode(encoding, \"replace\"))\n\n        # startDocument\n        write('<?xml version=\"1.0\" encoding=\"%s\"?>\\n' % self.encoding)\n\n        # startRDF\n        write(\"<rdf:RDF\\n\")\n\n        # If provided, write xml:base attribute for the RDF\n        if \"xml_base\" in kwargs:\n            write('   xml:base=\"%s\"\\n' % kwargs[\"xml_base\"])\n        elif self.base:\n            write('   xml:base=\"%s\"\\n' % self.base)\n        # TODO:\n        # assert(\n        #    namespaces[\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"]=='rdf')\n        bindings = list(self.__bindings())\n        bindings.sort()\n\n        for prefix, namespace in bindings:\n            if prefix:\n                write('   xmlns:%s=\"%s\"\\n' % (prefix, namespace))\n            else:\n                write('   xmlns=\"%s\"\\n' % namespace)\n        write(\">\\n\")\n\n        # write out triples by subject\n        for subject in self.store.subjects():\n            self.subject(subject, 1)\n\n        # endRDF\n        write(\"</rdf:RDF>\\n\")\n\n        # Set to None so that the memory can get garbage collected.\n        # self.__serialized = None\n        del self.__serialized\n\n    def subject(self, subject: Identifier, depth: int = 1) -> None:\n        if subject not in self.__serialized:\n            self.__serialized[subject] = 1\n\n            if isinstance(subject, (BNode, URIRef)):\n                write = self.write\n                indent = \"  \" * depth\n                element_name = \"rdf:Description\"\n\n                if isinstance(subject, BNode):\n                    write('%s<%s rdf:nodeID=\"%s\"' % (indent, element_name, subject))\n                else:\n                    uri = quoteattr(self.relativize(subject))\n                    write(\"%s<%s rdf:about=%s\" % (indent, element_name, uri))\n\n                if (subject, None, None) in self.store:\n                    write(\">\\n\")\n\n                    for predicate, object in self.store.predicate_objects(subject):\n                        self.predicate(predicate, object, depth + 1)\n                    write(\"%s</%s>\\n\" % (indent, element_name))\n\n                else:\n                    write(\"/>\\n\")\n\n    def predicate(\n        self, predicate: Identifier, object: Identifier, depth: int = 1\n    ) -> None:\n        write = self.write\n        indent = \"  \" * depth\n        qname = self.store.namespace_manager.qname_strict(predicate)\n\n        if isinstance(object, Literal):\n            attributes = \"\"\n\n            if object.language:\n                attributes += ' xml:lang=\"%s\"' % object.language\n\n            if object.datatype:\n                attributes += ' rdf:datatype=\"%s\"' % object.datatype\n\n            write(\n                \"%s<%s%s>%s</%s>\\n\"\n                % (indent, qname, attributes, escape(object, ESCAPE_ENTITIES), qname)\n            )\n        else:\n            if isinstance(object, BNode):\n                write('%s<%s rdf:nodeID=\"%s\"/>\\n' % (indent, qname, object))\n            else:\n                write(\n                    \"%s<%s rdf:resource=%s/>\\n\"\n                    % (indent, qname, quoteattr(self.relativize(object)))\n                )\n\n\nXMLLANG = \"http://www.w3.org/XML/1998/namespacelang\"\nXMLBASE = \"http://www.w3.org/XML/1998/namespacebase\"\nOWL_NS = Namespace(\"http://www.w3.org/2002/07/owl#\")\n\n\n# TODO:\ndef fix(val: str) -> str:\n    \"strip off _: from nodeIDs... as they are not valid NCNames\"\n    if val.startswith(\"_:\"):\n        return val[2:]\n    else:\n        return val\n\n\nclass PrettyXMLSerializer(Serializer):\n    \"\"\"Pretty RDF/XML RDF graph serializer.\"\"\"\n\n    def __init__(self, store: Graph, max_depth=3):\n        super(PrettyXMLSerializer, self).__init__(store)\n        self.forceRDFAbout: set[URIRef] = set()\n\n    def serialize(\n        self,\n        stream: IO[bytes],\n        base: str | None = None,\n        encoding: str | None = None,\n        **kwargs: Any,\n    ) -> None:\n        self.__serialized: dict[IdentifiedNode | Literal, int] = {}\n        store = self.store\n        # if base is given here, use that, if not and a base is set for the graph use that\n        if base is not None:\n            self.base = base\n        elif store.base is not None:\n            self.base = store.base\n        self.max_depth = kwargs.get(\"max_depth\", 3)\n        assert self.max_depth > 0, \"max_depth must be greater than 0\"\n\n        self.nm = nm = store.namespace_manager\n        self.writer = writer = XMLWriter(stream, nm, encoding)\n        namespaces = {}\n\n        possible: set[Node] = set(store.predicates()).union(\n            store.objects(None, RDF.type)\n        )\n\n        for predicate in possible:\n            # type error: Argument 1 to \"compute_qname_strict\" of \"NamespaceManager\" has incompatible type \"Node\"; expected \"str\"\n            prefix, namespace, local = nm.compute_qname_strict(predicate)  # type: ignore[arg-type]\n            namespaces[prefix] = namespace\n\n        namespaces[\"rdf\"] = \"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"\n\n        writer.push(RDFVOC.RDF)\n\n        if \"xml_base\" in kwargs:\n            writer.attribute(XMLBASE, kwargs[\"xml_base\"])\n        elif self.base:\n            writer.attribute(XMLBASE, self.base)\n\n        writer.namespaces(namespaces.items())\n\n        subject: IdentifiedNode | Literal\n        # Write out subjects that can not be inline\n        # type error: Incompatible types in assignment (expression has type \"Node\", variable has type \"IdentifiedNode\")\n        for subject in store.subjects():  # type: ignore[assignment]\n            if (None, None, subject) in store:\n                if (subject, None, subject) in store:\n                    self.subject(subject, 1)\n            else:\n                self.subject(subject, 1)\n\n        # write out anything that has not yet been reached\n        # write out BNodes last (to ensure they can be inlined where possible)\n        bnodes = set()\n\n        # type error: Incompatible types in assignment (expression has type \"Node\", variable has type \"IdentifiedNode\")\n        for subject in store.subjects():  # type: ignore[assignment]\n            if isinstance(subject, BNode):\n                bnodes.add(subject)\n                continue\n            self.subject(subject, 1)\n\n        # now serialize only those BNodes that have not been serialized yet\n        for bnode in bnodes:\n            if bnode not in self.__serialized:\n                self.subject(subject, 1)\n\n        writer.pop(RDFVOC.RDF)\n        stream.write(\"\\n\".encode(\"latin-1\"))\n\n        # Set to None so that the memory can get garbage collected.\n        self.__serialized = None  # type: ignore[assignment]\n\n    def subject(self, subject: IdentifiedNode | Literal, depth: int = 1):\n        store = self.store\n        writer = self.writer\n\n        if subject in self.forceRDFAbout:\n            writer.push(RDFVOC.Description)\n            writer.attribute(RDFVOC.about, self.relativize(subject))\n            writer.pop(RDFVOC.Description)\n            self.forceRDFAbout.remove(subject)  # type: ignore[arg-type]\n\n        elif subject not in self.__serialized:\n            self.__serialized[subject] = 1\n            type = first(store.objects(subject, RDF.type))\n\n            try:\n                # type error: Argument 1 to \"qname\" of \"NamespaceManager\" has incompatible type \"Optional[Node]\"; expected \"str\"\n                self.nm.qname(type)  # type: ignore[arg-type]\n            except Exception:\n                type = None\n\n            element = type or RDFVOC.Description\n            writer.push(element)\n\n            if isinstance(subject, BNode):\n\n                def subj_as_obj_more_than(ceil):\n                    return True\n                    # more_than(store.triples((None, None, subject)), ceil)\n\n                # here we only include BNode labels if they are referenced\n                # more than once (this reduces the use of redundant BNode\n                # identifiers)\n                if subj_as_obj_more_than(1):\n                    writer.attribute(RDFVOC.nodeID, fix(subject))\n\n            else:\n                writer.attribute(RDFVOC.about, self.relativize(subject))\n\n            if (subject, None, None) in store:\n                for _predicate, _object in store.predicate_objects(subject):\n                    object_: IdentifiedNode | Literal = _object  # type: ignore[assignment]\n                    predicate: IdentifiedNode = _predicate  # type: ignore[assignment]\n                    if not (predicate == RDF.type and object_ == type):\n                        self.predicate(predicate, object_, depth + 1)\n\n            writer.pop(element)\n\n        elif subject in self.forceRDFAbout:\n            # TODO FIXME?: this looks like a duplicate of first condition\n            writer.push(RDFVOC.Description)\n            writer.attribute(RDFVOC.about, self.relativize(subject))\n            writer.pop(RDFVOC.Description)\n            self.forceRDFAbout.remove(subject)  # type: ignore[arg-type]\n\n    def predicate(\n        self,\n        predicate: IdentifiedNode,\n        object: IdentifiedNode | Literal,\n        depth: int = 1,\n    ) -> None:\n        writer = self.writer\n        store = self.store\n        writer.push(predicate)\n\n        if isinstance(object, Literal):\n            if object.language:\n                writer.attribute(XMLLANG, object.language)\n\n            if object.datatype == RDF.XMLLiteral and isinstance(\n                object.value, xml.dom.minidom.Document\n            ):\n                writer.attribute(RDFVOC.parseType, \"Literal\")\n                writer.text(\"\")\n                writer.stream.write(object)\n            else:\n                if object.datatype:\n                    writer.attribute(RDFVOC.datatype, object.datatype)\n                writer.text(object)\n\n        elif (\n            object in self.__serialized\n            or not (object, None, None) in store  # noqa: E713\n        ):\n            if isinstance(object, BNode):\n                if more_than(store.triples((None, None, object",
+      "total_lines": 396
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 78,
+      "start_line": 58,
+      "end_line": 98,
+      "matched_line": "        # TODO:",
+      "excerpt": "58:         if base is not None:\n59:             self.base = base\n60:         elif self.store.base is not None:\n61:             self.base = self.store.base\n62:         self.__stream = stream\n63:         self.__serialized: dict[Identifier, int] = {}\n64:         encoding = self.encoding\n65:         self.write = write = lambda uni: stream.write(uni.encode(encoding, \"replace\"))\n66: \n67:         # startDocument\n68:         write('<?xml version=\"1.0\" encoding=\"%s\"?>\\n' % self.encoding)\n69: \n70:         # startRDF\n71:         write(\"<rdf:RDF\\n\")\n72: \n73:         # If provided, write xml:base attribute for the RDF\n74:         if \"xml_base\" in kwargs:\n75:             write('   xml:base=\"%s\"\\n' % kwargs[\"xml_base\"])\n76:         elif self.base:\n77:             write('   xml:base=\"%s\"\\n' % self.base)\n78:         # TODO:\n79:         # assert(\n80:         #    namespaces[\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"]=='rdf')\n81:         bindings = list(self.__bindings())\n82:         bindings.sort()\n83: \n84:         for prefix, namespace in bindings:\n85:             if prefix:\n86:                 write('   xmlns:%s=\"%s\"\\n' % (prefix, namespace))\n87:             else:\n88:                 write('   xmlns=\"%s\"\\n' % namespace)\n89:         write(\">\\n\")\n90: \n91:         # write out triples by subject\n92:         for subject in self.store.subjects():\n93:             self.subject(subject, 1)\n94: \n95:         # endRDF\n96:         write(\"</rdf:RDF>\\n\")\n97: \n98:         # Set to None so that the memory can get garbage collected."
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "serialize",
+      "start_line": 50,
+      "end_line": 100,
+      "source": "    def serialize(\n        self,\n        stream: IO[bytes],\n        base: str | None = None,\n        encoding: str | None = None,\n        **kwargs: Any,\n    ) -> None:\n        # if base is given here, use that, if not and a base is set for the graph use that\n        if base is not None:\n            self.base = base\n        elif self.store.base is not None:\n            self.base = self.store.base\n        self.__stream = stream\n        self.__serialized: dict[Identifier, int] = {}\n        encoding = self.encoding\n        self.write = write = lambda uni: stream.write(uni.encode(encoding, \"replace\"))\n\n        # startDocument\n        write('<?xml version=\"1.0\" encoding=\"%s\"?>\\n' % self.encoding)\n\n        # startRDF\n        write(\"<rdf:RDF\\n\")\n\n        # If provided, write xml:base attribute for the RDF\n        if \"xml_base\" in kwargs:\n            write('   xml:base=\"%s\"\\n' % kwargs[\"xml_base\"])\n        elif self.base:\n            write('   xml:base=\"%s\"\\n' % self.base)\n        # TODO:\n        # assert(\n        #    namespaces[\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"]=='rdf')\n        bindings = list(self.__bindings())\n        bindings.sort()\n\n        for prefix, namespace in bindings:\n            if prefix:\n                write('   xmlns:%s=\"%s\"\\n' % (prefix, namespace))\n            else:\n                write('   xmlns=\"%s\"\\n' % namespace)\n        write(\">\\n\")\n\n        # write out triples by subject\n        for subject in self.store.subjects():\n            self.subject(subject, 1)\n\n        # endRDF\n        write(\"</rdf:RDF>\\n\")\n\n        # Set to None so that the memory can get garbage collected.\n        # self.__serialized = None\n        del self.__serialized"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "xml.dom.minidom",
+        "collections.abc:Generator",
+        "typing:IO",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "xml.sax.saxutils:escape",
+        "xml.sax.saxutils:quoteattr",
+        "rdflib.collection:Collection",
+        "rdflib.graph:Graph",
+        "rdflib.namespace:RDF",
+        "rdflib.namespace:RDFS",
+        "rdflib.namespace:Namespace",
+        "rdflib.plugins.parsers.RDFVOC:RDFVOC",
+        "rdflib.plugins.serializers.xmlwriter:XMLWriter",
+        "rdflib.serializer:Serializer",
+        "rdflib.term:BNode",
+        "rdflib.term:IdentifiedNode",
+        "rdflib.term:Identifier",
+        "rdflib.term:Literal",
+        "rdflib.term:Node",
+        "rdflib.term:URIRef",
+        "rdflib.util:first",
+        "rdflib.util:more_than",
+        "xmlwriter:ESCAPE_ENTITIES",
+        "warnings"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/RDFLib/rdflib/main/README.md",
+      "content_excerpt": "![](docs/_static/RDFlib.png)\n\n# RDFLib\n\n[![Build Status](https://github.com/RDFLib/rdflib/actions/workflows/validate.yaml/badge.svg?branch=main)](https://github.com/RDFLib/rdflib/actions?query=branch%3Amain)\n[![Documentation Status](https://readthedocs.org/projects/rdflib/badge/?version=latest)](https://rdflib.readthedocs.io/en/latest/?badge=latest)\n[![Coveralls branch](https://img.shields.io/coveralls/RDFLib/rdflib/main.svg)](https://coveralls.io/r/RDFLib/rdflib?branch=main)\n\n[![GitHub stars](https://img.shields.io/github/stars/RDFLib/rdflib.svg)](https://github.com/RDFLib/rdflib/stargazers)\n[![Downloads](https://pepy.tech/badge/rdflib/week)](https://pepy.tech/project/rdflib)\n[![PyPI](https://img.shields.io/pypi/v/rdflib.svg)](https://pypi.python.org/pypi/rdflib)\n[![PyPI](https://img.shields.io/pypi/pyversions/rdflib.svg)](https://pypi.python.org/pypi/rdflib)\n[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6845245.svg)](https://doi.org/10.5281/zenodo.6845245)\n\n[![Contribute with Gitpod](https://img.shields.io/badge/Contribute%20with-Gitpod-908a85?logo=gitpod)](https://gitpod.io/#https://github.com/RDFLib/rdflib)\n[![Gitter](https://badges.gitter.im/RDFLib/rdflib.svg)](https://gitter.im/RDFLib/rdflib?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)\n[![Matrix](https://img.shields.io/matrix/rdflib:matrix.org?label=matrix.org%20chat)](https://matrix.to/#/#RDFLib_rdflib:gitter.im)\n\nRDFLib is a pure Python package for working with [RDF](http://www.w3.org/RDF/). RDFLib contains most things you need to work with RDF, including:\n\n* parsers and serializers for RDF/XML, N3"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "serialize test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_serializer_xml.py",
+          "path": "test/test_serializers/test_serializer_xml.py",
+          "sha": "d546ebbbf1fc8f9845786669bda626accf794020",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_serializers/test_serializer_xml.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_prefix_types.py",
+          "path": "test/test_misc/test_prefix_types.py",
+          "sha": "1498ca43e9c0962a703f00f1e24fa1b2b5d3e682",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_misc/test_prefix_types.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_issue1808.py",
+          "path": "test/test_issues/test_issue1808.py",
+          "sha": "04f0927a48b58718560eb0053cebd3ce6e97e20c",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_issues/test_issue1808.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_prettyxml.py",
+          "path": "test/test_serializers/test_prettyxml.py",
+          "sha": "f5ba46abbefd0149288a2e9c4ea8a05a0c017dc0",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_serializers/test_prettyxml.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_dataset_default_serialize_format.py",
+          "path": "test/test_dataset/test_dataset_default_serialize_format.py",
+          "sha": "ba12d0c7061c9e4870cba1c26179dd53189c6e63",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_dataset/test_dataset_default_serialize_format.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_chunk_serializer.py",
+          "path": "test/test_tools/test_chunk_serializer.py",
+          "sha": "b067476f7390ca50740d49e536f54bc5a2669dd4",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_tools/test_chunk_serializer.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_serializer_trix.py",
+          "path": "test/test_serializers/test_serializer_trix.py",
+          "sha": "37bc5912f8bcda7a76fdc16c96e7d4c86ce8c524",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_serializers/test_serializer_trix.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_serializer_jsonld.py",
+          "path": "test/test_serializers/test_serializer_jsonld.py",
+          "sha": "45cb255fecb53b816e40d95a67e8628043e28a8b",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/test/test_serializers/test_serializer_jsonld.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"serialize(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "plugins.md",
+          "path": "docs/plugins.md",
+          "sha": "d8fd997b95258c29a1e17e7fdf4d0d9dbb4a249b",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/docs/plugins.md",
+          "score": 1.0
+        },
+        {
+          "name": "intro_to_parsing.md",
+          "path": "docs/intro_to_parsing.md",
+          "sha": "92b672da7e7386b44ba4fb9c8c246466797c6387",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/docs/intro_to_parsing.md",
+          "score": 1.0
+        },
+        {
+          "name": "serializer.py",
+          "path": "rdflib/serializer.py",
+          "sha": "d30cb05ea3dc1f3e4fdc2d00ff795306376c082c",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/rdflib/serializer.py",
+          "score": 1.0
+        },
+        {
+          "name": "smushing.py",
+          "path": "examples/smushing.py",
+          "sha": "701993abb742c11a15f469692546c5a55ff8f1bc",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/examples/smushing.py",
+          "score": 1.0
+        },
+        {
+          "name": "rdfpipe.py",
+          "path": "rdflib/tools/rdfpipe.py",
+          "sha": "c74700e868a4ce8dbdd5f6a01ab7e0978f5e6787",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/rdflib/tools/rdfpipe.py",
+          "score": 1.0
+        },
+        {
+          "name": "simple_example.py",
+          "path": "examples/simple_example.py",
+          "sha": "c27f3181d370ae30c08f733a1f52597bbf1d53cc",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/examples/simple_example.py",
+          "score": 1.0
+        },
+        {
+          "name": "custom_datatype.py",
+          "path": "examples/custom_datatype.py",
+          "sha": "197578b96c77427909cca7db0e748a87bce8c96b",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/examples/custom_datatype.py",
+          "score": 1.0
+        },
+        {
+          "name": "conjunctive_graphs.py",
+          "path": "examples/conjunctive_graphs.py",
+          "sha": "310ff3c44a6f11eba986c112cb4b9ec63743add4",
+          "html_url": "https://github.com/RDFLib/rdflib/blob/a0be37fce44a8cf96da87a7181080f6c235dcf19/examples/conjunctive_graphs.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "rdflib/plugins/serializers",
+      "count": 13,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "rdflib/plugins/serializers/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "hext.py",
+          "path": "rdflib/plugins/serializers/hext.py",
+          "type": "file"
+        },
+        {
+          "name": "jsonld.py",
+          "path": "rdflib/plugins/serializers/jsonld.py",
+          "type": "file"
+        },
+        {
+          "name": "longturtle.py",
+          "path": "rdflib/plugins/serializers/longturtle.py",
+          "type": "file"
+        },
+        {
+          "name": "n3.py",
+          "path": "rdflib/plugins/serializers/n3.py",
+          "type": "file"
+        },
+        {
+          "name": "nquads.py",
+          "path": "rdflib/plugins/serializers/nquads.py",
+          "type": "file"
+        },
+        {
+          "name": "nt.py",
+          "path": "rdflib/plugins/serializers/nt.py",
+          "type": "file"
+        },
+        {
+          "name": "patch.py",
+          "path": "rdflib/plugins/serializers/patch.py",
+          "type": "file"
+        },
+        {
+          "name": "rdfxml.py",
+          "path": "rdflib/plugins/serializers/rdfxml.py",
+          "type": "file"
+        },
+        {
+          "name": "trig.py",
+          "path": "rdflib/plugins/serializers/trig.py",
+          "type": "file"
+        },
+        {
+          "name": "trix.py",
+          "path": "rdflib/plugins/serializers/trix.py",
+          "type": "file"
+        },
+        {
+          "name": "turtle.py",
+          "path": "rdflib/plugins/serializers/turtle.py",
+          "type": "file"
+        },
+        {
+          "name": "xmlwriter.py",
+          "path": "rdflib/plugins/serializers/xmlwriter.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "rdflib/plugins/serializers/__init__.py"
+        },
+        {
+          "name": "hext.py",
+          "path": "rdflib/plugins/serializers/hext.py"
+        },
+        {
+          "name": "jsonld.py",
+          "path": "rdflib/plugins/serializers/jsonld.py"
+        },
+        {
+          "name": "longturtle.py",
+          "path": "rdflib/plugins/serializers/longturtle.py"
+        },
+        {
+          "name": "n3.py",
+          "path": "rdflib/plugins/serializers/n3.py"
+        },
+        {
+          "name": "nquads.py",
+          "path": "rdflib/plugins/serializers/nquads.py"
+        },
+        {
+          "name": "nt.py",
+          "path": "rdflib/plugins/serializers/nt.py"
+        },
+        {
+          "name": "patch.py",
+          "path": "rdflib/plugins/serializers/patch.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "rdflib/plugins/serializers/rdfxml.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "3b2c6f33b40922a084e6f181a71ea4b19b627944",
+          "html_url": "https://github.com/RDFLib/rdflib/commit/3b2c6f33b40922a084e6f181a71ea4b19b627944",
+          "message": "Pr/3143 (#3144)\n\n* Start migrating the documentation from .rst sphynx to .md material for mkdocs. Add mkdocs.yml with proper configuration, enable automated generation of the doc API from the docstring, and start converting a few pages (index, getting started, developers) for demo.\n\n* Add automated ",
+          "author": "Nicholas Car",
+          "date": "2025-06-01T02:23:57Z"
+        },
+        {
+          "sha": "ac0566f74c9ac1b40c1e03d9618c50a6f645d871",
+          "html_url": "https://github.com/RDFLib/rdflib/commit/ac0566f74c9ac1b40c1e03d9618c50a6f645d871",
+          "message": "chore: type annotations - convert uses of Optional and some Union usage to union operator | (#2971)\n\n* chore: type annotations update checkpoint.\r\n\r\nsome w3c sparql10 tests now passing, but not sure how\r\n\r\n* chore: type annotations - refactor usage of typing.Optional",
+          "author": "Edmond Chuc",
+          "date": "2024-11-06T03:24:58Z"
+        },
+        {
+          "sha": "06bd927eb0d0a4cad6c77c16abd576cc07bdf721",
+          "html_url": "https://github.com/RDFLib/rdflib/commit/06bd927eb0d0a4cad6c77c16abd576cc07bdf721",
+          "message": "Annotate Serializer.serialize and descendants (#2970)\n\nThis patch aligns the type signatures on `Serializer` subclasses,\r\nincluding renaming the arbitrary-keywords dictionary to always be\r\n`**kwargs`.  This is in part to prepare for the possibility of adding\r\n`*args` as a positional-argument delimit",
+          "author": "Alex Nelson",
+          "date": "2024-11-04T20:49:23Z"
+        },
+        {
+          "sha": "086a4f7de110c71890aa3543a9099fc5ee2b1aab",
+          "html_url": "https://github.com/RDFLib/rdflib/commit/086a4f7de110c71890aa3543a9099fc5ee2b1aab",
+          "message": "Bump to Python 3.9, Big typing updates (#2963)\n\n* Bump minimum python version to 3.9\r\nUpdate dependencies minimum package versions to post-3.9 versions.\r\nUpgrade latest pyparsing\r\nUpdate to latest MyPy\r\nUpdate to latest Black\r\nRe-issue new Poetry lockfile\r\n\r\n* First round of relatively simple typing",
+          "author": "Ashley Sommer",
+          "date": "2024-11-04T04:13:35Z"
+        },
+        {
+          "sha": "ad7ab5fee5e13a32cd76a8b24b0569da52e3ae71",
+          "html_url": "https://github.com/RDFLib/rdflib/commit/ad7ab5fee5e13a32cd76a8b24b0569da52e3ae71",
+          "message": "feat: enable `check_untyped_defs` for Mypy (#2580)\n\nThis change enables `check_untyped_defs` so that Mypy will check all\r\ncode, even if it is not annotated with type hints.\r\n\r\nThis change also fixes all errors that were raised after\r\n`check_untyped_defs` was enabled.",
+          "author": "Iwan Aucamp",
+          "date": "2023-09-10T20:11:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "serialize TODO warn that assertions object",
+      "count": 1,
+      "items": [
+        {
+          "number": 2748,
+          "title": "FAILED test/test_misc/test_parse_file_guess_format.py::TestFileParserGuessFormat::test_warning",
+          "state": "closed",
+          "html_url": "https://github.com/RDFLib/rdflib/issues/2748",
+          "is_pull_request": false
+        }
+      ]
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "rdflib/plugins/serializers/rdfxml.py",
+      "satd_line": 78,
+      "last_commit": {
+        "sha": "3b2c6f33b40922a084e6f181a71ea4b19b627944",
+        "html_url": "https://github.com/RDFLib/rdflib/commit/3b2c6f33b40922a084e6f181a71ea4b19b627944",
+        "message": "Pr/3143 (#3144)\n\n* Start migrating the documentation from .rst sphynx to .md material for mkdocs. Add mkdocs.yml with proper configuration, enable automated generation of the doc API from the docstring, and start converting a few pages (index, getting started, developers) for demo.\n\n* Add automated ",
+        "author": "Nicholas Car",
+        "date": "2025-06-01T02:23:57Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying the warning to add",
+        "code snippet shows exact location for the warning",
+        "no complex dependencies or multi-file changes needed"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "serialize",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

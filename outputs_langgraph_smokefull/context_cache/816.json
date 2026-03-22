@@ -1,0 +1,273 @@
+{
+  "task_id": "816",
+  "repo_owner": "ocf",
+  "repo_name": "ocflib",
+  "file_path": "ocflib/account/manage.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:48:35+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:48:44+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:48:49+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "ocflib/account/manage.py",
+    "original_code": "def change_password(user_account, new_password):\n    \"\"\"Change a user's Kerberos password.\n\n    Runs a kadmin command in a pexpect session to change a user's password.\n\n    Args:\n        user_account: a dirty string of a user's OCF account\n        new_password: a dirty string of a user's new password\n\n    Returns:\n        True if successful\n\n    Raises:\n        Exception: kadmin returned an error. Probably incorrect\n            principal or error with sending the new password.\n        pexpect.TIMEOUT: We never got the line that we were expecting,\n            so something probably went wrong with the lines that we sent.\n        pexpect.EOF: The child ended prematurely.\n\n    \"\"\"\n\n    # TODO: don't clean these, error if bad instead\n    user_account = clean_user_account(user_account)\n    new_password = clean_password(new_password)\n    cmd = kerberos._kadmin_command(user_account)\n    child = pexpect.spawn(cmd, timeout=10)\n\n    child.expect(\"%s@OCF.BERKELEY.EDU's Password:\" % user_account)\n    child.sendline(new_password)\n\n    child.expect(\"Verify password - %s@OCF.BERKELEY.EDU's Password:\" % user_account)\n    child.sendline(new_password)\n\n    child.expect(pexpect.EOF)\n    if \"kadmin\" in child.before:\n        raise Exception(\"kadmin Error: %s\" % child.before)\n\n    return True",
+    "satd_comment": "# TODO: don't clean these, error if bad instead",
+    "target_file": {
+      "ok": true,
+      "path": "ocflib/account/manage.py",
+      "sha": "bd93011452cce114261d5a27c5d8540e19a38fee",
+      "download_url": "https://raw.githubusercontent.com/ocf/ocflib/master/ocflib/account/manage.py",
+      "content_excerpt": "\"\"\"Module containing account management methods, such as password changing, but\nnot account creation (since it's too large).\"\"\"\nimport shlex\n\nimport pexpect\n\nimport ocflib.account.search as search\nimport ocflib.account.utils as utils\nimport ocflib.account.validators as validators\nimport ocflib.infra.ldap as ldap_ocf\nimport ocflib.misc as misc\nimport ocflib.misc.mail as mail\n\nKADMIN_PATH = '/usr/bin/kadmin'\n\n\ndef change_password_with_staffer(username, password, principal,\n                                 admin_password, comment=None):\n    \"\"\"Change a user's Kerberos password using kadmin and a password, subject\n    to username and password validation.\n\n    :param comment: comment to include in notification email\n    \"\"\"\n    validators.validate_username(username)\n    validators.validate_password(username, password)\n\n    # try changing using kadmin pexpect\n    cmd = '{kadmin_path} -p {principal} cpw {username}'.format(\n        kadmin_path=shlex.quote(KADMIN_PATH),\n        principal=shlex.quote(principal),\n        username=shlex.quote(username))\n\n    child = pexpect.spawn(cmd, timeout=10)\n\n    child.expect(\"{}@OCF.BERKELEY.EDU's Password:\".format(username))\n    child.sendline(password)\n    child.expect(\"Verify password - {}@OCF.BERKELEY.EDU's Password:\"\n                 .format(username))\n    child.sendline(password)\n\n    # now give admin principal password\n    child.expect(\"{}@OCF.BERKELEY.EDU's Password:\".format(principal))\n    child.sendline(admin_password)\n\n    child.expect(pexpect.EOF)\n\n    output = child.before.decode('utf8')\n    if 'Looping detected' in output:\n        raise ValueError('Invalid admin password given.')\n    elif 'kadmin' in output:\n        raise ValueError('kadmin Error: {}'.format(output))\n\n    _notify_password_change(username, comment=comment)\n\n\ndef change_password_with_keytab(username, password, keytab, principal, comment=None):\n    \"\"\"Change a user's Kerberos password using a keytab, subject to username\n    and password validation.\n\n    :param comment: comment to include in notification email\n    \"\"\"\n    validators.validate_username(username, check_exists=True)\n    validators.validate_password(username, password)\n\n    # try changing using kadmin pexpect\n    cmd = '{kadmin_path} -K {keytab} -p {principal} cpw {username}'.format(\n        kadmin_path=shlex.quote(KADMIN_PATH),\n        keytab=shlex.quote(keytab),\n        principal=shlex.quote(principal),\n        username=shlex.quote(username))\n\n    child = pexpect.spawn(cmd, timeout=10)\n\n    child.expect(\"{}@OCF.BERKELEY.EDU's Password:\".format(username))\n    child.sendline(password)\n    child.expect(\"Verify password - {}@OCF.BERKELEY.EDU's Password:\"\n                 .format(username))\n    child.sendline(password)\n\n    child.expect(pexpect.EOF)\n\n    output = child.before.decode('utf8')\n    if 'kadmin' in output:\n        raise ValueError('kadmin Error: {}'.format(output))\n\n    _notify_password_change(username, comment=comment)\n\n\ndef modify_ldap_attributes(username, attributes, **kwargs):\n    \"\"\"Adds or modifies arbitrary attributes of a user's LDAP record subject to\n    minor validation beyond the LDAP schema.\n\n    At the moment, the only attribute that benefits from extra validation is\n    the 'loginShell' attribute.\n    \"\"\"\n\n    login_shell = attributes.get('loginShell', None)\n    if login_shell is not None:\n        if not isinstance(login_shell, str):\n            raise ValueError('Login shell must be a string')\n\n        if not misc.validators.valid_login_shell(login_shell):\n            raise ValueError(\"Invalid login shell '{}'\".format(login_shell))\n\n    ldap_ocf.modify_ldap_entry(\n        utils.dn_for_username(username),\n        attributes,\n        **kwargs\n    )\n    # TODO: Add trailing comma to **kwargs for Python 3.6+\n\n\ndef _notify_password_change(username, comment=None):\n    \"\"\"Send email about a password change.\n\n    :param username:\n    :param comment: a string to include indicating how/why the password was\n                    reset\n\n    >>> _notify_password_change('ckuehl', comment='Your password was reset in the lab.')\n    \"\"\"\n\n    name = search.user_attrs(username)['cn'][0]\n    body = \"\"\"Howdy there {name},\n\nJust a quick heads up that your Open Computing Facility account password was\njust reset, hopefully by you.\n{comment_line}\nAs a reminder, your OCF username is: {username}\n\nIf you're not sure why this happened, please reply to this email ASAP.\n\n{signature}\"\"\".format(\n        name=name,\n        username=username,\n        signature=mail.MAIL_SIGNATURE,\n        comment_line=('\\n' + comment + '\\n') if comment else '',\n    )\n\n    mail.send_mail_user(username, '[OCF] Account password changed', body)\n",
+      "total_lines": 140
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "shlex",
+        "pexpect",
+        "ocflib.account.search",
+        "ocflib.account.utils",
+        "ocflib.account.validators",
+        "ocflib.infra.ldap",
+        "ocflib.misc",
+        "ocflib.misc.mail"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/ocf/ocflib/master/README.md",
+      "content_excerpt": "# ocflib\n\n[![Build Status](https://jenkins.ocf.berkeley.edu/buildStatus/icon?job=ocf/ocflib/master)](https://jenkins.ocf.berkeley.edu/job/ocf/job/ocflib/job/master)\n[![Coverage Status](https://coveralls.io/repos/github/ocf/ocflib/badge.svg?branch=master)](https://coveralls.io/github/ocf/ocflib?branch=master)\n[![PyPI version](https://badge.fury.io/py/ocflib.svg)](https://pypi.org/project/ocflib/)\n\nocflib is a Python library for working with [Open Computing Facility][ocf]\nservices (in particular, accounts and server management).\n\nThe library targets Python 3.5.3 and 3.7 (the versions available in Debian\nstretch and buster).\n\nThe goal of the library is to make it easier to re-use OCF python code. In the\npast, code was split between approve, atool, create, chpass, sorry, signat,\netc., which made it difficult to do things like share common password\nrequirements.\n\n## What belongs here\n\nIn general, code which can be re-used should be here, but standalone\napplications or binaries shouldn't. For example, [ocfweb][ocfweb] uses ocflib\ncode to change passwords and create accounts, but the Django web app doesn't\nbelong here.\n\n## Using on OCF\n\nocflib is installed by [Puppet][puppet] on the OCF, so you can simply do things\nlike `import ocflib.lab.stats` from the system python3 installation. We _don't_\ninstall it to python2 site-packages.\n\nWe build [a Debian package][debian-pkg] which is installed by Puppet. We also\npublish new versions to [PyPI][pypi], which is useful because it allows easy\ninstallation into virtualenvs.\n\n## Note about lockfiles\n\nThis repository includes a `poetry.lock` f"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "change_password test",
+      "count": 2,
+      "items": [
+        {
+          "name": "submission_test.py",
+          "path": "tests/account/submission_test.py",
+          "sha": "3e9fc1aa700ee079c8122d53f8aab0653818ef0f",
+          "html_url": "https://github.com/ocf/ocflib/blob/31d446a36245fe4213970d6a8d200067128e8b05/tests/account/submission_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "manage_test.py",
+          "path": "tests/account/manage_test.py",
+          "sha": "8c8d63832253d38407e9b31284355de05bff8cb7",
+          "html_url": "https://github.com/ocf/ocflib/blob/31d446a36245fe4213970d6a8d200067128e8b05/tests/account/manage_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"change_password(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "submission.py",
+          "path": "ocflib/account/submission.py",
+          "sha": "233d379f8e22e1a85dabaaa4610a9a5d5de80186",
+          "html_url": "https://github.com/ocf/ocflib/blob/31d446a36245fe4213970d6a8d200067128e8b05/ocflib/account/submission.py",
+          "score": 1.0
+        },
+        {
+          "name": "submission_test.py",
+          "path": "tests/account/submission_test.py",
+          "sha": "3e9fc1aa700ee079c8122d53f8aab0653818ef0f",
+          "html_url": "https://github.com/ocf/ocflib/blob/31d446a36245fe4213970d6a8d200067128e8b05/tests/account/submission_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "ocflib/account",
+      "count": 8,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "ocflib/account/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "creation.py",
+          "path": "ocflib/account/creation.py",
+          "type": "file"
+        },
+        {
+          "name": "mail_templates",
+          "path": "ocflib/account/mail_templates",
+          "type": "dir"
+        },
+        {
+          "name": "manage.py",
+          "path": "ocflib/account/manage.py",
+          "type": "file"
+        },
+        {
+          "name": "search.py",
+          "path": "ocflib/account/search.py",
+          "type": "file"
+        },
+        {
+          "name": "submission.py",
+          "path": "ocflib/account/submission.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "ocflib/account/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "validators.py",
+          "path": "ocflib/account/validators.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "ocflib/account/__init__.py"
+        },
+        {
+          "name": "creation.py",
+          "path": "ocflib/account/creation.py"
+        },
+        {
+          "name": "search.py",
+          "path": "ocflib/account/search.py"
+        },
+        {
+          "name": "submission.py",
+          "path": "ocflib/account/submission.py"
+        },
+        {
+          "name": "utils.py",
+          "path": "ocflib/account/utils.py"
+        },
+        {
+          "name": "validators.py",
+          "path": "ocflib/account/validators.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "ocflib/account/manage.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b7467d27a89afc9837101c0813349743c3e23fbb",
+          "html_url": "https://github.com/ocf/ocflib/commit/b7467d27a89afc9837101c0813349743c3e23fbb",
+          "message": "Remove trailing comma that was causing a syntax error on Python 3.4 hosts.",
+          "author": "Benjamin Zhang",
+          "date": "2018-11-12T03:57:00Z"
+        },
+        {
+          "sha": "c2c5b9c5f17f139761027d95139209e3f566ee4f",
+          "html_url": "https://github.com/ocf/ocflib/commit/c2c5b9c5f17f139761027d95139209e3f566ee4f",
+          "message": "Fix loginShell validation to require a string",
+          "author": "Jason Perrin",
+          "date": "2018-11-07T06:24:14Z"
+        },
+        {
+          "sha": "57cad3b67e462b498fc296770a99ad9d4352fa1b",
+          "html_url": "https://github.com/ocf/ocflib/commit/57cad3b67e462b498fc296770a99ad9d4352fa1b",
+          "message": "Allow LDAP changes without a keytab\n\nThis then allows these functions to be used in user-facing scripts\nwhere they have potentially already authenticated with their password\nand have an existing Kerberos ticket.\n\nI also did a pretty major refactor to use subprocess instead of pyexpect\nfor changing L",
+          "author": "Jason Perrin",
+          "date": "2018-11-03T23:17:45Z"
+        },
+        {
+          "sha": "44e6a53452b371cc6112452390d146271fc1c570",
+          "html_url": "https://github.com/ocf/ocflib/commit/44e6a53452b371cc6112452390d146271fc1c570",
+          "message": "MAIL_SIGNATURE seems to have been missed on the first pass",
+          "author": "Abizer Lokhandwala",
+          "date": "2017-04-07T05:27:13Z"
+        },
+        {
+          "sha": "eb4d880139064bfadc0fd857cfe22d8999b43a42",
+          "html_url": "https://github.com/ocf/ocflib/commit/eb4d880139064bfadc0fd857cfe22d8999b43a42",
+          "message": "finished moving constants to its respective files -- RT#5941.",
+          "author": "mrminos",
+          "date": "2017-03-04T00:41:25Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "change_password TODO clean these error instead",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "ocflib/account/manage.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "b7467d27a89afc9837101c0813349743c3e23fbb",
+        "html_url": "https://github.com/ocf/ocflib/commit/b7467d27a89afc9837101c0813349743c3e23fbb",
+        "message": "Remove trailing comma that was causing a syntax error on Python 3.4 hosts.",
+        "author": "Benjamin Zhang",
+        "date": "2018-11-12T03:57:00Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

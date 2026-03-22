@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -292,6 +292,69 @@ class OpenAICompatClient:
                 parts.append(f"[{layer_name.upper()}]\n" + json.dumps(payload, ensure_ascii=False))
         return "\n\n".join(parts)
 
+    def compact_context_for_stage(self, bundle: dict[str, Any] | None, stage: str) -> str:
+        if not bundle:
+            return ""
+        metadata = bundle.get("metadata") or {}
+        base = bundle.get("base_context") or {}
+        repair = bundle.get("repair_context") or {}
+        review = bundle.get("review_context") or {}
+        compact = {
+            "metadata": {
+                "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
+                "github_evidence_strength": metadata.get("github_evidence_strength"),
+                "target_file_ok": metadata.get("target_file_ok"),
+                "satd_window_found": metadata.get("satd_window_found"),
+                "enclosing_symbol_found": metadata.get("enclosing_symbol_found"),
+                "related_tests_count": metadata.get("related_tests_count"),
+                "call_sites_count": metadata.get("call_sites_count"),
+                "commits_count": metadata.get("commits_count"),
+                "similar_history_count": metadata.get("similar_history_count"),
+                "symbol_name": metadata.get("symbol_name"),
+                "satd_line": metadata.get("satd_line"),
+            },
+            "base_context": {
+                "file_path": base.get("file_path"),
+                "satd_comment": base.get("satd_comment"),
+                "target_file": {
+                    "ok": (base.get("target_file") or {}).get("ok"),
+                    "path": (base.get("target_file") or {}).get("path"),
+                    "content_excerpt": (base.get("target_file") or {}).get("content_excerpt"),
+                    "total_lines": (base.get("target_file") or {}).get("total_lines"),
+                },
+                "satd_window": base.get("satd_window"),
+                "enclosing_symbol": base.get("enclosing_symbol"),
+                "imports": ((base.get("imports") or {}).get("imports", []) if isinstance(base.get("imports"), dict) else (base.get("imports") or []))[:20],
+                "issue_refs": ((base.get("issue_refs") or []) if isinstance(base.get("issue_refs"), list) else [])[:2],
+                "module_docs": base.get("module_docs"),
+            },
+        }
+        if stage in {"repair", "review"}:
+            compact["repair_context"] = {
+                "related_tests": {
+                    "count": (repair.get("related_tests") or {}).get("count", 0),
+                    "items": (repair.get("related_tests") or {}).get("items", [])[:5],
+                },
+                "call_sites": {
+                    "count": (repair.get("call_sites") or {}).get("count", 0),
+                    "items": (repair.get("call_sites") or {}).get("items", [])[:5],
+                },
+                "neighbor_files": repair.get("neighbor_files"),
+                "commits_for_path": {
+                    "count": (repair.get("commits_for_path") or {}).get("count", 0),
+                    "commits": (repair.get("commits_for_path") or {}).get("commits", [])[:2],
+                },
+                "similar_history": {
+                    "count": (repair.get("similar_history") or {}).get("count", 0),
+                    "items": (repair.get("similar_history") or {}).get("items", [])[:2],
+                },
+                "last_commit_for_line": repair.get("last_commit_for_line"),
+            }
+        if stage == "review":
+            compact["review_context"] = review
+        return json.dumps(compact, ensure_ascii=False)
+
+
     def _ensure_bundle(self, bundle: dict[str, Any] | None, state: GraphState) -> dict[str, Any]:
         current = dict(bundle or {})
         current.setdefault("task_id", state["task_id"])
@@ -424,12 +487,14 @@ class OpenAIAnalyzer:
         github_context = self.client.format_context(context_bundle, layers=("base_context",))
         system_prompt = (
             "You are the analyzer agent in a SATD repair workflow. "
-            "You are a balanced precision-recall repairability assessor. "
+            "Your job is to decide whether a SATD item is a good candidate for automatic repair, not whether it is theoretically fixable in some ideal setting. "
             "Use SATD comment, original code, and file path as the primary evidence. "
             "Use current GitHub repository state only as auxiliary evidence because the SATD may come from an older snapshot that has already been repaired. "
             "Missing GitHub files, missing symbols, missing tests, or missing history must be treated as neutral missing evidence, not as automatic reasons to drop. "
+            "Score the task on five general dimensions: intent_clarity, change_locality, semantic_risk, context_sufficiency, and verifiability. "
+            "Prefer tasks that are clear, local, low-risk, and reviewable. "
             "Drop only when the primary evidence itself indicates vague intent, architecture-level change, high behavioral risk, or an external blocking dependency. "
-            "Prefer sending clear and local SATD items to the fixer. Return JSON only."
+            "Return JSON only."
         )
         user_prompt = (
             "Return a JSON object with keys: "
@@ -438,7 +503,9 @@ class OpenAIAnalyzer:
             "clarity_score (float 0-1), scope_radius (line|function|class|file|multi_file), validation_signals (array of strings), "
             "context_gaps (array of strings), repair_strategy (string), drop_reason (one of: intent_too_vague, architecture_level_change, insufficient_context, "
             "missing_validation_signal, high_behavioral_risk, too_many_call_sites, external_dependency_blocked, repo_history_conflict, or null), "
-            "followup_context_requests (array of strings). Keep evidence_summary concise and evidence-based.\n\n"
+            "followup_context_requests (array of strings), intent_clarity (float 0-1), change_locality (float 0-1), semantic_risk (float 0-1), "
+            "context_sufficiency (float 0-1), verifiability (float 0-1), analyze_score (float 0-1). "
+            "Keep evidence_summary concise and evidence-based. If repository evidence is stale or missing but the task still looks clear and local from SATD comment plus original code, do not drop solely for that reason.\n\n"
             f"Repository owner: {state['user']}\n"
             f"Repository name: {state['project']}\n"
             f"File path: {state['file_path']}\n"
@@ -476,53 +543,109 @@ class OpenAIAnalyzer:
         repair_strategy = str(payload.get("repair_strategy") or "")
         drop_reason = self._normalize_drop_reason(payload.get("drop_reason"), decision)
 
+        intent_clarity = self._clamp_float(payload.get("intent_clarity"), clarity_score)
+        change_locality = self._clamp_float(payload.get("change_locality"), self._scope_to_locality(scope_radius))
+        semantic_risk = self._clamp_float(payload.get("semantic_risk"), self._risk_to_numeric(risk_level))
+        context_sufficiency = self._clamp_float(
+            payload.get("context_sufficiency"),
+            context_score,
+        )
+        verifiability = self._clamp_float(
+            payload.get("verifiability"),
+            self._estimate_verifiability(scope_radius, validation_signals, context_gaps),
+        )
+        analyze_score = self._clamp_float(
+            payload.get("analyze_score"),
+            self._weighted_analyze_score(
+                intent_clarity,
+                change_locality,
+                semantic_risk,
+                context_sufficiency,
+                verifiability,
+            ),
+        )
+
         if historical_snapshot_mismatch and "github_snapshot_mismatch" not in validation_signals:
             validation_signals.append("github_snapshot_mismatch")
 
-        primary_clear = self._primary_evidence_clear(state, clarity_score, scope_radius, repairability_score)
-        local_enough = scope_radius in {"line", "function", "class", "file"}
-        strong_negative = drop_reason in {
+        primary_clear = self._primary_evidence_clear(
+            state,
+            intent_clarity=intent_clarity,
+            change_locality=change_locality,
+            context_sufficiency=context_sufficiency,
+            analyze_score=analyze_score,
+            scope_radius=scope_radius,
+        )
+        local_enough = scope_radius in {"line", "function", "class", "file"} and change_locality >= 0.52
+        hard_drop_reason = drop_reason in {
             "intent_too_vague",
             "architecture_level_change",
             "high_behavioral_risk",
             "external_dependency_blocked",
+        }
+        weak_drop_reason = drop_reason in {
+            None,
+            "insufficient_context",
+            "missing_validation_signal",
+            "too_many_call_sites",
             "repo_history_conflict",
         }
 
-        if decision == "needs_more_context" and primary_clear and local_enough and risk_level != "high" and (clarity_score >= 0.5 or repairability_score >= 0.55):
+        if decision == "needs_more_context" and primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.62:
             decision = "repairable"
-            repairability_score = max(repairability_score, 0.62)
-            confidence = max(confidence, 0.57)
+            repairability_score = max(repairability_score, analyze_score, 0.64)
+            confidence = max(confidence, 0.60)
             drop_reason = None
             followup_context_requests = []
 
-        if decision == "drop" and drop_reason in {None, "insufficient_context", "missing_validation_signal", "too_many_call_sites"}:
-            if primary_clear and local_enough and risk_level != "high" and (clarity_score >= 0.6 or repairability_score >= 0.64):
+        if decision == "drop" and weak_drop_reason:
+            if primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.66:
                 decision = "repairable"
-                repairability_score = max(repairability_score, 0.62 if historical_snapshot_mismatch else 0.6)
-                confidence = max(confidence, 0.55)
+                repairability_score = max(repairability_score, analyze_score, 0.66)
+                confidence = max(confidence, 0.60 if historical_snapshot_mismatch else 0.58)
                 drop_reason = None
+            elif analyze_score >= 0.54 and not hard_drop_reason:
+                decision = "needs_more_context"
+                drop_reason = "insufficient_context"
 
-        if decision == "repairable" and (clarity_score >= 0.58 and local_enough and risk_level != "high"):
-            repairability_score = max(repairability_score, 0.6)
-            confidence = max(confidence, 0.54)
+        if (
+            decision == "drop"
+            and drop_reason == "architecture_level_change"
+            and scope_radius in {"line", "function", "class"}
+            and analyze_score >= 0.58
+        ):
+            decision = "repairable"
+            repairability_score = max(repairability_score, analyze_score, 0.62)
+            confidence = max(confidence, 0.57)
+            drop_reason = None
+
+        if decision == "repairable" and primary_clear and local_enough and semantic_risk <= 0.72:
+            repairability_score = max(repairability_score, analyze_score, 0.64)
+            confidence = max(confidence, 0.58)
             drop_reason = None
 
         if decision == "repairable":
             repair_strategy = repair_strategy or "Apply a local, behavior-preserving fix within the smallest stable scope."
-            drop_reason = None
             followup_context_requests = []
         elif decision == "needs_more_context":
             repair_strategy = repair_strategy or "Gather only the missing context needed to localize the change."
+            if not followup_context_requests:
+                followup_context_requests = ["clarify_missing_local_context"]
         else:
             repair_strategy = repair_strategy or "Do not attempt automatic repair."
-            if not drop_reason and not strong_negative:
+            if not drop_reason:
                 drop_reason = "insufficient_context"
 
         return AnalysisResult(
             decision=decision,
             repairable=decision == "repairable",
             repairability_score=repairability_score,
+            intent_clarity=intent_clarity,
+            change_locality=change_locality,
+            semantic_risk=semantic_risk,
+            context_sufficiency=context_sufficiency,
+            verifiability=verifiability,
+            analyze_score=analyze_score,
             confidence=confidence,
             satd_type=satd_type,
             reason=evidence_summary,
@@ -543,23 +666,67 @@ class OpenAIAnalyzer:
     def _primary_evidence_clear(
         self,
         state: GraphState,
-        clarity_score: float,
+        intent_clarity: float,
+        change_locality: float,
+        context_sufficiency: float,
+        analyze_score: float,
         scope_radius: str,
-        repairability_score: float,
     ) -> bool:
         comment = (state.get("satd_comment") or "").strip()
         code = (state.get("original_code") or "").strip()
         comment_tokens = len(re.findall(r"[A-Za-z_]+", comment))
         code_lines = len([line for line in code.splitlines() if line.strip()])
-        has_local_structure = bool(re.search(r"\b(def|class|return|if|for|while|try|except)\b", code))
+        has_local_structure = bool(re.search(r"\b(def|class|return|if|for|while|try|except|with|raise)\b", code))
         scope_local = scope_radius in {"line", "function", "class", "file"}
         return (
             comment_tokens >= 3
             and code_lines >= 1
             and has_local_structure
             and scope_local
-            and (clarity_score >= 0.5 or repairability_score >= 0.55)
+            and intent_clarity >= 0.48
+            and change_locality >= 0.50
+            and context_sufficiency >= 0.45
+            and analyze_score >= 0.54
         )
+
+    def _scope_to_locality(self, scope_radius: str) -> float:
+        return {
+            "line": 0.95,
+            "function": 0.85,
+            "class": 0.70,
+            "file": 0.58,
+            "multi_file": 0.28,
+        }.get(scope_radius, 0.50)
+
+    def _risk_to_numeric(self, risk_level: str) -> float:
+        return {"low": 0.22, "medium": 0.55, "high": 0.86}.get(risk_level, 0.55)
+
+    def _estimate_verifiability(self, scope_radius: str, validation_signals: list[str], context_gaps: list[str]) -> float:
+        score = 0.45
+        if scope_radius in {"line", "function", "class"}:
+            score += 0.10
+        if validation_signals:
+            score += min(0.25, 0.05 * len(validation_signals))
+        if context_gaps:
+            score -= min(0.20, 0.04 * len(context_gaps))
+        return max(0.0, min(1.0, score))
+
+    def _weighted_analyze_score(
+        self,
+        intent_clarity: float,
+        change_locality: float,
+        semantic_risk: float,
+        context_sufficiency: float,
+        verifiability: float,
+    ) -> float:
+        score = (
+            0.30 * intent_clarity
+            + 0.25 * change_locality
+            + 0.20 * context_sufficiency
+            + 0.15 * verifiability
+            + 0.10 * (1.0 - semantic_risk)
+        )
+        return max(0.0, min(1.0, score))
 
     def _normalize_decision(self, value: Any) -> str:
         text = str(value or "").strip().lower()
@@ -625,7 +792,7 @@ class OpenAIFixer:
         assert analysis is not None
 
         round_id = state["round_id"] + 1
-        github_context = self.client.format_context(state.get("github_context"), layers=("base_context", "repair_context"))
+        github_context = self.client.compact_context_for_stage(state.get("github_context"), "repair")
         system_prompt = (
             "You are the fixer agent in a SATD repair workflow. "
             "Produce repaired code, not a patch description. "
@@ -662,13 +829,23 @@ class OpenAIFixer:
             f"Base + repair context:\n{github_context}\n"
         )
         payload = self.client.generate_json(system_prompt, user_prompt)
+        repair_plan = str(payload.get("repair_plan") or analysis.repair_strategy or "Apply the smallest plausible local fix.")
+        repaired_code = str(payload.get("repaired_code") or state["original_code"])
+        changed_scope = str(payload.get("changed_scope") or analysis.scope_radius or "function")
+        if changed_scope not in {"line", "function", "class", "file", "multi_file"}:
+            changed_scope = analysis.scope_radius or "function"
+        try:
+            confidence = max(0.0, min(1.0, float(payload.get("confidence", analysis.confidence or 0.45))))
+        except (TypeError, ValueError):
+            confidence = max(0.0, min(1.0, float(analysis.confidence or 0.45)))
+        notes = str(payload.get("notes") or "model response normalized with fixer fallback")
         return RepairAttempt(
             round_id=round_id,
-            repair_plan=str(payload["repair_plan"]),
-            repaired_code=str(payload["repaired_code"]),
-            changed_scope=str(payload["changed_scope"]),
-            confidence=float(payload["confidence"]),
-            notes=str(payload["notes"]),
+            repair_plan=repair_plan,
+            repaired_code=repaired_code,
+            changed_scope=changed_scope,
+            confidence=confidence,
+            notes=notes,
         )
 
 
@@ -682,27 +859,22 @@ class OpenAIReviewer:
         assert analysis is not None
         assert repair is not None
 
-        github_context = self.client.format_context(
-            state.get("github_context"),
-            layers=("base_context", "repair_context", "review_context"),
-        )
+        github_context = self.client.compact_context_for_stage(state.get("github_context"), "review")
         system_prompt = (
             "You are the reviewer agent in a SATD repair workflow. "
-            "You are a moderately strict final gate whose job is to keep strong repairs, reject clearly unsafe ones, and avoid over-accepting borderline fixes. "
-            "Judge the repaired code itself, not a patch description. "
-            "Use the analyzer evidence, repair context, validation summary, and change-scope evidence when judging. "
-            "Treat GitHub evidence weakness as uncertainty, not automatic failure. "
-            "If the analyzer marked historical snapshot mismatch, rely more on original_code and SATD comment when deciding. "
-            "Reject repairs that are clearly vague, over-scoped, unsupported by the primary evidence, or likely to alter behavior incorrectly. "
-            "Approve solid local repairs even when some repository evidence is incomplete. "
-            "You do not have access to any ground truth labels. Return JSON only."
+            "You are a moderately strict final gate. "
+            "Judge whether the repaired code is a focused, credible response to the SATD, with minimal unnecessary changes and acceptable semantic risk. "
+            "Use the analyzer evidence and repair/review context, but do not reject solely because repository evidence is incomplete or stale. "
+            "If historical snapshot mismatch is present, rely more on SATD comment and original code semantics. "
+            "Return JSON only."
         )
         user_prompt = (
             "Return a JSON object with keys: approved (bool), review_score (float 0-1), "
+            "problem_alignment (float 0-1), minimality (float 0-1), semantic_preservation (float 0-1), internal_consistency (float 0-1), "
             "issues (array of strings), revision_advice (string), reject_type (string or null), rationale (string).\n"
-            "Be moderately conservative, but do not reject a repair only because repository evidence is incomplete.\n"
-            "If the repair is a credible local response to the SATD and there is no strong contradiction, it can be approved.\n"
-            "Keep issues and rationale concise.\n\n"
+            "Use these meanings: problem_alignment = whether the repair truly responds to the SATD; minimality = whether the change stays within the smallest necessary scope; "
+            "semantic_preservation = whether the repair keeps the original behavior boundaries unless the SATD explicitly asks to change them; internal_consistency = whether the repaired code is self-consistent and fits the context.\n"
+            "Be moderately conservative. Approve strong local repairs, but reject repairs that fail to address the SATD, expand the scope too much, or create plausible semantic drift.\n\n"
             f"Round: {repair.round_id}\n"
             f"Repository owner: {state['user']}\n"
             f"Repository name: {state['project']}\n"
@@ -710,6 +882,12 @@ class OpenAIReviewer:
             f"SATD comment: {state['satd_comment']}\n"
             f"Analysis decision: {analysis.decision}\n"
             f"Analysis repairability score: {analysis.repairability_score}\n"
+            f"Analysis score: {analysis.analyze_score}\n"
+            f"Analysis intent clarity: {analysis.intent_clarity}\n"
+            f"Analysis change locality: {analysis.change_locality}\n"
+            f"Analysis semantic risk: {analysis.semantic_risk}\n"
+            f"Analysis context sufficiency: {analysis.context_sufficiency}\n"
+            f"Analysis verifiability: {analysis.verifiability}\n"
             f"Analysis summary: {analysis.evidence_summary}\n"
             f"Analysis strategy: {analysis.repair_strategy}\n"
             f"Analysis scope radius: {analysis.scope_radius}\n"
@@ -725,39 +903,98 @@ class OpenAIReviewer:
         )
         payload = self.client.generate_json(system_prompt, user_prompt)
 
-        review_score = float(payload["review_score"])
-        issues = [str(item) for item in payload.get("issues", [])]
-        approved = bool(payload["approved"])
+        problem_alignment = self._clamp_float(payload.get("problem_alignment"), 0.0)
+        minimality = self._clamp_float(payload.get("minimality"), 0.0)
+        semantic_preservation = self._clamp_float(payload.get("semantic_preservation"), 0.0)
+        internal_consistency = self._clamp_float(payload.get("internal_consistency"), 0.0)
+        review_score = self._clamp_float(
+            payload.get("review_score"),
+            self._weighted_review_score(problem_alignment, minimality, semantic_preservation, internal_consistency),
+        )
+        issues = [str(item).strip() for item in payload.get("issues", []) if str(item).strip()]
+        approved = bool(payload.get("approved"))
         reject_type = payload.get("reject_type")
-        rationale = str(payload["rationale"])
+        rationale = str(payload.get("rationale") or "")
+        softened_gate_used = False
+
+        if problem_alignment < 0.58:
+            approved = False
+            reject_type = reject_type or "not_satd_aligned"
+            rationale = rationale + " | hard_gate=problem_not_addressed"
+
+        if minimality < 0.42:
+            approved = False
+            reject_type = reject_type or "over_scoped_change"
+            rationale = rationale + " | hard_gate=change_too_large"
+
+        if semantic_preservation < 0.45:
+            approved = False
+            reject_type = reject_type or "unsafe_semantic_change"
+            rationale = rationale + " | hard_gate=semantic_drift_risk"
 
         credible_local_fix = (
             analysis.scope_radius in {"line", "function", "class", "file"}
             and analysis.risk_level != "high"
-            and repair.confidence >= 0.6
-            and review_score >= 0.64
-            and len(issues) <= 1
-            and reject_type not in {"unsafe_semantic_change", "high_behavioral_risk", "architecture_level_change"}
+            and analysis.analyze_score >= 0.63
+            and repair.confidence >= 0.68
+            and review_score >= 0.72
+            and problem_alignment >= 0.72
+            and minimality >= 0.58
+            and semantic_preservation >= 0.58
+            and len(issues) == 0
+            and reject_type not in {
+                "unsafe_semantic_change",
+                "high_behavioral_risk",
+                "architecture_level_change",
+                "not_satd_aligned",
+                "over_scoped_change",
+            }
         )
         if not approved and credible_local_fix:
             approved = True
             reject_type = None
+            softened_gate_used = True
             rationale = rationale + " | softened_gate=accepted_as_credible_local_fix"
 
-        if approved and review_score < 0.52:
-            review_score = 0.52
-
-        if approved and review_score < 0.56 and len(issues) >= 2:
+        if approved and review_score < 0.60 and (problem_alignment < 0.62 or len(issues) >= 2):
             approved = False
             reject_type = reject_type or "borderline_review_confidence"
             rationale = rationale + " | softened_gate=reverted_due_to_borderline_confidence"
+            softened_gate_used = False
 
         return ReviewResult(
             round_id=repair.round_id,
             approved=approved,
             review_score=review_score,
+            problem_alignment=problem_alignment,
+            minimality=minimality,
+            semantic_preservation=semantic_preservation,
+            internal_consistency=internal_consistency,
             issues=issues,
-            revision_advice=str(payload["revision_advice"]),
+            revision_advice=str(payload.get("revision_advice") or ""),
             reject_type=reject_type,
             rationale=rationale,
+            softened_gate_used=softened_gate_used,
         )
+
+    def _weighted_review_score(
+        self,
+        problem_alignment: float,
+        minimality: float,
+        semantic_preservation: float,
+        internal_consistency: float,
+    ) -> float:
+        score = (
+            0.40 * problem_alignment
+            + 0.25 * minimality
+            + 0.20 * semantic_preservation
+            + 0.15 * internal_consistency
+        )
+        return max(0.0, min(1.0, score))
+
+    def _clamp_float(self, value: Any, default: float) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return default
+

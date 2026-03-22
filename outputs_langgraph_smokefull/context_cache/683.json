@@ -1,0 +1,312 @@
+{
+  "task_id": "683",
+  "repo_owner": "candlepin",
+  "repo_name": "subscription-manager",
+  "file_path": "src/rhsm/connection.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:01:12+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_print_debug_info_about_request",
+    "satd_line": 889,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:01:19+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:01:21+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/rhsm/connection.py",
+    "original_code": "# FIXME: This method should return True, when it was successful, not None\ndef unbindBySerial(self, consumerId: str, serial: str) -> None:\n    \"\"\"\n    Try to remove consumed pool by serial number\n    :param consumerId: consumer UUID\n    :param serial: serial number of consumed pool\n    \"\"\"\n    method = \"/consumers/%s/certificates/%s\" % (self.sanitize(consumerId), self.sanitize(str(serial)))\n    return self.conn.request_delete(method, description=_(\"Unsubscribing\"))",
+    "satd_comment": "# FIXME: This method should return True, when it was successful, not None",
+    "target_file": {
+      "ok": true,
+      "path": "src/rhsm/connection.py",
+      "sha": "3ba42ff8efe8008cd931b2d8875fd28aa96edd40",
+      "download_url": "https://raw.githubusercontent.com/candlepin/subscription-manager/main/src/rhsm/connection.py",
+      "content_excerpt": "# A proxy interface to initiate and interact with candlepin.\n#\n# Copyright (c) 2010 - 2012 Red Hat, Inc.\n#\n# This software is licensed to you under the GNU General Public License,\n# version 2 (GPLv2). There is NO WARRANTY for this software, express or\n# implied, including the implied warranties of MERCHANTABILITY or FITNESS\n# FOR A PARTICULAR PURPOSE. You should have received a copy of GPLv2\n# along with this software; if not, see\n# http://www.gnu.org/licenses/old-licenses/gpl-2.0.txt.\n#\n# Red Hat trademarks are not licensed under GPLv2. No permission is\n# granted to use or replicate Red Hat trademarks that are incorporated\n# in this software or its documentation.\n#\n\nimport base64\nfrom rhsm import certificate\nimport datetime\nimport dateutil.parser\nimport locale\nimport logging\nimport os\nimport socket\nimport sys\nimport time\nimport traceback\nfrom typing import Any, Dict, Iterable, List, Optional, Tuple, Union\nfrom pathlib import Path\nimport re\nimport enum\n\nfrom email.utils import format_datetime\n\nfrom rhsm.https import httplib, ssl\n\nfrom urllib.request import proxy_bypass\nfrom urllib.parse import urlencode, urlparse, quote, quote_plus\n\nfrom rhsm.config import get_config_parser\nfrom rhsm import ourjson as json\nfrom rhsm import utils\n\ntry:\n    import subscription_manager.version\n\n    subman_version = subscription_manager.version.pkg_version\nexcept ImportError:\n    subman_version = \"unknown\"\n\ntry:\n    from subscription_manager.i18n import ugettext as _\nexcept ImportError:\n\n    def _(message: str):\n        return message\n\n\nconfig = get_config_parser()\nMULTI_ENV = \"multi_environment\"\n\nREUSE_CONNECTION = True\n\n\ndef safe_int(value: Any, safe_value: Any = None) -> Union[int, None, Any]:\n    try:\n        return int(value)\n    except Exception:\n        return safe_value\n\n\ndef normalized_host(host: str) -> str:\n    \"\"\"\n    When you want to use IPv6 address and port in e.g. HTTP header, then you cannot use following\n    notation common for IPv4 (147.230.16.1:53). You have to use following notation for IPv6\n    [2001:718:1c01:16::aa]:53.\n    :param host: hostname or IPv4 or IPv6 address\n    :return: When host is IPv6 address, then it encapsulated in [] brackets\n    \"\"\"\n    if \":\" in host:\n        return \"[%s]\" % host\n    else:\n        return host\n\n\ndef get_time_drift(timestamp: str) -> datetime.timedelta:\n    \"\"\"Get a difference between server and local clock.\n\n    :param timestamp: A timezone-unaware timestamp in RFC 1123 format.\n    :returns: Absolute difference between server and local time.\n    \"\"\"\n    # RFC 1123: 'Fri, 12 Jan 2024 08:10:46 GMT'\n    timestamp: datetime.datetime = dateutil.parser.parse(timestamp)\n    if timestamp.tzinfo.tzname(timestamp) != \"UTC\":\n        log.warning(f\"Expected UTC timestamp, got '{timestamp}', drift check may be off.\")\n    # dateutil has its own tzinfo object representing UTC\n    timestamp = timestamp.replace(tzinfo=datetime.timezone.utc)\n\n    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    drift: datetime.timedelta = abs(timestamp - now)\n    return drift\n\n\nclass NullHandler(logging.Handler):\n    def emit(self, record: Any) -> None:\n        pass\n\n\nh = NullHandler()\nlogging.getLogger(\"rhsm\").addHandler(h)\n\nlog = logging.getLogger(__name__)\n\n\nclass NoValidEntitlement(Exception):\n    \"\"\"Throw when there is no valid entitlement certificate for accessing CDN\"\"\"\n\n    pass\n\n\nclass ConnectionException(Exception):\n    pass\n\n\nclass ProxyException(Exception):\n    \"\"\"\n    Thrown in case of errors related to the proxy server.\n    \"\"\"\n\n    def __init__(self, hostname: str = None, port: int = None, exc: Optional[Exception] = None):\n        self._hostname = hostname\n        self.port = port\n        self.exc = exc\n\n    @property\n    def hostname(self) -> str:\n        return normalized_host(self._hostname)\n\n    @property\n    def address(self) -> str:\n        return f\"{self.hostname}:{self.port}\"\n\n    def __str__(self) -> str:\n        addr = self.address\n        err = f\"Proxy error at {addr}\"\n        if self.exc is not None:\n            err = f\"{err}: {self.exc}\"\n        return err\n\n\nclass ConnectionSetupException(ConnectionException):\n    pass\n\n\nclass BadCertificateException(ConnectionException):\n    \"\"\"Thrown when an error parsing a certificate is encountered.\"\"\"\n\n    def __init__(self, cert_path: str, ssl_exc: ssl.SSLError) -> None:\n        \"\"\"Pass the full path to the bad certificate.\"\"\"\n        self.cert_path = cert_path\n        self.ssl_exc = ssl_exc\n\n    def __str__(self) -> str:\n        return \"Bad certificate at %s\" % self.cert_path\n\n\nclass ConnectionOSErrorException(ConnectionException):\n    \"\"\"\n    Thrown in case of OSError during the connect() of HTTPSConnection,\n    in case the OSError does not come from a syscall failure (and thus\n    its 'errno' attribute is None.\n    \"\"\"\n\n    def __init__(self, host: str, port: int, handler: str, exc: OSError):\n        self._host = host\n        self.port = port\n        self.handler = handler\n        self.exc = exc\n\n    @property\n    def host(self) -> str:\n        return normalized_host(self._host)\n\n\nclass ConnectionType(enum.Enum):\n    \"\"\"\n    Enumerate of allowed connection types\n    \"\"\"\n\n    # Connection uses no authentication\n    NO_AUTH = enum.auto()\n\n    # Connection uses basic authentication (username and password)\n    BASIC_AUTH = enum.auto()\n\n    # Connection uses consumer certificate for authentication\n    CONSUMER_CERT_AUTH = enum.auto()\n\n    # Connection uses Keycloak token\n    KEYCLOAK_AUTH = enum.auto()\n\n\nclass BaseConnection:\n    def __init__(\n        self,\n        host: Optional[str] = None,\n        ssl_port: Optional[int] = None,\n        handler: Optional[str] = None,\n        ca_dir: Optional[str] = None,\n        insecure: Optional[bool] = None,\n        proxy_hostname: Optional[str] = None,\n        proxy_port: Optional[int] = None,\n        proxy_user: Optional[str] = None,\n        proxy_password: Optional[str] = None,\n        no_proxy: Optional[bool] = None,\n        username: Optional[str] = None,\n        password: Optional[str] = None,\n        cert_file: Optional[str] = None,\n        key_file: Optional[str] = None,\n        cert_dir: Optional[str] = None,\n        token: Optional[str] = None,\n        user_agent: Optional[str] = None,\n        correlation_id: Optional[str] = None,\n        timeout: Optional[int] = None,\n        auth_type: Optional[ConnectionType] = None,\n        **kwargs,\n    ) -> None:\n        self.host = host or config.get(\"server\", \"hostname\")\n        self.handler = handler or config.get(\"server\", \"prefix\")\n        self.ssl_port = ssl_port or safe_int(config.get(\"server\", \"port\"))\n        self.timeout = timeout or safe_int(config.get(\"server\", \"server_timeout\"))\n\n        # allow specifying no_proxy via api or config\n        no_proxy_override = no_proxy or config.get(\"server\", \"no_proxy\")\n        if no_proxy_override:\n            os.environ[\"no_proxy\"] = no_proxy_override\n\n        utils.fix_no_proxy()\n        log.debug(\"Environment variable NO_PROXY=%s will be used\" % no_proxy_override)\n\n        # honor no_proxy environment variable\n        if proxy_bypass(self.host):\n            self.proxy_hostname = None\n            self.proxy_port = None\n            self.proxy_user = None\n            self.proxy_password = None\n        else:\n            info = utils.get_env_proxy_info()\n\n            if proxy_hostname is not None:\n                self.proxy_hostname = proxy_hostname\n            else:\n                self.proxy_hostname = config.get(\"server\", \"proxy_hostname\") or info[\"proxy_hostname\"]\n            if proxy_port is not None:\n                self.proxy_port = proxy_port\n            else:\n                self.proxy_port = config.get(\"server\", \"proxy_port\") or info[\"proxy_port\"]\n            if proxy_user is not None:\n                self.proxy_user = proxy_user\n            else:\n                self.proxy_user = config.get(\"server\", \"proxy_user\") or info[\"proxy_username\"]\n            if proxy_password is not None:\n                self.proxy_password = proxy_password\n            else:\n                self.proxy_password = config.get(\"server\", \"proxy_password\") or info[\"proxy_password\"]\n\n        self.cert_file = cert_file\n        self.key_file = key_file\n        self.username = username\n        self.password = password\n        self.token = token\n        self.auth_type = auth_type\n\n        self.ca_dir = ca_dir or config.get(\"rhsm\", \"ca_cert_dir\")\n\n        self.insecure = insecure\n        if insecure is None:\n            self.insecure = False\n            config_insecure = safe_int(config.get(\"server\", \"insecure\"))\n            if config_insecure:\n                self.insecure = True\n\n        using_basic_auth = False\n        using_id_cert_auth = False\n        using_ent_cert_auth = False\n        using_keycloak_auth = False\n\n        if username and password:\n            using_basic_auth = True\n        elif cert_file and key_file:\n            using_id_cert_auth = True\n        elif cert_dir:\n            using_ent_cert_auth = True\n        elif token:\n            using_keycloak_auth = True\n\n        if (\n            len(\n                [\n                    value\n                    for value in (\n                        using_basic_auth,\n                        using_id_cert_auth,\n                        using_keycloak_auth,\n                        using_ent_cert_auth,\n                    )\n                    if value\n                ]\n            )\n            > 1\n        ):\n            raise Exception(\"Cannot specify multiple auth types\")\n\n        proxy_description = None\n        if self.proxy_hostname and self.proxy_port:\n            proxy_description = \"http_proxy=%s:%s \" % (\n                normalized_host(self.proxy_hostname),\n                safe_int(self.proxy_port),\n            )\n        # initialize connection\n        self.conn: BaseRestLib = BaseRestLib(\n            self.host,\n            self.ssl_port,\n            self.handler,\n            username=self.username,\n            password=self.password,\n            token=self.token,\n            cert_file=self.cert_file,\n            key_file=self.key_file,\n            proxy_hostname=self.proxy_hostname,\n            proxy_port=self.proxy_port,\n            proxy_user=self.proxy_user,\n            proxy_password=self.proxy_password,\n            ca_dir=self.ca_dir,\n            insecure=self.insecure,\n            cert_dir=cert_dir,\n            timeout=self.timeout,\n            correlation_id=correlation_id,\n            user_agent=user_agent,\n            auth_type=auth_type,\n        )\n\n        if using_keycloak_auth:\n            auth_description = \"auth=bearer %s\" % token\n        elif using_basic_auth:\n            auth_description = \"auth=basic username=%s\" % username\n        elif using_id_cert_auth:\n            auth_description = \"auth=identity_cert ca_dir=%s insecure=%s\" % (self.ca_dir, self.insecure)\n        elif using_ent_cert_auth:\n            auth_description = \"auth=entitlement_certs\"\n        else:\n            auth_description = \"auth=none\"\n\n        self.resources = None\n        self.capabilities = None\n        connection_description = \"\"\n        if proxy_description:\n            connection_description += proxy_description\n        connection_description += \"host=%s port=%s handler=%s %s\" % (\n            normalized_host(self.host),\n            safe_int(self.ssl_port),\n            self.handler,\n            auth_description,\n        )\n        log.debug(\"Connection built: %s\", connection_description)\n\n\nclass TokenAuthException(Exception):\n    pass\n\n\nclass KeycloakConnection(BaseConnection):\n    \"\"\"\n    Keycloak Based Authentication\n    \"\"\"\n\n    def __init__(self, realm: Any, auth_url: str, resource: Any, **kwargs) -> None:\n        host = urlparse(auth_url).hostname or \"\"\n        handler = urlparse(auth_url).path\n        ssl_port = urlparse(auth_url).port or 443\n        super(KeycloakConnection, self).__init__(host=host, ssl_port=ssl_port, handler=handler, **kwargs)\n        self.realm = realm\n        self.resource = reso",
+      "total_lines": 2163
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 889,
+      "start_line": 869,
+      "end_line": 909,
+      "matched_line": "            return",
+      "excerpt": "869: \n870:     def _print_debug_info_about_request(\n871:         self, request_type: str, handler: str, final_headers: dict, body: Union[dict, Any]\n872:     ) -> None:\n873:         \"\"\"\n874:         This method can print debug information about sent http request. We do not use\n875:         httplib.HTTPConnection.debuglevel = 1, because it doesn't provide control about displayed information.\n876:         The debug print is printed to stdout, when environment variable SUBMAN_DEBUG_PRINT_REQUEST is set.\n877:         Output can be modified with following environment variables:\n878:          * SUBMAN_DEBUG_PRINT_REQUEST_HEADER\n879:          * SUBMAN_DEBUG_PRINT_REQUEST_BODY\n880:         :param request_type: (GET, POST, PUT, ...)\n881:         :param handler: e.g. /candlepin/status\n882:         :param final_headers: HTTP headers used by request\n883:         :param body: request can contain body. It is usually dictionary, but it can be anything that\n884:             can be serialized by json.dumps()\n885:         :return: None\n886:         \"\"\"\n887: \n888:         if os.environ.get(\"SUBMAN_DEBUG_PRINT_REQUEST\", \"\") == \"\":\n889:             return\n890: \n891:         print()\n892: \n893:         # Print information about TCP/IP layer\n894:         if (\n895:             os.environ.get(\"SUBMAN_DEBUG_TCP_IP\", \"\")\n896:             and self.__conn is not None\n897:             and self.__conn.sock is not None\n898:         ):\n899:             print(utils.colorize(\"TCP socket:\", utils.COLOR.GREEN))\n900:             print(utils.colorize(f\"{self.__conn.sock}\", utils.COLOR.BLUE))\n901:             print(utils.colorize(\"TLS handshake:\", utils.COLOR.GREEN))\n902:             print(utils.colorize(f\"{self._get_tls_handshake_info()}\", utils.COLOR.BLUE))\n903: \n904:         # When proxy server is used, then print some additional information about proxy connection\n905:         if self.proxy_hostname and self.proxy_port:\n906:             print(utils.colorize(\"Proxy:\", utils.COLOR.GREEN))\n907:             # Note: using only https:// is not a mistake. We use only https for proxy connection.\n908:             proxy_msg: str = \"https://\"\n909:             # Print username and eventually password"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_print_debug_info_about_request",
+      "start_line": 870,
+      "end_line": 988,
+      "source": "    def _print_debug_info_about_request(\n        self, request_type: str, handler: str, final_headers: dict, body: Union[dict, Any]\n    ) -> None:\n        \"\"\"\n        This method can print debug information about sent http request. We do not use\n        httplib.HTTPConnection.debuglevel = 1, because it doesn't provide control about displayed information.\n        The debug print is printed to stdout, when environment variable SUBMAN_DEBUG_PRINT_REQUEST is set.\n        Output can be modified with following environment variables:\n         * SUBMAN_DEBUG_PRINT_REQUEST_HEADER\n         * SUBMAN_DEBUG_PRINT_REQUEST_BODY\n        :param request_type: (GET, POST, PUT, ...)\n        :param handler: e.g. /candlepin/status\n        :param final_headers: HTTP headers used by request\n        :param body: request can contain body. It is usually dictionary, but it can be anything that\n            can be serialized by json.dumps()\n        :return: None\n        \"\"\"\n\n        if os.environ.get(\"SUBMAN_DEBUG_PRINT_REQUEST\", \"\") == \"\":\n            return\n\n        print()\n\n        # Print information about TCP/IP layer\n        if (\n            os.environ.get(\"SUBMAN_DEBUG_TCP_IP\", \"\")\n            and self.__conn is not None\n            and self.__conn.sock is not None\n        ):\n            print(utils.colorize(\"TCP socket:\", utils.COLOR.GREEN))\n            print(utils.colorize(f\"{self.__conn.sock}\", utils.COLOR.BLUE))\n            print(utils.colorize(\"TLS handshake:\", utils.COLOR.GREEN))\n            print(utils.colorize(f\"{self._get_tls_handshake_info()}\", utils.COLOR.BLUE))\n\n        # When proxy server is used, then print some additional information about proxy connection\n        if self.proxy_hostname and self.proxy_port:\n            print(utils.colorize(\"Proxy:\", utils.COLOR.GREEN))\n            # Note: using only https:// is not a mistake. We use only https for proxy connection.\n            proxy_msg: str = \"https://\"\n            # Print username and eventually password\n            if self.proxy_user:\n                if self.proxy_user and self.proxy_password:\n                    proxy_msg += f\"{self.proxy_user}:{self.proxy_password}@\"\n                elif self.proxy_user and not self.proxy_password:\n                    proxy_msg += f\"{self.proxy_user}@\"\n            # Print hostname and port\n            proxy_msg += f\"{normalized_host(self.proxy_hostname)}:{safe_int(self.proxy_port)}\"\n            print(utils.colorize(proxy_msg, utils.COLOR.MAGENTA))\n\n            # Print HTTP headers used for proxy connection\n            tunnel_msg = \"\"\n            tunnel_headers = None\n            if self.__conn is not None and hasattr(self.__conn, \"_tunnel_headers\"):\n                tunnel_headers = getattr(self.__conn, \"_tunnel_headers\")\n            if tunnel_headers is not None:\n                tunnel_msg = f\"{tunnel_headers}\"\n            if tunnel_msg:\n                print(utils.colorize(tunnel_msg, utils.COLOR.BLUE))\n\n        auth = \"\"\n        if self.insecure:\n            auth = \"insecure \"\n        if self.auth_type == ConnectionType.KEYCLOAK_AUTH:\n            auth += \"keycloak auth\"\n        elif self.auth_type == ConnectionType.BASIC_AUTH:\n            auth += \"basic auth\"\n        elif self.auth_type == ConnectionType.CONSUMER_CERT_AUTH:\n            auth += \"consumer auth\"\n        elif self.auth_type == ConnectionType.NO_AUTH:\n            auth += \"no auth\"\n        else:\n            auth += \"undefined auth\"\n\n        print(utils.colorize(\"Request:\", utils.COLOR.GREEN))\n        print(\n            utils.colorize(\n                f\"{request_type} \"\n                + \"https://\"\n                + f\"{normalized_host(self.host)}:{safe_int(self.ssl_port)}{handler}\",\n                utils.COLOR.RED,\n            )\n            + \" using \"\n            + utils.colorize(f\"{auth}\", utils.COLOR.BLUE)\n        )\n\n        if os.environ.get(\"SUBMAN_DEBUG_PRINT_REQUEST_HEADER\", \"\"):\n            print(utils.colorize(\"Request headers:\", utils.COLOR.GREEN))\n            print(utils.colorize(f\"{final_headers}\", utils.COLOR.BLUE))\n\n        if os.environ.get(\"SUBMAN_DEBUG_PRINT_REQUEST_BODY\", \"\") and body is not None:\n            print(utils.colorize(\"Request body:\", utils.COLOR.GREEN))\n            print(utils.colorize(f\"{body}\", utils.COLOR.YELLOW))\n\n        if os.environ.get(\"SUBMAN_DEBUG_PRINT_TRACEBACKS\", \"\"):\n            print(utils.colorize(\"Current call stack:\", utils.COLOR.GREEN))\n            traceback.print_stack(file=sys.stdout)\n\n        if os.environ.get(\"SUBMAN_DEBUG_SAVE_TRACEBACKS\", \"\"):\n            debug_dir = Path(\"/tmp/rhsm/\")\n            debug_dir.mkdir(exist_ok=True)\n\n            timestamp: str = datetime.datetime.now().strftime(\"%Y-%m-%d_%H-%M-%S\")\n\n            # make sure we don't overwrite previous logs\n            i = 0\n            while True:\n                filename = Path(f\"{timestamp}_{i}.log\")\n                debug_log = debug_dir / filename\n                if not debug_log.exists():\n                    break\n                i += 1\n\n            with debug_log.open(\"w\", encoding=\"utf-8\") as handle:\n                traceback.print_stack(file=handle)\n\n            print(utils.colorize(\"Call stack file:\", utils.COLOR.GREEN))\n            print(f\"{str(debug_log)}\")\n\n        print()"
+    },
+    "imports": {
+      "imports": [
+        "base64",
+        "rhsm:certificate",
+        "datetime",
+        "dateutil.parser",
+        "locale",
+        "logging",
+        "os",
+        "socket",
+        "sys",
+        "time",
+        "traceback",
+        "typing:Any",
+        "typing:Dict",
+        "typing:Iterable",
+        "typing:List",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:Union",
+        "pathlib:Path",
+        "re",
+        "enum",
+        "email.utils:format_datetime",
+        "rhsm.https:httplib",
+        "rhsm.https:ssl",
+        "urllib.request:proxy_bypass",
+        "urllib.parse:urlencode",
+        "urllib.parse:urlparse",
+        "urllib.parse:quote",
+        "urllib.parse:quote_plus",
+        "rhsm.config:get_config_parser"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/candlepin/subscription-manager/main/README.md",
+      "content_excerpt": "subscription-manager\n====================\n\nThe Subscription Manager package provides programs and libraries\nto allow users to manage subscriptions and DNF repositories\nfrom the Candlepin.\n\n - https://candlepinproject.org/\n - https://github.com/candlepin/subscription-manager\n\nLocal Installation\n------------------\n\nIn order to build, develop, and test locally, please follow\n[INSTALL.md](INSTALL.md).\n\nFor instructions on building the debian-packages of this project, see instructions in [contrib/debian/README.source](contrib/debian/README.source).\n\nTo ignore bulk commits that only change the format of the code, not the code\nitself (e.g. `black`ing whole codebase), add `.git-blame-ignore-revs` to your\ngit configuration:\n\n```bash\ngit config blame.ignoreRevsFile .git-blame-ignore-revs\n```\n\nDevelopment of the Subscription-Manager Deployment Ansible role\n---------------------------------------------------------------\nThe Ansible role that is used for deploying subscription-manager can be found at \nhttps://github.com/candlepin/ansible-role-subman-devel. In order to test \nchanges for this Ansible role you will need to check it out locally. \nThis will pull the latest commit from this path and use it for deployment. \n\nTesting\n-------\nWe run tests using pytest. [See TESTING.md for more details.](./TESTING.md)\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_print_debug_info_about_request test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_print_debug_info_about_request(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "connection.py",
+          "path": "src/rhsm/connection.py",
+          "sha": "3ba42ff8efe8008cd931b2d8875fd28aa96edd40",
+          "html_url": "https://github.com/candlepin/subscription-manager/blob/900eef62a3cef1a7f6a5b4b398a9e3ef31490f65/src/rhsm/connection.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/rhsm",
+      "count": 13,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/rhsm/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "bitstream.py",
+          "path": "src/rhsm/bitstream.py",
+          "type": "file"
+        },
+        {
+          "name": "certificate.py",
+          "path": "src/rhsm/certificate.py",
+          "type": "file"
+        },
+        {
+          "name": "certificate2.py",
+          "path": "src/rhsm/certificate2.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "src/rhsm/config.py",
+          "type": "file"
+        },
+        {
+          "name": "connection.py",
+          "path": "src/rhsm/connection.py",
+          "type": "file"
+        },
+        {
+          "name": "https.py",
+          "path": "src/rhsm/https.py",
+          "type": "file"
+        },
+        {
+          "name": "huffman.py",
+          "path": "src/rhsm/huffman.py",
+          "type": "file"
+        },
+        {
+          "name": "logutil.py",
+          "path": "src/rhsm/logutil.py",
+          "type": "file"
+        },
+        {
+          "name": "ourjson.py",
+          "path": "src/rhsm/ourjson.py",
+          "type": "file"
+        },
+        {
+          "name": "pathtree.py",
+          "path": "src/rhsm/pathtree.py",
+          "type": "file"
+        },
+        {
+          "name": "profile.py",
+          "path": "src/rhsm/profile.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "src/rhsm/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/rhsm/__init__.py"
+        },
+        {
+          "name": "bitstream.py",
+          "path": "src/rhsm/bitstream.py"
+        },
+        {
+          "name": "certificate.py",
+          "path": "src/rhsm/certificate.py"
+        },
+        {
+          "name": "certificate2.py",
+          "path": "src/rhsm/certificate2.py"
+        },
+        {
+          "name": "config.py",
+          "path": "src/rhsm/config.py"
+        },
+        {
+          "name": "https.py",
+          "path": "src/rhsm/https.py"
+        },
+        {
+          "name": "huffman.py",
+          "path": "src/rhsm/huffman.py"
+        },
+        {
+          "name": "logutil.py",
+          "path": "src/rhsm/logutil.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/rhsm/connection.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ec4e58927e96aa5d63bb8ee8b410a2dc50ed48fa",
+          "html_url": "https://github.com/candlepin/subscription-manager/commit/ec4e58927e96aa5d63bb8ee8b410a2dc50ed48fa",
+          "message": "chore: Make black-26.* happy again (./src)\n\n* It was necessary to update black, because older versions\n  of black had some CVEs and we use black in our CI\n* Updates of file in ./src\n* No functional changes\n\nSigned-off-by: Jiri Hnidek <jhnidek@redhat.com>",
+          "author": "Jiri Hnidek",
+          "date": "2026-03-17T11:33:42Z"
+        },
+        {
+          "sha": "6b6cef899efa362e9c3b1ce2b43c2ec7136404b3",
+          "html_url": "https://github.com/candlepin/subscription-manager/commit/6b6cef899efa362e9c3b1ce2b43c2ec7136404b3",
+          "message": "feat: added signature type log in TLS handshake",
+          "author": "mjcr99",
+          "date": "2025-12-15T16:26:11Z"
+        },
+        {
+          "sha": "3dde00122ce8739b66ac5472a4ddfbb7d9e8dd84",
+          "html_url": "https://github.com/candlepin/subscription-manager/commit/3dde00122ce8739b66ac5472a4ddfbb7d9e8dd84",
+          "message": "feat: added internal method to get tls handshake info\n\n* Card ID: CCT-1468",
+          "author": "mjcr99",
+          "date": "2025-12-04T09:44:01Z"
+        },
+        {
+          "sha": "cd53bb7338e303028eec0ed08fe748439a8c2e85",
+          "html_url": "https://github.com/candlepin/subscription-manager/commit/cd53bb7338e303028eec0ed08fe748439a8c2e85",
+          "message": "chore: Removed getSyspurposeCompliance\n\n* Card ID: CCT-1177\n* Removed getSyspurposeCompliance() from connection.py.\n  Thus, nothing should not be able to do this REST API call\n  to /consumer/{uuid}/purpose_compliance endpoint\n* Removed getSyspurposeCompliance from stub for unit tests\n\nSigned-off-by:",
+          "author": "Jiri Hnidek",
+          "date": "2025-09-22T12:16:54Z"
+        },
+        {
+          "sha": "4a9f7a55006548e1930ad156b11a3f0a3f89deb3",
+          "html_url": "https://github.com/candlepin/subscription-manager/commit/4a9f7a55006548e1930ad156b11a3f0a3f89deb3",
+          "message": "feat: Added warning to dnf4 plugin about skewed clock\n\n* Card ID: CCT-1126\n* When the time drift between server and client is bigger\n  then two seconds, then subscription-manager dnf plugin\n  prints warning message about this issue.\n* The latest time drift is stored in BaseRestLib class\n  to be easi",
+          "author": "Jiri Hnidek",
+          "date": "2025-05-20T15:01:07Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_print_debug_info_about_request FIXME This method should return",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/rhsm/connection.py",
+      "satd_line": 889,
+      "last_commit": {
+        "sha": "ec4e58927e96aa5d63bb8ee8b410a2dc50ed48fa",
+        "html_url": "https://github.com/candlepin/subscription-manager/commit/ec4e58927e96aa5d63bb8ee8b410a2dc50ed48fa",
+        "message": "chore: Make black-26.* happy again (./src)\n\n* It was necessary to update black, because older versions\n  of black had some CVEs and we use black in our CI\n* Updates of file in ./src\n* No functional changes\n\nSigned-off-by: Jiri Hnidek <jhnidek@redhat.com>",
+        "author": "Jiri Hnidek",
+        "date": "2026-03-17T11:33:42Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_print_debug_info_about_request",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

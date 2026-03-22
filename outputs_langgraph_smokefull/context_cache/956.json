@@ -1,0 +1,401 @@
+{
+  "task_id": "956",
+  "repo_owner": "denoland",
+  "repo_name": "chromium_build",
+  "file_path": "chromeos/test_runner.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T02:29:30+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "main",
+    "satd_line": 1023,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T02:29:39+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T02:29:45+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "chromeos/test_runner.py",
+    "original_code": "def add_common_args(*parsers):\n  for parser in parsers:\n    parser.add_argument('--verbose', '-v', action='store_true')\n    parser.add_argument(\n        '--board', type=str, required=True, help='Type of CrOS device.')\n    parser.add_argument(\n        '--cros-cache',\n        type=str,\n        default=DEFAULT_CROS_CACHE,\n        help='Path to cros cache.')\n    parser.add_argument(\n        '--path-to-outdir',\n        type=str,\n        required=True,\n        help='Path to output directory, all of whose contents will be '\n        'deployed to the device.')\n    parser.add_argument(\n        '--runtime-deps-path',\n        type=str,\n        help='Runtime data dependency file from GN.')\n    parser.add_argument(\n        '--vpython-dir',\n        type=str,\n        help='Location on host of a directory containing a vpython binary to '\n        'deploy to the device before the test starts. The location of '\n        'this dir will be added onto PATH in the device. WARNING: The '\n        'arch of the device might not match the arch of the host, so '\n        'avoid using \"${platform}\" when downloading vpython via CIPD.')\n    # TODO(bpastene): Switch all uses of \"--vm-logs-dir\" to \"--logs-dir\".\n    parser.add_argument(\n        '--vm-logs-dir',\n        '--logs-dir',\n        type=str,\n        dest='logs_dir',\n        help='Will copy everything under /var/log/ from the device after the '\n        'test into the specified dir.')\n    parser.add_argument(\n        '--flash',\n        action='store_true',\n        help='Will flash the device to the current SDK version before running '\n        'the test.')\n    parser.add_argument(\n        '--public-image',\n        action='store_true',\n        help='Will flash a public \"full\" image to the device.')\n\n    vm_or_device_group = parser.add_mutually_exclusive_group()\n    vm_or_device_group.add_argument(\n        '--use-vm',\n        action='store_true',\n        help='Will run the test in the VM instead of a device.')\n    vm_or_device_group.add_argument(\n        '--device',\n        type=str,\n        help='Hostname (or IP) of device to run the test on. This arg is not '\n        'required if --use-vm is set.')",
+    "satd_comment": "# TODO(bpastene): Switch all uses of \"--vm-logs-dir\" to \"--logs-dir\".",
+    "target_file": {
+      "ok": true,
+      "path": "chromeos/test_runner.py",
+      "sha": "dd27ab2d2a968ee637686688d78c56522eb264d9",
+      "download_url": "https://raw.githubusercontent.com/denoland/chromium_build/upstream/chromeos/test_runner.py",
+      "content_excerpt": "#!/usr/bin/env vpython3\n#\n# Copyright 2018 The Chromium Authors\n# Use of this source code is governed by a BSD-style license that can be\n# found in the LICENSE file.\n\nimport argparse\nimport collections\nimport json\nimport logging\nimport os\nimport re\nimport shutil\nimport signal\nimport socket\nimport sys\nimport tempfile\n\n# The following non-std imports are fetched via vpython. See the list at\n# //.vpython3\nimport dateutil.parser  # pylint: disable=import-error\nimport jsonlines  # pylint: disable=import-error\nimport psutil  # pylint: disable=import-error\n\nCHROMIUM_SRC_PATH = os.path.abspath(\n    os.path.join(os.path.dirname(__file__), '..', '..'))\n\n# Use the android test-runner's gtest results support library for generating\n# output json ourselves.\nsys.path.insert(0, os.path.join(CHROMIUM_SRC_PATH, 'build', 'android'))\nfrom pylib.base import base_test_result  # pylint: disable=import-error\nfrom pylib.results import json_results  # pylint: disable=import-error\n\nsys.path.insert(0, os.path.join(CHROMIUM_SRC_PATH, 'build', 'util'))\n# TODO(crbug.com/40259280): Re-enable the 'no-name-in-module' check.\nfrom lib.results import result_sink  # pylint: disable=import-error,no-name-in-module\n\nimport subprocess  # pylint: disable=import-error,wrong-import-order\n\nDEFAULT_CROS_CACHE = os.path.abspath(\n    os.path.join(CHROMIUM_SRC_PATH, 'build', 'cros_cache'))\nCHROMITE_PATH = os.path.abspath(\n    os.path.join(CHROMIUM_SRC_PATH, 'third_party', 'chromite'))\nCROS_RUN_TEST_PATH = os.path.abspath(\n    os.path.join(CHROMITE_PATH, 'bin', 'cros_run_test'))\n\n# This is a special hostname that resolves to a different DUT in the lab\n# depending on which lab machine you're on.\nLAB_DUT_HOSTNAME = 'variable_chromeos_device_hostname'\n\nSYSTEM_LOG_LOCATIONS = [\n    '/home/chronos/crash/',\n    '/var/log/chrome/',\n    '/var/log/messages',\n    '/var/log/ui/',\n]\n\nTAST_DEBUG_DOC = 'https://bit.ly/2LgvIXz'\n\n\nclass TestFormatError(Exception):\n  pass\n\n\nclass RemoteTest:\n\n  # This is a basic shell script that can be appended to in order to invoke the\n  # test on the device.\n  BASIC_SHELL_SCRIPT = [\n      '#!/bin/sh',\n\n      # /home and /tmp are mounted with \"noexec\" in the device, but some of our\n      # tools and tests use those dirs as a workspace (eg: vpython downloads\n      # python binaries to ~/.vpython-root and /tmp/vpython_bootstrap).\n      # /usr/local/tmp doesn't have this restriction, so change the location of\n      # the home and temp dirs for the duration of the test.\n      'export HOME=/usr/local/tmp',\n      'export TMPDIR=/usr/local/tmp',\n  ]\n\n  def __init__(self, args, unknown_args):\n    self._additional_args = unknown_args\n    self._path_to_outdir = args.path_to_outdir\n    self._test_launcher_summary_output = args.test_launcher_summary_output\n    self._logs_dir = args.logs_dir\n    self._use_vm = args.use_vm\n    self._rdb_client = result_sink.TryInitClient()\n\n    self._retries = 0\n    self._timeout = None\n    self._test_launcher_shard_index = args.test_launcher_shard_index\n    self._test_launcher_total_shards = args.test_launcher_total_shards\n\n    # The location on disk of a shell script that can be optionally used to\n    # invoke the test on the device. If it's not set, we assume self._test_cmd\n    # contains the test invocation.\n    self._on_device_script = None\n\n    self._test_cmd = [\n        CROS_RUN_TEST_PATH,\n        '--board',\n        args.board,\n        '--cache-dir',\n        args.cros_cache,\n    ]\n    if args.use_vm:\n      self._test_cmd += [\n          '--start',\n          # Don't persist any filesystem changes after the VM shutsdown.\n          '--copy-on-write',\n      ]\n    else:\n      if args.fetch_cros_hostname:\n        self._test_cmd += ['--device', get_cros_hostname()]\n      else:\n        self._test_cmd += [\n            '--device', args.device if args.device else LAB_DUT_HOSTNAME\n        ]\n\n    if args.logs_dir:\n      for log in SYSTEM_LOG_LOCATIONS:\n        self._test_cmd += ['--results-src', log]\n      self._test_cmd += [\n          '--results-dest-dir',\n          os.path.join(args.logs_dir, 'system_logs')\n      ]\n    if args.flash:\n      self._test_cmd += ['--flash']\n      if args.public_image:\n        self._test_cmd += ['--public-image']\n\n    self._test_env = setup_env()\n\n  @property\n  def suite_name(self):\n    raise NotImplementedError('Child classes need to define suite name.')\n\n  @property\n  def test_cmd(self):\n    return self._test_cmd\n\n  def write_test_script_to_disk(self, script_contents):\n    # Since we're using an on_device_script to invoke the test, we'll need to\n    # set cwd.\n    self._test_cmd += [\n        '--remote-cmd',\n        '--cwd',\n        os.path.relpath(self._path_to_outdir, CHROMIUM_SRC_PATH),\n    ]\n    logging.info('Running the following command on the device:')\n    logging.info('\\n%s', '\\n'.join(script_contents))\n    fd, tmp_path = tempfile.mkstemp(suffix='.sh', dir=self._path_to_outdir)\n    os.fchmod(fd, 0o755)\n    with os.fdopen(fd, 'w') as f:\n      f.write('\\n'.join(script_contents) + '\\n')\n    return tmp_path\n\n  def write_runtime_files_to_disk(self, runtime_files):\n    logging.info('Writing runtime files to disk.')\n    fd, tmp_path = tempfile.mkstemp(suffix='.txt', dir=self._path_to_outdir)\n    os.fchmod(fd, 0o755)\n    with os.fdopen(fd, 'w') as f:\n      f.write('\\n'.join(runtime_files) + '\\n')\n    return tmp_path\n\n  def run_test(self):\n    # Traps SIGTERM and kills all child processes of cros_run_test when it's\n    # caught. This will allow us to capture logs from the device if a test hangs\n    # and gets timeout-killed by swarming. See also:\n    # https://chromium.googlesource.com/infra/luci/luci-py/+/main/appengine/swarming/doc/Bot.md#graceful-termination_aka-the-sigterm-and-sigkill-dance\n    test_proc = None\n\n    def _kill_child_procs(trapped_signal, _):\n      logging.warning('Received signal %d. Killing child processes of test.',\n                      trapped_signal)\n      if not test_proc or not test_proc.pid:\n        # This shouldn't happen?\n        logging.error('Test process not running.')\n        return\n      for child in psutil.Process(test_proc.pid).children():\n        logging.warning('Killing process %s', child)\n        child.kill()\n\n    signal.signal(signal.SIGTERM, _kill_child_procs)\n\n    for i in range(self._retries + 1):\n      logging.info('########################################')\n      logging.info('Test attempt #%d', i)\n      logging.info('########################################')\n      test_proc = subprocess.Popen(\n          self._test_cmd,\n          stdout=sys.stdout,\n          stderr=sys.stderr,\n          env=self._test_env)\n      try:\n        test_proc.wait(timeout=self._timeout)\n      except subprocess.TimeoutExpired:  # pylint: disable=no-member\n        logging.error('Test timed out. Sending SIGTERM.')\n        # SIGTERM the proc and wait 10s for it to close.\n        test_proc.terminate()\n        try:\n          test_proc.wait(timeout=10)\n        except subprocess.TimeoutExpired:  # pylint: disable=no-member\n          # If it hasn't closed in 10s, SIGKILL it.\n          logging.error('Test did not exit in time. Sending SIGKILL.')\n          test_proc.kill()\n          test_proc.wait()\n      logging.info('Test exited with %d.', test_proc.returncode)\n      if test_proc.returncode == 0:\n        break\n\n    self.post_run(test_proc.returncode)\n    # Allow post_run to override test proc return code. (Useful when the host\n    # side Tast bin returns 0 even for failed tests.)\n    return test_proc.returncode\n\n  def post_run(self, _):\n    if self._on_device_script:\n      os.remove(self._on_device_script)\n\n  @staticmethod\n  def get_artifacts(path):\n    \"\"\"Crawls a given directory for file artifacts to attach to a test.\n\n    Args:\n      path: Path to a directory to search for artifacts.\n    Returns:\n      A dict mapping name of the artifact to its absolute filepath.\n    \"\"\"\n    artifacts = {}\n    for dirpath, _, filenames in os.walk(path):\n      for f in filenames:\n        artifact_path = os.path.join(dirpath, f)\n        artifact_id = os.path.relpath(artifact_path, path)\n        # Some artifacts will have non-Latin characters in the filename, eg:\n        # 'ui_tree_Chinese Pinyin-你好.txt'. ResultDB's API rejects such\n        # characters as an artifact ID, so force the file name down into ascii.\n        # For more info, see:\n        # https://source.chromium.org/chromium/infra/infra/+/main:go/src/go.chromium.org/luci/resultdb/proto/v1/artifact.proto;drc=3bff13b8037ca76ec19f9810033d914af7ec67cb;l=46\n        artifact_id = artifact_id.encode('ascii', 'replace').decode()\n        artifact_id = artifact_id.replace('\\\\', '?')\n        artifacts[artifact_id] = {\n            'filePath': artifact_path,\n        }\n    return artifacts\n\n\nclass TastTest(RemoteTest):\n\n  def __init__(self, args, unknown_args):\n    super().__init__(args, unknown_args)\n\n    self._suite_name = args.suite_name\n    self._tast_vars = args.tast_vars\n    self._tast_retries = args.tast_retries\n    self._tests = args.tests\n    # The CQ passes in '--gtest_filter' when specifying tests to skip. Store it\n    # here and parse it later to integrate it into Tast executions.\n    self._gtest_style_filter = args.gtest_filter\n    self._attr_expr = args.attr_expr\n    self._should_strip = args.strip_chrome\n    self._deploy_chrome = args.deploy_chrome\n\n    if not self._logs_dir:\n      # The host-side Tast bin returns 0 when tests fail, so we need to capture\n      # and parse its json results to reliably determine if tests fail.\n      raise TestFormatError(\n          'When using the host-side Tast bin, \"--logs-dir\" must be passed in '\n          'order to parse its results.')\n\n    # If the first test filter is negative, it should be safe to assume all of\n    # them are, so just test the first filter.\n    if self._gtest_style_filter and self._gtest_style_filter[0] == '-':\n      raise TestFormatError('Negative test filters not supported for Tast.')\n\n  @property\n  def suite_name(self):\n    return self._suite_name\n\n  def build_test_command(self):\n    unsupported_args = [\n        '--test-launcher-retry-limit',\n        '--test-launcher-batch-limit',\n        '--gtest_repeat',\n    ]\n    for unsupported_arg in unsupported_args:\n      if any(arg.startswith(unsupported_arg) for arg in self._additional_args):\n        logging.info(\n            '%s not supported for Tast tests. The arg will be ignored.',\n            unsupported_arg)\n        self._additional_args = [\n            arg for arg in self._additional_args\n            if not arg.startswith(unsupported_arg)\n        ]\n\n    self._test_cmd.extend(['--deploy', '--mount'])\n    self._test_cmd += [\n        '--build-dir',\n        os.path.relpath(self._path_to_outdir, CHROMIUM_SRC_PATH)\n    ] + self._additional_args\n\n    # Capture tast's results in the logs dir as well.\n    if self._logs_dir:\n      self._test_cmd += [\n          '--results-dir',\n          self._logs_dir,\n      ]\n    self._test_cmd += [\n        '--tast-total-shards=%d' % self._test_launcher_total_shards,\n        '--tast-shard-index=%d' % self._test_launcher_shard_index,\n    ]\n    # If we're using a test filter, replace the contents of the Tast\n    # conditional with a long list of \"name:test\" expressions, one for each\n    # test in the filter.\n    if self._gtest_style_filter:\n      if self._attr_expr or self._tests:\n        logging.warning(\n            'Presence of --gtest_filter will cause the specified Tast expr'\n            ' or test list to be ignored.')\n      names = []\n      for test in self._gtest_style_filter.split(':'):\n        names.append('\"name:%s\"' % test)\n      self._attr_expr = '(' + ' || '.join(names) + ')'\n\n    if self._attr_expr:\n      # Don't use shlex.quote() here. Something funky happens with the arg\n      # as it gets passed down from cros_run_test to tast. (Tast picks up the\n      # escaping single quotes and complains that the attribute expression\n      # \"must be within parentheses\".)\n      self._test_cmd.append('--tast=%s' % self._attr_expr)\n    else:\n      self._test_cmd.append('",
+      "total_lines": 1119
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 1023,
+      "start_line": 1003,
+      "end_line": 1043,
+      "matched_line": "  )",
+      "excerpt": "1003:       '--set-selinux-label',\n1004:       action='append',\n1005:       default=[],\n1006:       help='Set the selinux label for a file before running. The format is:\\n'\n1007:       '  --set-selinux-label=<filename>=<label>\\n'\n1008:       'So:\\n'\n1009:       '  --set-selinux-label=my_test=u:r:cros_foo_label:s0\\n'\n1010:       'You can specify it more than one time to set multiple files tags.')\n1011:   gtest_parser.add_argument(\n1012:       '--use-deployed-dbus-configs',\n1013:       action='store_true',\n1014:       help='When set, will bind mount deployed dbus config to chrome dbus dir '\n1015:       'and ask dbus daemon to reload config before running tests.')\n1016: \n1017:   # Tast test args.\n1018:   # pylint: disable=line-too-long\n1019:   tast_test_parser = subparsers.add_parser(\n1020:       'tast',\n1021:       help='Runs a device-side set of Tast tests. For more details, see: '\n1022:       'https://chromium.googlesource.com/chromiumos/platform/tast/+/main/docs/running_tests.md'\n1023:   )\n1024:   tast_test_parser.set_defaults(func=device_test)\n1025:   tast_test_parser.add_argument(\n1026:       '--suite-name',\n1027:       type=str,\n1028:       required=True,\n1029:       help='Name to apply to the set of Tast tests to run. This has no effect '\n1030:       'on what is executed, but is used mainly for test results reporting '\n1031:       'and tracking (eg: flakiness dashboard).')\n1032:   tast_test_parser.add_argument(\n1033:       '--test-launcher-summary-output',\n1034:       type=str,\n1035:       help='Generates a simple GTest-style JSON result file for the test run.')\n1036:   tast_test_parser.add_argument(\n1037:       '--attr-expr',\n1038:       type=str,\n1039:       help='A boolean expression whose matching tests will run '\n1040:       '(eg: (\"dep:chrome\")).')\n1041:   tast_test_parser.add_argument(\n1042:       '--strip-chrome',\n1043:       action='store_true',"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "main",
+      "start_line": 935,
+      "end_line": 1115,
+      "source": "def main():\n  parser = argparse.ArgumentParser()\n  subparsers = parser.add_subparsers(dest='test_type')\n  # Host-side test args.\n  host_cmd_parser = subparsers.add_parser(\n      'host-cmd',\n      help='Runs a host-side test. Pass the host-side command to run after '\n      '\"--\". If --use-vm is passed, hostname and port for the device '\n      'will be 127.0.0.1:9222.')\n  host_cmd_parser.set_defaults(func=host_cmd)\n  host_cmd_parser.add_argument(\n      '--strip-chrome',\n      action='store_true',\n      help='Strips symbols from ash-chrome before deploying to the device.')\n\n  gtest_parser = subparsers.add_parser(\n      'gtest', help='Runs a device-side gtest.')\n  gtest_parser.set_defaults(func=device_test)\n  gtest_parser.add_argument(\n      '--test-exe',\n      type=str,\n      required=True,\n      help='Path to test executable to run inside the device.')\n\n  # GTest args. Some are passed down to the test binary in the device. Others\n  # are parsed here since they might need tweaking or special handling.\n  gtest_parser.add_argument(\n      '--test-launcher-summary-output',\n      type=str,\n      help='When set, will pass the same option down to the test and retrieve '\n      'its result file at the specified location.')\n  gtest_parser.add_argument(\n      '--stop-ui',\n      action='store_true',\n      help='Will stop the UI service in the device before running the test. '\n      'Also start the UI service after all tests are done.')\n  gtest_parser.add_argument(\n      '--as-root',\n      action='store_true',\n      help='Will run the test as root on the device. Runs as user=chronos '\n      'otherwise. This is mutually exclusive with \"--stop-ui\" above due to '\n      'setup issues.')\n  gtest_parser.add_argument(\n      '--trace-dir',\n      type=str,\n      help='When set, will pass down to the test to generate the trace and '\n      'retrieve the trace files to the specified location.')\n  gtest_parser.add_argument(\n      '--env-var',\n      nargs=2,\n      action='append',\n      default=[],\n      help='Env var to set on the device for the duration of the test. '\n      'Expected format is \"--env-var SOME_VAR_NAME some_var_value\". Specify '\n      'multiple times for more than one var.')\n  gtest_parser.add_argument(\n      '--run-test-sudo-helper',\n      action='store_true',\n      help='When set, will run test_sudo_helper before the test and stop it '\n      'after test finishes.')\n  gtest_parser.add_argument(\n      \"--no-clean\",\n      action=\"store_false\",\n      dest=\"clean\",\n      default=True,\n      help=\"Do not clean up the deployed files after running the test. \"\n      \"Only supported for --remote-cmd tests\")\n  gtest_parser.add_argument(\n      '--set-selinux-label',\n      action='append',\n      default=[],\n      help='Set the selinux label for a file before running. The format is:\\n'\n      '  --set-selinux-label=<filename>=<label>\\n'\n      'So:\\n'\n      '  --set-selinux-label=my_test=u:r:cros_foo_label:s0\\n'\n      'You can specify it more than one time to set multiple files tags.')\n  gtest_parser.add_argument(\n      '--use-deployed-dbus-configs',\n      action='store_true',\n      help='When set, will bind mount deployed dbus config to chrome dbus dir '\n      'and ask dbus daemon to reload config before running tests.')\n\n  # Tast test args.\n  # pylint: disable=line-too-long\n  tast_test_parser = subparsers.add_parser(\n      'tast',\n      help='Runs a device-side set of Tast tests. For more details, see: '\n      'https://chromium.googlesource.com/chromiumos/platform/tast/+/main/docs/running_tests.md'\n  )\n  tast_test_parser.set_defaults(func=device_test)\n  tast_test_parser.add_argument(\n      '--suite-name',\n      type=str,\n      required=True,\n      help='Name to apply to the set of Tast tests to run. This has no effect '\n      'on what is executed, but is used mainly for test results reporting '\n      'and tracking (eg: flakiness dashboard).')\n  tast_test_parser.add_argument(\n      '--test-launcher-summary-output',\n      type=str,\n      help='Generates a simple GTest-style JSON result file for the test run.')\n  tast_test_parser.add_argument(\n      '--attr-expr',\n      type=str,\n      help='A boolean expression whose matching tests will run '\n      '(eg: (\"dep:chrome\")).')\n  tast_test_parser.add_argument(\n      '--strip-chrome',\n      action='store_true',\n      help='Strips symbols from ash-chrome before deploying to the device.')\n  tast_test_parser.add_argument(\n      '--tast-var',\n      action='append',\n      dest='tast_vars',\n      help='Runtime variables for Tast tests, and the format are expected to '\n      'be \"key=value\" pairs.')\n  tast_test_parser.add_argument(\n      '--tast-retries',\n      type=int,\n      dest='tast_retries',\n      help='Number of retries for failed Tast tests on the same DUT.')\n  tast_test_parser.add_argument(\n      '--test',\n      '-t',\n      action='append',\n      dest='tests',\n      help='A Tast test to run in the device (eg: \"login.Chrome\").')\n  tast_test_parser.add_argument(\n      '--gtest_filter',\n      type=str,\n      help=\"Similar to GTest's arg of the same name, this will filter out the \"\n      \"specified tests from the Tast run. However, due to the nature of Tast's \"\n      'cmd-line API, this will overwrite the value(s) of \"--test\" above.')\n\n  add_common_args(gtest_parser, tast_test_parser, host_cmd_parser)\n  args, unknown_args = parser.parse_known_args()\n\n  if args.test_type == 'gtest' and args.stop_ui and args.as_root:\n    parser.error('Unable to run gtests with both --stop-ui and --as-root')\n\n  # Re-add N-1 -v/--verbose flags to the args we'll pass to whatever we are\n  # running. The assumption is that only one verbosity incrase would be meant\n  # for this script since it's a boolean value instead of increasing verbosity\n  # with more instances.\n  verbose_flags = [a for a in sys.argv if a in ('-v', '--verbose')]\n  if verbose_flags:\n    unknown_args += verbose_flags[1:]\n\n  logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARN)\n\n  if not args.use_vm and not args.device and not args.fetch_cros_hostname:\n    logging.warning(\n        'The test runner is now assuming running in the lab environment, if '\n        'this is unintentional, please re-invoke the test runner with the '\n        '\"--use-vm\" arg if using a VM, otherwise use the \"--device=<DUT>\" arg '\n        'to specify a DUT.')\n\n    # If we're not running on a VM, but haven't specified a hostname, assume\n    # we're on a lab bot and are trying to run a test on a lab DUT. See if the\n    # magic lab DUT hostname resolves to anything. (It will in the lab and will\n    # not on dev machines.)\n    try:\n      socket.getaddrinfo(LAB_DUT_HOSTNAME, None)\n    except socket.gaierror:\n      logging.error('The default lab DUT hostname of %s is unreachable.',\n                    LAB_DUT_HOSTNAME)\n      return 1\n\n  if args.flash and args.public_image:\n    # The flashing tools depend on being unauthenticated with GS when flashing\n    # public images, so make sure the env var GS uses to locate its creds is\n    # unset in that case.\n    os.environ.pop('BOTO_CONFIG', None)\n\n  if args.magic_vm_cache:\n    full_vm_cache_path = os.path.join(CHROMIUM_SRC_PATH, args.magic_vm_cache)\n    if os.path.exists(full_vm_cache_path):\n      with open(os.path.join(full_vm_cache_path, 'swarming.txt'), 'w') as f:\n        f.write('non-empty file to make swarming persist this cache')\n\n  return args.func(args, unknown_args)"
+    },
+    "imports": {
+      "imports": [
+        "argparse",
+        "collections",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "shutil",
+        "signal",
+        "socket",
+        "sys",
+        "tempfile",
+        "dateutil.parser",
+        "jsonlines",
+        "psutil",
+        "pylib.base:base_test_result",
+        "pylib.results:json_results",
+        "lib.results:result_sink",
+        "subprocess"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "chromeos/README.md",
+      "download_url": "https://raw.githubusercontent.com/denoland/chromium_build/upstream/chromeos/README.md",
+      "content_excerpt": "This directory contains a few scripts used to run tests on CrOS VMs/DUTs.\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "main test",
+      "count": 8,
+      "items": [
+        {
+          "name": "main.rs",
+          "path": "rust/tests/test_aliased_deps/main.rs",
+          "sha": "2d66598cf76ae8d8fb35a9df5fa0f25f81634108",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/rust/tests/test_aliased_deps/main.rs",
+          "score": 1.0
+        },
+        {
+          "name": "main.cc",
+          "path": "rust/tests/test_cpp_including_rust/main.cc",
+          "sha": "d515a3464459570af9576b46b3657103672cd467",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/rust/tests/test_cpp_including_rust/main.cc",
+          "score": 1.0
+        },
+        {
+          "name": "create_test_apk_wrapper_script.py",
+          "path": "android/gyp/create_test_apk_wrapper_script.py",
+          "sha": "1e6374872432e91ece4ac4694ca62b8912f52a10",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/android/gyp/create_test_apk_wrapper_script.py",
+          "score": 1.0
+        },
+        {
+          "name": "copy_test_data_ios.py",
+          "path": "copy_test_data_ios.py",
+          "sha": "69b957a72e20036d78f0015e0e46b57c40df94dd",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/copy_test_data_ios.py",
+          "score": 1.0
+        },
+        {
+          "name": "main.rs",
+          "path": "rust/tests/test_rust_multiple_dep_versions_exe/main.rs",
+          "sha": "fdf730dfe7c69eb08177cc70ec8f4d25f1ecafe9",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/rust/tests/test_rust_multiple_dep_versions_exe/main.rs",
+          "score": 1.0
+        },
+        {
+          "name": "private_code_test.py",
+          "path": "private_code_test/private_code_test.py",
+          "sha": "f51888443ab74e8442c33806107272c186376dfb",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/private_code_test/private_code_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_control_flow_guard.rs",
+          "path": "rust/tests/test_control_flow_guard/test_control_flow_guard.rs",
+          "sha": "33809c7301312fe9e3f8757749731cb5f2ca9023",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/rust/tests/test_control_flow_guard/test_control_flow_guard.rs",
+          "score": 1.0
+        },
+        {
+          "name": "main.rs",
+          "path": "rust/tests/bindgen_static_fns_test/main.rs",
+          "sha": "3258345ebcf39c39bbb218f2434db94b8ea12c1a",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/rust/tests/bindgen_static_fns_test/main.rs",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"main(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "rm.py",
+          "path": "rm.py",
+          "sha": "11e8a6439900406132b7bdaf810aae80ea7b7f5c",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/rm.py",
+          "score": 1.0
+        },
+        {
+          "name": "envsetup.sh",
+          "path": "android/envsetup.sh",
+          "sha": "315db296a7ab44217b8ef8f7dad50bb202511432",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/android/envsetup.sh",
+          "score": 1.0
+        },
+        {
+          "name": "common.py",
+          "path": "3pp_common/common.py",
+          "sha": "aa5b942b64807ec0d5bb92306a8773423126f0b8",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/3pp_common/common.py",
+          "score": 1.0
+        },
+        {
+          "name": "android_chrome_version.py",
+          "path": "util/android_chrome_version.py",
+          "sha": "df72ff54c0eb2f21cfeb6b2eb4e2437d0a9a32da",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/util/android_chrome_version.py",
+          "score": 1.0
+        },
+        {
+          "name": "gn_editor.py",
+          "path": "gn_ast/gn_editor.py",
+          "sha": "3b63ba82547d29972108dbde185948db2915b331",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/gn_ast/gn_editor.py",
+          "score": 1.0
+        },
+        {
+          "name": "list_class_verification_failures.py",
+          "path": "android/list_class_verification_failures.py",
+          "sha": "9c94e308aa61a0640e30f9d11d4fdd66c1b4f4d7",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/android/list_class_verification_failures.py",
+          "score": 1.0
+        },
+        {
+          "name": "replace_gn_files.py",
+          "path": "linux/unbundle/replace_gn_files.py",
+          "sha": "f5db9d23c886b7bd1f43742c14ac8b1b5f3c8906",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/linux/unbundle/replace_gn_files.py",
+          "score": 1.0
+        },
+        {
+          "name": "protoc_java.py",
+          "path": "protoc_java.py",
+          "sha": "8f25e3a5e6c757b564745504a3e8912474771940",
+          "html_url": "https://github.com/denoland/chromium_build/blob/01729aa4668a1ae918003ce79b456a3c92cc3954/protoc_java.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "chromeos",
+      "count": 12,
+      "entries": [
+        {
+          "name": ".style.yapf",
+          "path": "chromeos/.style.yapf",
+          "type": "file"
+        },
+        {
+          "name": "OWNERS",
+          "path": "chromeos/OWNERS",
+          "type": "file"
+        },
+        {
+          "name": "PRESUBMIT.py",
+          "path": "chromeos/PRESUBMIT.py",
+          "type": "file"
+        },
+        {
+          "name": "README.md",
+          "path": "chromeos/README.md",
+          "type": "file"
+        },
+        {
+          "name": "crosier_tests.gni",
+          "path": "chromeos/crosier_tests.gni",
+          "type": "file"
+        },
+        {
+          "name": "embed_sections.gni",
+          "path": "chromeos/embed_sections.gni",
+          "type": "file"
+        },
+        {
+          "name": "embed_sections.py",
+          "path": "chromeos/embed_sections.py",
+          "type": "file"
+        },
+        {
+          "name": "generate_skylab_tast_filter.py",
+          "path": "chromeos/generate_skylab_tast_filter.py",
+          "type": "file"
+        },
+        {
+          "name": "generate_skylab_tast_filter_test.py",
+          "path": "chromeos/generate_skylab_tast_filter_test.py",
+          "type": "file"
+        },
+        {
+          "name": "pylintrc",
+          "path": "chromeos/pylintrc",
+          "type": "file"
+        },
+        {
+          "name": "test_runner.py",
+          "path": "chromeos/test_runner.py",
+          "type": "file"
+        },
+        {
+          "name": "test_runner_test.py",
+          "path": "chromeos/test_runner_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": ".style.yapf",
+          "path": "chromeos/.style.yapf"
+        },
+        {
+          "name": "OWNERS",
+          "path": "chromeos/OWNERS"
+        },
+        {
+          "name": "PRESUBMIT.py",
+          "path": "chromeos/PRESUBMIT.py"
+        },
+        {
+          "name": "README.md",
+          "path": "chromeos/README.md"
+        },
+        {
+          "name": "crosier_tests.gni",
+          "path": "chromeos/crosier_tests.gni"
+        },
+        {
+          "name": "embed_sections.gni",
+          "path": "chromeos/embed_sections.gni"
+        },
+        {
+          "name": "embed_sections.py",
+          "path": "chromeos/embed_sections.py"
+        },
+        {
+          "name": "generate_skylab_tast_filter.py",
+          "path": "chromeos/generate_skylab_tast_filter.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "chromeos/test_runner.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "dc8b2298602e358156f40e1c5531c7c8c3d27c93",
+          "html_url": "https://github.com/denoland/chromium_build/commit/dc8b2298602e358156f40e1c5531c7c8c3d27c93",
+          "message": "Fix common misspelling 'exitted' -> 'exited'.\n\nBUG=None\nTEST=None\n\nChange-Id: I9c8244cb1b116fa5d1c95bc15726e416eec7b25a\nReviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/6075767\nReviewed-by: Ben Pastene <bpastene@chromium.org>\nReviewed-by: Will Harris <wfh@chromium.org>\nCommit-Q",
+          "author": "Jorge Lucangeli Obes",
+          "date": "2024-12-06T01:03:20Z"
+        },
+        {
+          "sha": "eb5c12dff90b56c1651478a43ae865e93d7ad7f0",
+          "html_url": "https://github.com/denoland/chromium_build/commit/eb5c12dff90b56c1651478a43ae865e93d7ad7f0",
+          "message": "Remove Lacros support from CrOS test runner\n\nRemove Lacros support from build/chromeos/test_runner_test.py\nsince it is obsolete. This includes removing the --deploy-lacros\nswitch.\n\nBug: b:370356213, b:372806533\nChange-Id: I623d845a1e99f648b50d35fa3cbd5f206a169170\nReviewed-on: https://chromium-review",
+          "author": "Georg Neis",
+          "date": "2024-10-17T01:51:26Z"
+        },
+        {
+          "sha": "8f33df3aa80d76e0b74f5d2f616b785dcf5b1357",
+          "html_url": "https://github.com/denoland/chromium_build/commit/8f33df3aa80d76e0b74f5d2f616b785dcf5b1357",
+          "message": "Add option to CrOS test runner to run gtests as root\n\nRight now gtests launched by the chromium test runner hard-codes\nrunning as chronos. But some tests apparently need root. So this\nopens up the ability to run as root via cmd-line arg.\n\nIt can be specified similar to the \"--stop-ui\" arg, eg:\nhttps",
+          "author": "Ben Pastene",
+          "date": "2024-08-08T21:08:30Z"
+        },
+        {
+          "sha": "64971678b7d97261007db6cde1cfc2406b8f313a",
+          "html_url": "https://github.com/denoland/chromium_build/commit/64971678b7d97261007db6cde1cfc2406b8f313a",
+          "message": "crosier: Use `--files-from` for `cros_run_test`\n\nRuntime files list gets too long to be passed via `--files` as\nshown in http://crbug.com/344457767. This CL writes the runtime\nfiles to a temp file and pass to `cros_run_test` via `--files-from`\narg.\n\nBug: 344457767\nChange-Id: If29fe0dd7e394e4cecd1d89",
+          "author": "Xiyuan Xia",
+          "date": "2024-06-03T19:10:29Z"
+        },
+        {
+          "sha": "26998e9872e3952758c2a4246714ae9ce987ccbe",
+          "html_url": "https://github.com/denoland/chromium_build/commit/26998e9872e3952758c2a4246714ae9ce987ccbe",
+          "message": "crosier: Use deployed dbus config\n\nCrosier currently uses existing dbus config on device. As shown\nin b/340133121, this is a problem when a CL adds a new dbus service.\nCrosier would fail because the new dbus service config is not\nused. This CL fixes the problem by changing the test script to\nbind mo",
+          "author": "Xiyuan Xia",
+          "date": "2024-05-14T22:43:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "main TODO bpastene Switch uses logs",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "chromeos/test_runner.py",
+      "satd_line": 1023,
+      "last_commit": {
+        "sha": "dc8b2298602e358156f40e1c5531c7c8c3d27c93",
+        "html_url": "https://github.com/denoland/chromium_build/commit/dc8b2298602e358156f40e1c5531c7c8c3d27c93",
+        "message": "Fix common misspelling 'exitted' -> 'exited'.\n\nBUG=None\nTEST=None\n\nChange-Id: I9c8244cb1b116fa5d1c95bc15726e416eec7b25a\nReviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/6075767\nReviewed-by: Ben Pastene <bpastene@chromium.org>\nReviewed-by: Will Harris <wfh@chromium.org>\nCommit-Q",
+        "author": "Jorge Lucangeli Obes",
+        "date": "2024-12-06T01:03:20Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "main",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

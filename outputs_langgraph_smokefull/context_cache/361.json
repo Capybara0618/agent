@@ -1,0 +1,421 @@
+{
+  "task_id": "361",
+  "repo_owner": "tlsfuzzer",
+  "repo_name": "tlsfuzzer",
+  "file_path": "tlsfuzzer/messages.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T18:02:13+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "ClientKeyExchangeGenerator",
+    "satd_line": 749,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 7,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T18:02:29+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T18:02:33+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "tlsfuzzer/messages.py",
+    "original_code": "def generate(self, status):\n    if self.version is None:\n        self.version = status.version\n\n    cke = ClientKeyExchange(status.cipher, self.version)\n    premaster_secret = self.premaster_secret\n    assert len(premaster_secret) > 1\n\n    premaster_secret[0] = self.version[0]\n    premaster_secret[1] = self.version[1]\n\n    # TODO encrypt with server cert\n    cke.createRSA(premaster_secret)\n\n    return cke",
+    "satd_comment": "# TODO encrypt with server cert",
+    "target_file": {
+      "ok": true,
+      "path": "tlsfuzzer/messages.py",
+      "sha": "9c93020c5835d84cc10c81d042e7ea97367be2b1",
+      "download_url": "https://raw.githubusercontent.com/tlsfuzzer/tlsfuzzer/master/tlsfuzzer/messages.py",
+      "content_excerpt": "# Author: Hubert Kario, (c) 2015\n# Released under Gnu GPL v2.0, see LICENSE file for details\n\n\"\"\"Objects for generating TLS messages to send.\"\"\"\n\nimport random\nimport struct\nfrom tlslite.messages import ClientHello, ClientKeyExchange, ChangeCipherSpec,\\\n        Finished, Alert, ApplicationData, Message, Certificate, \\\n        CertificateVerify, CertificateRequest, ClientMasterKey, \\\n        ClientFinished, ServerKeyExchange, ServerHello, Heartbeat, \\\n        KeyUpdate, CompressedCertificate\nfrom tlslite.constants import AlertLevel, AlertDescription, ContentType, \\\n        ExtensionType, CertificateType, HashAlgorithm, \\\n        SignatureAlgorithm, CipherSuite, SignatureScheme, TLS_1_3_HRR, \\\n        HeartbeatMessageType, CertificateCompressionAlgorithm, GroupName\nimport tlslite.utils.tlshashlib as hashlib\nfrom tlslite.extensions import TLSExtension, RenegotiationInfoExtension, \\\n        ClientKeyShareExtension, StatusRequestExtension\nfrom tlslite.messagesocket import MessageSocket\nfrom tlslite.defragmenter import Defragmenter\nfrom tlslite.mathtls import calc_key, \\\n        calcExtendedMasterSecret\nfrom tlslite.handshakehashes import HandshakeHashes\nfrom tlslite.utils.codec import Writer\nfrom tlslite.utils.cryptomath import getRandomBytes, numBytes, \\\n    numberToByteArray, bytesToNumber, HKDF_expand_label, secureHMAC, \\\n    derive_secret\nfrom tlslite.utils.compression import compression_algo_impls\nfrom tlslite.keyexchange import KeyExchange\nfrom tlslite.bufferedsocket import BufferedSocket\nfrom tlslite.recordlayer import ConnectionState\nfrom .helpers import key_share_gen, AutoEmptyExtension, ECDSA_SIG_ALL, \\\n        RSA_PKCS1_ALL, RSA_PSS_PSS_ALL, RSA_PSS_RSAE_ALL, SIG_ALL, DSA_ALL\nfrom .handshake_helpers import calc_pending_states, curve_name_to_hash_tls13\nfrom .tree import TreeNode\nimport socket\nfrom functools import partial\nfrom ecdsa import VerifyingKey\nfrom tlslite.utils import ecc\n\nclass Command(TreeNode):\n    \"\"\"Command objects.\"\"\"\n\n    def __init__(self):\n        \"\"\"Create object.\"\"\"\n        super(Command, self).__init__()\n\n    def is_command(self):\n        \"\"\"Define object as a command node.\"\"\"\n        return True\n\n    def is_expect(self):\n        \"\"\"Define object as a command node.\"\"\"\n        return False\n\n    def is_generator(self):\n        \"\"\"Define object as a command node.\"\"\"\n        return False\n\n    def process(self, state):\n        \"\"\"Change the state of the connection.\"\"\"\n        raise NotImplementedError(\"Subclasses need to implement this!\")\n\n\nclass Connect(Command):\n    \"\"\"Object used to connect to a TCP server.\"\"\"\n\n    def __init__(self, hostname, port, version=(3, 0), timeout=5):\n        \"\"\"\n        Provide minimal settings needed to connect to other peer.\n\n        :param str hostname: host name of the server to connect to\n        :param int port: :term:`TCP` port number to connect to\n        :param tuple(int,int) version: the protocol version used in the\n            record layer for the initial messages\n        :param float timeout: amount of time to wait while expecting a message\n            before aborting the connection, in seconds\n        \"\"\"\n        super(Connect, self).__init__()\n        self.hostname = hostname\n        self.port = port\n        self.version = version\n        self.timeout = timeout\n\n    def process(self, state):\n        \"\"\"Connect to a server.\"\"\"\n        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n        sock.settimeout(self.timeout)\n        sock.connect((self.hostname, self.port))\n        # disable Nagle - we handle buffering and flushing ourselves\n        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)\n\n        # allow for later buffering of writes to the socket\n        sock = BufferedSocket(sock)\n\n        defragmenter = Defragmenter()\n        defragmenter.add_static_size(ContentType.alert, 2)\n        defragmenter.add_static_size(ContentType.change_cipher_spec, 1)\n        defragmenter.add_dynamic_size(ContentType.handshake, 1, 3)\n\n        state.msg_sock = MessageSocket(sock, defragmenter)\n\n        state.msg_sock.version = self.version\n\n\nclass SetRecordVersion(Command):\n    \"\"\"Change the version used at record layer.\"\"\"\n    def __init__(self, version):\n        super(SetRecordVersion, self).__init__()\n        self.version = version\n\n    def process(self, state):\n        state.msg_sock.version = self.version\n\n\nclass Close(Command):\n    \"\"\"Object used to close a TCP connection.\"\"\"\n\n    def __init__(self):\n        \"\"\"Close connection object.\"\"\"\n        super(Close, self).__init__()\n\n    def process(self, state):\n        \"\"\"Close currently open connection.\"\"\"\n        state.msg_sock.sock.close()\n\n\nclass CloseRST(Command):\n    \"\"\"Object used to close a TCP connection with a RST packet.\"\"\"\n\n    def __init__(self):\n        \"\"\"CloseRST connection object.\"\"\"\n        super(CloseRST, self).__init__()\n\n    def process(self, state):\n        \"\"\"Close currently open connection by sending a RST packet.\"\"\"\n        l_onoff = 1\n        l_linger = 0\n        state.msg_sock.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,\n                                       struct.pack('ii', l_onoff, l_linger))\n        state.msg_sock.sock.close()\n\n\nclass ResetHandshakeHashes(Command):\n    \"\"\"\n    Object used to reset current state of handshake hashes to zero.\n\n    Used for session renegotiation or resumption.\n\n    Also prepares for negotiation (or dropping) of record_size_limit extension.\n    \"\"\"\n\n    def __init__(self):\n        \"\"\"Object for resetting handshake hashes of session.\"\"\"\n        super(ResetHandshakeHashes, self).__init__()\n\n    def process(self, state):\n        \"\"\"Reset current running handshake protocol hashes.\"\"\"\n        state.handshake_hashes = HandshakeHashes()\n        # remove the keys that can interfere with key calculation\n        # don't remove all as we need things like \"resumption master secret\"\n        # to actually resume next session\n        state.key.pop('PSK secret', None)\n        state.key.pop('DH shared secret', None)\n\n        # while not part of handshake hashes, it needs to be done every time\n        # renegotiation or resumption is performed as the extension needs to\n        # be negotiated every time\n        state._our_record_size_limit = 2**14\n        state._peer_record_size_limit = 2**14\n\n\nclass ResetRenegotiationInfo(Command):\n    \"\"\"Object used to reset state of data needed for secure renegotiation.\"\"\"\n\n    def __init__(self, client=None, server=None):\n        \"\"\"Reset the stored rengotiation info to provided values.\"\"\"\n        super(ResetRenegotiationInfo, self).__init__()\n        self.client_verify_data = client\n        self.server_verify_data = server\n\n    def process(self, state):\n        \"\"\"Reset current Finished message values.\"\"\"\n        if self.client_verify_data is None:\n            self.client_verify_data = bytearray(0)\n        if self.server_verify_data is None:\n            self.server_verify_data = bytearray(0)\n        state.key['client_verify_data'] = self.client_verify_data\n        state.key['server_verify_data'] = self.server_verify_data\n\n\nclass SetMaxRecordSize(Command):\n    \"\"\"Change the Record Layer to send records of non standard size.\"\"\"\n\n    def __init__(self, max_size=None):\n        \"\"\"Set the maximum record layer message size, no option for default.\"\"\"\n        super(SetMaxRecordSize, self).__init__()\n        self.max_size = max_size\n\n    def process(self, state):\n        \"\"\"Change the size of messages in record layer.\"\"\"\n        if self.max_size is None:\n            # the maximum for SSLv3, TLS1.0, TLS1.1 and TLS1.2\n            state.msg_sock.recordSize = 2**14\n        else:\n            state.msg_sock.recordSize = self.max_size\n\n\nclass SetPaddingCallback(Command):\n    \"\"\"\n    Set the padding callback which returns the length of the padding to be\n    added to the message in the record layer.\n    \"\"\"\n\n    def __init__(self, cb=None):\n        \"\"\"Set the padding callback\"\"\"\n        super(SetPaddingCallback, self).__init__()\n        self.padding_cb = cb\n\n    @staticmethod\n    def fixed_length_cb(size):\n        \"\"\"\n        Returns a callback function which returns a fixed number as the\n        padding size\n        \"\"\"\n        def _fixed_len_cb(length, contenttype, max_padding, zeroes=size):\n            \"\"\"\n            Simple callback which returns a fixed number as the padding size\n            to be added to the message\n            \"\"\"\n            if zeroes > (max_padding - length):\n                raise ValueError(\"requested padding size is too large\")\n\n            return zeroes\n        return _fixed_len_cb\n\n    @staticmethod\n    def fill_padding_cb(length, contenttype, max_padding):\n        \"\"\"\n        Simple callback which returns the maximum padding size as\n        the size of the padding to be added to the message\n        \"\"\"\n        return max_padding - length\n\n    @staticmethod\n    def add_fixed_padding_cb(size):\n        \"\"\"\n        Returns a callback function which returns a fixed number as the\n        padding size\n        \"\"\"\n        def _add_fixed_passing_cb(length, contenttype, max_padding,\n                                  zeros=size):\n            \"\"\"\n            Simple callback which returns a fixed number as the padding size\n            to be added to the message.\n            This function does not check a correct size of padding, can cause\n            buffer overflow alert.\n            \"\"\"\n            return zeros\n        return _add_fixed_passing_cb\n\n    def process(self, state):\n        \"\"\"\n        Set the callback which returns the length of the padding in record\n        layer.\n        \"\"\"\n        state.msg_sock.padding_cb = self.padding_cb\n\n\nclass TCPBufferingEnable(Command):\n    \"\"\"\n    Start buffering all writes on the TCP level of connection.\n\n    You will need to call an explicit flush to send the messages.\n    \"\"\"\n\n    def process(self, state):\n        \"\"\"Enable TCP buffering.\"\"\"\n        state.msg_sock.sock.buffer_writes = True\n\n\nclass TCPBufferingDisable(Command):\n    \"\"\"\n    Stop buffering all writes on the TCP level.\n\n    All messages will be now passed directly to the TCP socket\n    \"\"\"\n\n    def process(self, state):\n        \"\"\"Disable TCP buffering.\"\"\"\n        state.msg_sock.sock.buffer_writes = False\n\n\nclass TCPBufferingFlush(Command):\n    \"\"\"\n    Send all messages in the buffer.\n\n    Does not change the state of buffering\n    \"\"\"\n\n    def process(self, state):\n        \"\"\"Flush all messages to TCP socket.\"\"\"\n        state.msg_sock.sock.flush()\n\n\nclass ResetWriteConnectionState(Command):\n    \"\"\"\n    Reset _writeState configuration to default values\n\n    All sent messages will be unencrypted now\n    \"\"\"\n\n    def process(self, state):\n        state.msg_sock._writeState = ConnectionState()\n\n\nclass CollectNonces(Command):\n    \"\"\"\n    Start collecting nonces being sent by the server in the provided array.\n\n    Works only for ciphers like AES-GCM which use explicit nonces. Ciphers\n    like Chacha20 use implicit nonce constructed from PRF output and sequence\n    number.\n\n    Needs to be run after the cipher was negotiated and switched to (after\n    CCS), will collect nonces only till next renegotiation.\n    \"\"\"\n\n    def __init__(self, nonces):\n        \"\"\"Link the list for storing nonces with the object.\"\"\"\n        super(CollectNonces, self).__init__()\n        self.nonces = nonces\n\n    def process(self, state):\n        \"\"\"Monkey patch the seal() method.\"\"\"\n        seal_mthd = state.msg_sock._writeState.encContext.seal\n\n        def collector(nonce, buf, authData, old_seal=seal_mthd,\n                      nonces=self.nonces):\n            \"\"\"Collect used nonces for encryption.\"\"\"\n            nonces.append(nonce)\n            return old_seal(nonce, buf, authData)\n\n        state.msg_sock._writeState.encContext.seal = collector\n\n\nclass CopyVariables(Command):\n    \"\"\"\n    Copy current random values of connection to provided arrays.\n\n    Available keys are either ``ClientHello.random``, ``ServerHello.random``,\n    ``ServerHello.session_id`` or\n    one of the values in",
+      "total_lines": 2418
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 749,
+      "start_line": 729,
+      "end_line": 769,
+      "matched_line": "       server",
+      "excerpt": "729:     :vartype dh_Yc: int\n730:     :ivar dh_Yc: Override the sent dh_Yc value to the specified one\n731:     :vartype padding_subs: dict(int,int)\n732:     :ivar padding_subs: Substitutions for the encrypted premaster secret\n733:        padding bytes (applicable only for the RSA key exchange)\n734:     :vartype padding_xors: dict(int,int)\n735:     :ivar padding_xors: XORs for the encrypted premaster secret padding bytes\n736:        (applicable only for the RSA key exchange)\n737:     :vartype ecdh_Yc: bytearray\n738:     :ivar ecdh_Yc: encoded ECC point being the client key share for the\n739:        key exchange\n740:     :vartype encrypted_premaster: bytearray\n741:     :ivar encrypted_premaster: the premaster secret after it was encrypted,\n742:        as it will be sent on the wire\n743:     :vartype modulus_as_encrypted_premaster: bool\n744:     :ivar modulus_as_encrypted_premaster: if True, set the encrypted\n745:        premaster (the value seen on the wire) to the server's certificate\n746:        modulus (the server's public key)\n747:     :vartype p_as_share: bool\n748:     :ivar p_as_share: set the key share to the value :math:`p` provided by\n749:        server\n750:        in Server Key Exchange (applicable only to FFDHE key exchange)\n751:     :vartype p_1_as_share: bool\n752:     :ivar p_1_as_share: set the key share to the value :math:`p - 1`, as\n753:        provided by\n754:        server in Server Key Exchange (applicable only to FFDHE key exchange\n755:        with safe primes)\n756:     :ivar int padding_byte: byte to use as padding instead of randomly\n757:        generated bytes (applicable only for RSA key exchange)\n758:     :ivar tuple(int,int) client_version: the version to set in the RSA\n759:        pre-master secret\n760:     :ivar bool reuse_encrypted_premaster: if set to true, the message generator\n761:        will create the RSA ciphertext once and reuse it for subsequent\n762:        connections. Applicable only to RSA key exchange, useful only for\n763:        tests that run the same conversation over and over (like timing tests).\n764:     :ivar encrypted_premaster_file: The :term:`file object` from which to\n765:        read the encrypted premaster secret, on node re-ececution will read\n766:        subsequent values, does not rewind the file pointer or close the file.\n767:        The file must be opened in binary mode\n768:     :vartype encrypted_premaster_file: :term:`file object`\n769:     :ivar int encrypted_premaster_length: The length of data to read, in bytes"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "ClassDef",
+      "symbol_name": "ClientKeyExchangeGenerator",
+      "start_line": 725,
+      "end_line": 915,
+      "source": "class ClientKeyExchangeGenerator(HandshakeProtocolMessageGenerator):\n    \"\"\"\n    Generator for TLS handshake protocol Client Key Exchange messages.\n\n    :vartype dh_Yc: int\n    :ivar dh_Yc: Override the sent dh_Yc value to the specified one\n    :vartype padding_subs: dict(int,int)\n    :ivar padding_subs: Substitutions for the encrypted premaster secret\n       padding bytes (applicable only for the RSA key exchange)\n    :vartype padding_xors: dict(int,int)\n    :ivar padding_xors: XORs for the encrypted premaster secret padding bytes\n       (applicable only for the RSA key exchange)\n    :vartype ecdh_Yc: bytearray\n    :ivar ecdh_Yc: encoded ECC point being the client key share for the\n       key exchange\n    :vartype encrypted_premaster: bytearray\n    :ivar encrypted_premaster: the premaster secret after it was encrypted,\n       as it will be sent on the wire\n    :vartype modulus_as_encrypted_premaster: bool\n    :ivar modulus_as_encrypted_premaster: if True, set the encrypted\n       premaster (the value seen on the wire) to the server's certificate\n       modulus (the server's public key)\n    :vartype p_as_share: bool\n    :ivar p_as_share: set the key share to the value :math:`p` provided by\n       server\n       in Server Key Exchange (applicable only to FFDHE key exchange)\n    :vartype p_1_as_share: bool\n    :ivar p_1_as_share: set the key share to the value :math:`p - 1`, as\n       provided by\n       server in Server Key Exchange (applicable only to FFDHE key exchange\n       with safe primes)\n    :ivar int padding_byte: byte to use as padding instead of randomly\n       generated bytes (applicable only for RSA key exchange)\n    :ivar tuple(int,int) client_version: the version to set in the RSA\n       pre-master secret\n    :ivar bool reuse_encrypted_premaster: if set to true, the message generator\n       will create the RSA ciphertext once and reuse it for subsequent\n       connections. Applicable only to RSA key exchange, useful only for\n       tests that run the same conversation over and over (like timing tests).\n    :ivar encrypted_premaster_file: The :term:`file object` from which to\n       read the encrypted premaster secret, on node re-ececution will read\n       subsequent values, does not rewind the file pointer or close the file.\n       The file must be opened in binary mode\n    :vartype encrypted_premaster_file: :term:`file object`\n    :ivar int encrypted_premaster_length: The length of data to read, in bytes\n    :ivar bool random_premaster: whether to use a random premaster value\n       or the static default (48 zero bytes)\n    :ivar str ec_point_encoding: the encoding of the\n       ECC point in the key share extension\n    \"\"\"\n\n    def __init__(self, cipher=None, version=None, client_version=None,\n                 dh_Yc=None, padding_subs=None, padding_xors=None,\n                 ecdh_Yc=None, encrypted_premaster=None,\n                 modulus_as_encrypted_premaster=False, p_as_share=False,\n                 p_1_as_share=False, premaster_secret=None,\n                 padding_byte=None, reuse_encrypted_premaster=False,\n                 encrypted_premaster_file=None,\n                 encrypted_premaster_length=None,\n                 random_premaster=False, ec_point_encoding=None,):\n        \"\"\"Set settings of the Client Key Exchange to be sent.\"\"\"\n        super(ClientKeyExchangeGenerator, self).__init__()\n        self.cipher = cipher\n        self.version = version\n        self.client_version = client_version\n        if premaster_secret is None:\n            self.premaster_secret = bytearray(48)\n        else:\n            self.premaster_secret = premaster_secret\n        self.dh_Yc = dh_Yc\n        self.padding_subs = padding_subs\n        self.padding_xors = padding_xors\n        self.ecdh_Yc = ecdh_Yc\n        self.encrypted_premaster = encrypted_premaster\n        self.modulus_as_encrypted_premaster = modulus_as_encrypted_premaster\n        self.p_as_share = p_as_share\n        self.p_1_as_share = p_1_as_share\n        self.padding_byte = padding_byte\n        self.reuse_encrypted_premaster = reuse_encrypted_premaster\n        self.encrypted_premaster_file = encrypted_premaster_file\n        self.encrypted_premaster_length = encrypted_premaster_length\n        self.random_premaster = random_premaster\n        self.ec_point_encoding = ec_point_encoding\n\n        if encrypted_premaster_file and not encrypted_premaster_length:\n            raise ValueError(\"Must specify the length of data to read from\"\n                             \" encrypted_premaster_file\")\n\n        if modulus_as_encrypted_premaster and encrypted_premaster_file:\n            raise ValueError(\"Can't set both modulus_as_encrypted_premaster \"\n                             \"and encrypted_premaster_file at the same time\")\n\n        if p_as_share and p_1_as_share:\n            raise ValueError(\"Can't set both p_as_share and p_1_as_share at \"\n                             \"the same time\")\n\n    def generate(self, status):\n        \"\"\"Create a Client Key Exchange message.\"\"\"\n        if self.version is None:\n            self.version = status.version\n\n        if self.cipher is None:\n            self.cipher = status.cipher\n\n        if self.client_version is None:\n            self.client_version = status.client_version\n\n        cke = ClientKeyExchange(self.cipher, self.version)\n        if self.cipher in CipherSuite.certSuites:\n            if self.modulus_as_encrypted_premaster:\n                public_key = status.get_server_public_key()\n                self.encrypted_premaster = numberToByteArray(public_key.n)\n            elif self.encrypted_premaster_file:\n                self.encrypted_premaster = self.encrypted_premaster_file.read(\n                    self.encrypted_premaster_length)\n            if self.encrypted_premaster:\n                cke.createRSA(self.encrypted_premaster)\n                if self.reuse_encrypted_premaster:\n                    status.key['premaster_secret'] = self.premaster_secret\n            else:\n                if self.random_premaster:\n                    self.premaster_secret = getRandomBytes(48)\n                if len(self.premaster_secret) >= 2:\n                    self.premaster_secret[0] = self.client_version[0]\n                    self.premaster_secret[1] = self.client_version[1]\n\n                status.key['premaster_secret'] = self.premaster_secret\n\n                public_key = status.get_server_public_key()\n\n                enc_premaster = self._encrypt_with_fuzzing(public_key)\n\n                if self.reuse_encrypted_premaster:\n                    self.encrypted_premaster = enc_premaster\n\n                cke.createRSA(enc_premaster)\n        elif self.cipher in CipherSuite.dheCertSuites or \\\n                self.cipher in CipherSuite.dheDsaSuites:\n            if self.dh_Yc is not None:\n                cke = ClientKeyExchange(self.cipher,\n                                        self.version).createDH(self.dh_Yc)\n            elif self.p_as_share or self.p_1_as_share:\n                ske = status.get_last_message_of_type(ServerKeyExchange)\n                assert ske, \"No server key exchange in messages\"\n                if self.p_as_share:\n                    cke = ClientKeyExchange(self.cipher,\n                                            self.version).createDH(ske.dh_p)\n                else:\n                    cke = ClientKeyExchange(self.cipher,\n                                            self.version).createDH(ske.dh_p-1)\n            else:\n                cke = status.key_exchange.makeClientKeyExchange()\n            status.key['ClientKeyExchange.dh_Yc'] = cke.dh_Yc\n        elif self.cipher in CipherSuite.ecdhAllSuites:\n            if self.ecdh_Yc is not None:\n                cke = ClientKeyExchange(self.cipher,\n                                        self.version).createECDH(self.ecdh_Yc)\n            else:\n                cke = status.key_exchange.makeClientKeyExchange()\n            if self.ec_point_encoding is not None:\n                ske = status.get_last_message_of_type(ServerKeyExchange)\n                curve_name = GroupName.toRepr(ske.named_curve)\n                curve = ecc.getCurveByName(curve_name)\n                client_public_key = cke.ecdh_Yc\n                verify_key = VerifyingKey.from_string(client_public_key, curve)\n                new_public_key = verify_key.to_string(encoding=self.ec_point_encoding)\n                cke.ecdh_Yc = new_public_key\n            status.key['ClientKeyExchange.ecdh_Yc'] = cke.ecdh_Yc\n        else:\n            raise AssertionError(\"Unknown cipher/key exchange type\")\n\n        self.msg = cke\n\n        return cke\n\n    def _encrypt_with_fuzzing(self, public_key):\n        \"\"\"Use public_key to encrypt premaster secret with fuzzed padding.\"\"\"\n        old_addPKCS1Padding = public_key._addPKCS1Padding\n        public_key = fuzz_pkcs1_padding(public_key, self.padding_subs,\n                                        self.padding_xors, self.padding_byte)\n        ret = public_key.encrypt(self.premaster_secret)\n        public_key._addPKCS1Padding = old_addPKCS1Padding\n        return ret\n\n    def post_send(self, state):\n        \"\"\"Save intermediate handshake hash value.\"\"\"\n        # for EMS all messages up to and including CKE are part of\n        # \"session_hash\"\n        super(ClientKeyExchangeGenerator, self).post_send(state)\n        state.certificate_verify_handshake_hashes = \\\n            state.handshake_hashes.copy()"
+    },
+    "imports": {
+      "imports": [
+        "random",
+        "struct",
+        "tlslite.messages:ClientHello",
+        "tlslite.messages:ClientKeyExchange",
+        "tlslite.messages:ChangeCipherSpec",
+        "tlslite.messages:Finished",
+        "tlslite.messages:Alert",
+        "tlslite.messages:ApplicationData",
+        "tlslite.messages:Message",
+        "tlslite.messages:Certificate",
+        "tlslite.messages:CertificateVerify",
+        "tlslite.messages:CertificateRequest",
+        "tlslite.messages:ClientMasterKey",
+        "tlslite.messages:ClientFinished",
+        "tlslite.messages:ServerKeyExchange",
+        "tlslite.messages:ServerHello",
+        "tlslite.messages:Heartbeat",
+        "tlslite.messages:KeyUpdate",
+        "tlslite.messages:CompressedCertificate",
+        "tlslite.constants:AlertLevel",
+        "tlslite.constants:AlertDescription",
+        "tlslite.constants:ContentType",
+        "tlslite.constants:ExtensionType",
+        "tlslite.constants:CertificateType",
+        "tlslite.constants:HashAlgorithm",
+        "tlslite.constants:SignatureAlgorithm",
+        "tlslite.constants:CipherSuite",
+        "tlslite.constants:SignatureScheme",
+        "tlslite.constants:TLS_1_3_HRR",
+        "tlslite.constants:HeartbeatMessageType"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/tlsfuzzer/tlsfuzzer/master/README.md",
+      "content_excerpt": "[![GitHub CI](https://github.com/tlsfuzzer/tlsfuzzer/actions/workflows/ci.yml/badge.svg)](https://github.com/tlsfuzzer/tlsfuzzer/actions/workflows/ci.yml)\n[![Read the Docs](https://img.shields.io/readthedocs/tlsfuzzer)](https://tlsfuzzer.readthedocs.io/en/latest/)\n[![Coverage Status](https://coveralls.io/repos/tlsfuzzer/tlsfuzzer/badge.svg?branch=master)](https://coveralls.io/r/tlsfuzzer/tlsfuzzer?branch=master)\n\n# tlsfuzzer\ntlsfuzzer is a test suite for SSLv2, SSLv3, TLS 1.0, TLS 1.1, TLS 1.2, and\nTLS 1.3 implementations. It's in early stages of development, so there are\nno API stability guarantees. While it uses fuzzing techniques for testing\n(randomisation of passed in inputs), the scripts are generally written in a\nway that verifies correct error handling: unlike typical fuzzers it doesn't\ncheck only that the system under test didn't crash, it checks that it\nreturned correct error messages.\n\nYou can find ready-to-use scripts testing for many vulnerabilities (\n[ROBOT](https://robotattack.org/),\n[DROWN](https://drownattack.com/), etc.)\nand general standards conformity\n([RFC 5246](https://tools.ietf.org/html/rfc5246),\n[RFC 7627](https://tools.ietf.org/html/rfc7627),\n[RFC 7905](https://tools.ietf.org/html/rfc7905), etc.) in the `scripts/`\ndirectory.\n\n## Dependencies\n\nYou'll need:\n\n * Python 2.6 or later or Python 3.6 or later\n * [tlslite-ng](https://github.com/tlsfuzzer/tlslite-ng)\n   0.8.1 or later (note that `tlslite` will *not* work and\n   they conflict with each other)\n * [ecdsa](https://github.com/warner/python-ecdsa)\n   python module (dependency of tlslite-ng, should "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "ClientKeyExchangeGenerator test",
+      "count": 7,
+      "items": [
+        {
+          "name": "test_ocsp_stapling.py",
+          "path": "tlsfuzzer/_apps/test_ocsp_stapling.py",
+          "sha": "9daf6537bddc65a66a56aa3e94244cd8dae26235",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_ocsp_stapling.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_zero_length_data.py",
+          "path": "tlsfuzzer/_apps/test_zero_length_data.py",
+          "sha": "8096f79da8cd51bb229762b6c5c14aab923c25f0",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_zero_length_data.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_certificate_request.py",
+          "path": "tlsfuzzer/_apps/test_certificate_request.py",
+          "sha": "d8cc14936b1d987d965c7b4da41b4a7b465e51fe",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_certificate_request.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_dhe_key_share_random.py",
+          "path": "tlsfuzzer/_apps/test_dhe_key_share_random.py",
+          "sha": "f2d95aa3ca40165d7a8559911ee95db2038d0ce2",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_dhe_key_share_random.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_lengths.py",
+          "path": "tlsfuzzer/_apps/test_lengths.py",
+          "sha": "b4641e5f2f66fc89b9c04eb0e3b8c26c29ebf0e3",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_lengths.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_extensions.py",
+          "path": "tlsfuzzer/_apps/test_extensions.py",
+          "sha": "64b7d470314cd5d7a8de28ceb803b2b5fa3d6a44",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_extensions.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_tls13_non_support.py",
+          "path": "tlsfuzzer/_apps/test_tls13_non_support.py",
+          "sha": "9935b637bf2de2238eddb64d8cf493a5f448656f",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_tls13_non_support.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"ClientKeyExchangeGenerator(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "USAGE.md",
+          "path": "USAGE.md",
+          "sha": "7c3221592d564bbd5ac53f220c71614a47d3c474",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/USAGE.md",
+          "score": 1.0
+        },
+        {
+          "name": "hello-world.py",
+          "path": "docs/source/hello-world.py",
+          "sha": "281313defa47343cffe1d88d2ace559658f3f11a",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/docs/source/hello-world.py",
+          "score": 1.0
+        },
+        {
+          "name": "advanced-decision-graph.rst",
+          "path": "docs/source/advanced-decision-graph.rst",
+          "sha": "3aa98a66d78d98e3dd13943653fd95d7a8e0417c",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/docs/source/advanced-decision-graph.rst",
+          "score": 1.0
+        },
+        {
+          "name": "messages.py",
+          "path": "tlsfuzzer/messages.py",
+          "sha": "9c93020c5835d84cc10c81d042e7ea97367be2b1",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/messages.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_fuzzed_padding.py",
+          "path": "tlsfuzzer/_apps/test_fuzzed_padding.py",
+          "sha": "7e4120917e74470c0062ebff4c103d537219ad15",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_fuzzed_padding.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_cve_2016_7054.py",
+          "path": "tlsfuzzer/_apps/test_cve_2016_7054.py",
+          "sha": "6a68c7c8826c139436102163e43fd2a704be4991",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_cve_2016_7054.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_invalid_cipher_suites.py",
+          "path": "tlsfuzzer/_apps/test_invalid_cipher_suites.py",
+          "sha": "9376ce5602706dfe9c4426ae7d630239d6807984",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_invalid_cipher_suites.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_certificate_verify_malformed.py",
+          "path": "tlsfuzzer/_apps/test_certificate_verify_malformed.py",
+          "sha": "6bbb571f2504154386971feb4a99a06f1a9600ea",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/blob/bf7f579dc0e65498cfb21b60e9b152f6bd84a3bf/tlsfuzzer/_apps/test_certificate_verify_malformed.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "tlsfuzzer",
+      "count": 15,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "tlsfuzzer/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_apps",
+          "path": "tlsfuzzer/_apps",
+          "type": "dir"
+        },
+        {
+          "name": "analysis.py",
+          "path": "tlsfuzzer/analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "combine.py",
+          "path": "tlsfuzzer/combine.py",
+          "type": "file"
+        },
+        {
+          "name": "expect.py",
+          "path": "tlsfuzzer/expect.py",
+          "type": "file"
+        },
+        {
+          "name": "extract.py",
+          "path": "tlsfuzzer/extract.py",
+          "type": "file"
+        },
+        {
+          "name": "fuzzers.py",
+          "path": "tlsfuzzer/fuzzers.py",
+          "type": "file"
+        },
+        {
+          "name": "handshake_helpers.py",
+          "path": "tlsfuzzer/handshake_helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "helpers.py",
+          "path": "tlsfuzzer/helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "messages.py",
+          "path": "tlsfuzzer/messages.py",
+          "type": "file"
+        },
+        {
+          "name": "runner.py",
+          "path": "tlsfuzzer/runner.py",
+          "type": "file"
+        },
+        {
+          "name": "scanner.py",
+          "path": "tlsfuzzer/scanner.py",
+          "type": "file"
+        },
+        {
+          "name": "timing_runner.py",
+          "path": "tlsfuzzer/timing_runner.py",
+          "type": "file"
+        },
+        {
+          "name": "tree.py",
+          "path": "tlsfuzzer/tree.py",
+          "type": "file"
+        },
+        {
+          "name": "utils",
+          "path": "tlsfuzzer/utils",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "tlsfuzzer/__init__.py"
+        },
+        {
+          "name": "analysis.py",
+          "path": "tlsfuzzer/analysis.py"
+        },
+        {
+          "name": "combine.py",
+          "path": "tlsfuzzer/combine.py"
+        },
+        {
+          "name": "expect.py",
+          "path": "tlsfuzzer/expect.py"
+        },
+        {
+          "name": "extract.py",
+          "path": "tlsfuzzer/extract.py"
+        },
+        {
+          "name": "fuzzers.py",
+          "path": "tlsfuzzer/fuzzers.py"
+        },
+        {
+          "name": "handshake_helpers.py",
+          "path": "tlsfuzzer/handshake_helpers.py"
+        },
+        {
+          "name": "helpers.py",
+          "path": "tlsfuzzer/helpers.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "tlsfuzzer/messages.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "06bfa8dc170eed6e8e545f1114a0570b7568ce13",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/commit/06bfa8dc170eed6e8e545f1114a0570b7568ce13",
+          "message": "tls13-mldsa-in-certificate-verify: test with TLS 1.2 style signatures",
+          "author": "Alicja Kario",
+          "date": "2025-10-10T16:00:05Z"
+        },
+        {
+          "sha": "a4e9e4158e7e811110c83b947409fdad6939de32",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/commit/a4e9e4158e7e811110c83b947409fdad6939de32",
+          "message": "messages: Allow easy modification of the calculated signature in CertificateVerify",
+          "author": "Alicja Kario",
+          "date": "2025-10-03T20:47:04Z"
+        },
+        {
+          "sha": "30f88f9ebcec33eb171634daff43c05b2d6cdaef",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/commit/30f88f9ebcec33eb171634daff43c05b2d6cdaef",
+          "message": "ML-DSA support in client certificates",
+          "author": "Alicja Kario",
+          "date": "2025-09-29T18:09:27Z"
+        },
+        {
+          "sha": "f31b51d16af3eb0ee94c4bd21a02426aad2031ee",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/commit/f31b51d16af3eb0ee94c4bd21a02426aad2031ee",
+          "message": "ec point extension tests\n\nfix: changes in clientKeyExchange to pass the existing  tests\n\nfix: deleted the unneded check of point encoding (happens in the KeyExchange)\n\nfix: changed the arg option for setting ec_point_formats that server supports;\nfeat: test for checking the server hello ec_point_for",
+          "author": "gstarovo",
+          "date": "2024-08-26T14:08:55Z"
+        },
+        {
+          "sha": "5550413bb341b8615bd71c92d891bd598241b17e",
+          "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/commit/5550413bb341b8615bd71c92d891bd598241b17e",
+          "message": "add simple tests for Brainpool curves in TLS 1.3 (RFC8734)",
+          "author": "Alicja Kario",
+          "date": "2024-09-12T16:51:49Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "ClientKeyExchangeGenerator TODO encrypt with server cert",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "tlsfuzzer/messages.py",
+      "satd_line": 749,
+      "last_commit": {
+        "sha": "06bfa8dc170eed6e8e545f1114a0570b7568ce13",
+        "html_url": "https://github.com/tlsfuzzer/tlsfuzzer/commit/06bfa8dc170eed6e8e545f1114a0570b7568ce13",
+        "message": "tls13-mldsa-in-certificate-verify: test with TLS 1.2 style signatures",
+        "author": "Alicja Kario",
+        "date": "2025-10-10T16:00:05Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 7,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "ClientKeyExchangeGenerator",
+      "symbol_type": "ClassDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

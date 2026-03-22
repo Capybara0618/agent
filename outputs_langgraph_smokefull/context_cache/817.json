@@ -1,0 +1,295 @@
+{
+  "task_id": "817",
+  "repo_owner": "sapcc",
+  "repo_name": "networking-nsx-t",
+  "file_path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:48:56+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:49:04+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:49:09+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+    "original_code": "def refresh(self, list_aged: Set[Tuple[str, str, int]]):\n    # TODO: mngr has to be removed after POLICY is fully supported\n    provider = self.plcy_provider if self.USE_POLICY_API else self.mngr_provider\n\n    for o in list_aged:\n        if o[0] == provider.PORT:\n            self.callback(o[1], self.port)\n        elif o[0] == provider.QOS:\n            self.callback(o[1], self.qos)\n        elif o[0] == self.plcy_provider.SG_RULES:\n            self.callback(o[1], self.security_group_rules)\n        elif o[0] == self.plcy_provider.SG_MEMBERS:\n            self.callback(o[1], self.security_group_members)",
+    "satd_comment": "# TODO: mngr has to be removed after POLICY is fully supported",
+    "target_file": {
+      "ok": true,
+      "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+      "sha": "391ed0576fc886f9948d5d55d362dd71acf03db5",
+      "download_url": "https://raw.githubusercontent.com/sapcc/networking-nsx-t/stable/2024.1-m3/networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+      "content_excerpt": "import eventlet\neventlet.monkey_patch()\n\nfrom oslo_log import log as logging\nfrom oslo_config import cfg\nfrom networking_nsxv3.api.rpc import NSXv3ServerRpcApi\nfrom networking_nsxv3.plugins.ml2.drivers.nsxv3.agent import provider\nfrom networking_nsxv3.plugins.ml2.drivers.nsxv3.agent.provider_nsx_policy import API\nfrom networking_nsxv3.common.locking import LockManager\nfrom typing import Callable, List, Set, Tuple\nimport itertools\nimport json\nimport time\n\n\nLOG: logging.KeywordArgumentAdapter = logging.getLogger(__name__)\n\n\nclass AgentRealizer(object):\n\n    def __init__(\n        self,\n        rpc: NSXv3ServerRpcApi,\n        callback: Callable[[List or str, Callable[[str], None]], None],\n        kpi: Callable[[], dict],\n        nsx_provider: provider.Provider\n    ):\n        self.rpc = rpc\n        self.callback = callback\n        self.kpi = kpi\n        self.nsx_provider = nsx_provider\n\n        self.AGE = int(time.time())\n        LOG.info(\"Detected NSX-T %s version.\", self.nsx_provider.client.version)\n        self._dryrun()\n\n    @staticmethod\n    def _os_meta(query: Callable):\n        step = cfg.CONF.AGENT.rpc_max_records_per_query\n        cursor = 0\n        meta = dict()\n        while cursor != -1:\n            result = query(step, cursor)\n            meta.update({id: rev for id, rev, _ in result})\n            cursor = result[-1][2] if len(result) >= step else -1\n        return meta\n\n    def refresh(self, list_aged: Set[Tuple[str, str, int]]):\n        for o in list_aged:\n            if o[0] == self.nsx_provider.PORT:\n                self.callback(o[1], self.port)\n            elif o[0] == self.nsx_provider.QOS:\n                self.callback(o[1], self.qos)\n            elif o[0] == self.nsx_provider.SG_RULES:\n                self.callback(o[1], self.security_group_rules)\n            elif o[0] == self.nsx_provider.SG_MEMBERS:\n                self.callback(o[1], self.security_group_members)\n\n    def all(self, dryrun=False):\n        \"\"\"\n        Enforce desired state between OpenStack and Provider objects\n        Objects concidered outdated include new, updated or removed\n\n        :force: bool -- if True concider all objects as outdated\n        \"\"\"\n        with LockManager.get_lock(\"all\"):\n            if self.kpi().get(\"passive\") > 0:\n                return\n\n            _slice = cfg.CONF.AGENT.synchronization_queue_size\n            r = self.rpc\n\n            port_meta = self._os_meta(r.get_ports_with_revisions)\n            sg_meta = self._os_meta(r.get_security_groups_with_revisions)\n            qos_meta = self._os_meta(r.get_qos_policies_with_revisions)\n\n            # Refresh entire metadata with its latest state\n            LOG.info(\"Inventory metadata is going to be refreshed.\")\n\n            # Force networks refresh, only\n            self.nsx_provider.metadata_refresh(self.nsx_provider.NETWORK)\n\n            port_outdated, port_current = self.nsx_provider.outdated(self.nsx_provider.PORT, port_meta)\n            sgr_outdated, sgr_current = self.nsx_provider.outdated(self.nsx_provider.SG_RULES, sg_meta)\n            qos_outdated, qos_current = self.nsx_provider.outdated(self.nsx_provider.QOS, qos_meta)\n\n            # There is not way to revision group members but can 'age' them\n            sgm_outdated, sgm_maybe_orphans = self.nsx_provider.outdated(\n                self.nsx_provider.SG_MEMBERS, {sg: 0 for sg in sg_meta})\n            LOG.info(\"Inventory metadata have been refreshed.\")\n\n            if dryrun:\n                LOG.info(\"Dryrun:%s. Metadata refresh completed.\", dryrun)\n                return\n\n            # Don't count ports into synchronization limit, since they could exhaust the worker queue\n            # and cause the agent to be stuck.\n            outdated = list(itertools.islice(port_outdated, _slice))\n            _slice -= len(outdated)\n            LOG.info(\"Realizing %s/%s resources of Type:Ports\", len(outdated), len(port_outdated))\n            self.callback(outdated, self.port)\n            if _slice <= 0:\n                return\n\n            outdated = list(itertools.islice(sgr_outdated, _slice))\n            _slice -= len(outdated)\n            LOG.info(\"Realizing %s/%s resources of Type:Security Group Rules\", len(outdated), len(sgr_outdated))\n            self.callback(outdated, self.security_group_rules)\n            if _slice <= 0:\n                return\n\n            # sgm_outdated only includes missing objects, orphans are removed by ageing\n            outdated = list(itertools.islice(sgm_outdated, _slice))\n            _slice -= len(outdated)\n            LOG.info(\"Realizing %s/%s resources of Type:Security Group Members\", len(outdated), len(sgm_outdated))\n            self.callback(outdated, self.security_group_members)\n            if _slice <= 0:\n                return\n\n            outdated = list(itertools.islice(qos_outdated, _slice))\n            _slice -= len(outdated)\n            LOG.info(\"Realizing %s/%s resources of Type:QoS\", len(outdated), len(qos_outdated))\n            self.callback(outdated, self.qos)\n            if _slice <= 0:\n                return\n\n            return self._age_cycle(_slice, port_current, sgr_current, qos_current, sgm_maybe_orphans)\n\n    def _age_cycle(self, _slice, port_current, sgr_current, qos_current, sgm_maybe_orphans):\n        run_sanitize = True\n        if cfg.CONF.AGENT.resync_objects_based_on_age:\n            current = self.nsx_provider.age(self.nsx_provider.PORT, port_current)\n            current += self.nsx_provider.age(self.nsx_provider.SG_RULES, sgr_current)\n            current += self.nsx_provider.age(self.nsx_provider.SG_MEMBERS, sgm_maybe_orphans)\n            current += self.nsx_provider.age(self.nsx_provider.QOS, qos_current)\n\n            # Sanitize when there are no elements or the eldest age > current age\n            aged = [entry for entry in current if entry[2] and int(entry[2]) <= self.AGE]\n            LOG.info(\"Items outdated since last Agent sanitize:%d\", len(aged))\n\n            for i in aged:\n                LOG.debug(\"Last sync of %s with ID: %s on %s is older than %s\", i[0], i[1], i[2], self.AGE)\n\n            if aged:\n                run_sanitize = False\n                aged = set(itertools.islice(aged, _slice))\n                LOG.info(\"Refreshing %s of least updated resources\", len(aged))\n                self.refresh(aged)\n        else:\n            if time.time() - self.AGE < 3600:\n                run_sanitize = False\n\n        if run_sanitize:\n            LOG.info(\"Sanitizing provider by removing orphan remote_prefixes, services and address_groups based on age cycles\")\n            sanitize = self.nsx_provider.sanitize(_slice)\n\n            if sanitize:\n                for id, callback in sanitize:\n                    LOG.debug(\"Sanitizing ID: %s with callback: %s\", id, callback)\n                    self.callback(id, callback)\n\n                _slice -= len(sanitize)\n                if _slice <= 0:\n                    return\n\n            self.AGE = int(time.time())\n\n    def security_group_members(self, os_id: str, reference=False):\n        \"\"\"\n        Realize security group members state.\n        Realization will happen only if the group has active ports on the host\n        or if it used as remote security group by a group having such ports.\n        :os_id: -- OpenStack ID of the Security Group\n        :reference: -- if True will create the group if unknown by the provider\n        \"\"\"\n        with LockManager.get_lock(\"member-{}\".format(os_id)):\n            meta = self.nsx_provider.metadata(self.nsx_provider.SG_MEMBERS, os_id)\n            if not (reference and meta):\n                if self.rpc.has_security_group_used_by_host(os_id):\n                    cidrs = self.rpc.get_security_group_members_effective_ips(os_id)\n                    port_ids_with_sg_count = self.rpc.get_security_group_port_ids(os_id)\n                    max_sg_tags = min(cfg.CONF.AGENT.max_sg_tags_per_segment_port, 27)\n\n                    filtered_port_ids = [p[\"port_id\"]\n                        for p in port_ids_with_sg_count if int(p[\"sg_count\"]) > max_sg_tags]\n\n                    paths = [p.path for p in self.nsx_provider.get_port_meta_by_ids(\n                        filtered_port_ids)] if filtered_port_ids else []\n\n                    # SG Members are not revisionable, use default \"0\"\n                    self.nsx_provider.sg_members_realize(\n                        {\"id\": os_id, \"cidrs\": cidrs, \"revision_number\": 0, \"member_paths\": paths})\n                else:\n                    self.nsx_provider.sg_members_realize({\"id\": os_id}, delete=True)\n\n    def security_group_rules(self, os_id: str):\n        \"\"\"\n        Realize security group rules state.\n        Realization will happen only if the group has active ports on the host.\n        :os_id: -- OpenStack ID of the Security Group\n        \"\"\"\n        with LockManager.get_lock(\"rules-{}\".format(os_id)):\n            os_sg = self.rpc.get_security_group(os_id)\n\n            if os_sg and os_sg.get(\"ports\"):\n                # Create Members Container\n                self.security_group_members(os_id, reference=True)\n\n                os_sg[\"rules\"] = self.rpc.get_rules_for_security_group_id(os_id)\n\n                for os_rule in os_sg[\"rules\"]:\n                    remote_id = os_rule.get(\"remote_group_id\")\n                    if remote_id:\n                        self.security_group_members(remote_id, reference=True)\n\n                    addr_grp_id = os_rule.get(\"remote_address_group_id\")\n                    if addr_grp_id:\n                        # Realize the remote address group first\n                        self.address_group_members(addr_grp_id)\n\n                logged = self.rpc.has_security_group_logging(os_id)\n                LOG.info(f\"Neutron DB logged flag for {os_id}: rpc.has_security_group_logging(os_id): {logged}\")\n                self.nsx_provider.sg_rules_realize(os_sg, logged=logged)\n\n            else:\n                self.nsx_provider.sg_rules_realize({\"id\": os_id}, delete=True)\n                # Skip members as they can be used as references\n\n    def precreate_port(self, os_id: str, network_meta: dict):\n        \"\"\"\n        Try to precreate port on first binding request.\n        :os_id: -- OpenStack ID of the Port\n        :network_meta: -- NSX Switch metadata\n        \"\"\"\n        with LockManager.get_lock(\"port-{}\".format(os_id)):\n            port: dict = self.rpc.get_port(os_id)\n            if port:\n                os_qid = port.get(\"qos_policy_id\")\n                if os_qid:\n                    self.qos(os_qid, reference=True)\n\n                if not port.get(\"vif_details\") and network_meta:\n                    port[\"vif_details\"] = network_meta\n                self._port_realize(port)\n\n    def precreate_unbound_port(self, os_id: str, network_meta: dict):\n        \"\"\"\n        Try to precreate port on multiple binding ports, fetch port from active binding.\n        :os_id: -- OpenStack ID of the Port\n        :network_meta: -- NSX Switch metadata\n        \"\"\"\n        with LockManager.get_lock(\"port-{}\".format(os_id)):\n            port: dict = self.rpc.get_port_from_any_host(os_id)\n            if port:\n                port.pop(\"vif_details\", None)\n                os_qid = port.get(\"qos_policy_id\")\n                if os_qid:\n                    self.qos(os_qid, reference=True)\n\n                if network_meta:\n                    port[\"vif_details\"] = network_meta\n\n                self._port_realize(port)\n\n    def port(self, os_id: str):\n        \"\"\"\n        Realize port state.\n        :os_id: -- OpenStack ID of the Port\n        \"\"\"\n        with LockManager.get_lock(\"port-{}\".format(os_id)):\n            port: dict = self.rpc.get_port(os_id)\n            if port:\n                if port.get(\"binding_status\") == \"INACTIVE\":\n                    # port pre-creation happens in get_network_bridge - if that fails, we let the agent loop take care of\n                    # fixing the (vmotioned) segment port after migration is finished.\n                    # Otherwise, we would risk a dupli",
+      "total_lines": 419
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "eventlet",
+        "oslo_log:log",
+        "oslo_config:cfg",
+        "networking_nsxv3.api.rpc:NSXv3ServerRpcApi",
+        "networking_nsxv3.plugins.ml2.drivers.nsxv3.agent:provider",
+        "networking_nsxv3.plugins.ml2.drivers.nsxv3.agent.provider_nsx_policy:API",
+        "networking_nsxv3.common.locking:LockManager",
+        "typing:Callable",
+        "typing:List",
+        "typing:Set",
+        "typing:Tuple",
+        "itertools",
+        "json",
+        "time"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/sapcc/networking-nsx-t/stable/2024.1-m3/README.rst",
+      "content_excerpt": "networking-nsxv3\n================\n\nOpenstack L2 network components for VMware NSX-T (NSXv3)\n\nThis project allowes an OpenStack region to implement complex L2 network topology distributed accross many VMware NSX-T managers, where at the same time all these managers will share the same security context.\n\n\nNSX-T ML2 Mechanism Dirver\n--------------------------\n\nNSX-T ML2 Mechanism Dirver is an extension to the Modular Layer 2 (ml2) plugin framework. This driver enables OpenStack Neutron to simultaneously utilize NSX-T network technology in combination with other technologies to reach the goal of Hierarchical Port Binding.\n\n\nNSX-T L2 Agent\n--------------\n\nNSX-T L2 Agent implements OpenStack network related events into VMware NSX-T constructions.\n- OpenStack network segments are mapped to NSX-T Logical Switches (VLAN backed)\n- OpenStack ports are mapped NSX-T Logical Ports\n- OpenStack port security is mapped to NSX-T IP Discovery and SpoofGuard Switching Profiles (applied per port)\n- OpenStack QoS Profiles are mapped to NSX-T QoS Switching Profiles\n- OpenStack Security Groups are mapped to NSX-T Firewall Sections, NS Groups and IP Sets\n- OpenStack Security Groups Rules are mapped to NSX-T Firewall Section Rules\n- OpenStack Security Groups Members are mapped to NSX-T IP Sets\n- OpenStack Security Groups Membership is mapped to NSX-T NS Groups Membership Tags\n\nNSX-T ML2 Selective Logging\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nControl over the debug log of NSX-T DWF Rules\n\nUse\n::\n\n    openstack network log create \\\n        --target <port name/id> \\\n        --resource <security group name / id"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "refresh test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_provider_nsx_policy.py",
+          "path": "networking_nsxv3/tests/unit/test_provider_nsx_policy.py",
+          "sha": "f1896d265f7f2466fe24c3e35a92f93812487dad",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/blob/908abac1c5c363711c054ec7ea583693dd9bc3e5/networking_nsxv3/tests/unit/test_provider_nsx_policy.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"refresh(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "realization.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+          "sha": "391ed0576fc886f9948d5d55d362dd71acf03db5",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/blob/908abac1c5c363711c054ec7ea583693dd9bc3e5/networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+          "score": 1.0
+        },
+        {
+          "name": "provider.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider.py",
+          "sha": "435f350cebd3d8e991f550239cc44f9ecf090c99",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/blob/908abac1c5c363711c054ec7ea583693dd9bc3e5/networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider.py",
+          "score": 1.0
+        },
+        {
+          "name": "provider_nsx_policy.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider_nsx_policy.py",
+          "sha": "6875559ca79e201178aa4b73d62482ebbd8d007b",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/blob/908abac1c5c363711c054ec7ea583693dd9bc3e5/networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider_nsx_policy.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_provider_nsx_policy.py",
+          "path": "networking_nsxv3/tests/unit/test_provider_nsx_policy.py",
+          "sha": "f1896d265f7f2466fe24c3e35a92f93812487dad",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/blob/908abac1c5c363711c054ec7ea583693dd9bc3e5/networking_nsxv3/tests/unit/test_provider_nsx_policy.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent",
+      "count": 9,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "agent.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/agent.py",
+          "type": "file"
+        },
+        {
+          "name": "cli.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/cli.py",
+          "type": "file"
+        },
+        {
+          "name": "client_nsx.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/client_nsx.py",
+          "type": "file"
+        },
+        {
+          "name": "constants_nsx.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/constants_nsx.py",
+          "type": "file"
+        },
+        {
+          "name": "extensions",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/extensions",
+          "type": "dir"
+        },
+        {
+          "name": "provider.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider.py",
+          "type": "file"
+        },
+        {
+          "name": "provider_nsx_policy.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider_nsx_policy.py",
+          "type": "file"
+        },
+        {
+          "name": "realization.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 7,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/__init__.py"
+        },
+        {
+          "name": "agent.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/agent.py"
+        },
+        {
+          "name": "cli.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/cli.py"
+        },
+        {
+          "name": "client_nsx.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/client_nsx.py"
+        },
+        {
+          "name": "constants_nsx.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/constants_nsx.py"
+        },
+        {
+          "name": "provider.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider.py"
+        },
+        {
+          "name": "provider_nsx_policy.py",
+          "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/provider_nsx_policy.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "937ff7e19fa6685b413589e8c2d7f52f658b18c4",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/commit/937ff7e19fa6685b413589e8c2d7f52f658b18c4",
+          "message": "fix: Nova fetch realization status\n\nIn some cases, Nova does not wait for the network-realized custom event,\nas this may be sent too early. Therefore, an API extension was developed\nto allow checking the status of a segment port explicitly when the event\nis not available.\n\nThe check for whether a po",
+          "author": "Sven Rosenzweig",
+          "date": "2025-07-30T13:12:49Z"
+        },
+        {
+          "sha": "e39c1bbe0cb5cf157aed7d59f68a209238e89978",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/commit/e39c1bbe0cb5cf157aed7d59f68a209238e89978",
+          "message": "Neutron API Extension: Check Port Realization State\n\nThis Neutron API extension is used by Nova to verify\nwhether a segment port has reached a successful realization state.\n* The API communicates with the NSX-T agent, which is responsible for port binding.\n* The agent is queried for the realization ",
+          "author": "Sven Rosenzweig",
+          "date": "2025-07-18T15:52:40Z"
+        },
+        {
+          "sha": "e7e7e050d639a281929c197c76a89226e80431a0",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/commit/e7e7e050d639a281929c197c76a89226e80431a0",
+          "message": "Fix duplicate segment port creation due to Nova/vSphere/NSX-T race\n\nA race condition between Nova, vSphere, and the NSX-T agent can result in\nvSphere preemptively creating a segment port before the NSX-T agent does.\nThese pre-created ports lack security group tags, yet share the same\nattachment ID a",
+          "author": "Sven Rosenzweig",
+          "date": "2025-07-02T10:18:39Z"
+        },
+        {
+          "sha": "5176d4759c9ca4b57acb2599b2735d8f900d87c7",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/commit/5176d4759c9ca4b57acb2599b2735d8f900d87c7",
+          "message": "Prevent SG rule losses during age‐based sync\n\nIn the past, we experienced a few incidents where customers lost individual\nsecurity group rules. The logs indicate that the age-based sync\nprocess touched those objects before the incidents began.\n\nThe agent’s sync routine consists of three phases:\n1. F",
+          "author": "Sven Rosenzweig",
+          "date": "2025-05-13T07:38:07Z"
+        },
+        {
+          "sha": "19b698f07390dfcd551ea9966b9c879af4f02503",
+          "html_url": "https://github.com/sapcc/networking-nsx-t/commit/19b698f07390dfcd551ea9966b9c879af4f02503",
+          "message": "All Mgmt and MP-to-Policy related source code removed",
+          "author": "Georgi Kostadinov",
+          "date": "2023-10-10T16:15:15Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "refresh TODO mngr removed after POLICY",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "networking_nsxv3/plugins/ml2/drivers/nsxv3/agent/realization.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "937ff7e19fa6685b413589e8c2d7f52f658b18c4",
+        "html_url": "https://github.com/sapcc/networking-nsx-t/commit/937ff7e19fa6685b413589e8c2d7f52f658b18c4",
+        "message": "fix: Nova fetch realization status\n\nIn some cases, Nova does not wait for the network-realized custom event,\nas this may be sent too early. Therefore, an API extension was developed\nto allow checking the status of a segment port explicitly when the event\nis not available.\n\nThe check for whether a po",
+        "author": "Sven Rosenzweig",
+        "date": "2025-07-30T13:12:49Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

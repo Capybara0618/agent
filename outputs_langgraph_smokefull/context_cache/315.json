@@ -1,0 +1,265 @@
+{
+  "task_id": "315",
+  "repo_owner": "google",
+  "repo_name": "jax",
+  "file_path": "jax/_src/interpreters/mlir.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T17:41:24+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 168,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T17:41:39+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T17:41:47+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "jax/_src/interpreters/mlir.py",
+    "original_code": "def reshape(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue) -> ir.Value:\n  if dtypes.is_opaque_dtype(aval_out.dtype):  # type: ignore\n    # TODO(frostig,mattjj,necula): asserts a single physical aval, and a\n    # particular reshape rule (reshape to the output physical aval's shape)\n    aval_out, = aval_out.dtype._rules.physical_avals(aval_out)  # type: ignore\n  if not core.is_constant_shape(aval_out.shape):  # type: ignore\n    shape = eval_dynamic_shape(ctx, aval_out.shape)  # type: ignore\n    return hlo.DynamicReshapeOp(\n        aval_to_ir_type(aval_out), op,\n        shape_tensor(shape),\n    ).result\n  else:\n    return hlo.ReshapeOp(aval_to_ir_type(aval_out), op).result",
+    "satd_comment": "# TODO(frostig,mattjj,necula): asserts a single physical aval, and a\n# particular reshape rule (reshape to the output physical aval's shape)",
+    "target_file": {
+      "ok": true,
+      "path": "jax/_src/interpreters/mlir.py",
+      "sha": "fad9daff6831f8119c36e69659dde507770a5334",
+      "download_url": "https://raw.githubusercontent.com/jax-ml/jax/main/jax/_src/interpreters/mlir.py",
+      "content_excerpt": "# Copyright 2021 The JAX Authors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     https://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n# Lowering and execution path that converts jaxprs into MLIR.\nfrom __future__ import annotations\n\nimport collections\nfrom collections.abc import Callable, Iterable, Iterator, Sequence\nimport dataclasses\nimport functools\nfrom functools import partial\nimport heapq\nimport io\nimport itertools\nimport operator\nimport re\nimport types\nimport typing\nfrom typing import Any, NamedTuple, Protocol, Union, cast as type_cast\nimport warnings\n\nfrom jax._src import ad_util\nfrom jax._src import api_util\nfrom jax._src import config\nfrom jax._src import core\nfrom jax._src import dtypes\nfrom jax._src import effects as effects_lib\nfrom jax._src import frozen_dict\nfrom jax._src import hashable_array\nfrom jax._src import literals\nfrom jax._src import jaxpr_util\nfrom jax._src import linear_util as lu\nfrom jax._src import path\nfrom jax._src import sharding_impls\nfrom jax._src import source_info_util\nfrom jax._src import util\nfrom jax._src import xla_bridge as xb\nfrom jax._src.interpreters import partial_eval as pe\nfrom jax._src.layout import AutoLayout, Layout\nfrom jax._src.lib import _jax\nfrom jax._src.lib import jaxlib_extension_version\nfrom jax._src.lib import jax_mlir_ext\nfrom jax._src.lib import xla_client as xc\nfrom jax._src.lib.mlir import dialects, ir, passmanager\nfrom jax._src.lib.mlir.dialects import func as func_dialect, hlo\nfrom jax._src.mesh import AxisType\nfrom jax._src.partition_spec import PartitionSpec\nfrom jax._src.sharding import Sharding as JSharding\nfrom jax._src.sharding_impls import ( AUTO, NamedSharding,\n                                     SdyArray, SdyArrayList,\n                                     modify_sdy_sharding_wrt_axis_types)\nfrom jax._src.state.types import AbstractRef\nfrom jax._src.typing import ArrayLike\nfrom jax._src.util import foreach\nimport numpy as np\n\n\nmap, unsafe_map = util.safe_map, map\nzip, unsafe_zip = util.safe_zip, zip\n\nT = typing.TypeVar(\"T\")\n\nValue = Any  # = ir.Value\n\n# mypy implicitly sets this variable to true when type checking.\nMYPY = False\n\n# IR Helpers\n\nIrValues = Union[ir.Value, tuple[ir.Value, ...]]\n\n\ndef dense_int_elements(xs) -> ir.DenseElementsAttr:\n  return ir.DenseIntElementsAttr.get(np.asarray(xs, np.int64))\n\ndense_int_array = ir.DenseI64ArrayAttr.get\n\ndef i32_attr(i): return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), i)\ndef i64_attr(i): return ir.IntegerAttr.get(ir.IntegerType.get_signless(64), i)\n\ndef shape_tensor(sizes: Sequence[int | ir.RankedTensorType]) -> IrValues:\n  int1d = aval_to_ir_type(core.ShapedArray((1,), np.int32))\n  i32_type = aval_to_ir_type(core.ShapedArray((), np.int32))\n  def lower_dim(d):\n    if type(d) is int:\n      return ir_constant(np.array([d], np.int32))\n    else:\n      if d.type != i32_type:\n        d = hlo.convert(i32_type, d)\n      return hlo.reshape(int1d, d)\n  ds = map(lower_dim, sizes)\n  if not ds:\n    return ir_constant(np.array([], np.int32))\n  elif len(ds) == 1:\n    return ds[0]\n  else:\n    return hlo.concatenate(ds, i64_attr(0))\n\n\ndef delegate_lowering(ctx, lowering_fun, *args, **ctx_override_kwargs):\n  \"\"\"Side-effects on `ctx`\"\"\"\n  ctx_new = ctx.replace(**ctx_override_kwargs)\n  out = lowering_fun(ctx_new, *args)\n  ctx.set_tokens_out(ctx_new.tokens_out)\n  return out\n\n\n# IR Types\n\nIrTypes = Union[ir.Type, tuple[ir.Type, ...]]\n\ndef _is_ir_values(x: IrValues) -> bool:\n  \"\"\"Returns true if `x` is an ir.Value or tuple of ir.Values\"\"\"\n  if isinstance(x, ir.Value):\n    return True\n  return (isinstance(x, tuple) and len(x) != 1\n          and all(isinstance(v, ir.Value) for v in x))\n\n\n# Non-canonicalized dtype to IR type mapping.\n_dtype_to_ir_type : dict[np.dtype, Callable[[], ir.Type]] = {\n  np.dtype(dtypes.float0): partial(ir.IntegerType.get_signless, 1),\n  np.dtype(np.bool_): partial(ir.IntegerType.get_signless, 1),\n  np.dtype(dtypes.int4): partial(ir.IntegerType.get_signless, 4),\n  np.dtype(np.int8): partial(ir.IntegerType.get_signless, 8),\n  np.dtype(np.int16): partial(ir.IntegerType.get_signless, 16),\n  np.dtype(np.int32): partial(ir.IntegerType.get_signless, 32),\n  np.dtype(np.int64): partial(ir.IntegerType.get_signless, 64),\n  np.dtype(dtypes.uint4): partial(ir.IntegerType.get_unsigned, 4),\n  np.dtype(np.uint8): partial(ir.IntegerType.get_unsigned, 8),\n  np.dtype(np.uint16): partial(ir.IntegerType.get_unsigned, 16),\n  np.dtype(np.uint32): partial(ir.IntegerType.get_unsigned, 32),\n  np.dtype(np.uint64): partial(ir.IntegerType.get_unsigned, 64),\n  np.dtype(dtypes.float8_e4m3b11fnuz): ir.Float8E4M3B11FNUZType.get,\n  np.dtype(dtypes.float8_e4m3fn): ir.Float8E4M3FNType.get,\n  np.dtype(dtypes.float8_e4m3fnuz): ir.Float8E4M3FNUZType.get,\n  np.dtype(dtypes.float8_e5m2): ir.Float8E5M2Type.get,\n  np.dtype(dtypes.float8_e5m2fnuz): ir.Float8E5M2FNUZType.get,\n  np.dtype(dtypes.bfloat16): ir.BF16Type.get,\n  np.dtype(np.float16): ir.F16Type.get,\n  np.dtype(np.float32): ir.F32Type.get,\n  np.dtype(np.float64): ir.F64Type.get,\n  np.dtype(np.complex64): lambda: ir.ComplexType.get(ir.F32Type.get()),\n  np.dtype(np.complex128): lambda: ir.ComplexType.get(ir.F64Type.get()),\n  np.dtype(dtypes.int2): partial(ir.IntegerType.get_signless, 2),\n  np.dtype(dtypes.uint2): partial(ir.IntegerType.get_unsigned, 2),\n  np.dtype(dtypes.float8_e3m4): ir.Float8E3M4Type.get,\n  np.dtype(dtypes.float8_e4m3): ir.Float8E4M3Type.get,\n  np.dtype(dtypes.float8_e8m0fnu): ir.Float8E8M0FNUType.get,\n  np.dtype(dtypes.float4_e2m1fn): ir.Float4E2M1FNType.get,\n}\n\nif dtypes.int1 is not None:\n  assert dtypes.uint1 is not None\n  _dtype_to_ir_type[np.dtype(dtypes.int1)] = partial(\n      ir.IntegerType.get_signless, 1\n  )\n  _dtype_to_ir_type[np.dtype(dtypes.uint1)] = partial(\n      ir.IntegerType.get_unsigned, 1\n  )\n\n\ndef dtype_to_ir_type(dtype: core.bint | np.dtype | np.generic) -> ir.Type:\n  if isinstance(dtype, core.bint):\n    # TODO Support different-size underlying dtypes to take advantage of the\n    # bound for packing?\n    dtype = np.dtype(np.int32)\n  assert isinstance(dtype, (np.dtype, np.generic)), type(dtype)\n  dtype = np.dtype(dtype)\n  try:\n    ir_type_factory = _dtype_to_ir_type[dtype]\n  except KeyError as err:\n    raise TypeError(\n        f\"No dtype_to_ir_type handler for dtype: {dtype}\") from err\n  return ir_type_factory()\n\ndef _array_ir_types(aval: core.ShapedArray) -> ir.Type:\n  aval = core.physical_aval(aval)\n  if not core.is_constant_shape(aval.shape):\n    return _dynamic_array_ir_types(aval)\n  return ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype))\n\ndef _dynamic_array_ir_types(aval: core.ShapedArray) -> ir.Type:\n  dyn_size = ir.ShapedType.get_dynamic_size()\n  shape = [d if type(d) is int else dyn_size for d in aval.shape]\n  return ir.RankedTensorType.get(shape, dtype_to_ir_type(aval.dtype))\n\nir_type_handlers: dict[type[core.AbstractValue], Callable[[Any], IrTypes]] = {}\n\ndef aval_to_ir_type(aval: core.AbstractValue) -> IrTypes:\n  \"\"\"Converts a JAX aval to zero or more MLIR IR types.\n\n  In general, a JAX value may be represented by multiple IR values, so this\n  function may return a tuple of types.\"\"\"\n  try:\n    return ir_type_handlers[type(aval)](aval)\n  except KeyError as err:\n    raise TypeError(f\"No ir_type_handler for aval type: {type(aval)}\") from err\n\nir_type_handlers[core.ShapedArray] = _array_ir_types\nir_type_handlers[core.AbstractToken] = lambda _: hlo.TokenType.get()\nir_type_handlers[core.AbstractTodo] = lambda x: _array_ir_types(x.inner_aval)\n\n# This is a backwards compatibility shim for external users of jax.mlir apis.\ndef aval_to_ir_types(aval: core.AbstractValue) -> tuple[ir.Type, ...]:\n  typ = aval_to_ir_type(aval)\n  return (typ,) if isinstance(typ, ir.Type) else typ\n\n# Constants\n\nclass ConstantHandler(Protocol):\n  def __call__(self, val: Any, aval: core.AbstractValue | None) -> IrValues:\n    \"\"\"Builds an IR representation for a constant `val`.\n\n    A JAX value is represented by zero or more IR values.\"\"\"\n\n_constant_handlers : dict[type, ConstantHandler] = {}\n\ndef register_constant_handler(type_: type, handler_fun: ConstantHandler):\n  _constant_handlers[type_] = handler_fun\n\ndef get_constant_handler(type_: type) -> ConstantHandler:\n  return _constant_handlers[type_]\n\ndef ir_constant(\n  val: Any, *,\n  const_lowering: dict[tuple[int, core.AbstractValue], IrValues] | None = None,\n  aval: core.AbstractValue | None = None\n) -> IrValues:\n  \"\"\"Translate a Python `val` to an IR constant.\n\n  See https://docs.jax.dev/en/latest/internals/constants.html.\n  Args:\n    val: a Python value to be translated to a constant.\n    const_lowering: an optional dictionary with known lowering for some\n      constants, indexed by `id`. This is used, e.g., when we pass constants\n      as MLIR function arguments.\n    aval: the abstract value of `val`, if known. Required where ambiguous, e.g.\n      for Python scalars.\n\n  Returns:\n    A representation of the constant as an IR value or sequence of IR values.\n  \"\"\"\n  if const_lowering is not None:\n    # pyrefly: ignore[no-matching-overload]\n    if np.shape(val) and (c_val := const_lowering.get((id(val), aval))) is not None:\n      return c_val\n  for t in type(val).__mro__:\n    handler = _constant_handlers.get(t)\n    if handler:\n      out = handler(val, aval)\n      assert _is_ir_values(out), (type(val), out)\n      return out\n  if hasattr(val, '__jax_array__'):\n    return ir_constant(val.__jax_array__())\n  raise TypeError(f\"No constant handler for type: {type(val)}\")\n\ndef _numpy_array_constant(x: np.ndarray | np.generic) -> IrValues:\n  return hlo.constant(_numpy_array_attribute(x))\n\n\ndef _masked_array_constant_handler(*args, **kwargs):\n  raise ValueError(\"numpy masked arrays are not supported as direct inputs to JAX functions. \"\n                   \"Use arr.filled() to convert the value to a standard numpy array.\")\n\nregister_constant_handler(np.ma.MaskedArray, _masked_array_constant_handler)\n\ndef _shape_dtype_struct_constant_handler(*args, **kwargs):\n  raise TypeError(\"A ShapeDtypeStruct does not have a value and cannot be \"\n                  \"used as a constant in a JAX function.\")\n\nregister_constant_handler(core.ShapeDtypeStruct,\n                          _shape_dtype_struct_constant_handler)\n\ndef _ndarray_constant_handler(val: np.ndarray | np.generic,\n                              aval: core.AbstractValue | None) -> IrValues:\n  \"\"\"Constant handler for ndarray literals, handling zero-size strides.\n\n  In most cases this function calls _numpy_array_constant(val) except it has\n  special handling of arrays with any strides of size zero: for those, it\n  generates appropriate calls to NumpyArrayConstant, Broadcast, and Transpose\n  to avoid staging in large literals that might arise from np.zeros or np.ones\n  or the output of lax.broadcast (which uses np.broadcast_to which in turn\n  uses size-zero strides).\n\n  Args:\n    val: an ndarray.\n\n  Returns:\n    An XLA ComputationDataHandle / XlaOp representing the constant ndarray\n    staged into the XLA Computation.\n  \"\"\"\n  if val.dtype == dtypes.float0:\n    return _numpy_array_constant(np.zeros(val.shape, dtype=np.bool_))\n  elif 0 in val.strides and val.size > 0:\n    zero_stride_axes, = np.where(np.equal(0, val.strides))\n    other_axes, = np.where(np.not_equal(0, val.strides))\n    collapsed_val = val[tuple(0 if ax in zero_stride_axes else slice(None)  # type: ignore\n                              for ax in range(val.ndim))]\n    out = hlo.broadcast_in_dim(\n        ir.RankedTensorType.get(\n            val.shape, dtype_to_ir_type(collapsed_val.dtype)),\n        _numpy_array_co",
+      "total_lines": 3339
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 168,
+      "start_line": 148,
+      "end_line": 188,
+      "matched_line": "  )",
+      "excerpt": "148:   np.dtype(dtypes.float8_e5m2): ir.Float8E5M2Type.get,\n149:   np.dtype(dtypes.float8_e5m2fnuz): ir.Float8E5M2FNUZType.get,\n150:   np.dtype(dtypes.bfloat16): ir.BF16Type.get,\n151:   np.dtype(np.float16): ir.F16Type.get,\n152:   np.dtype(np.float32): ir.F32Type.get,\n153:   np.dtype(np.float64): ir.F64Type.get,\n154:   np.dtype(np.complex64): lambda: ir.ComplexType.get(ir.F32Type.get()),\n155:   np.dtype(np.complex128): lambda: ir.ComplexType.get(ir.F64Type.get()),\n156:   np.dtype(dtypes.int2): partial(ir.IntegerType.get_signless, 2),\n157:   np.dtype(dtypes.uint2): partial(ir.IntegerType.get_unsigned, 2),\n158:   np.dtype(dtypes.float8_e3m4): ir.Float8E3M4Type.get,\n159:   np.dtype(dtypes.float8_e4m3): ir.Float8E4M3Type.get,\n160:   np.dtype(dtypes.float8_e8m0fnu): ir.Float8E8M0FNUType.get,\n161:   np.dtype(dtypes.float4_e2m1fn): ir.Float4E2M1FNType.get,\n162: }\n163: \n164: if dtypes.int1 is not None:\n165:   assert dtypes.uint1 is not None\n166:   _dtype_to_ir_type[np.dtype(dtypes.int1)] = partial(\n167:       ir.IntegerType.get_signless, 1\n168:   )\n169:   _dtype_to_ir_type[np.dtype(dtypes.uint1)] = partial(\n170:       ir.IntegerType.get_unsigned, 1\n171:   )\n172: \n173: \n174: def dtype_to_ir_type(dtype: core.bint | np.dtype | np.generic) -> ir.Type:\n175:   if isinstance(dtype, core.bint):\n176:     # TODO Support different-size underlying dtypes to take advantage of the\n177:     # bound for packing?\n178:     dtype = np.dtype(np.int32)\n179:   assert isinstance(dtype, (np.dtype, np.generic)), type(dtype)\n180:   dtype = np.dtype(dtype)\n181:   try:\n182:     ir_type_factory = _dtype_to_ir_type[dtype]\n183:   except KeyError as err:\n184:     raise TypeError(\n185:         f\"No dtype_to_ir_type handler for dtype: {dtype}\") from err\n186:   return ir_type_factory()\n187: \n188: def _array_ir_types(aval: core.ShapedArray) -> ir.Type:"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "collections",
+        "collections.abc:Callable",
+        "collections.abc:Iterable",
+        "collections.abc:Iterator",
+        "collections.abc:Sequence",
+        "dataclasses",
+        "functools",
+        "functools:partial",
+        "heapq",
+        "io",
+        "itertools",
+        "operator",
+        "re",
+        "types",
+        "typing",
+        "typing:Any",
+        "typing:NamedTuple",
+        "typing:Protocol",
+        "typing:Union",
+        "typing:cast",
+        "warnings",
+        "jax._src:ad_util",
+        "jax._src:api_util",
+        "jax._src:config",
+        "jax._src:core",
+        "jax._src:dtypes",
+        "jax._src:effects",
+        "jax._src:frozen_dict",
+        "jax._src:hashable_array"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/jax-ml/jax/main/README.md",
+      "content_excerpt": "<div align=\"center\">\n<img src=\"https://raw.githubusercontent.com/jax-ml/jax/main/images/jax_logo_250px.png\" alt=\"logo\"></img>\n</div>\n\n# Transformable numerical computing at scale\n\n[![Continuous integration](https://github.com/jax-ml/jax/actions/workflows/ci-build.yaml/badge.svg)](https://github.com/jax-ml/jax/actions/workflows/ci-build.yaml)\n[![PyPI version](https://img.shields.io/pypi/v/jax)](https://pypi.org/project/jax/)\n\n[**Transformations**](#transformations)\n| [**Scaling**](#scaling)\n| [**Install guide**](#installation)\n| [**Change logs**](https://docs.jax.dev/en/latest/changelog.html)\n| [**Reference docs**](https://docs.jax.dev/en/latest/)\n\n\n## What is JAX?\n\nJAX is a Python library for accelerator-oriented array computation and program transformation,\ndesigned for high-performance numerical computing and large-scale machine learning.\n\nJAX can automatically differentiate native\nPython and NumPy functions. It can differentiate through loops, branches,\nrecursion, and closures, and it can take derivatives of derivatives of\nderivatives. It supports reverse-mode differentiation (a.k.a. backpropagation)\nvia [`jax.grad`](#automatic-differentiation-with-grad) as well as forward-mode differentiation,\nand the two can be composed arbitrarily to any order.\n\nJAX uses [XLA](https://www.openxla.org/xla)\nto compile and scale your NumPy programs on TPUs, GPUs, and other hardware accelerators.\nYou can compile your own pure functions with [`jax.jit`](#compilation-with-jit).\nCompilation and automatic differentiation can be composed arbitrarily.\n\nDig a little deeper, and you'll see that J"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "reshape test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"reshape(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "jax/_src/interpreters",
+      "count": 7,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "jax/_src/interpreters/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "ad.py",
+          "path": "jax/_src/interpreters/ad.py",
+          "type": "file"
+        },
+        {
+          "name": "batching.py",
+          "path": "jax/_src/interpreters/batching.py",
+          "type": "file"
+        },
+        {
+          "name": "mlir.py",
+          "path": "jax/_src/interpreters/mlir.py",
+          "type": "file"
+        },
+        {
+          "name": "partial_eval.py",
+          "path": "jax/_src/interpreters/partial_eval.py",
+          "type": "file"
+        },
+        {
+          "name": "pxla.py",
+          "path": "jax/_src/interpreters/pxla.py",
+          "type": "file"
+        },
+        {
+          "name": "remat.py",
+          "path": "jax/_src/interpreters/remat.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "jax/_src/interpreters/__init__.py"
+        },
+        {
+          "name": "ad.py",
+          "path": "jax/_src/interpreters/ad.py"
+        },
+        {
+          "name": "batching.py",
+          "path": "jax/_src/interpreters/batching.py"
+        },
+        {
+          "name": "partial_eval.py",
+          "path": "jax/_src/interpreters/partial_eval.py"
+        },
+        {
+          "name": "pxla.py",
+          "path": "jax/_src/interpreters/pxla.py"
+        },
+        {
+          "name": "remat.py",
+          "path": "jax/_src/interpreters/remat.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "jax/_src/interpreters/mlir.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "4438dede4d0115be1c0bc24c67c6d552888e64a1",
+          "html_url": "https://github.com/jax-ml/jax/commit/4438dede4d0115be1c0bc24c67c6d552888e64a1",
+          "message": "Reverts f39a8adc0abfcaf6af0039a637f1851d6298ef6f\n\nPiperOrigin-RevId: 886747151",
+          "author": "jax authors",
+          "date": "2026-03-20T13:17:37Z"
+        },
+        {
+          "sha": "f39a8adc0abfcaf6af0039a637f1851d6298ef6f",
+          "html_url": "https://github.com/jax-ml/jax/commit/f39a8adc0abfcaf6af0039a637f1851d6298ef6f",
+          "message": "Add avals to TypedNdArray and TypedInt/TypedFloat/TypedComplex.\n\nIf we construct avals at the time of canonicalization, when we have gone to the trouble of thinking about the types already, we can make subsequent `typeof` calls cheaper.\n\nTo avoid a circular dependency we had to add some registration",
+          "author": "Peter Hawkins",
+          "date": "2026-03-20T11:56:06Z"
+        },
+        {
+          "sha": "83ac59f1625ba8e2de119598feb256f0634c5ec4",
+          "html_url": "https://github.com/jax-ml/jax/commit/83ac59f1625ba8e2de119598feb256f0634c5ec4",
+          "message": "Do a few more cleanups after the pmap shmap merge deletion.\n\nPiperOrigin-RevId: 886658703",
+          "author": "Yash Katariya",
+          "date": "2026-03-20T09:27:11Z"
+        },
+        {
+          "sha": "e49045a44af5f772adea4a2e12950a1d9a09c911",
+          "html_url": "https://github.com/jax-ml/jax/commit/e49045a44af5f772adea4a2e12950a1d9a09c911",
+          "message": "Reverts 9cecb18d3d811b751aebfc6c6e8f97caf169be6d\n\nPiperOrigin-RevId: 886614784",
+          "author": "Peter Hawkins",
+          "date": "2026-03-20T07:32:22Z"
+        },
+        {
+          "sha": "9cecb18d3d811b751aebfc6c6e8f97caf169be6d",
+          "html_url": "https://github.com/jax-ml/jax/commit/9cecb18d3d811b751aebfc6c6e8f97caf169be6d",
+          "message": "Remove spmd_lowering from MeshComputation and do more cleanups after pmap, PmapSharding is gone\n\nPiperOrigin-RevId: 886376740",
+          "author": "Yash Katariya",
+          "date": "2026-03-19T21:28:49Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "reshape TODO frostig mattjj necula asserts",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "jax/_src/interpreters/mlir.py",
+      "satd_line": 168,
+      "last_commit": {
+        "sha": "4438dede4d0115be1c0bc24c67c6d552888e64a1",
+        "html_url": "https://github.com/jax-ml/jax/commit/4438dede4d0115be1c0bc24c67c6d552888e64a1",
+        "message": "Reverts f39a8adc0abfcaf6af0039a637f1851d6298ef6f\n\nPiperOrigin-RevId: 886747151",
+        "author": "jax authors",
+        "date": "2026-03-20T13:17:37Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function reshape",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

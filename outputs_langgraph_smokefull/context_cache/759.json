@@ -1,0 +1,422 @@
+{
+  "task_id": "759",
+  "repo_owner": "awslabs",
+  "repo_name": "sockeye",
+  "file_path": "sockeye/inference.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:27:01+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:27:09+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:27:14+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "sockeye/inference.py",
+    "original_code": "def translate_nd(self,\n                 source: mx.nd.NDArray,\n                 bucket_key: int) -> Tuple[np.ndarray, np.ndarray, float]:\n    \"\"\"\n    Translates source of source_length, given a bucket_key.\n\n    :param source: Source ids. Shape: (1, bucket_key).\n    :param bucket_key: Bucket key.\n\n    :return: Sequence of translated ids, attention matrix, length-normalized negative log probability.\n    \"\"\"\n    # allow output sentence to be at most 2 times the current bucket_key\n    # TODO: max_output_length adaptive to source_length\n    max_output_length = bucket_key * C.TARGET_MAX_LENGTH_FACTOR\n\n    return self._get_best_from_beam(*self._beam_search(source, bucket_key, max_output_length))",
+    "satd_comment": "# TODO: max_output_length adaptive to source_length",
+    "target_file": {
+      "ok": true,
+      "path": "sockeye/inference.py",
+      "sha": "d5f360c24f8352c162de668b71e137338a1946ee",
+      "download_url": "https://raw.githubusercontent.com/awslabs/sockeye/main/sockeye/inference.py",
+      "content_excerpt": "# Copyright 2017--2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\"). You may not\n# use this file except in compliance with the License. A copy of the License\n# is located at\n#\n#     http://aws.amazon.com/apache2.0/\n#\n# or in the \"license\" file accompanying this file. This file is distributed on\n# an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either\n# express or implied. See the License for the specific language governing\n# permissions and limitations under the License.\n\n\"\"\"\nCode for inference/translation\n\"\"\"\n\nimport copy\nimport itertools\nimport json\nimport logging\nfrom dataclasses import dataclass\nfrom functools import partial\nfrom typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Union\n\nimport numpy as np\nimport torch as pt\n\nfrom . import constants as C\nfrom . import lexicon\nfrom . import utils\nfrom . import vocab\nfrom .beam_search import CandidateScorer, get_search_algorithm, GreedySearch, SearchResult\nfrom .data_io import tokens2ids, get_prepended_token_length\nfrom .model import SockeyeModel\n\nlogger = logging.getLogger(__name__)\n\n\ndef models_max_input_output_length(models: List[SockeyeModel],\n                                   num_stds: int,\n                                   forced_max_input_length: Optional[int] = None,\n                                   forced_max_output_length: Optional[int] = None) -> Tuple[int, Callable]:\n    \"\"\"\n    Returns a function to compute maximum output length given a fixed number of standard deviations as a\n    safety margin, and the current input length.\n    Mean and std are taken from the model with the largest values to allow proper ensembling of models\n    trained on different data sets.\n\n    :param models: List of models.\n    :param num_stds: Number of standard deviations to add as a safety margin. If -1, returned maximum output lengths\n                     will always be 2 * input_length.\n    :param forced_max_input_length: An optional overwrite of the maximum input length. Does not include eos.\n    :param forced_max_output_length: An optional overwrite of the maximum output length. Does not include bos.\n    :return: The maximum input length and a function to get the output length given the input length.\n    \"\"\"\n    max_mean = max(model.length_ratio_mean for model in models)\n    max_std = max(model.length_ratio_std for model in models)\n    supported_max_seq_len_source = min((model.max_supported_len_source for model in models))\n    supported_max_seq_len_target = min((model.max_supported_len_target for model in models))\n    return get_max_input_output_length(supported_max_seq_len_source,\n                                       supported_max_seq_len_target,\n                                       length_ratio_mean=max_mean,\n                                       length_ratio_std=max_std,\n                                       num_stds=num_stds,\n                                       forced_max_input_len=forced_max_input_length,\n                                       forced_max_output_len=forced_max_output_length)\n\n\ndef get_max_input_output_length(supported_max_seq_len_source: int,\n                                supported_max_seq_len_target: int,\n                                length_ratio_mean: float,\n                                length_ratio_std: float,\n                                num_stds: int,\n                                forced_max_input_len: Optional[int] = None,\n                                forced_max_output_len: Optional[int] = None) -> Tuple[int, Callable]:\n    \"\"\"\n    Returns a function to compute maximum output length given a fixed number of standard deviations as a\n    safety margin, and the current input length. It takes into account optional maximum source and target lengths.\n\n    :param supported_max_seq_len_source: The maximum source length supported by the models (includes eos).\n    :param supported_max_seq_len_target: The maximum target length supported by the models (includes bos).\n    :param length_ratio_mean: Length ratio mean computed on the training data (including bos/eos).\n    :param length_ratio_std: The standard deviation of the length ratio.\n    :param num_stds: The number of standard deviations the target length may exceed the mean target length (as long as\n           the supported maximum length allows for this).\n    :param forced_max_input_len: An optional overwrite of the maximum input length. Does not include eos.\n    :param forced_max_output_len: An optional overwrite of the maximum output length. Does not include bos.\n    :return: The maximum input length and a function to get the output length given the input length.\n    \"\"\"\n\n    if num_stds < 0:\n        factor = C.TARGET_MAX_LENGTH_FACTOR  # type: float\n    else:\n        factor = length_ratio_mean + (length_ratio_std * num_stds)\n\n    if forced_max_input_len is not None:\n        max_input_len = min(supported_max_seq_len_source, forced_max_input_len + C.SPACE_FOR_XOS)\n    else:\n        max_input_len = supported_max_seq_len_source\n\n    def get_max_output_length(input_length: int):\n        \"\"\"\n        Returns the maximum output length (including bos/eos) for inference given an input length that includes <eos>.\n        \"\"\"\n        if forced_max_output_len is not None:\n            return forced_max_output_len + C.SPACE_FOR_XOS\n        return int(np.ceil(factor * input_length))\n\n    return max_input_len, get_max_output_length\n\n\nTokens = List[str]\nTokenIds = List[List[int]]  # each token id may contain multiple factors\nSentenceId = Union[int, str]\n\n\n@dataclass\nclass TranslatorInput:\n    \"\"\"\n    Object required by Translator.translate().\n    If not None, `pass_through_dict` is an arbitrary dictionary instantiated from a JSON object\n    via `make_input_from_dict()`, and it contains extra fields found in an input JSON object.\n    If `--output-type json` is selected, all such fields that are not fields used or changed by\n    Sockeye will be included in the output JSON object. This provides a mechanism for passing\n    fields through the call to Sockeye.\n    \"\"\"\n\n    sentence_id: SentenceId\n    tokens: Tokens\n    factors: Optional[List[Tokens]] = None\n    source_prefix_tokens: Optional[Tokens] = None\n    source_prefix_factors: Optional[List[Tokens]] = None\n    target_prefix_tokens: Optional[Tokens] = None\n    target_prefix_factors: Optional[List[Tokens]] = None\n    use_target_prefix_all_chunks: Optional[bool] = True\n    keep_target_prefix_key: Optional[bool] = True\n    restrict_lexicon: Optional[lexicon.RestrictLexicon] = None\n    constraints: Optional[List[Tokens]] = None\n    avoid_list: Optional[List[Tokens]] = None\n    pass_through_dict: Optional[Dict] = None\n\n    def __str__(self):\n        return f'TranslatorInput({self.sentence_id}, {self.tokens}, factors={self.factors}, source_prefix_tokens={self.source_prefix_tokens}, source_prefix_factors={self.source_prefix_factors}, target_prefix_tokens={self.target_prefix_tokens}, target_prefix_factors={self.target_prefix_factors}, use_target_prefix_all_chunks={self.use_target_prefix_all_chunks}, keep_target_prefix_key={self.keep_target_prefix_key}, constraints={self.constraints}, avoid={self.avoid_list})'\n\n    def __len__(self):\n        return len(self.tokens) + self.num_source_prefix_tokens\n\n    @property\n    def num_factors(self) -> int:\n        \"\"\"\n        Returns the number of factors of this instance.\n        \"\"\"\n        return 1 + (0 if not self.factors else len(self.factors))\n\n    def get_source_prefix_tokens(self) -> Tokens:\n        \"\"\"\n        Returns the source prefix tokens of this instance.\n        \"\"\"\n        return self.source_prefix_tokens if self.source_prefix_tokens is not None else []\n\n    @property\n    def num_source_prefix_tokens(self) -> int:\n        \"\"\"\n        Returns the number of source prefix tokens of this instance.\n        \"\"\"\n        return len(self.get_source_prefix_tokens())\n\n    def get_target_prefix_tokens(self) -> Tokens:\n        \"\"\"\n        Returns the target prefix tokens of this instance.\n        \"\"\"\n        return self.target_prefix_tokens if self.target_prefix_tokens is not None else []\n\n    @property\n    def num_target_prefix_tokens(self) -> int:\n        \"\"\"\n        Returns the number of target prefix tokens of this instance.\n        \"\"\"\n        return len(self.get_target_prefix_tokens())\n\n    def get_target_prefix_factors(self) -> List[Tokens]:\n        \"\"\"\n        Returns the target prefix factors of this instance.\n        \"\"\"\n        return self.target_prefix_factors if self.target_prefix_factors is not None else [[]]\n\n    @property\n    def num_target_prefix_factors(self) -> int:\n        \"\"\"\n        Returns the number of target prefix factors of this instance.\n        \"\"\"\n        return len(self.get_target_prefix_factors()[0])\n\n    def chunks(self, chunk_size: int) -> Generator['TranslatorInput', None, None]:\n        \"\"\"\n        Takes a TranslatorInput (itself) and yields TranslatorInputs for chunks of size chunk_size.\n\n        :param chunk_size: The maximum size of a chunk.\n        :return: A generator of TranslatorInputs, one for each chunk created.\n        \"\"\"\n\n        if len(self.tokens) > chunk_size and self.constraints is not None:\n            logger.warning(\n                'Input %s has length (%d) that exceeds max input length (%d), '\n                'triggering internal splitting. Placing all target-side constraints '\n                'with the first chunk, which is probably wrong.',\n                self.sentence_id, len(self.tokens), chunk_size)\n\n        for chunk_id, i in enumerate(range(0, len(self) - self.num_source_prefix_tokens, chunk_size)):\n            factors = [factor[i:i + chunk_size] for factor in self.factors] if self.factors is not None else None\n            # Constrained decoding is not supported for chunked TranslatorInputs. As a fall-back, constraints are\n            # assigned to the first chunk\n            constraints = self.constraints if chunk_id == 0 else None\n            # Target_prefix_tokens are assigned to all chunks if self.use_target_prefix_all_chunks is True,\n            # otherwise target_prefix_tokens are assigned only to the first chunk\n            target_prefix_tokens = self.target_prefix_tokens if chunk_id == 0 or self.use_target_prefix_all_chunks else None\n            target_prefix_factors = self.target_prefix_factors if chunk_id == 0 or self.use_target_prefix_all_chunks else None\n            pass_through_dict = copy.deepcopy(self.pass_through_dict) \\\n                if (chunk_id == 0 and self.pass_through_dict is not None) else None\n            yield TranslatorInput(sentence_id=self.sentence_id,\n                                  tokens=self.tokens[i:i + chunk_size],\n                                  factors=factors,\n                                  source_prefix_tokens=self.source_prefix_tokens,\n                                  source_prefix_factors=self.source_prefix_factors,\n                                  target_prefix_tokens=target_prefix_tokens,\n                                  target_prefix_factors=self.target_prefix_factors,\n                                  use_target_prefix_all_chunks=self.use_target_prefix_all_chunks,\n                                  keep_target_prefix_key=self.keep_target_prefix_key,\n                                  restrict_lexicon=self.restrict_lexicon,\n                                  constraints=constraints,\n                                  avoid_list=self.avoid_list,\n                                  pass_through_dict=pass_through_dict)\n\n    def with_eos(self) -> 'TranslatorInput':\n        \"\"\"\n        :return: A new translator input with EOS appended to the tokens and factors.\n        \"\"\"\n        return TranslatorInput(sentence_id=self.sentence_id,\n                               tokens=self.tokens + [C.EOS_SYMBOL],\n                               factors=[factor + [C.EOS_SYMBOL] for factor in\n                                        self.factors] if self.facto",
+      "total_lines": 1318
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "itertools",
+        "json",
+        "logging",
+        "dataclasses:dataclass",
+        "functools:partial",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:Generator",
+        "typing:List",
+        "typing:Optional",
+        "typing:Set",
+        "typing:Tuple",
+        "typing:Union",
+        "numpy",
+        "torch",
+        ":constants",
+        ":lexicon",
+        ":utils",
+        ":vocab",
+        "beam_search:CandidateScorer",
+        "beam_search:get_search_algorithm",
+        "beam_search:GreedySearch",
+        "beam_search:SearchResult",
+        "data_io:tokens2ids",
+        "data_io:get_prepended_token_length",
+        "model:SockeyeModel"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/awslabs/sockeye/main/README.md",
+      "content_excerpt": "# Sockeye\n\n**Sockeye has entered maintenance mode and is no longer adding new features. We are grateful to everyone who has contributed to Sockeye throughout its development with pull requests, issue reports, and more.**\n\n[![PyPI version](https://badge.fury.io/py/sockeye.svg)](https://badge.fury.io/py/sockeye)\n[![GitHub license](https://img.shields.io/github/license/awslabs/sockeye.svg)](https://github.com/awslabs/sockeye/blob/main/LICENSE)\n[![GitHub issues](https://img.shields.io/github/issues/awslabs/sockeye.svg)](https://github.com/awslabs/sockeye/issues)\n[![Documentation Status](https://readthedocs.org/projects/sockeye/badge/?version=latest)](http://sockeye.readthedocs.io/en/latest/?badge=latest)\n[![Torch Nightly](https://github.com/awslabs/sockeye/actions/workflows/torch_nightly.yml/badge.svg)](https://github.com/awslabs/sockeye/actions/workflows/torch_nightly.yml)\n\nSockeye is an open-source sequence-to-sequence framework for Neural Machine Translation built on [PyTorch](https://pytorch.org/). It implements distributed training and optimized inference for state-of-the-art models, powering [Amazon Translate](https://aws.amazon.com/translate/) and other MT applications. Recent developments and changes are tracked in our [CHANGELOG](https://github.com/awslabs/sockeye/blob/master/CHANGELOG.md).\n\nFor a quickstart guide to training a standard NMT model on any size of data, see the [WMT 2014 English-German tutorial](docs/tutorials/wmt_large.md).\n\nFor questions and issue reports, please [file an issue](https://github.com/awslabs/sockeye/issues/new) on GitHub.\n\n### Version 3.1."
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "translate_nd test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"translate_nd(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "sockeye",
+      "count": 38,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "sockeye/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "arguments.py",
+          "path": "sockeye/arguments.py",
+          "type": "file"
+        },
+        {
+          "name": "average.py",
+          "path": "sockeye/average.py",
+          "type": "file"
+        },
+        {
+          "name": "beam_search.py",
+          "path": "sockeye/beam_search.py",
+          "type": "file"
+        },
+        {
+          "name": "checkpoint_decoder.py",
+          "path": "sockeye/checkpoint_decoder.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "sockeye/config.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "sockeye/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "convert_deepspeed.py",
+          "path": "sockeye/convert_deepspeed.py",
+          "type": "file"
+        },
+        {
+          "name": "data_io.py",
+          "path": "sockeye/data_io.py",
+          "type": "file"
+        },
+        {
+          "name": "decoder.py",
+          "path": "sockeye/decoder.py",
+          "type": "file"
+        },
+        {
+          "name": "embeddings.py",
+          "path": "sockeye/embeddings.py",
+          "type": "file"
+        },
+        {
+          "name": "encoder.py",
+          "path": "sockeye/encoder.py",
+          "type": "file"
+        },
+        {
+          "name": "evaluate.py",
+          "path": "sockeye/evaluate.py",
+          "type": "file"
+        },
+        {
+          "name": "generate_decoder_states.py",
+          "path": "sockeye/generate_decoder_states.py",
+          "type": "file"
+        },
+        {
+          "name": "inference.py",
+          "path": "sockeye/inference.py",
+          "type": "file"
+        },
+        {
+          "name": "initial_setup.py",
+          "path": "sockeye/initial_setup.py",
+          "type": "file"
+        },
+        {
+          "name": "knn.py",
+          "path": "sockeye/knn.py",
+          "type": "file"
+        },
+        {
+          "name": "layers.py",
+          "path": "sockeye/layers.py",
+          "type": "file"
+        },
+        {
+          "name": "lexicon.py",
+          "path": "sockeye/lexicon.py",
+          "type": "file"
+        },
+        {
+          "name": "log.py",
+          "path": "sockeye/log.py",
+          "type": "file"
+        },
+        {
+          "name": "loss.py",
+          "path": "sockeye/loss.py",
+          "type": "file"
+        },
+        {
+          "name": "lr_scheduler.py",
+          "path": "sockeye/lr_scheduler.py",
+          "type": "file"
+        },
+        {
+          "name": "model.py",
+          "path": "sockeye/model.py",
+          "type": "file"
+        },
+        {
+          "name": "nvs.py",
+          "path": "sockeye/nvs.py",
+          "type": "file"
+        },
+        {
+          "name": "optimizers.py",
+          "path": "sockeye/optimizers.py",
+          "type": "file"
+        },
+        {
+          "name": "output_handler.py",
+          "path": "sockeye/output_handler.py",
+          "type": "file"
+        },
+        {
+          "name": "prepare_data.py",
+          "path": "sockeye/prepare_data.py",
+          "type": "file"
+        },
+        {
+          "name": "quantize.py",
+          "path": "sockeye/quantize.py",
+          "type": "file"
+        },
+        {
+          "name": "rerank.py",
+          "path": "sockeye/rerank.py",
+          "type": "file"
+        },
+        {
+          "name": "score.py",
+          "path": "sockeye/score.py",
+          "type": "file"
+        },
+        {
+          "name": "scoring.py",
+          "path": "sockeye/scoring.py",
+          "type": "file"
+        },
+        {
+          "name": "test_utils.py",
+          "path": "sockeye/test_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "train.py",
+          "path": "sockeye/train.py",
+          "type": "file"
+        },
+        {
+          "name": "training.py",
+          "path": "sockeye/training.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer.py",
+          "path": "sockeye/transformer.py",
+          "type": "file"
+        },
+        {
+          "name": "translate.py",
+          "path": "sockeye/translate.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "sockeye/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "vocab.py",
+          "path": "sockeye/vocab.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "sockeye/__init__.py"
+        },
+        {
+          "name": "arguments.py",
+          "path": "sockeye/arguments.py"
+        },
+        {
+          "name": "average.py",
+          "path": "sockeye/average.py"
+        },
+        {
+          "name": "beam_search.py",
+          "path": "sockeye/beam_search.py"
+        },
+        {
+          "name": "checkpoint_decoder.py",
+          "path": "sockeye/checkpoint_decoder.py"
+        },
+        {
+          "name": "config.py",
+          "path": "sockeye/config.py"
+        },
+        {
+          "name": "constants.py",
+          "path": "sockeye/constants.py"
+        },
+        {
+          "name": "convert_deepspeed.py",
+          "path": "sockeye/convert_deepspeed.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "sockeye/inference.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "a59e7a27cfac86a150b0991a7785487db3f14e07",
+          "html_url": "https://github.com/awslabs/sockeye/commit/a59e7a27cfac86a150b0991a7785487db3f14e07",
+          "message": "Refactor inference optimizations (#1094)",
+          "author": "Xing Niu",
+          "date": "2023-08-25T17:36:47Z"
+        },
+        {
+          "sha": "d912554b28da362e3831b1e5bf2c02e2a042a3db",
+          "html_url": "https://github.com/awslabs/sockeye/commit/d912554b28da362e3831b1e5bf2c02e2a042a3db",
+          "message": "Add blocking cross-attention between decoder and encoded prepended tokens (#1085)\n\n* Add blocking cross-attention between decoder and encoded prepended tokens\r\n* Use a new dictionary-based prepared data format",
+          "author": "Xing Niu",
+          "date": "2023-02-23T15:50:50Z"
+        },
+        {
+          "sha": "a08216cff2a7d1fca2bd75b0598659e7ca3e117e",
+          "html_url": "https://github.com/awslabs/sockeye/commit/a08216cff2a7d1fca2bd75b0598659e7ca3e117e",
+          "message": "Enable bfloat16 inference and fix unrelated NumPy issue (#1077)",
+          "author": "Michael Denkowski",
+          "date": "2022-12-20T14:52:12Z"
+        },
+        {
+          "sha": "4dba5a30811e4cef2627e72af5d2c2df8c9b3bde",
+          "html_url": "https://github.com/awslabs/sockeye/commit/4dba5a30811e4cef2627e72af5d2c2df8c9b3bde",
+          "message": "Code cleanup: refactoring, type checking, and formatting (#1076)",
+          "author": "Michael Denkowski",
+          "date": "2022-12-11T11:11:32Z"
+        },
+        {
+          "sha": "b4c8427d873cdf20bf2ccf76059454075f4969ae",
+          "html_url": "https://github.com/awslabs/sockeye/commit/b4c8427d873cdf20bf2ccf76059454075f4969ae",
+          "message": "Add kNN-MT (#1062)\n\nCo-authored-by: Shuoyang Ding <dings@amazon.com>\r\nCo-authored-by: Gary Gao <gary_gao2000@hotmail.com>\r\nCo-authored-by: Jeremy Gwinnup <jeremy@gwinnup.org>\r\nCo-authored-by: Tobias Domhan <domhant@amazon.com>",
+          "author": "shuoyangd",
+          "date": "2022-12-10T15:39:22Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "translate_nd TODO max_output_length adaptive source_length",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "sockeye/inference.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "a59e7a27cfac86a150b0991a7785487db3f14e07",
+        "html_url": "https://github.com/awslabs/sockeye/commit/a59e7a27cfac86a150b0991a7785487db3f14e07",
+        "message": "Refactor inference optimizations (#1094)",
+        "author": "Xing Niu",
+        "date": "2023-08-25T17:36:47Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "translate_nd function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

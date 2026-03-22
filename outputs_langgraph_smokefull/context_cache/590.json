@@ -1,0 +1,422 @@
+{
+  "task_id": "590",
+  "repo_owner": "mars-project",
+  "repo_name": "mars",
+  "file_path": "mars/dataframe/reduction/core.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T19:28:09+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T19:28:19+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T19:28:25+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "mars/dataframe/reduction/core.py",
+    "original_code": "def _call_series(self, series):\n    level = getattr(self, 'level', None)\n    axis = getattr(self, 'axis', None)\n    skipna = getattr(self, 'skipna', None)\n    numeric_only = getattr(self, 'numeric_only', None)\n    bool_only = getattr(self, 'bool_only', None)\n    if axis == 'index':\n        axis = 0\n    self._axis = axis\n    # TODO: enable specify level if we support groupby\n    if level is not None:\n        raise NotImplementedError('Not support specified level now')\n\n    empty_series = build_series(series)\n    func_name = getattr(self, '_func_name')\n    if func_name == 'count':\n        reduced_series = empty_series.count(level=level)\n    elif func_name == 'nunique':\n        reduced_series = empty_series.nunique()\n    elif func_name in ('all', 'any'):\n        reduced_series = getattr(empty_series, func_name)(axis=axis, level=level, bool_only=bool_only)\n    elif func_name == 'size':\n        reduced_series = empty_series.size\n    elif func_name == 'custom_reduction':\n        reduced_series = getattr(self, 'custom_reduction').__call_agg__(empty_series)\n    elif func_name == 'str_concat':\n        reduced_series = pd.Series([empty_series.str.cat(**getattr(self, 'get_reduction_args')())])\n    else:\n        reduced_series = getattr(empty_series, func_name)(axis=axis, level=level, skipna=skipna,\n                                                          numeric_only=numeric_only)\n\n    return self.new_scalar([series], dtype=np.array(reduced_series).dtype)",
+    "satd_comment": "# TODO: enable specify level if we support groupby",
+    "target_file": {
+      "ok": true,
+      "path": "mars/dataframe/reduction/core.py",
+      "sha": "69f01a7a2d040834e33b7cd0c764adef5027d402",
+      "download_url": "https://raw.githubusercontent.com/mars-project/mars/master/mars/dataframe/reduction/core.py",
+      "content_excerpt": "# Copyright 1999-2021 Alibaba Group Holding Ltd.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport functools\nimport inspect\nfrom collections import OrderedDict\nfrom typing import Any, Callable, Dict, List, NamedTuple, Optional\n\nimport numpy as np\nimport pandas as pd\n\nfrom ...core import (\n    OutputType,\n    ENTITY_TYPE,\n    is_build_mode,\n    is_kernel_mode,\n    enter_mode,\n    recursive_tile,\n)\nfrom ...core.operand import OperandStage\nfrom ...serialization.serializables import (\n    BoolField,\n    AnyField,\n    DataTypeField,\n    Int32Field,\n    StringField,\n)\nfrom ...utils import pd_release_version, tokenize\nfrom ..core import SERIES_TYPE\nfrom ..utils import (\n    parse_index,\n    build_df,\n    build_empty_df,\n    build_series,\n    build_empty_series,\n    validate_axis,\n)\nfrom ..operands import DataFrameOperandMixin, DataFrameOperand, DATAFRAME_TYPE\n\n# in pandas<1.3, when aggregating with multiple levels and numeric_only is True,\n# object cols not ignored with min-max funcs\n_level_reduction_keep_object = pd_release_version[:2] < (1, 3)\n# in pandas>=1.3, when dataframes are reduced into series, mixture of float and bool\n# results in object.\n_reduce_bool_as_object = pd_release_version[:2] != (1, 2)\n\n\nclass DataFrameReductionOperand(DataFrameOperand):\n    _axis = AnyField(\"axis\")\n    _skipna = BoolField(\"skipna\")\n    _level = AnyField(\"level\")\n    _numeric_only = BoolField(\"numeric_only\")\n    _bool_only = BoolField(\"bool_only\")\n    _min_count = Int32Field(\"min_count\")\n    _use_inf_as_na = BoolField(\"use_inf_as_na\")\n    _method = StringField(\"method\")\n\n    _dtype = DataTypeField(\"dtype\")\n    _combine_size = Int32Field(\"combine_size\")\n\n    def __init__(\n        self,\n        axis=None,\n        skipna=None,\n        level=None,\n        numeric_only=None,\n        bool_only=None,\n        min_count=None,\n        dtype=None,\n        combine_size=None,\n        gpu=None,\n        sparse=None,\n        output_types=None,\n        use_inf_as_na=None,\n        method=None,\n        **kw,\n    ):\n        super().__init__(\n            _axis=axis,\n            _skipna=skipna,\n            _level=level,\n            _numeric_only=numeric_only,\n            _bool_only=bool_only,\n            _min_count=min_count,\n            _dtype=dtype,\n            _combine_size=combine_size,\n            gpu=gpu,\n            sparse=sparse,\n            _output_types=output_types,\n            _use_inf_as_na=use_inf_as_na,\n            _method=method,\n            **kw,\n        )\n\n    @property\n    def axis(self):\n        return self._axis\n\n    @property\n    def skipna(self):\n        return self._skipna\n\n    @property\n    def level(self):\n        return self._level\n\n    @property\n    def numeric_only(self):\n        return self._numeric_only\n\n    @property\n    def bool_only(self):\n        return self._bool_only\n\n    @property\n    def min_count(self):\n        return self._min_count\n\n    @property\n    def dtype(self):\n        return self._dtype\n\n    @property\n    def combine_size(self):\n        return self._combine_size\n\n    @property\n    def use_inf_as_na(self):\n        return self._use_inf_as_na\n\n    @property\n    def is_atomic(self):\n        return False\n\n    @property\n    def method(self):\n        return self._method\n\n    def get_reduction_args(self, axis=None):\n        args = dict(skipna=self.skipna)\n        if self.inputs and self.inputs[0].ndim > 1:\n            args[\"axis\"] = axis\n        if self.numeric_only is not None:\n            args[\"numeric_only\"] = self.numeric_only\n        if self.bool_only is not None:\n            args[\"bool_only\"] = self.bool_only\n        return {k: v for k, v in args.items() if v is not None}\n\n\nclass DataFrameCumReductionOperand(DataFrameOperand):\n    _axis = AnyField(\"axis\")\n    _skipna = BoolField(\"skipna\")\n    _use_inf_as_na = BoolField(\"use_inf_as_na\")\n\n    _dtype = DataTypeField(\"dtype\")\n\n    def __init__(\n        self,\n        axis=None,\n        skipna=None,\n        dtype=None,\n        gpu=None,\n        sparse=None,\n        output_types=None,\n        use_inf_as_na=None,\n        **kw,\n    ):\n        super().__init__(\n            _axis=axis,\n            _skipna=skipna,\n            _dtype=dtype,\n            gpu=gpu,\n            sparse=sparse,\n            _output_types=output_types,\n            _use_inf_as_na=use_inf_as_na,\n            **kw,\n        )\n\n    @property\n    def axis(self):\n        return self._axis\n\n    @property\n    def skipna(self):\n        return self._skipna\n\n    @property\n    def dtype(self):\n        return self._dtype\n\n    @property\n    def use_inf_as_na(self):\n        return self._use_inf_as_na\n\n\ndef _default_agg_fun(value, func_name=None, **kw):\n    if value.ndim == 1:\n        kw.pop(\"bool_only\", None)\n        kw.pop(\"numeric_only\", None)\n        return getattr(value, func_name)(**kw)\n    else:\n        return getattr(value, func_name)(**kw)\n\n\n@functools.lru_cache(100)\ndef _get_series_reduction_dtype(\n    dtype,\n    func_name,\n    axis=None,\n    bool_only=False,\n    skipna=True,\n    numeric_only=False,\n):\n    test_series = build_series(dtype=dtype, ensure_string=True)\n    if func_name == \"count\":\n        reduced = test_series.count()\n    elif func_name == \"nunique\":\n        reduced = test_series.nunique()\n    elif func_name in (\"all\", \"any\"):\n        reduced = getattr(test_series, func_name)(axis=axis, bool_only=bool_only)\n    elif func_name == \"size\":\n        reduced = test_series.size\n    elif func_name == \"str_concat\":\n        reduced = pd.Series([test_series.str.cat()])\n    else:\n        reduced = getattr(test_series, func_name)(\n            axis=axis, skipna=skipna, numeric_only=numeric_only\n        )\n    return pd.Series(reduced).dtype\n\n\n@functools.lru_cache(100)\ndef _get_df_reduction_dtype(\n    dtype, func_name, axis=None, bool_only=False, skipna=False, numeric_only=False\n):\n    test_df = build_series(dtype=dtype, ensure_string=True).to_frame()\n    if func_name == \"count\":\n        reduced = getattr(test_df, func_name)(axis=axis, numeric_only=numeric_only)\n    elif func_name == \"nunique\":\n        reduced = getattr(test_df, func_name)(axis=axis)\n    elif func_name in (\"all\", \"any\"):\n        reduced = getattr(test_df, func_name)(axis=axis, bool_only=bool_only)\n    elif func_name == \"str_concat\":\n        reduced = test_df.apply(lambda s: s.str.cat(), axis=axis)\n    else:\n        reduced = getattr(test_df, func_name)(\n            axis=axis, skipna=skipna, numeric_only=numeric_only\n        )\n    if len(reduced) == 0:\n        return None\n    return reduced.dtype\n\n\nclass DataFrameReductionMixin(DataFrameOperandMixin):\n    @classmethod\n    def get_reduction_callable(cls, op):\n        func_name = getattr(op, \"_func_name\")\n        kw = dict(\n            skipna=op.skipna, numeric_only=op.numeric_only, bool_only=op.bool_only\n        )\n        kw = {k: v for k, v in kw.items() if v is not None}\n        fun = functools.partial(_default_agg_fun, func_name=func_name, **kw)\n        fun.__name__ = func_name\n        return fun\n\n    @classmethod\n    def tile(cls, op):\n        in_df = op.inputs[0]\n        out_df = op.outputs[0]\n\n        if isinstance(out_df, SERIES_TYPE):\n            output_type = OutputType.series\n            dtypes = pd.Series([out_df.dtype], index=[out_df.name])\n            index = out_df.index_value.to_pandas()\n        elif out_df.ndim == 1:\n            output_type = OutputType.tensor\n            dtypes, index = out_df.dtype, None\n        else:\n            output_type = OutputType.scalar\n            dtypes, index = out_df.dtype, None\n\n        out_df = yield from recursive_tile(\n            in_df.agg(\n                cls.get_reduction_callable(op),\n                axis=op.axis or 0,\n                _numeric_only=op.numeric_only,\n                _bool_only=op.bool_only,\n                _combine_size=op.combine_size,\n                _output_type=output_type,\n                _dtypes=dtypes,\n                _index=index,\n            )\n        )\n        return [out_df]\n\n    def _call_groupby_level(self, df, level):\n        return df.groupby(level=level).agg(\n            self.get_reduction_callable(self), method=self.method\n        )\n\n    def _call_dataframe(self, df):\n        axis = getattr(self, \"axis\", None) or 0\n        level = getattr(self, \"level\", None)\n        skipna = getattr(self, \"skipna\", True)\n        numeric_only = getattr(self, \"numeric_only\", None)\n        bool_only = getattr(self, \"bool_only\", None)\n        self._axis = axis = validate_axis(axis, df)\n        func_name = getattr(self, \"_func_name\")\n\n        if level is not None and axis == 1:\n            raise NotImplementedError(\"Not support specify level for axis==1\")\n\n        if func_name == \"size\":\n            reduced = pd.Series(\n                np.zeros(df.shape[1 - axis]),\n                index=df.dtypes.index if axis == 0 else None,\n            )\n            reduced_cols = list(reduced.index)\n            reduced_dtype = reduced.dtype\n        elif func_name == \"custom_reduction\":\n            empty_df = build_df(df, ensure_string=True)\n            reduced = getattr(self, \"custom_reduction\").__call_agg__(empty_df)\n            reduced_cols = list(reduced.index)\n            reduced_dtype = reduced.dtype\n        else:\n            reduced_cols, dtypes = [], []\n            for col, src_dt in df.dtypes.items():\n                dt = _get_df_reduction_dtype(\n                    src_dt,\n                    func_name,\n                    axis=axis,\n                    bool_only=bool_only,\n                    skipna=skipna,\n                    numeric_only=numeric_only,\n                )\n                if dt is not None:\n                    reduced_cols.append(col)\n                    dtypes.append(dt)\n                elif (\n                    _level_reduction_keep_object\n                    and numeric_only\n                    and level is not None\n                    and func_name in (\"min\", \"max\")\n                    and src_dt == np.dtype(object)\n                ):  # pragma: no cover\n                    reduced_cols.append(col)\n                    dtypes.append(np.dtype(object))\n            if len(dtypes) == 0:\n                reduced_dtype = np.dtype(\"O\")\n            elif all(dt == dtypes[0] for dt in dtypes):\n                reduced_dtype = dtypes[0]\n            else:\n                # as we already bypassed dtypes with same values,\n                # when has_mixed_bool is True, there are other dtypes\n                # other than bool.\n                has_mixed_bool = any(dt == np.dtype(bool) for dt in dtypes)\n                if _reduce_bool_as_object and has_mixed_bool:\n                    reduced_dtype = np.dtype(\"O\")\n                elif not all(isinstance(dt, np.dtype) for dt in dtypes):\n                    # todo currently we return mixed dtypes as np.dtype('O').\n                    #  handle pandas Dtypes in the future more carefully.\n                    reduced_dtype = np.dtype(\"O\")\n                else:\n                    reduced_dtype = np.find_common_type(dtypes, [])\n\n        if level is not None:\n            return self._call_groupby_level(df[reduced_cols], level)\n\n        if axis == 0:\n            reduced_shape = (len(reduced_cols),)\n            reduced_index_value = parse_index(pd.Index(reduced_cols), store_data=True)\n        else:\n            reduced_shape = (df.shape[0],)\n            reduced_index_value = parse_index(pd.RangeIndex(-1))\n\n        return self.new_series(\n            [df],\n            shape=reduced_shape,\n            dtype=reduced_dtype,\n            index_value=reduced_ind",
+      "total_lines": 1250
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "functools",
+        "inspect",
+        "collections:OrderedDict",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:List",
+        "typing:NamedTuple",
+        "typing:Optional",
+        "numpy",
+        "pandas",
+        "core:OutputType",
+        "core:ENTITY_TYPE",
+        "core:is_build_mode",
+        "core:is_kernel_mode",
+        "core:enter_mode",
+        "core:recursive_tile",
+        "core.operand:OperandStage",
+        "serialization.serializables:BoolField",
+        "serialization.serializables:AnyField",
+        "serialization.serializables:DataTypeField",
+        "serialization.serializables:Int32Field",
+        "serialization.serializables:StringField",
+        "utils:pd_release_version",
+        "utils:tokenize",
+        "core:SERIES_TYPE",
+        "utils:parse_index",
+        "utils:build_df",
+        "utils:build_empty_df",
+        "utils:build_series"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/mars-project/mars/master/README.rst",
+      "content_excerpt": ".. image:: https://raw.githubusercontent.com/mars-project/mars/master/docs/source/images/mars-logo-title.png\n\n|PyPI version| |Docs| |Build| |Coverage| |Quality| |License|\n\nMars is a tensor-based unified framework for large-scale data computation\nwhich scales numpy, pandas, scikit-learn and many other libraries.\n\n`Documentation`_, `中文文档`_\n\nInstallation\n------------\n\nMars is easy to install by\n\n.. code-block:: bash\n\n    pip install pymars\n\n\nInstallation for Developers\n```````````````````````````\n\nWhen you want to contribute code to Mars, you can follow the instructions below to install Mars\nfor development:\n\n.. code-block:: bash\n\n    git clone https://github.com/mars-project/mars.git\n    cd mars\n    pip install -e \".[dev]\"\n\nMore details about installing Mars can be found at\n`installation <https://mars-project.readthedocs.io/en/latest/installation/index.html>`_ section in\nMars document.\n\n\nArchitecture Overview\n---------------------\n\n.. image:: https://raw.githubusercontent.com/mars-project/mars/master/docs/source/images/architecture.png\n\n\nGetting Started\n---------------\n\nStarting a new runtime locally via:\n\n.. code-block:: python\n\n    >>> import mars\n    >>> mars.new_session()\n\nOr connecting to a Mars cluster which is already initialized.\n\n.. code-block:: python\n\n    >>> import mars\n    >>> mars.new_session('http://<web_ip>:<ui_port>')\n\n\nMars Tensor\n-----------\n\nMars tensor provides a familiar interface like Numpy.\n\n+-----------------------------------------------+-----------------------------------------------+\n| **Numpy**                                     | **Mars tensor**"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_call_series test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_call_series(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "apply.py",
+          "path": "mars/dataframe/base/apply.py",
+          "sha": "59ed251367bc9e9dc3fbfeaf0d8761d56f0383d2",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/base/apply.py",
+          "score": 1.0
+        },
+        {
+          "name": "append.py",
+          "path": "mars/dataframe/merge/append.py",
+          "sha": "cc9dcc3d3cb23d374b959025204416879d4d4dda",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/merge/append.py",
+          "score": 1.0
+        },
+        {
+          "name": "core.py",
+          "path": "mars/dataframe/reduction/core.py",
+          "sha": "69f01a7a2d040834e33b7cd0c764adef5027d402",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/reduction/core.py",
+          "score": 1.0
+        },
+        {
+          "name": "sort_index.py",
+          "path": "mars/dataframe/sort/sort_index.py",
+          "sha": "eaed3b62c93b4feee6416ac11cded9f04a0257e9",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/sort/sort_index.py",
+          "score": 1.0
+        },
+        {
+          "name": "concat.py",
+          "path": "mars/dataframe/merge/concat.py",
+          "sha": "b3ccc5c9215c8c5de4c1a41d1ea88a1954e2876d",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/merge/concat.py",
+          "score": 1.0
+        },
+        {
+          "name": "quantile.py",
+          "path": "mars/dataframe/statistics/quantile.py",
+          "sha": "f2da563bb7ce6f5f3484d739afce60dc7f967e67",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/statistics/quantile.py",
+          "score": 1.0
+        },
+        {
+          "name": "shift.py",
+          "path": "mars/dataframe/base/shift.py",
+          "sha": "6239c2d2ba07aa817608ede6201ad6d746b13616",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/base/shift.py",
+          "score": 1.0
+        },
+        {
+          "name": "aggregation.py",
+          "path": "mars/dataframe/groupby/aggregation.py",
+          "sha": "9508aaa9fe1131a374e7a6b05aeb5170cf986b05",
+          "html_url": "https://github.com/mars-project/mars/blob/bcc000554c8bd9ebd5cafe7c61b1f0090ab9d53b/mars/dataframe/groupby/aggregation.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "mars/dataframe/reduction",
+      "count": 26,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "mars/dataframe/reduction/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aggregation.py",
+          "path": "mars/dataframe/reduction/aggregation.py",
+          "type": "file"
+        },
+        {
+          "name": "all.py",
+          "path": "mars/dataframe/reduction/all.py",
+          "type": "file"
+        },
+        {
+          "name": "any.py",
+          "path": "mars/dataframe/reduction/any.py",
+          "type": "file"
+        },
+        {
+          "name": "core.py",
+          "path": "mars/dataframe/reduction/core.py",
+          "type": "file"
+        },
+        {
+          "name": "count.py",
+          "path": "mars/dataframe/reduction/count.py",
+          "type": "file"
+        },
+        {
+          "name": "cummax.py",
+          "path": "mars/dataframe/reduction/cummax.py",
+          "type": "file"
+        },
+        {
+          "name": "cummin.py",
+          "path": "mars/dataframe/reduction/cummin.py",
+          "type": "file"
+        },
+        {
+          "name": "cumprod.py",
+          "path": "mars/dataframe/reduction/cumprod.py",
+          "type": "file"
+        },
+        {
+          "name": "cumsum.py",
+          "path": "mars/dataframe/reduction/cumsum.py",
+          "type": "file"
+        },
+        {
+          "name": "custom_reduction.py",
+          "path": "mars/dataframe/reduction/custom_reduction.py",
+          "type": "file"
+        },
+        {
+          "name": "kurtosis.py",
+          "path": "mars/dataframe/reduction/kurtosis.py",
+          "type": "file"
+        },
+        {
+          "name": "max.py",
+          "path": "mars/dataframe/reduction/max.py",
+          "type": "file"
+        },
+        {
+          "name": "mean.py",
+          "path": "mars/dataframe/reduction/mean.py",
+          "type": "file"
+        },
+        {
+          "name": "min.py",
+          "path": "mars/dataframe/reduction/min.py",
+          "type": "file"
+        },
+        {
+          "name": "nunique.py",
+          "path": "mars/dataframe/reduction/nunique.py",
+          "type": "file"
+        },
+        {
+          "name": "prod.py",
+          "path": "mars/dataframe/reduction/prod.py",
+          "type": "file"
+        },
+        {
+          "name": "reduction_size.py",
+          "path": "mars/dataframe/reduction/reduction_size.py",
+          "type": "file"
+        },
+        {
+          "name": "sem.py",
+          "path": "mars/dataframe/reduction/sem.py",
+          "type": "file"
+        },
+        {
+          "name": "skew.py",
+          "path": "mars/dataframe/reduction/skew.py",
+          "type": "file"
+        },
+        {
+          "name": "std.py",
+          "path": "mars/dataframe/reduction/std.py",
+          "type": "file"
+        },
+        {
+          "name": "str_concat.py",
+          "path": "mars/dataframe/reduction/str_concat.py",
+          "type": "file"
+        },
+        {
+          "name": "sum.py",
+          "path": "mars/dataframe/reduction/sum.py",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "mars/dataframe/reduction/tests",
+          "type": "dir"
+        },
+        {
+          "name": "unique.py",
+          "path": "mars/dataframe/reduction/unique.py",
+          "type": "file"
+        },
+        {
+          "name": "var.py",
+          "path": "mars/dataframe/reduction/var.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "mars/dataframe/reduction/__init__.py"
+        },
+        {
+          "name": "aggregation.py",
+          "path": "mars/dataframe/reduction/aggregation.py"
+        },
+        {
+          "name": "all.py",
+          "path": "mars/dataframe/reduction/all.py"
+        },
+        {
+          "name": "any.py",
+          "path": "mars/dataframe/reduction/any.py"
+        },
+        {
+          "name": "count.py",
+          "path": "mars/dataframe/reduction/count.py"
+        },
+        {
+          "name": "cummax.py",
+          "path": "mars/dataframe/reduction/cummax.py"
+        },
+        {
+          "name": "cummin.py",
+          "path": "mars/dataframe/reduction/cummin.py"
+        },
+        {
+          "name": "cumprod.py",
+          "path": "mars/dataframe/reduction/cumprod.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "mars/dataframe/reduction/core.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "9b08d4aeaa0bf645ce32bce17bae6ba1dac68e6c",
+          "html_url": "https://github.com/mars-project/mars/commit/9b08d4aeaa0bf645ce32bce17bae6ba1dac68e6c",
+          "message": "Merge code (#3330)\n\n* Implements ColumnPruning optimization rule (#30)\r\n\r\nCo-authored-by: ChengjieLi <chengjieli23@outlook.com>\r\nCo-authored-by: aresnow <aresnow1@gmail.com>\r\n\r\n* Fix execution hang on optimization error (#33)\r\n\r\n* enh: Optimize groupby nunique implementation (#38)\r\n\r\n* enh: Support ",
+          "author": "Liu Bao",
+          "date": "2023-03-14T02:32:34Z"
+        },
+        {
+          "sha": "e873d77375bf2a2b26ee50e8c24f9a5dc19eb3ca",
+          "html_url": "https://github.com/mars-project/mars/commit/e873d77375bf2a2b26ee50e8c24f9a5dc19eb3ca",
+          "message": "Use cython to accelerate core serialization (#2924)",
+          "author": "Wenjun Si",
+          "date": "2022-04-18T07:22:05Z"
+        },
+        {
+          "sha": "3cfdaa22aa523244e65894d293cb9d74cad7d835",
+          "html_url": "https://github.com/mars-project/mars/commit/3cfdaa22aa523244e65894d293cb9d74cad7d835",
+          "message": "Fix default value of `gpu` property for some operands (#2811)",
+          "author": "He Kaisheng",
+          "date": "2022-03-13T05:49:56Z"
+        },
+        {
+          "sha": "56efd30a00b746f9cb7bc8c99a11b37ea87cd0be",
+          "html_url": "https://github.com/mars-project/mars/commit/56efd30a00b746f9cb7bc8c99a11b37ea87cd0be",
+          "message": "Fix as_index when calling groupby-agg (#2676)",
+          "author": "Wenjun Si",
+          "date": "2022-02-03T05:35:12Z"
+        },
+        {
+          "sha": "4e395b45d7a997d78944ab1a9a1bdecff2ff823d",
+          "html_url": "https://github.com/mars-project/mars/commit/4e395b45d7a997d78944ab1a9a1bdecff2ff823d",
+          "message": "Fix aggregation with comparison (#2647)",
+          "author": "Wenjun Si",
+          "date": "2022-01-25T03:59:17Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_call_series TODO enable specify level support",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "mars/dataframe/reduction/core.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "9b08d4aeaa0bf645ce32bce17bae6ba1dac68e6c",
+        "html_url": "https://github.com/mars-project/mars/commit/9b08d4aeaa0bf645ce32bce17bae6ba1dac68e6c",
+        "message": "Merge code (#3330)\n\n* Implements ColumnPruning optimization rule (#30)\r\n\r\nCo-authored-by: ChengjieLi <chengjieli23@outlook.com>\r\nCo-authored-by: aresnow <aresnow1@gmail.com>\r\n\r\n* Fix execution hang on optimization error (#33)\r\n\r\n* enh: Optimize groupby nunique implementation (#38)\r\n\r\n* enh: Support ",
+        "author": "Liu Bao",
+        "date": "2023-03-14T02:32:34Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

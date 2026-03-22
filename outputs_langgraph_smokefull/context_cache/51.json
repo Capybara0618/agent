@@ -1,0 +1,266 @@
+{
+  "task_id": "51",
+  "repo_owner": "ig-python",
+  "repo_name": "trading-ig",
+  "file_path": "trading_ig/rest.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T15:27:36+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "setup_rate_limiter",
+    "satd_line": 283,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T15:27:49+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T15:27:56+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "trading_ig/rest.py",
+    "original_code": "def fetch_historical_prices_by_epic_and_date_range(\n    self, epic, resolution, start_date, end_date, session=None, format=None\n):\n    \"\"\"Returns a list of historical prices for the given epic, resolution,\n    multiplier and date range\"\"\"\n    if self.return_dataframe:\n        resolution = conv_resol(resolution)\n    # TODO: Update to v2\n    version = \"1\"\n    # v2\n    # start_date = conv_datetime(start_date, 2)\n    # end_date = conv_datetime(end_date, 2)\n    # params = {}\n    # url_params = {\n    #     'epic': epic,\n    #     'resolution': resolution,\n    #     'start_date': start_date,\n    #     'end_date': end_date\n    # }\n    # endpoint = \"/prices/{epic}/{resolution}/{startDate}/{endDate}\".\\\n    #     format(**url_params)\n\n    # v1\n    start_date = conv_datetime(start_date, version)\n    end_date = conv_datetime(end_date, version)\n    params = {\"startdate\": start_date, \"enddate\": end_date}\n    url_params = {\"epic\": epic, \"resolution\": resolution}\n    endpoint = \"/prices/{epic}/{resolution}\".format(**url_params)\n    action = \"read\"\n    response = self._req(action, endpoint, params, session, version)\n    del self.crud_session.HEADERS[\"LOGGED_IN\"][\"VERSION\"]\n    data = self.parse_response(response.text)\n    if format is None:\n        format = self.format_prices\n    if self.return_dataframe:\n        data[\"prices\"] = format(data[\"prices\"], version)\n        data['prices'] = data['prices'].fillna(value=np.nan)\n    return data",
+    "satd_comment": "# TODO: Update to v2",
+    "target_file": {
+      "ok": true,
+      "path": "trading_ig/rest.py",
+      "sha": "4e3c620b22572b957c3dd9f17e7b64b5d0a40a71",
+      "download_url": "https://raw.githubusercontent.com/ig-python/trading-ig/master/trading_ig/rest.py",
+      "content_excerpt": "#!/usr/bin/env python\n# -*- coding:utf-8 -*-\n\n\"\"\"\nIG Markets REST API Library for Python\nhttps://labs.ig.com/rest-trading-api-reference\nOriginal version by Lewis Barber - 2014 - https://uk.linkedin.com/in/lewisbarber/\nModified by Femto Trader - 2014-2015 - https://github.com/femtotrader/\n\"\"\"  # noqa\n\nimport json\nimport logging\nimport time\nfrom base64 import b64encode, b64decode\n\nfrom Crypto.Cipher import PKCS1_v1_5\nfrom Crypto.PublicKey import RSA\nfrom requests import Session\nfrom urllib.parse import urlparse, parse_qs\n\nfrom datetime import timedelta, datetime\nfrom .utils import _HAS_PANDAS, _HAS_MUNCH\nfrom .utils import (\n    conv_resol,\n    conv_datetime,\n    conv_to_ms,\n    DATE_FORMATS,\n    api_limit_hit,\n    token_invalid,\n)\n\nif _HAS_MUNCH:\n    from .utils import munchify\n\nif _HAS_PANDAS:\n    from .utils import pd\n    from pandas import json_normalize\n\nfrom threading import Thread\nfrom queue import Queue, Empty\n\nlogger = logging.getLogger(__name__)\n\n\nclass ApiExceededException(Exception):\n    \"\"\"Raised when our code hits the IG endpoint too often\"\"\"\n\n    pass\n\n\nclass TokenInvalidException(Exception):\n    \"\"\"Raised when the session token is invalid or expired\"\"\"\n\n    pass\n\n\nclass IGException(Exception):\n    pass\n\n\nclass KycRequiredException(Exception):\n    \"\"\"Raised when IG needs the user to confirm or re-confirm their KYC status\"\"\"\n\n    pass\n\n\nclass IGSessionCRUD(object):\n    \"\"\"Session with CRUD operation\"\"\"\n\n    BASE_URL = None\n\n    def __init__(self, base_url, api_key, session):\n        self.BASE_URL = base_url\n        self.API_KEY = api_key\n        self.session = session\n\n        self.session.headers.update(\n            {\n                \"X-IG-API-KEY\": self.API_KEY,\n                \"Content-Type\": \"application/json\",\n                \"Accept\": \"application/json; charset=UTF-8\",\n            }\n        )\n\n    def _get_session(self, session):\n        \"\"\"Returns a Requests session if session is None\n        or session if it's not None (cached session\n        with requests-cache for example)\n\n        :param session:\n        :return:\n        \"\"\"\n        if session is None:\n            session = self.session  # requests Session\n        else:\n            session = session\n        return session\n\n    def _url(self, endpoint):\n        \"\"\"Returns url from endpoint and base url\"\"\"\n        return self.BASE_URL + endpoint\n\n    def create(self, endpoint, params, session, version):\n        \"\"\"Create = POST\"\"\"\n        url = self._url(endpoint)\n        session = self._get_session(session)\n        session.headers.update({\"VERSION\": version})\n        response = session.post(url, data=json.dumps(params))\n        logger.info(f\"POST '{endpoint}', resp {response.status_code}\")\n        if response.status_code in [401, 403]:\n            if api_limit_hit(response.text):\n                raise ApiExceededException()\n            if \"error.public-api.failure.kyc.required\" in response.text:\n                raise KycRequiredException(\n                    \"KYC issue: you need to login manually to the web interface and \"\n                    \"complete IGs occasional Know Your Customer checks\"\n                )\n            else:\n                raise IGException(f\"HTTP error: {response.status_code} {response.text}\")\n\n        return response\n\n    def read(self, endpoint, params, session, version):\n        \"\"\"Read = GET\"\"\"\n        url = self._url(endpoint)\n        session = self._get_session(session)\n        session.headers.update({\"VERSION\": version})\n        response = session.get(url, params=params)\n        # handle 'read_session' with 'fetchSessionTokens=true'\n        handle_session_tokens(response, self.session)\n        logger.info(f\"GET '{endpoint}', resp {response.status_code}\")\n        return response\n\n    def update(self, endpoint, params, session, version):\n        \"\"\"Update = PUT\"\"\"\n        url = self._url(endpoint)\n        session = self._get_session(session)\n        session.headers.update({\"VERSION\": version})\n        response = session.put(url, data=json.dumps(params))\n        logger.info(f\"PUT '{endpoint}', resp {response.status_code}\")\n        return response\n\n    def delete(self, endpoint, params, session, version):\n        \"\"\"Delete = POST\"\"\"\n        url = self._url(endpoint)\n        session = self._get_session(session)\n        session.headers.update({\"VERSION\": version})\n        session.headers.update({\"_method\": \"DELETE\"})\n        response = session.post(url, data=json.dumps(params))\n        logger.info(f\"DELETE (POST) '{endpoint}', resp {response.status_code}\")\n        if \"_method\" in session.headers:\n            del session.headers[\"_method\"]\n        return response\n\n    def req(self, action, endpoint, params, session, version):\n        \"\"\"Send a request (CREATE READ UPDATE or DELETE)\"\"\"\n        d_actions = {\n            \"create\": self.create,\n            \"read\": self.read,\n            \"update\": self.update,\n            \"delete\": self.delete,\n        }\n        return d_actions[action](endpoint, params, session, version)\n\n\nclass IGService:\n    D_BASE_URL = {\n        \"live\": \"https://api.ig.com/gateway/deal\",\n        \"demo\": \"https://demo-api.ig.com/gateway/deal\",\n    }\n\n    API_KEY = None\n    IG_USERNAME = None\n    IG_PASSWORD = None\n    _refresh_token = None\n    _valid_until = None\n\n    def __init__(\n        self,\n        username,\n        password,\n        api_key,\n        acc_type=\"demo\",\n        acc_number=None,\n        session=None,\n        return_dataframe=_HAS_PANDAS,\n        return_munch=_HAS_MUNCH,\n        retryer=None,\n        use_rate_limiter=False,\n    ):\n        \"\"\"Constructor, calls the method required to connect to\n        the API (accepts acc_type = LIVE or DEMO)\"\"\"\n        self.API_KEY = api_key\n        self.IG_USERNAME = username\n        self.IG_PASSWORD = password\n        self.ACC_NUMBER = acc_number\n        self._retryer = retryer\n        self._use_rate_limiter = use_rate_limiter\n        self._bucket_threads_run = False\n        try:\n            self.BASE_URL = self.D_BASE_URL[acc_type.lower()]\n        except Exception:\n            raise IGException(\n                \"Invalid account type '%s', please provide LIVE or DEMO\" % acc_type\n            )\n\n        self.return_dataframe = return_dataframe\n        self.return_munch = return_munch\n\n        if session is None:\n            self.session = Session()  # Requests Session (global)\n        else:\n            self.session = session\n\n        self.crud_session = IGSessionCRUD(self.BASE_URL, self.API_KEY, self.session)\n\n    def setup_rate_limiter(\n        self,\n    ):\n        data = self.get_client_apps()\n        for acc in data:\n            if acc[\"apiKey\"] == self.API_KEY:\n                break\n\n        # If self.create_session() is called a second time, we should exit any\n        # currently running threads\n        self._exit_bucket_threads()\n\n        # Horrific magic number to reduce API published allowable requests per minute\n        # to a value that wont result in\n        # 403 -> error.public-api.exceeded-account-trading-allowance\n        # Tested for non_trading = 30 (live) and 10 (demo) requests per minute.\n        # This wouldn't be needed if IG's API functioned as published!\n        MAGIC_NUMBER = 2\n\n        self._trading_requests_per_minute = (\n            acc[\"allowanceAccountTrading\"] - MAGIC_NUMBER\n        )\n        logger.info(\n            f\"Published IG Trading Request limits for trading request: \"\n            f\"{acc['allowanceAccountTrading']} per minute. \"\n            f\"Using: {self._trading_requests_per_minute}\"\n        )\n\n        self._non_trading_requests_per_minute = (\n            acc[\"allowanceAccountOverall\"] - MAGIC_NUMBER\n        )\n        logger.info(\n            f\"Published IG Trading Request limits for non-trading request: \"\n            f\"{acc['allowanceAccountOverall']} per minute. \"\n            f\"Using {self._non_trading_requests_per_minute}\"\n        )\n\n        time.sleep(60.0 / self._non_trading_requests_per_minute)\n\n        self._bucket_threads_run = True  # Thread exit variable\n\n        # Create a leaky token bucket for trading requests\n        trading_requests_burst = 1  # If IG ever allow bursting, increase this\n        self._trading_requests_queue = Queue(trading_requests_burst)\n        # prefill the bucket so we can burst\n        [self._trading_requests_queue.put(True) for i in range(trading_requests_burst)]\n        token_bucket_trading_thread = Thread(\n            target=self._token_bucket_trading,\n        )\n        token_bucket_trading_thread.start()\n        self._trading_times = []\n\n        # Create a leaky token bucket for non-trading requests\n        non_trading_requests_burst = 1  # If IG ever allow bursting, increase this\n        self._non_trading_requests_queue = Queue(non_trading_requests_burst)\n        # prefill the bucket so we can burst\n        [\n            self._non_trading_requests_queue.put(True)\n            for i in range(non_trading_requests_burst)\n        ]\n        token_bucket_non_trading_thread = Thread(\n            target=self._token_bucket_non_trading,\n        )\n        token_bucket_non_trading_thread.start()\n        self._non_trading_times = []\n\n        # TODO\n        # Create a leaky token bucket for allowanceAccountHistoricalData\n        return\n\n    def _token_bucket_trading(\n        self,\n    ):\n        while self._bucket_threads_run:\n            time.sleep(60.0 / self._trading_requests_per_minute)\n            self._trading_requests_queue.put(True, block=True)\n        return\n\n    def _token_bucket_non_trading(\n        self,\n    ):\n        while self._bucket_threads_run:\n            time.sleep(60.0 / self._non_trading_requests_per_minute)\n            self._non_trading_requests_queue.put(True, block=True)\n        return\n\n    def trading_rate_limit_pause_or_pass(\n        self,\n    ):\n        if self._use_rate_limiter:\n            self._trading_requests_queue.get(block=True)\n            self._trading_times.append(time.time())\n            self._trading_times = [\n                req_time\n                for req_time in self._trading_times\n                if req_time > time.time() - 60\n            ]\n            logger.info(\n                f\"Number of trading requests in last 60 seconds = \"\n                f\"{len(self._trading_times)} of {self._trading_requests_per_minute}\"\n            )\n        return\n\n    def non_trading_rate_limit_pause_or_pass(\n        self,\n    ):\n        if self._use_rate_limiter:\n            self._non_trading_requests_queue.get(block=True)\n            self._non_trading_times.append(time.time())\n            self._non_trading_times = [\n                req_time\n                for req_time in self._non_trading_times\n                if req_time > time.time() - 60\n            ]\n            logger.info(\n                f\"Number of non trading requests in last 60 seconds = \"\n                f\"{len(self._non_trading_times)} of \"\n                f\"{self._non_trading_requests_per_minute}\"\n            )\n        return\n\n    def _exit_bucket_threads(\n        self,\n    ):\n        if self._use_rate_limiter:\n            if self._bucket_threads_run:\n                self._bucket_threads_run = False\n                try:\n                    self._trading_requests_queue.get(block=False)\n                except Empty:\n                    pass\n                try:\n                    self._non_trading_requests_queue.get(block=False)\n                except Empty:\n                    pass\n        return\n\n    def _get_session(self, session):\n        \"\"\"Returns a Requests session (from self.session) if session is None\n        or session if it's not None (cached session with requests-cache\n        for example)\n        \"\"\"\n        if session is None:\n            session = self.session  # requests Session\n        else:\n            assert isinstance(\n                session, Session\n            ), \"session must be <requests.session.Session object> not %s\" % type(\n                session\n            )\n            session = session\n        return session\n\n    def _req(s",
+      "total_lines": 2239
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 283,
+      "start_line": 263,
+      "end_line": 303,
+      "matched_line": "        # TODO",
+      "excerpt": "263:         token_bucket_trading_thread = Thread(\n264:             target=self._token_bucket_trading,\n265:         )\n266:         token_bucket_trading_thread.start()\n267:         self._trading_times = []\n268: \n269:         # Create a leaky token bucket for non-trading requests\n270:         non_trading_requests_burst = 1  # If IG ever allow bursting, increase this\n271:         self._non_trading_requests_queue = Queue(non_trading_requests_burst)\n272:         # prefill the bucket so we can burst\n273:         [\n274:             self._non_trading_requests_queue.put(True)\n275:             for i in range(non_trading_requests_burst)\n276:         ]\n277:         token_bucket_non_trading_thread = Thread(\n278:             target=self._token_bucket_non_trading,\n279:         )\n280:         token_bucket_non_trading_thread.start()\n281:         self._non_trading_times = []\n282: \n283:         # TODO\n284:         # Create a leaky token bucket for allowanceAccountHistoricalData\n285:         return\n286: \n287:     def _token_bucket_trading(\n288:         self,\n289:     ):\n290:         while self._bucket_threads_run:\n291:             time.sleep(60.0 / self._trading_requests_per_minute)\n292:             self._trading_requests_queue.put(True, block=True)\n293:         return\n294: \n295:     def _token_bucket_non_trading(\n296:         self,\n297:     ):\n298:         while self._bucket_threads_run:\n299:             time.sleep(60.0 / self._non_trading_requests_per_minute)\n300:             self._non_trading_requests_queue.put(True, block=True)\n301:         return\n302: \n303:     def trading_rate_limit_pause_or_pass("
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "setup_rate_limiter",
+      "start_line": 217,
+      "end_line": 285,
+      "source": "    def setup_rate_limiter(\n        self,\n    ):\n        data = self.get_client_apps()\n        for acc in data:\n            if acc[\"apiKey\"] == self.API_KEY:\n                break\n\n        # If self.create_session() is called a second time, we should exit any\n        # currently running threads\n        self._exit_bucket_threads()\n\n        # Horrific magic number to reduce API published allowable requests per minute\n        # to a value that wont result in\n        # 403 -> error.public-api.exceeded-account-trading-allowance\n        # Tested for non_trading = 30 (live) and 10 (demo) requests per minute.\n        # This wouldn't be needed if IG's API functioned as published!\n        MAGIC_NUMBER = 2\n\n        self._trading_requests_per_minute = (\n            acc[\"allowanceAccountTrading\"] - MAGIC_NUMBER\n        )\n        logger.info(\n            f\"Published IG Trading Request limits for trading request: \"\n            f\"{acc['allowanceAccountTrading']} per minute. \"\n            f\"Using: {self._trading_requests_per_minute}\"\n        )\n\n        self._non_trading_requests_per_minute = (\n            acc[\"allowanceAccountOverall\"] - MAGIC_NUMBER\n        )\n        logger.info(\n            f\"Published IG Trading Request limits for non-trading request: \"\n            f\"{acc['allowanceAccountOverall']} per minute. \"\n            f\"Using {self._non_trading_requests_per_minute}\"\n        )\n\n        time.sleep(60.0 / self._non_trading_requests_per_minute)\n\n        self._bucket_threads_run = True  # Thread exit variable\n\n        # Create a leaky token bucket for trading requests\n        trading_requests_burst = 1  # If IG ever allow bursting, increase this\n        self._trading_requests_queue = Queue(trading_requests_burst)\n        # prefill the bucket so we can burst\n        [self._trading_requests_queue.put(True) for i in range(trading_requests_burst)]\n        token_bucket_trading_thread = Thread(\n            target=self._token_bucket_trading,\n        )\n        token_bucket_trading_thread.start()\n        self._trading_times = []\n\n        # Create a leaky token bucket for non-trading requests\n        non_trading_requests_burst = 1  # If IG ever allow bursting, increase this\n        self._non_trading_requests_queue = Queue(non_trading_requests_burst)\n        # prefill the bucket so we can burst\n        [\n            self._non_trading_requests_queue.put(True)\n            for i in range(non_trading_requests_burst)\n        ]\n        token_bucket_non_trading_thread = Thread(\n            target=self._token_bucket_non_trading,\n        )\n        token_bucket_non_trading_thread.start()\n        self._non_trading_times = []\n\n        # TODO\n        # Create a leaky token bucket for allowanceAccountHistoricalData\n        return"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "logging",
+        "time",
+        "base64:b64encode",
+        "base64:b64decode",
+        "Crypto.Cipher:PKCS1_v1_5",
+        "Crypto.PublicKey:RSA",
+        "requests:Session",
+        "urllib.parse:urlparse",
+        "urllib.parse:parse_qs",
+        "datetime:timedelta",
+        "datetime:datetime",
+        "utils:_HAS_PANDAS",
+        "utils:_HAS_MUNCH",
+        "utils:conv_resol",
+        "utils:conv_datetime",
+        "utils:conv_to_ms",
+        "utils:DATE_FORMATS",
+        "utils:api_limit_hit",
+        "utils:token_invalid",
+        "threading:Thread",
+        "queue:Queue",
+        "queue:Empty",
+        "utils:munchify",
+        "utils:pd",
+        "pandas:json_normalize"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ig-python/trading-ig/master/README.rst",
+      "content_excerpt": ".. image:: https://img.shields.io/pypi/v/trading-ig.svg\n    :target: https://pypi.python.org/pypi/trading-ig/\n    :alt: Latest Version\n\n.. image:: https://img.shields.io/pypi/pyversions/trading-ig.svg\n    :target: https://pypi.python.org/pypi/trading-ig/\n    :alt: Supported Python versions\n\n.. image:: https://img.shields.io/pypi/wheel/trading-ig.svg\n    :target: https://pypi.python.org/pypi/trading-ig/\n    :alt: Wheel format\n\n.. image:: https://img.shields.io/pypi/l/trading-ig.svg\n    :target: https://pypi.python.org/pypi/trading-ig/\n    :alt: License\n\n.. image:: https://img.shields.io/pypi/status/trading-ig.svg\n    :target: https://pypi.python.org/pypi/trading-ig/\n    :alt: Development Status\n\n.. image:: https://img.shields.io/pypi/dm/trading-ig.svg\n    :target: https://pypi.python.org/pypi/trading-ig/\n    :alt: Downloads monthly\n\n.. image:: https://readthedocs.org/projects/trading-ig/badge/?version=latest\n    :target: https://trading-ig.readthedocs.io/en/latest/?badge=latest\n    :alt: Documentation Status\n\n.. image:: https://coveralls.io/repos/github/ig-python/trading-ig/badge.svg\n    :target: https://coveralls.io/github/ig-python/trading-ig\n    :alt: Test Coverage\n\n.. image:: https://img.shields.io/badge/code%20style-black-000000.svg\n    :target: https://github.com/psf/black\n\ntrading-ig\n==========\n\nA lightweight Python wrapper for the IG Markets API. Simplifies access to the IG REST and Streaming APIs.\n\nWhat is it?\n-----------\n\n`IG Markets <https://www.ig.com/>`_ provides financial spread betting and CFD platforms for trading equities, forex,\ncommodities, indices, crypto"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "setup_rate_limiter test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"setup_rate_limiter(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "rest.py",
+          "path": "trading_ig/rest.py",
+          "sha": "4e3c620b22572b957c3dd9f17e7b64b5d0a40a71",
+          "html_url": "https://github.com/ig-python/trading-ig/blob/b0865ecca690ddf44a14a61ca8eea41efb67751b/trading_ig/rest.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "trading_ig",
+      "count": 7,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "trading_ig/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "trading_ig/config.py",
+          "type": "file"
+        },
+        {
+          "name": "lightstreamer.py",
+          "path": "trading_ig/lightstreamer.py",
+          "type": "file"
+        },
+        {
+          "name": "rest.py",
+          "path": "trading_ig/rest.py",
+          "type": "file"
+        },
+        {
+          "name": "stream.py",
+          "path": "trading_ig/stream.py",
+          "type": "file"
+        },
+        {
+          "name": "streamer",
+          "path": "trading_ig/streamer",
+          "type": "dir"
+        },
+        {
+          "name": "utils.py",
+          "path": "trading_ig/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "trading_ig/__init__.py"
+        },
+        {
+          "name": "config.py",
+          "path": "trading_ig/config.py"
+        },
+        {
+          "name": "lightstreamer.py",
+          "path": "trading_ig/lightstreamer.py"
+        },
+        {
+          "name": "stream.py",
+          "path": "trading_ig/stream.py"
+        },
+        {
+          "name": "utils.py",
+          "path": "trading_ig/utils.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "trading_ig/rest.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "024dfb29a22a860234a636b7fde428121a117164",
+          "html_url": "https://github.com/ig-python/trading-ig/commit/024dfb29a22a860234a636b7fde428121a117164",
+          "message": "black compliant again",
+          "author": "zansibal",
+          "date": "2025-05-02T09:13:16Z"
+        },
+        {
+          "sha": "ac2c89046a4eb00fa7da45d1e6560d09c5ab92c5",
+          "html_url": "https://github.com/ig-python/trading-ig/commit/ac2c89046a4eb00fa7da45d1e6560d09c5ab92c5",
+          "message": "black compliant",
+          "author": "zansibal",
+          "date": "2025-05-02T09:11:25Z"
+        },
+        {
+          "sha": "14df69948f6de3b72f89a29a83420249e3b2b603",
+          "html_url": "https://github.com/ig-python/trading-ig/commit/14df69948f6de3b72f89a29a83420249e3b2b603",
+          "message": "spelling error",
+          "author": "zansibal",
+          "date": "2025-05-02T08:14:17Z"
+        },
+        {
+          "sha": "020f6fa87bbced1283393ef83296a1804e6cd44c",
+          "html_url": "https://github.com/ig-python/trading-ig/commit/020f6fa87bbced1283393ef83296a1804e6cd44c",
+          "message": "added feature to request repeat dealing window for traded epics",
+          "author": "zansibal",
+          "date": "2025-05-02T07:56:13Z"
+        },
+        {
+          "sha": "995585d3a1958dcee9792215113f861221eeec68",
+          "html_url": "https://github.com/ig-python/trading-ig/commit/995585d3a1958dcee9792215113f861221eeec68",
+          "message": "handle stricter date parsing in pandas 2",
+          "author": "Andy Geach",
+          "date": "2025-01-15T10:19:11Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "setup_rate_limiter TODO Update",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "trading_ig/rest.py",
+      "satd_line": 283,
+      "last_commit": {
+        "sha": "024dfb29a22a860234a636b7fde428121a117164",
+        "html_url": "https://github.com/ig-python/trading-ig/commit/024dfb29a22a860234a636b7fde428121a117164",
+        "message": "black compliant again",
+        "author": "zansibal",
+        "date": "2025-05-02T09:13:16Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "setup_rate_limiter",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

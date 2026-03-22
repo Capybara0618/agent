@@ -1,0 +1,547 @@
+{
+  "task_id": "182",
+  "repo_owner": "borgbackup",
+  "repo_name": "borg",
+  "file_path": "src/borg/repository.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T16:38:45+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__init__",
+    "satd_line": 159,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T16:38:58+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T16:39:04+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/borg/repository.py",
+    "original_code": "def recover_segment(self, segment, filename):\n    if segment in self.fds:\n        del self.fds[segment]\n    with open(filename, 'rb') as fd:\n        # XXX: Rather use mmap, this loads the entire segment (up to 500 MB by default) into memory.\n        data = memoryview(fd.read())\n    os.rename(filename, filename + '.beforerecover')\n    logger.info('attempting to recover ' + filename)\n    with open(filename, 'wb') as fd:\n        fd.write(MAGIC)\n        while len(data) >= self.header_fmt.size:\n            crc, size, tag = self.header_fmt.unpack(data[:self.header_fmt.size])\n            if size < self.header_fmt.size or size > len(data):\n                data = data[1:]\n                continue\n            if crc32(data[4:size]) & 0xffffffff != crc:\n                data = data[1:]\n                continue\n            fd.write(data[:size])\n            data = data[size:]",
+    "satd_comment": "# XXX: Rather use mmap, this loads the entire segment (up to 500 MB by default) into memory.",
+    "target_file": {
+      "ok": true,
+      "path": "src/borg/repository.py",
+      "sha": "a3f8aa8cc27868f1186e2be899d2f233f811bdf5",
+      "download_url": "https://raw.githubusercontent.com/borgbackup/borg/master/src/borg/repository.py",
+      "content_excerpt": "import os\nimport time\nfrom pathlib import Path\n\nfrom xxhash import xxh64\n\nfrom borgstore.store import Store\nfrom borgstore.store import ObjectNotFound as StoreObjectNotFound\nfrom borgstore.backends.errors import BackendError as StoreBackendError\nfrom borgstore.backends.errors import BackendDoesNotExist as StoreBackendDoesNotExist\nfrom borgstore.backends.errors import BackendAlreadyExists as StoreBackendAlreadyExists\n\nfrom .constants import *  # NOQA\nfrom .hashindex import ChunkIndex, ChunkIndexEntry\nfrom .helpers import Error, ErrorWithTraceback, IntegrityError\nfrom .helpers import Location\nfrom .helpers import bin_to_hex, hex_to_bin\nfrom .storelocking import Lock\nfrom .logger import create_logger\nfrom .manifest import NoManifestError\nfrom .repoobj import RepoObj\n\nlogger = create_logger(__name__)\n\n\ndef repo_lister(repository, *, limit=None):\n    marker = None\n    finished = False\n    while not finished:\n        result = repository.list(limit=limit, marker=marker)\n        finished = (len(result) < limit) if limit is not None else (len(result) == 0)\n        if not finished:\n            marker = result[-1][0]\n        yield from result\n\n\nclass Repository:\n    \"\"\"borgstore-based key/value store.\"\"\"\n\n    class AlreadyExists(Error):\n        \"\"\"A repository already exists at {}.\"\"\"\n\n        exit_mcode = 10\n\n    class CheckNeeded(ErrorWithTraceback):\n        \"\"\"Inconsistency detected. Please run \"borg check {}\".\"\"\"\n\n        exit_mcode = 12\n\n    class DoesNotExist(Error):\n        \"\"\"Repository {} does not exist.\"\"\"\n\n        exit_mcode = 13\n\n    class InsufficientFreeSpaceError(Error):\n        \"\"\"Insufficient free space to complete the transaction (required: {}, available: {}).\"\"\"\n\n        exit_mcode = 14\n\n    class InvalidRepository(Error):\n        \"\"\"{} is not a valid repository. Check the repository config.\"\"\"\n\n        exit_mcode = 15\n\n    class InvalidRepositoryConfig(Error):\n        \"\"\"{} does not have a valid config. Check the repository config [{}].\"\"\"\n\n        exit_mcode = 16\n\n    class ObjectNotFound(ErrorWithTraceback):\n        \"\"\"Object with key {} not found in repository {}.\"\"\"\n\n        exit_mcode = 17\n\n        def __init__(self, id, repo):\n            if isinstance(id, bytes):\n                id = bin_to_hex(id)\n            super().__init__(id, repo)\n\n    class ParentPathDoesNotExist(Error):\n        \"\"\"The parent path of the repository directory [{}] does not exist.\"\"\"\n\n        exit_mcode = 18\n\n    class PathAlreadyExists(Error):\n        \"\"\"There is already something at {}.\"\"\"\n\n        exit_mcode = 19\n\n    # StorageQuotaExceeded was exit_mcode = 20\n\n    class PathPermissionDenied(Error):\n        \"\"\"Permission denied to {}.\"\"\"\n\n        exit_mcode = 21\n\n    def __init__(\n        self,\n        path_or_location,\n        create=False,\n        exclusive=False,\n        lock_wait=1.0,\n        lock=True,\n        send_log_cb=None,\n        permissions=None,\n    ):\n        if isinstance(path_or_location, Location):\n            location = path_or_location\n            if location.proto == \"file\":\n                url = Path(location.path).as_uri()\n            else:\n                url = location.processed  # location as given by user, processed placeholders\n        else:\n            url = Path(path_or_location).absolute().as_uri()\n            location = Location(url)\n        self._location = location\n        self.url = url\n        # lots of stuff in data: use 2 levels by default (data/00/00/ .. data/ff/ff/ dirs)!\n        data_levels = int(os.environ.get(\"BORG_STORE_DATA_LEVELS\", \"2\"))\n        levels_config = {\n            \"archives/\": [0],\n            \"cache/\": [0],\n            \"config/\": [0],\n            \"data/\": [data_levels],\n            \"keys/\": [0],\n            \"locks/\": [0],\n        }\n        # Get permissions from parameter or environment variable\n        permissions = permissions if permissions is not None else os.environ.get(\"BORG_REPO_PERMISSIONS\", \"all\")\n\n        if permissions == \"all\":\n            permissions = None  # permissions system will not be used\n        elif permissions == \"no-delete\":  # mostly no delete, no overwrite\n            permissions = {\n                \"\": \"lr\",\n                \"archives\": \"lrw\",\n                \"cache\": \"lrwWD\",  # WD for chunks.<HASH>, last-key-checked, ...\n                \"config\": \"lrW\",  # W for manifest\n                \"data\": \"lrw\",\n                \"keys\": \"lr\",\n                \"locks\": \"lrwD\",  # borg needs to create/delete a shared lock here\n            }\n        elif permissions == \"write-only\":  # mostly no reading\n            permissions = {\n                \"\": \"l\",\n                \"archives\": \"lw\",\n                \"cache\": \"lrwWD\",  # read allowed, e.g. for chunks.<HASH> cache\n                \"config\": \"lrW\",  # W for manifest\n                \"data\": \"lw\",  # no r!\n                \"keys\": \"lr\",\n                \"locks\": \"lrwD\",  # borg needs to create/delete a shared lock here\n            }\n        elif permissions == \"read-only\":  # mostly r/o\n            permissions = {\"\": \"lr\", \"locks\": \"lrwD\"}\n        else:\n            raise Error(\n                f\"Invalid BORG_REPO_PERMISSIONS value: {permissions}, should be one of: \"\n                f\"all, no-delete, write-only, read-only.\"\n            )\n\n        try:\n            self.store = Store(url, levels=levels_config, permissions=permissions)\n        except StoreBackendError as e:\n            raise Error(str(e))\n        self.store_opened = False\n        self.version = None\n        # long-running repository methods which emit log or progress output are responsible for calling\n        # the ._send_log method periodically to get log and progress output transferred to the borg client\n        # in a timely manner, in case we have a RemoteRepository.\n        # for local repositories ._send_log can be called also (it will just do nothing in that case).\n        self._send_log = send_log_cb or (lambda: None)\n        self.do_create = create\n        self.created = False\n        self.acceptable_repo_versions = (3,)\n        self.opened = False\n        self.lock = None\n        self.do_lock = lock\n        self.lock_wait = lock_wait\n        self.exclusive = exclusive\n\n    def __repr__(self):\n        return f\"<{self.__class__.__name__} {self._location}>\"\n\n    def __enter__(self):\n        if self.do_create:\n            self.do_create = False\n            self.create()\n            self.created = True\n        try:\n            self.open(exclusive=bool(self.exclusive), lock_wait=self.lock_wait, lock=self.do_lock)\n        except Exception:\n            self.close()\n            raise\n        return self\n\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        self.close()\n\n    @property\n    def id_str(self):\n        return bin_to_hex(self.id)\n\n    def create(self):\n        \"\"\"Create a new empty repository\"\"\"\n        try:\n            self.store.create()\n        except StoreBackendAlreadyExists:\n            raise self.AlreadyExists(self.url)\n        self.store.open()\n        try:\n            self.store.store(\"config/readme\", REPOSITORY_README.encode())\n            self.version = 3\n            self.store.store(\"config/version\", str(self.version).encode())\n            self.store.store(\"config/id\", bin_to_hex(os.urandom(32)).encode())\n            # we know repo/data/ still does not have any chunks stored in it,\n            # but for some stores, there might be a lot of empty directories and\n            # listing them all might be rather slow, so we better cache an empty\n            # ChunkIndex from here so that the first repo operation does not have\n            # to build the ChunkIndex the slow way by listing all the directories.\n            from borg.cache import write_chunkindex_to_repo_cache\n\n            write_chunkindex_to_repo_cache(self, ChunkIndex(), clear=True, force_write=True)\n        finally:\n            self.store.close()\n\n    def _set_id(self, id):\n        # for testing: change the id of an existing repository\n        assert self.opened\n        assert isinstance(id, bytes) and len(id) == 32\n        self.id = id\n        self.store.store(\"config/id\", bin_to_hex(id).encode())\n\n    def _lock_refresh(self):\n        if self.lock is not None:\n            self.lock.refresh()\n\n    def save_key(self, keydata):\n        # note: saving an empty key means that there is no repokey anymore\n        self.store.store(\"keys/repokey\", keydata)\n\n    def load_key(self):\n        keydata = self.store.load(\"keys/repokey\")\n        # note: if we return an empty string, it means there is no repo key\n        return keydata\n\n    def destroy(self):\n        \"\"\"Destroy the repository\"\"\"\n        self.close()\n        self.store.destroy()\n\n    def open(self, *, exclusive, lock_wait=None, lock=True):\n        assert lock_wait is not None\n        try:\n            self.store.open()\n        except StoreBackendDoesNotExist:\n            raise self.DoesNotExist(str(self._location)) from None\n        else:\n            self.store_opened = True\n        try:\n            readme = self.store.load(\"config/readme\").decode()\n        except StoreObjectNotFound:\n            raise self.DoesNotExist(str(self._location)) from None\n        if readme != REPOSITORY_README:\n            raise self.InvalidRepository(str(self._location))\n        self.version = int(self.store.load(\"config/version\").decode())\n        if self.version not in self.acceptable_repo_versions:\n            self.close()\n            raise self.InvalidRepositoryConfig(\n                str(self._location), \"repository version %d is not supported by this borg version\" % self.version\n            )\n        self.id = hex_to_bin(self.store.load(\"config/id\").decode(), length=32)\n        # important: lock *after* making sure that there actually is an existing, supported repository.\n        if lock:\n            self.lock = Lock(self.store, exclusive, timeout=lock_wait).acquire()\n        self.opened = True\n\n    def close(self):\n        if self.lock:\n            self.lock.release()\n            self.lock = None\n        if self.store_opened:\n            self.store.close()\n            self.store_opened = False\n        self.opened = False\n\n    def info(self):\n        \"\"\"return some infos about the repo (must be opened first)\"\"\"\n        # note: don't do anything expensive here or separate the lock refresh into a separate method.\n        self._lock_refresh()  # do not remove, see do_with_lock()\n        info = dict(id=self.id, version=self.version)\n        return info\n\n    def check(self, repair=False, max_duration=0):\n        \"\"\"Check repository consistency\"\"\"\n\n        def log_error(msg):\n            nonlocal obj_corrupted\n            obj_corrupted = True\n            logger.error(f\"Repo object {info.name} is corrupted: {msg}\")\n\n        def check_object(obj):\n            \"\"\"Check if obj looks valid.\"\"\"\n            hdr_size = RepoObj.obj_header.size\n            obj_size = len(obj)\n            if obj_size >= hdr_size:\n                hdr = RepoObj.ObjHeader(*RepoObj.obj_header.unpack(obj[:hdr_size]))\n                meta = obj[hdr_size : hdr_size + hdr.meta_size]\n                if hdr.meta_size != len(meta):\n                    log_error(\"metadata size incorrect.\")\n                elif hdr.meta_hash != xxh64(meta).digest():\n                    log_error(\"metadata does not match checksum.\")\n                data = obj[hdr_size + hdr.meta_size : hdr_size + hdr.meta_size + hdr.data_size]\n                if hdr.data_size != len(data):\n                    log_error(\"data size incorrect.\")\n                elif hdr.data_hash != xxh64(data).digest():\n                    log_error(\"data does not match checksum.\")\n            else:\n                log_error(\"too small.\")\n\n        # TODO: progress indicator, ...\n        partial = bool(max_duration)\n        assert not (repair and partial)\n        mode = \"partial\" if partial else \"full\"\n        LAST_KEY_CHECKED = \"cache/last-key-checked\"\n        logger.info(f\"Starting {mode} repository check\")\n        if partial:\n            # continue a past partial check (if any)",
+      "total_lines": 569
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 159,
+      "start_line": 139,
+      "end_line": 179,
+      "matched_line": "            )",
+      "excerpt": "139:                 \"data\": \"lrw\",\n140:                 \"keys\": \"lr\",\n141:                 \"locks\": \"lrwD\",  # borg needs to create/delete a shared lock here\n142:             }\n143:         elif permissions == \"write-only\":  # mostly no reading\n144:             permissions = {\n145:                 \"\": \"l\",\n146:                 \"archives\": \"lw\",\n147:                 \"cache\": \"lrwWD\",  # read allowed, e.g. for chunks.<HASH> cache\n148:                 \"config\": \"lrW\",  # W for manifest\n149:                 \"data\": \"lw\",  # no r!\n150:                 \"keys\": \"lr\",\n151:                 \"locks\": \"lrwD\",  # borg needs to create/delete a shared lock here\n152:             }\n153:         elif permissions == \"read-only\":  # mostly r/o\n154:             permissions = {\"\": \"lr\", \"locks\": \"lrwD\"}\n155:         else:\n156:             raise Error(\n157:                 f\"Invalid BORG_REPO_PERMISSIONS value: {permissions}, should be one of: \"\n158:                 f\"all, no-delete, write-only, read-only.\"\n159:             )\n160: \n161:         try:\n162:             self.store = Store(url, levels=levels_config, permissions=permissions)\n163:         except StoreBackendError as e:\n164:             raise Error(str(e))\n165:         self.store_opened = False\n166:         self.version = None\n167:         # long-running repository methods which emit log or progress output are responsible for calling\n168:         # the ._send_log method periodically to get log and progress output transferred to the borg client\n169:         # in a timely manner, in case we have a RemoteRepository.\n170:         # for local repositories ._send_log can be called also (it will just do nothing in that case).\n171:         self._send_log = send_log_cb or (lambda: None)\n172:         self.do_create = create\n173:         self.created = False\n174:         self.acceptable_repo_versions = (3,)\n175:         self.opened = False\n176:         self.lock = None\n177:         self.do_lock = lock\n178:         self.lock_wait = lock_wait\n179:         self.exclusive = exclusive"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__init__",
+      "start_line": 97,
+      "end_line": 179,
+      "source": "    def __init__(\n        self,\n        path_or_location,\n        create=False,\n        exclusive=False,\n        lock_wait=1.0,\n        lock=True,\n        send_log_cb=None,\n        permissions=None,\n    ):\n        if isinstance(path_or_location, Location):\n            location = path_or_location\n            if location.proto == \"file\":\n                url = Path(location.path).as_uri()\n            else:\n                url = location.processed  # location as given by user, processed placeholders\n        else:\n            url = Path(path_or_location).absolute().as_uri()\n            location = Location(url)\n        self._location = location\n        self.url = url\n        # lots of stuff in data: use 2 levels by default (data/00/00/ .. data/ff/ff/ dirs)!\n        data_levels = int(os.environ.get(\"BORG_STORE_DATA_LEVELS\", \"2\"))\n        levels_config = {\n            \"archives/\": [0],\n            \"cache/\": [0],\n            \"config/\": [0],\n            \"data/\": [data_levels],\n            \"keys/\": [0],\n            \"locks/\": [0],\n        }\n        # Get permissions from parameter or environment variable\n        permissions = permissions if permissions is not None else os.environ.get(\"BORG_REPO_PERMISSIONS\", \"all\")\n\n        if permissions == \"all\":\n            permissions = None  # permissions system will not be used\n        elif permissions == \"no-delete\":  # mostly no delete, no overwrite\n            permissions = {\n                \"\": \"lr\",\n                \"archives\": \"lrw\",\n                \"cache\": \"lrwWD\",  # WD for chunks.<HASH>, last-key-checked, ...\n                \"config\": \"lrW\",  # W for manifest\n                \"data\": \"lrw\",\n                \"keys\": \"lr\",\n                \"locks\": \"lrwD\",  # borg needs to create/delete a shared lock here\n            }\n        elif permissions == \"write-only\":  # mostly no reading\n            permissions = {\n                \"\": \"l\",\n                \"archives\": \"lw\",\n                \"cache\": \"lrwWD\",  # read allowed, e.g. for chunks.<HASH> cache\n                \"config\": \"lrW\",  # W for manifest\n                \"data\": \"lw\",  # no r!\n                \"keys\": \"lr\",\n                \"locks\": \"lrwD\",  # borg needs to create/delete a shared lock here\n            }\n        elif permissions == \"read-only\":  # mostly r/o\n            permissions = {\"\": \"lr\", \"locks\": \"lrwD\"}\n        else:\n            raise Error(\n                f\"Invalid BORG_REPO_PERMISSIONS value: {permissions}, should be one of: \"\n                f\"all, no-delete, write-only, read-only.\"\n            )\n\n        try:\n            self.store = Store(url, levels=levels_config, permissions=permissions)\n        except StoreBackendError as e:\n            raise Error(str(e))\n        self.store_opened = False\n        self.version = None\n        # long-running repository methods which emit log or progress output are responsible for calling\n        # the ._send_log method periodically to get log and progress output transferred to the borg client\n        # in a timely manner, in case we have a RemoteRepository.\n        # for local repositories ._send_log can be called also (it will just do nothing in that case).\n        self._send_log = send_log_cb or (lambda: None)\n        self.do_create = create\n        self.created = False\n        self.acceptable_repo_versions = (3,)\n        self.opened = False\n        self.lock = None\n        self.do_lock = lock\n        self.lock_wait = lock_wait\n        self.exclusive = exclusive"
+    },
+    "imports": {
+      "imports": [
+        "os",
+        "time",
+        "pathlib:Path",
+        "xxhash:xxh64",
+        "borgstore.store:Store",
+        "borgstore.store:ObjectNotFound",
+        "borgstore.backends.errors:BackendError",
+        "borgstore.backends.errors:BackendDoesNotExist",
+        "borgstore.backends.errors:BackendAlreadyExists",
+        "constants:*",
+        "hashindex:ChunkIndex",
+        "hashindex:ChunkIndexEntry",
+        "helpers:Error",
+        "helpers:ErrorWithTraceback",
+        "helpers:IntegrityError",
+        "helpers:Location",
+        "helpers:bin_to_hex",
+        "helpers:hex_to_bin",
+        "storelocking:Lock",
+        "logger:create_logger",
+        "manifest:NoManifestError",
+        "repoobj:RepoObj",
+        "borg.cache:write_chunkindex_to_repo_cache",
+        "cache:write_chunkindex_to_repo_cache"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/borgbackup/borg/master/README.rst",
+      "content_excerpt": "This is borg2!\n--------------\n\nPlease note that this is the README for borg2 / master branch.\n\nFor the stable version's docs, please see here:\n\nhttps://borgbackup.readthedocs.io/en/stable/\n\nBorg2 is currently in beta testing and might get major and/or\nbreaking changes between beta releases (and there is no beta to\nnext-beta upgrade code, so you will have to delete and re-create repos).\n\nThus, **DO NOT USE BORG2 FOR YOUR PRODUCTION BACKUPS!** Please help with\ntesting it, but set it up *additionally* to your production backups.\n\nTODO: the screencasts need a remake using borg2, see here:\n\nhttps://github.com/borgbackup/borg/issues/6303\n\n\nWhat is BorgBackup?\n-------------------\n\nBorgBackup (short: Borg) is a deduplicating backup program.\nOptionally, it supports compression and authenticated encryption.\n\nThe main goal of Borg is to provide an efficient and secure way to back up data.\nThe data deduplication technique used makes Borg suitable for daily backups\nsince only changes are stored.\nThe authenticated encryption technique makes it suitable for backups to targets not\nfully trusted.\n\nSee the `installation manual`_ or, if you have already\ndownloaded Borg, ``docs/installation.rst`` to get started with Borg.\nThere is also an `offline documentation`_ available, in multiple formats.\n\n.. _installation manual: https://borgbackup.readthedocs.io/en/master/installation.html\n.. _offline documentation: https://readthedocs.org/projects/borgbackup/downloads\n\nMain features\n~~~~~~~~~~~~~\n\n**Space efficient storage**\n  Deduplication based on content-defined chunking is used to reduce the numbe"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 8,
+      "items": [
+        {
+          "name": "archive_test.py",
+          "path": "src/borg/testsuite/archive_test.py",
+          "sha": "f05b22dd68a9befd6679ba1ef4b65d169f68f3c7",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/archive_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "remote_test.py",
+          "path": "src/borg/testsuite/remote_test.py",
+          "sha": "6f01fc334d6d58914dec9f7a3d9cb197c18b04b5",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/remote_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "fslocking_test.py",
+          "path": "src/borg/testsuite/fslocking_test.py",
+          "sha": "0d3ff9473fa8c2eff61eca35047a32ee55743478",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/fslocking_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "reader_test.py",
+          "path": "src/borg/testsuite/chunkers/reader_test.py",
+          "sha": "ff56350ee114d1116c95eca081041c0d61379fc6",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/chunkers/reader_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/borg/testsuite/__init__.py",
+          "sha": "0a75d743d8991d2d9c68776a21bb2479340cc874",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/__init__.py",
+          "score": 1.0
+        },
+        {
+          "name": "repository_test.py",
+          "path": "src/borg/testsuite/repository_test.py",
+          "sha": "112d2094d9a632f62b1e9c7684852936119eb853",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/repository_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "crypto_test.py",
+          "path": "src/borg/testsuite/crypto/crypto_test.py",
+          "sha": "edaa8b9cfb71c670c13fda0ecdbefff97ef72f3e",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/crypto/crypto_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "legacyrepository_test.py",
+          "path": "src/borg/testsuite/legacyrepository_test.py",
+          "sha": "a97a094c9730ff43fb6ad919c2fad1f6fe38dbf5",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/testsuite/legacyrepository_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "selftest.py",
+          "path": "src/borg/selftest.py",
+          "sha": "72f3926d255668bff9861424e46f6342c31990de",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/selftest.py",
+          "score": 1.0
+        },
+        {
+          "name": "errors.py",
+          "path": "src/borg/helpers/errors.py",
+          "sha": "71f2022e24359ff9aa4d3afb7924483b2721e325",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/helpers/errors.py",
+          "score": 1.0
+        },
+        {
+          "name": "widgets.py",
+          "path": "src/borg/cockpit/widgets.py",
+          "sha": "efae7b42b9d8862a5a98949204834884d05b9272",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/cockpit/widgets.py",
+          "score": 1.0
+        },
+        {
+          "name": "msgpack.py",
+          "path": "src/borg/helpers/msgpack.py",
+          "sha": "772110ceb914d166d9d32ac3c013635dd28628ec",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/helpers/msgpack.py",
+          "score": 1.0
+        },
+        {
+          "name": "low_level.pyi",
+          "path": "src/borg/crypto/low_level.pyi",
+          "sha": "9f8d619501092dc96395a9dd461b92ce385f0005",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/crypto/low_level.pyi",
+          "score": 1.0
+        },
+        {
+          "name": "cache.py",
+          "path": "src/borg/cache.py",
+          "sha": "c69553f840afd344ceef1ce1ec7094acdf66114b",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/cache.py",
+          "score": 1.0
+        },
+        {
+          "name": "reader.pyi",
+          "path": "src/borg/chunkers/reader.pyi",
+          "sha": "53e92188e56e2d4d0159dec01b165575485490fe",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/chunkers/reader.pyi",
+          "score": 1.0
+        },
+        {
+          "name": "item.pyx",
+          "path": "src/borg/item.pyx",
+          "sha": "184379b305a46a957d5304cfee72e8bb245be8ad",
+          "html_url": "https://github.com/borgbackup/borg/blob/6bc41465a404730d142e9df22e07f73b74bf3f00/src/borg/item.pyx",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/borg",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/borg/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "src/borg/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "_item.c",
+          "path": "src/borg/_item.c",
+          "type": "file"
+        },
+        {
+          "name": "archive.py",
+          "path": "src/borg/archive.py",
+          "type": "file"
+        },
+        {
+          "name": "archiver",
+          "path": "src/borg/archiver",
+          "type": "dir"
+        },
+        {
+          "name": "cache.py",
+          "path": "src/borg/cache.py",
+          "type": "file"
+        },
+        {
+          "name": "checksums.pyi",
+          "path": "src/borg/checksums.pyi",
+          "type": "file"
+        },
+        {
+          "name": "checksums.pyx",
+          "path": "src/borg/checksums.pyx",
+          "type": "file"
+        },
+        {
+          "name": "chunkers",
+          "path": "src/borg/chunkers",
+          "type": "dir"
+        },
+        {
+          "name": "cockpit",
+          "path": "src/borg/cockpit",
+          "type": "dir"
+        },
+        {
+          "name": "compress.pyi",
+          "path": "src/borg/compress.pyi",
+          "type": "file"
+        },
+        {
+          "name": "compress.pyx",
+          "path": "src/borg/compress.pyx",
+          "type": "file"
+        },
+        {
+          "name": "conftest.py",
+          "path": "src/borg/conftest.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "src/borg/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "crypto",
+          "path": "src/borg/crypto",
+          "type": "dir"
+        },
+        {
+          "name": "fslocking.py",
+          "path": "src/borg/fslocking.py",
+          "type": "file"
+        },
+        {
+          "name": "fuse.py",
+          "path": "src/borg/fuse.py",
+          "type": "file"
+        },
+        {
+          "name": "fuse_impl.py",
+          "path": "src/borg/fuse_impl.py",
+          "type": "file"
+        },
+        {
+          "name": "hashindex.pyi",
+          "path": "src/borg/hashindex.pyi",
+          "type": "file"
+        },
+        {
+          "name": "hashindex.pyx",
+          "path": "src/borg/hashindex.pyx",
+          "type": "file"
+        },
+        {
+          "name": "helpers",
+          "path": "src/borg/helpers",
+          "type": "dir"
+        },
+        {
+          "name": "hlfuse.py",
+          "path": "src/borg/hlfuse.py",
+          "type": "file"
+        },
+        {
+          "name": "item.pyi",
+          "path": "src/borg/item.pyi",
+          "type": "file"
+        },
+        {
+          "name": "item.pyx",
+          "path": "src/borg/item.pyx",
+          "type": "file"
+        },
+        {
+          "name": "legacyremote.py",
+          "path": "src/borg/legacyremote.py",
+          "type": "file"
+        },
+        {
+          "name": "legacyrepository.py",
+          "path": "src/borg/legacyrepository.py",
+          "type": "file"
+        },
+        {
+          "name": "logger.py",
+          "path": "src/borg/logger.py",
+          "type": "file"
+        },
+        {
+          "name": "manifest.py",
+          "path": "src/borg/manifest.py",
+          "type": "file"
+        },
+        {
+          "name": "paperkey.html",
+          "path": "src/borg/paperkey.html",
+          "type": "file"
+        },
+        {
+          "name": "patterns.py",
+          "path": "src/borg/patterns.py",
+          "type": "file"
+        },
+        {
+          "name": "platform",
+          "path": "src/borg/platform",
+          "type": "dir"
+        },
+        {
+          "name": "platformflags.py",
+          "path": "src/borg/platformflags.py",
+          "type": "file"
+        },
+        {
+          "name": "remote.py",
+          "path": "src/borg/remote.py",
+          "type": "file"
+        },
+        {
+          "name": "repoobj.py",
+          "path": "src/borg/repoobj.py",
+          "type": "file"
+        },
+        {
+          "name": "repository.py",
+          "path": "src/borg/repository.py",
+          "type": "file"
+        },
+        {
+          "name": "selftest.py",
+          "path": "src/borg/selftest.py",
+          "type": "file"
+        },
+        {
+          "name": "storelocking.py",
+          "path": "src/borg/storelocking.py",
+          "type": "file"
+        },
+        {
+          "name": "testsuite",
+          "path": "src/borg/testsuite",
+          "type": "dir"
+        },
+        {
+          "name": "upgrade.py",
+          "path": "src/borg/upgrade.py",
+          "type": "file"
+        },
+        {
+          "name": "version.py",
+          "path": "src/borg/version.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/borg/__init__.py"
+        },
+        {
+          "name": "__main__.py",
+          "path": "src/borg/__main__.py"
+        },
+        {
+          "name": "_item.c",
+          "path": "src/borg/_item.c"
+        },
+        {
+          "name": "archive.py",
+          "path": "src/borg/archive.py"
+        },
+        {
+          "name": "cache.py",
+          "path": "src/borg/cache.py"
+        },
+        {
+          "name": "checksums.pyi",
+          "path": "src/borg/checksums.pyi"
+        },
+        {
+          "name": "checksums.pyx",
+          "path": "src/borg/checksums.pyx"
+        },
+        {
+          "name": "compress.pyi",
+          "path": "src/borg/compress.pyi"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/borg/repository.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ba6706395a41f949b673b191b369b91216979e0b",
+          "html_url": "https://github.com/borgbackup/borg/commit/ba6706395a41f949b673b191b369b91216979e0b",
+          "message": "use xxhash from PyPI, fixes #6535",
+          "author": "Suryansh Pal",
+          "date": "2026-03-08T12:06:01Z"
+        },
+        {
+          "sha": "ffe360a2ec68d767bada2b41a2555d9724937208",
+          "html_url": "https://github.com/borgbackup/borg/commit/ffe360a2ec68d767bada2b41a2555d9724937208",
+          "message": "fix typos found by codespell\n\n- backupped → backed-up (docs/faq.rst)\n- splitted → expected (src/borg/testsuite/xattr_test.py)\n- uptodate → up-to-date (docs/development.rst, src/borg/repository.py)\n\nCloses #9295",
+          "author": "Mrityunjay Raj",
+          "date": "2026-02-12T18:46:54Z"
+        },
+        {
+          "sha": "88581d1bb8a6cf49fb41f9c6c1c5f98dbde95672",
+          "html_url": "https://github.com/borgbackup/borg/commit/88581d1bb8a6cf49fb41f9c6c1c5f98dbde95672",
+          "message": "Improve Windows path handling with forward slash standardization\n\nThis commit implements a comprehensive approach to Windows path compatibility\nby standardizing on forward slashes (/) for all internal path representations\nwhile maintaining cross-platform archive compatibility.\n\nCore Strategy:\n- All ",
+          "author": "Thomas Waldmann",
+          "date": "2026-01-25T10:01:25Z"
+        },
+        {
+          "sha": "0f0566ea6309b6a7663f0d224269eab5a3f8a20e",
+          "html_url": "https://github.com/borgbackup/borg/commit/0f0566ea6309b6a7663f0d224269eab5a3f8a20e",
+          "message": "correctly construct file: URL on windows",
+          "author": "Thomas Waldmann",
+          "date": "2026-01-27T11:40:32Z"
+        },
+        {
+          "sha": "9e2d8492e18f31359013790e2369e2477da40211",
+          "html_url": "https://github.com/borgbackup/borg/commit/9e2d8492e18f31359013790e2369e2477da40211",
+          "message": "cosmetic fix: black format src",
+          "author": "Thomas Waldmann",
+          "date": "2025-10-27T22:08:21Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ Rather mmap this loads entire",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/borg/repository.py",
+      "satd_line": 159,
+      "last_commit": {
+        "sha": "ba6706395a41f949b673b191b369b91216979e0b",
+        "html_url": "https://github.com/borgbackup/borg/commit/ba6706395a41f949b673b191b369b91216979e0b",
+        "message": "use xxhash from PyPI, fixes #6535",
+        "author": "Suryansh Pal",
+        "date": "2026-03-08T12:06:01Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

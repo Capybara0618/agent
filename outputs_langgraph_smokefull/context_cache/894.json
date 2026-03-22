@@ -1,0 +1,358 @@
+{
+  "task_id": "894",
+  "repo_owner": "saopicc",
+  "repo_name": "ddfacet",
+  "file_path": "DDFacet/Imager/ClassFrequencyMachine.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T02:08:00+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T02:08:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T02:08:09+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "DDFacet/Imager/ClassFrequencyMachine.py",
+    "original_code": "# TODO - more reliable way to do this, maybe store in dict keyed on components\ndef EvalPolyApparent(self, coeffs):\n    \"\"\"\n    Gives the apparent flux for coeffs given beam in this facet\n    Args:\n        coeffs: the coefficients of the polynomial in order corresponding to (1,v,v**2,...)\n        Freqs: the frequencies at which to evaluate the polynomial\n    Returns:\n        The polynomial evaluated at Freqs\n    \"\"\"\n    return self.SAX.dot(coeffs)",
+    "satd_comment": "# TODO - more reliable way to do this, maybe store in dict keyed on components",
+    "target_file": {
+      "ok": true,
+      "path": "DDFacet/Imager/ClassFrequencyMachine.py",
+      "sha": "a858d0d2eb49d79f08fff4797d50aec8455de72e",
+      "download_url": "https://raw.githubusercontent.com/saopicc/DDFacet/master/DDFacet/Imager/ClassFrequencyMachine.py",
+      "content_excerpt": "'''\nDDFacet, a facet-based radio imaging package\nCopyright (C) 2013-2016  Cyril Tasse, l'Observatoire de Paris,\nSKA South Africa, Rhodes University\n\nThis program is free software; you can redistribute it and/or\nmodify it under the terms of the GNU General Public License\nas published by the Free Software Foundation; either version 2\nof the License, or (at your option) any later version.\n\nThis program is distributed in the hope that it will be useful,\nbut WITHOUT ANY WARRANTY; without even the implied warranty of\nMERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\nGNU General Public License for more details.\n\nYou should have received a copy of the GNU General Public License\nalong with this program; if not, write to the Free Software\nFoundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.\n'''\n\nfrom __future__ import absolute_import\nfrom __future__ import division\nfrom __future__ import print_function\n\nfrom DDFacet.compatibility import range\n\nimport pdb\nimport numpy as np\nimport warnings\nwarnings.simplefilter('ignore', np.exceptions.RankWarning)\nfrom scipy.optimize import curve_fit, fmin_l_bfgs_b\nfrom DDFacet.Other import logger\nfrom DDFacet.Imager.ClassScaleMachine import Store\nlog = logger.getLogger(\"ClassFreqMachine\")\n\nclass ClassFrequencyMachine(object):\n    \"\"\"\n    Interface to fit frequency axis in model image. All fitting is currently based on some polynomial model in normalised frequencies (v/v_0).\n    For the alpha map the fit happens in log space.\n        Initialisation:\n                ModelCube   = A cube containing the model image with shape [NChannel,NPol,Npix,Npix]\n                Freqs       = The gridding frequencies\n                Freqsp      = The degridding frequencies\n                ref_freq    = The reference frequency\n        Methods:\n                getFitMask  : Creates a mask to fit models to\n                setDesMat   : Creates a design matrix in either log or normal space\n                FitAlphaMap : Fits an alpha map to pixels in the model image above a user specified threshold\n                EvalAlphaMap: Evaluates the model image from the alpha map\n                FitPolyCube : Fits a polynomial to pixels in the model image above a user specified threshhold\n                EvalPoly    : Evaluates the polynomial from the computed coefficients\n                FitGP       : Fits a Gaussian process to the spectral axis of the model image to pixels above a user specified threshold\n\n    \"\"\"\n    def __init__(self, Freqs, Freqsp, ref_freq, GD=None, weights=None, PSFServer=None):\n        self.Freqs = np.asarray(Freqs,dtype=np.float32)\n        # Use the longer of the two frequency arrays\n        self.Freqsp = np.asarray(Freqsp,dtype=np.float32)\n        self.nchan = self.Freqs.size\n        self.nchan_degrid = self.Freqsp.size\n        self.ref_freq = ref_freq\n        freq_diffs = np.abs(self.Freqsp - self.ref_freq)\n        self.ref_freq_index = np.argwhere(freq_diffs == freq_diffs.min()).squeeze()\n        if self.ref_freq_index.size > 1:\n            self.ref_freq_index = self.ref_freq_index[0]\n        self.GD = GD\n        self.CurrentFacet = 999999\n        self.DicoBeamFactors = {}\n        self.BeamEnable = self.GD[\"Beam\"][\"Model\"] is not None\n        self.weight = weights if weights is not None else np.ones(self.nchan, dtype=np.float32)\n\n        self.DeconvMode = self.GD[\"Deconv\"][\"Mode\"]\n        # in case we want to use the full channel resolution we need to get the full freqs from somewhere\n        if PSFServer is not None:\n            self.PSFServer = PSFServer\n        else:\n            mode = self.GD['Deconv']['Mode']\n            if mode == 'Hogbom' or mode == 'WSCMS':\n                print(\"No PSFServer provided, unable to use new freq fit mode\", file=log)\n\n    def set_Method(self, mode=\"Poly\"):\n        \"\"\"\n        Here we set the method used to fit the frequency axis\n        :param mode: the mode to use. options are Poly for normal polynomial, GPR for reduced rank GPR (deprecated)\n                     or iPoly for integrated polynomial (similar to what wsclean does)\n        :return: \n        \"\"\"\n        if self.nchan==1: #hack to deal with a single channel\n            self.Fit = lambda vals, a, b: vals\n            self.Eval = lambda vals: vals # this will just be the value in that channel\n            self.Eval_Degrid = lambda vals, Freqs: np.repeat(vals[0], Freqs.size)\n            # Freqs unused here - nothing to be done but use the same model through\n            # the entire passband. LB - Give SPI of -0.7 maybe?\n        else:\n            if mode == \"Poly\":\n                self.Eval_Degrid = lambda coeffs, Freqs: self.EvalPoly(coeffs, Freqsp=Freqs)\n                if self.GD['Output'][\"Mode\"] != 'Predict':  # None of this is needed in Predict mode\n                    # set order\n                    if self.GD[\"Deconv\"][\"Mode\"] == 'Hogbom':\n                        self.order = self.GD[\"Hogbom\"][\"PolyFitOrder\"]\n                    elif self.GD[\"Deconv\"][\"Mode\"] == 'WSCMS':\n                        self.order = self.GD[\"WSCMS\"][\"NumFreqBasisFuncs\"]\n                    print(\"Using %i order polynomial for frequency fit\" % self.order, file=log)\n                    # construct design matrix at gridding channel resolution\n                    self.Xdes = self.setDesMat(self.Freqs, order=self.order, mode=\"Mono\")\n                    self.Xdesp = self.setDesMat(self.Freqsp, order=self.order, mode=\"Mono\")\n                    self.Xdes_ref = self.setDesMat(self.ref_freq, order=self.order, mode=\"Mono\")\n\n\n                    # get frequencies at full channel resolution\n                    self.freqs_full = []\n                    for iCh in range(self.nchan):\n                        self.freqs_full.append(self.PSFServer.DicoVariablePSF[\"freqs\"][iCh]\n                        if hasattr(self, \"PSFServer\") and self.PSFServer is not None else [self.Freqs[iCh]])\n                    self.freqs_full = np.concatenate(self.freqs_full)\n                    self.nchan_full = np.size(self.freqs_full)\n\n                    # set design matrix at full channel resolution\n                    self.Xdes_full = self.setDesMat(self.freqs_full, order=self.order,\n                                                    mode=\"Mono\")\n\n                    # # build the S matrix\n                    # ChanMappingGrid = self.PSFServer.DicoMappingDesc[\"ChanMappingGrid\"] \n                    # self.S = np.zeros([self.nchan, self.nchan_full], dtype=np.float32)\n                    # for iChannel in range(self.nchan):\n                    #     active_chans = [ChanMappingGrid[iMS]==iChannel for iMS in ChanMappingGrid.keys()]\n                    #     nchunk = sum([a.sum() for a in active_chans])   # count all active channels\n                    #     w = 1.0/nchunk if nchunk else 0\n                    #     for a in active_chans:\n                    #         self.S[iChannel, a] = 1.0/nchunk\n\n                    # dictionaries to hold pseudo inverses and design matrices\n                    self.pinv_dict = {}\n                    self.sax_dict = {}\n\n                    self.Fit = self.FitPoly\n                    self.Eval = self.EvalPolyApparent\n\n            else:\n                raise NotImplementedError(\"Frequency fit mode %s not supported\" % mode)\n\n    def FitSPIComponents(self, FitCube, nu, nu0):\n        \"\"\"\n        Slow version using serial scipy.optimise.curve_fit to fit the spectral indices.\n        Used as a fallback if africanus version not found\n        :param FitCube: (ncomps, nfreqs) data array  \n        :param nu: freqs\n        :param nu0: ref freq\n        :return: \n        \"\"\"\n        def spi_func(nu, I0, alpha):\n            return I0 * nu ** alpha\n        nchan, ncomps = FitCube.shape\n        Iref = np.zeros([ncomps])\n        varIref = np.zeros([ncomps])\n        alpha = np.zeros([ncomps])\n        varalpha = np.zeros([ncomps])\n        I0 = 1.0\n        alpha0 = -0.7\n        for i in range(ncomps):\n            popt, pcov = curve_fit(spi_func, nu/nu0, FitCube[:, i], p0=np.array([I0, alpha0]))\n            Iref[i] = popt[0]\n            varIref[i] = pcov[0,0]\n            alpha[i] = popt[1]\n            varalpha[i] = pcov[1,1]\n        return alpha, varalpha, Iref, varIref\n\n    def setDesMat(self, Freqs, order=None, mode=\"Normal\"):\n        \"\"\"\n        This function creates the design matrix. Use any linear model your heart desires\n        Args:\n            order   = The number of basis functions to use\n            mode    = sets the kind of basis functions to use. Options are\n                    - \"Normal\" for monomial model\n                    - \"log\" for log monomial model\n                    - \"Cyril\" for Cyril's sum of power law model\n                    - \"Andre\" for Andre's integrated polynomial model\n        Returns:\n            Xdesign    = The design matrix [1, (v/v_0), (v/v_0)**2, ...]\n\n        \"\"\"\n        if order is None:\n            order = self.order\n        if mode == \"Mono\" or mode == \"Poly\":\n            # Construct vector of frequencies\n            w = (Freqs / self.ref_freq).reshape(Freqs.size, 1)\n            # create tiled array and raise each column to the correct power\n            Xdesign = np.tile(w, order) ** np.arange(0, order)\n        elif mode == \"log\":\n            # Construct vector of frequencies\n            w = np.log(Freqs / self.ref_freq).reshape(Freqs.size, 1)\n            # create tiled array and raise each column to the correct power\n            Xdesign = np.tile(w, order) ** np.arange(0, order)\n        else:\n            raise NotImplementedError(\"Frequency basis %s not supported\" % mode)\n        return Xdesign\n\n    # this is taken directly from ClassSpectralFunctions (its all the functionality we need in here)\n    def GiveBeamFactorsFacet(self, iFacet):\n        if iFacet in self.DicoBeamFactors:\n            return self.DicoBeamFactors[iFacet]\n\n        SumJonesChan = self.PSFServer.DicoMappingDesc[\"SumJonesChan\"]\n        ChanMappingGrid = self.PSFServer.DicoMappingDesc[\"ChanMappingGrid\"]\n\n        ChanMappingGridChan = self.PSFServer.DicoMappingDesc[\"ChanMappingGridChan\"]\n        ListBeamFactor = []\n        ListBeamFactorWeightSq = []\n        for iChannel in range(self.nchan):\n            nfreq = len(self.PSFServer.DicoMappingDesc[\"freqs\"][iChannel])\n            ThisSumJonesChan = np.zeros(nfreq, np.float64)\n            ThisSumJonesChanWeightSq = np.zeros(nfreq, np.float64)\n            for iMS in SumJonesChan.keys():\n                ind = np.where(ChanMappingGrid[iMS] == iChannel)[0]\n                channels = ChanMappingGridChan[iMS][ind]\n                ThisSumJonesChan[channels] += SumJonesChan[iMS][iFacet, 0, ind]\n                ThisSumJonesChanWeightSq[channels] += SumJonesChan[iMS][iFacet, 1, ind]\n            ListBeamFactor.append(ThisSumJonesChan)\n            ListBeamFactorWeightSq.append(ThisSumJonesChanWeightSq)\n\n        self.DicoBeamFactors[iFacet] = ListBeamFactor, ListBeamFactorWeightSq, self.PSFServer.DicoMappingDesc['MeanJonesBand'][iFacet]\n\n        return ListBeamFactor, ListBeamFactorWeightSq, self.PSFServer.DicoMappingDesc['MeanJonesBand'][iFacet]\n\n    def compute_pseudo_inverse(self, A, W):\n        \"\"\"\n        Computes the pseudo-inverse of design matrix A for the facet \n        weighted by the WeightsChansImages\n        \"\"\"\n        sqrtW = np.sqrt(W)\n        WX = sqrtW[:, None] * A\n        if self.nchan >= self.order:\n            # get left pinv\n            XTX = WX.T.dot(WX)\n            XTXinv = np.linalg.inv(XTX)\n            pinv = XTXinv.dot(WX.T)\n        else:\n            # get right pinv\n            XXT = WX.dot(WX.T)\n            XXTinv = np.linalg.inv(XXT)\n            pinv = WX.T.dot(XXTinv)\n        return pinv\n\n    def give_pseudo_inverse(self, JonesNorm, WeightsChansImages):\n        \"\"\"\n        Checks if we need to recompute the pseudo-inverse and recomputes it if necessary\n        :return: \n        \"\"\"\n        if self.BeamEnable:\n            key = self.PSFServer.iFacet\n            if key not in self.sax",
+      "total_lines": 394
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "__future__:division",
+        "__future__:print_function",
+        "DDFacet.compatibility:range",
+        "pdb",
+        "numpy",
+        "warnings",
+        "scipy.optimize:curve_fit",
+        "scipy.optimize:fmin_l_bfgs_b",
+        "DDFacet.Other:logger",
+        "DDFacet.Imager.ClassScaleMachine:Store"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/saopicc/DDFacet/master/README.rst",
+      "content_excerpt": "DDFacet\n###################################\nA facet-based radio imaging package\n\nCopyright (C) 2013-2024  Cyril Tasse, l'Observatoire de Paris,\nSKA South Africa, South African Radio Astronomy Observatory, Rhodes University\n\nThis program is free software; you can redistribute it and/or\nmodify it under the terms of the GNU General Public License\nas published by the Free Software Foundation; either version 2\nof the License, or (at your option) any later version.\n\nThis program is distributed in the hope that it will be useful,\nbut WITHOUT ANY WARRANTY; without even the implied warranty of\nMERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\nGNU General Public License for more details.\n\n(Users / Recommended - Docker based) Run via. Stimela >= 0.2.9 \n===============================================================\nWe recommend running the imaging package through the Stimela framework <https://github.com/SpheMakh/Stimela>, built on a\nwidely supported containerization framework, called Docker. This package is on PiPY and and is purely python-based, requiring no dependencies other than Docker. It gives the user instantanious access to other commonly used packages such as Meqtrees, CASA, etc.\n\n\n1. Install the latest docker from the Docker PPA: <https://docs.docker.com/engine/installation/linux/ubuntu/>. If you're not running Debian then select the suitable distribution. \n\n2. Ensure to add your user to the ``docker`` group. On Debian-based systems this can be done as follows::\n\n        $ sudo usermod -aG docker $USER\n\n3. Set up a virtual environment, activate it and upgrade pi"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "EvalPolyApparent test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"EvalPolyApparent(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "ClassFrequencyMachine.py",
+          "path": "DDFacet/Imager/ClassFrequencyMachine.py",
+          "sha": "a858d0d2eb49d79f08fff4797d50aec8455de72e",
+          "html_url": "https://github.com/saopicc/DDFacet/blob/f7b0b2aaadc34bd8d21accf1d9f8dc61ccb5b670/DDFacet/Imager/ClassFrequencyMachine.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "DDFacet/Imager",
+      "count": 27,
+      "entries": [
+        {
+          "name": "ClassCasaImage.py",
+          "path": "DDFacet/Imager/ClassCasaImage.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassDDEGridMachine.py",
+          "path": "DDFacet/Imager/ClassDDEGridMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassDeconvMachine.py",
+          "path": "DDFacet/Imager/ClassDeconvMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassFacetMachine.py",
+          "path": "DDFacet/Imager/ClassFacetMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassFacetMachineTessel.py",
+          "path": "DDFacet/Imager/ClassFacetMachineTessel.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassFrequencyMachine.py",
+          "path": "DDFacet/Imager/ClassFrequencyMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassGainMachine.py",
+          "path": "DDFacet/Imager/ClassGainMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassImToGrid.py",
+          "path": "DDFacet/Imager/ClassImToGrid.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassImageDeconvMachine.py",
+          "path": "DDFacet/Imager/ClassImageDeconvMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassImageNoiseMachine.py",
+          "path": "DDFacet/Imager/ClassImageNoiseMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassMaskMachine.py",
+          "path": "DDFacet/Imager/ClassMaskMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassModelMachine.py",
+          "path": "DDFacet/Imager/ClassModelMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassMontblancMachine.py",
+          "path": "DDFacet/Imager/ClassMontblancMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassPSFServer.py",
+          "path": "DDFacet/Imager/ClassPSFServer.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassScaleMachine.py",
+          "path": "DDFacet/Imager/ClassScaleMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "ClassWeighting.py",
+          "path": "DDFacet/Imager/ClassWeighting.py",
+          "type": "file"
+        },
+        {
+          "name": "GA",
+          "path": "DDFacet/Imager/GA",
+          "type": "dir"
+        },
+        {
+          "name": "HOGBOM",
+          "path": "DDFacet/Imager/HOGBOM",
+          "type": "dir"
+        },
+        {
+          "name": "MSMF",
+          "path": "DDFacet/Imager/MSMF",
+          "type": "dir"
+        },
+        {
+          "name": "ModCF.py",
+          "path": "DDFacet/Imager/ModCF.py",
+          "type": "file"
+        },
+        {
+          "name": "ModModelMachine.py",
+          "path": "DDFacet/Imager/ModModelMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "MultiSliceDeconv",
+          "path": "DDFacet/Imager/MultiSliceDeconv",
+          "type": "dir"
+        },
+        {
+          "name": "SASIR",
+          "path": "DDFacet/Imager/SASIR",
+          "type": "dir"
+        },
+        {
+          "name": "SSD",
+          "path": "DDFacet/Imager/SSD",
+          "type": "dir"
+        },
+        {
+          "name": "SSD2",
+          "path": "DDFacet/Imager/SSD2",
+          "type": "dir"
+        },
+        {
+          "name": "WSCMS",
+          "path": "DDFacet/Imager/WSCMS",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "DDFacet/Imager/__init__.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "ClassCasaImage.py",
+          "path": "DDFacet/Imager/ClassCasaImage.py"
+        },
+        {
+          "name": "ClassDDEGridMachine.py",
+          "path": "DDFacet/Imager/ClassDDEGridMachine.py"
+        },
+        {
+          "name": "ClassDeconvMachine.py",
+          "path": "DDFacet/Imager/ClassDeconvMachine.py"
+        },
+        {
+          "name": "ClassFacetMachine.py",
+          "path": "DDFacet/Imager/ClassFacetMachine.py"
+        },
+        {
+          "name": "ClassFacetMachineTessel.py",
+          "path": "DDFacet/Imager/ClassFacetMachineTessel.py"
+        },
+        {
+          "name": "ClassGainMachine.py",
+          "path": "DDFacet/Imager/ClassGainMachine.py"
+        },
+        {
+          "name": "ClassImToGrid.py",
+          "path": "DDFacet/Imager/ClassImToGrid.py"
+        },
+        {
+          "name": "ClassImageDeconvMachine.py",
+          "path": "DDFacet/Imager/ClassImageDeconvMachine.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "DDFacet/Imager/ClassFrequencyMachine.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "5b554372900ec658cb862f38004436e393a6afab",
+          "html_url": "https://github.com/saopicc/DDFacet/commit/5b554372900ec658cb862f38004436e393a6afab",
+          "message": "Port to Python v3.12 and Numpy 2.x (#905)\n\n\n* Simplify dockerfiles to use kern installations\n\n* add 24.04 dockerfile\n* python 3.12 port\n* additional primary beam options to invert rotation and offset pointing centre from phase centre\n* change bool8 to bool_\n* pin upper bounds for dependency versions",
+          "author": "Benjamin Hugo",
+          "date": "2026-01-23T06:44:12Z"
+        },
+        {
+          "sha": "48f5d49d9dcb3fa35780a7d353349c020a98f5e6",
+          "html_url": "https://github.com/saopicc/DDFacet/commit/48f5d49d9dcb3fa35780a7d353349c020a98f5e6",
+          "message": "Full stokes hogbom clean (#771)\n\nAdds joint-polarization CLEAN to hogbom along with necessary changes to the\r\ngrinding and degridding backend to support I, IQ, IU, IV, IQU, IQUV cleaning modes\r\n\r\nThe algorithm fits a polynomial in I and V and a linear interpolation in Q and U to reconstruct\r\ncomplex",
+          "author": "astro-fgao",
+          "date": "2022-11-21T19:59:11Z"
+        },
+        {
+          "sha": "272aaf5326b1369b6afce3e70561e69480dbf86f",
+          "html_url": "https://github.com/saopicc/DDFacet/commit/272aaf5326b1369b6afce3e70561e69480dbf86f",
+          "message": "Forgot to commit changes to FreqMachine",
+          "author": "landmanbester",
+          "date": "2020-03-30T09:05:29Z"
+        },
+        {
+          "sha": "fd81f566569ab4e55559492a52b99a788e594b8e",
+          "html_url": "https://github.com/saopicc/DDFacet/commit/fd81f566569ab4e55559492a52b99a788e594b8e",
+          "message": "fixes #675 for MSs with same frequency coverage. Fuller fix still needed.",
+          "author": "Oleg Smirnov",
+          "date": "2020-03-01T16:12:19Z"
+        },
+        {
+          "sha": "ebc830efb0d1ea7e86d335f539103248efa25c1c",
+          "html_url": "https://github.com/saopicc/DDFacet/commit/ebc830efb0d1ea7e86d335f539103248efa25c1c",
+          "message": "Further python 3 fixes (#663)\n\n* Upgrade to casacore 3.1 and latest meqtrees\r\n* not quite a fix for #636, but at least it adds an experimental FITSFeedSwap option\r\n* Dockerfile now builds python 3 only\r\n* Installation includes latest version of bdsf wheel\r\n* Installation includes latest LOFARBeam mo",
+          "author": "Benjamin Hugo",
+          "date": "2020-01-22T08:00:37Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "EvalPolyApparent TODO more reliable this maybe",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "DDFacet/Imager/ClassFrequencyMachine.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "5b554372900ec658cb862f38004436e393a6afab",
+        "html_url": "https://github.com/saopicc/DDFacet/commit/5b554372900ec658cb862f38004436e393a6afab",
+        "message": "Port to Python v3.12 and Numpy 2.x (#905)\n\n\n* Simplify dockerfiles to use kern installations\n\n* add 24.04 dockerfile\n* python 3.12 port\n* additional primary beam options to invert rotation and offset pointing centre from phase centre\n* change bool8 to bool_\n* pin upper bounds for dependency versions",
+        "author": "Benjamin Hugo",
+        "date": "2026-01-23T06:44:12Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

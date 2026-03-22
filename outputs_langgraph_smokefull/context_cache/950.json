@@ -1,0 +1,446 @@
+{
+  "task_id": "950",
+  "repo_owner": "omniosorg",
+  "repo_name": "pkg5",
+  "file_path": "src/modules/manifest.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T02:27:49+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__load_cached_data",
+    "satd_line": 1790,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T02:27:55+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T02:27:59+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/modules/manifest.py",
+    "original_code": "def __storebytype(self):\n        \"\"\" create manifest.<typename> files to accelerate partial\n        parsing of manifests.  Separate from __storeback code to \n        allow upgrade to reuse existing on disk manifests\"\"\"\n\n        assert self.loaded\n\n        # create per-action type cache; use rename to avoid\n        # corrupt files if ^C'd in the middle \n        # XXX consider use of per-process tmp file names\n        for n in self.actions_bytype.keys():\n                f = file(self.__file_path(\"manifest.%s.tmp\" % n), \n                    \"w\")\n                for a in self.actions_bytype[n]:\n                        f.write(\"%s\\n\" % a)\n                f.close()\n                portable.rename(self.__file_path(\"manifest.%s.tmp\" % n),\n                    self.__file_path(\"manifest.%s\" % n))\n        # create dircache\n        f = file(self.__file_path(\"manifest.dircache.tmp\"), \"w\")\n        dirs = self.__actions_to_dirs()\n\n        for s in self.__gen_dirs_to_str(dirs):\n                f.write(s)\n\n        f.close()\n        portable.rename(self.__file_path(\"manifest.dircache.tmp\"),\n            self.__file_path(\"manifest.dircache\"))",
+    "satd_comment": "# XXX consider use of per-process tmp file names",
+    "target_file": {
+      "ok": true,
+      "path": "src/modules/manifest.py",
+      "sha": "9a73faa762b8643531b7d2c6df5c0efe9bbf2319",
+      "download_url": "https://raw.githubusercontent.com/omniosorg/pkg5/master/src/modules/manifest.py",
+      "content_excerpt": "#!/usr/bin/python3\n#\n# CDDL HEADER START\n#\n# The contents of this file are subject to the terms of the\n# Common Development and Distribution License (the \"License\").\n# You may not use this file except in compliance with the License.\n#\n# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE\n# or http://www.opensolaris.org/os/licensing.\n# See the License for the specific language governing permissions\n# and limitations under the License.\n#\n# When distributing Covered Code, include this CDDL HEADER in each\n# file and include the License file at usr/src/OPENSOLARIS.LICENSE.\n# If applicable, add the following below this CDDL HEADER, with the\n# fields enclosed by brackets \"[]\" replaced with your own identifying\n# information: Portions Copyright [yyyy] [name of copyright owner]\n#\n# CDDL HEADER END\n#\n\n#\n# Copyright 2024 OmniOS Community Edition (OmniOSce) Association.\n# Copyright (c) 2007, 2025, Oracle and/or its affiliates.\n#\n\nfrom collections import namedtuple, defaultdict\nfrom functools import reduce\n\nimport errno\nimport fnmatch\nimport hashlib\nimport os\nimport re\nimport tempfile\nfrom itertools import groupby, chain, product, repeat\nfrom operator import itemgetter\n\nimport pkg.actions as actions\nimport pkg.client.api_errors as apx\nimport pkg.facet as facet\nimport pkg.fmri as fmri\nimport pkg.misc as misc\nimport pkg.portable as portable\nimport pkg.variant as variant\nimport pkg.version as version\n\nfrom pkg.misc import EmptyDict, EmptyI, expanddirs, PKG_FILE_MODE, PKG_DIR_MODE\nfrom pkg.actions.attribute import AttributeAction\nfrom pkg.actions.directory import DirectoryAction\n\n\ndef _compile_fnpats(fn_pats):\n    \"\"\"Private helper function that returns a compiled version of a\n    dictionary of fnmatch patterns.\"\"\"\n\n    return dict(\n        (\n            key,\n            [\n                re.compile(fnmatch.translate(pat), re.IGNORECASE).match\n                for pat in pats\n            ],\n        )\n        for (key, pats) in fn_pats.items()\n    )\n\n\ndef _attr_matches(action, attr_match):\n    \"\"\"Private helper function: given an action, return True if any of its\n    attributes' values matches the pattern for the same attribute in the\n    attr_match dictionary, and False otherwise. Note that the patterns must\n    be pre-comiled using re.compile() or _compile_fnpats.\"\"\"\n\n    if not attr_match:\n        return True\n\n    for attr, matches in attr_match.items():\n        if attr in action.attrs:\n            for match in matches:\n                for attrval in action.attrlist(attr):\n                    if match(attrval):\n                        return True\n    return False\n\n\nclass ManifestDifference(\n    namedtuple(\"ManifestDifference\", \"added changed removed\")\n):\n    __slots__ = []\n\n    __state__desc = tuple(\n        [\n            [(actions.generic.NSG, actions.generic.NSG)],\n            [(actions.generic.NSG, actions.generic.NSG)],\n            [(actions.generic.NSG, actions.generic.NSG)],\n        ]\n    )\n\n    __state__commonize = frozenset(\n        [\n            actions.generic.NSG,\n        ]\n    )\n\n    @staticmethod\n    def getstate(obj, je_state=None):\n        \"\"\"Returns the serialized state of this object in a format\n        that that can be easily stored using JSON, pickle, etc.\"\"\"\n        return misc.json_encode(\n            ManifestDifference.__name__,\n            tuple(obj),\n            ManifestDifference.__state__desc,\n            commonize=ManifestDifference.__state__commonize,\n            je_state=je_state,\n        )\n\n    @staticmethod\n    def fromstate(state, jd_state=None):\n        \"\"\"Allocate a new object using previously serialized state\n        obtained via getstate().\"\"\"\n\n        # decode serialized state into python objects\n        state = misc.json_decode(\n            ManifestDifference.__name__,\n            state,\n            ManifestDifference.__state__desc,\n            commonize=ManifestDifference.__state__commonize,\n            jd_state=jd_state,\n        )\n\n        return ManifestDifference(*state)\n\n\nclass Manifest(object):\n    \"\"\"A Manifest is the representation of the actions composing a specific\n    package version on both the client and the repository.  Both purposes\n    utilize the same storage format.\n\n    The serialized structure of a manifest is an unordered list of actions.\n\n    The special action, \"set\", represents a package attribute.\n\n    The reserved attribute, \"fmri\", represents the package and version\n    described by this manifest.  It is available as a string via the\n    attributes dictionary, and as an FMRI object from the fmri member.\n\n    The list of manifest-wide reserved attributes is\n\n    base_directory          Default base directory, for non-user images.\n    fmri                    Package FMRI.\n    isa                     Package is intended for a list of ISAs.\n    platform                Package is intended for a list of platforms.\n    relocatable             Suitable for User Image.\n\n    All non-prefixed attributes are reserved to the framework.  Third\n    parties may prefix their attributes with a reversed domain name, domain\n    name, or stock symbol.  An example might be\n\n    com.example,supported\n\n    as an indicator that a specific package version is supported by the\n    vendor, example.com.\n\n    manifest.null is provided as the null manifest.  Differences against the\n    null manifest result in the complete set of attributes and actions of\n    the non-null manifest, meaning that all operations can be viewed as\n    transitions between the manifest being installed and the manifest already\n    present in the image (which may be the null manifest).\n    \"\"\"\n\n    def __init__(self, pfmri=None):\n        self.fmri = pfmri\n\n        self._cache = {}\n        self._absent_cache = []\n        self.actions = []\n        self.actions_bytype = {}\n        self.attributes = {}  # package-wide attributes\n        self.signatures = EmptyDict\n        self.excludes = EmptyI\n        if pfmri is not None:\n            if not isinstance(pfmri, fmri.PkgFmri):\n                pfmri = fmri.PkgFmri(pfmri)\n            self.publisher = pfmri.publisher\n        else:\n            self.publisher = None\n\n    def __str__(self):\n        r = \"\"\n        if \"pkg.fmri\" not in self.attributes and self.fmri is not None:\n            r += \"set name=pkg.fmri value={0}\\n\".format(self.fmri)\n\n        for act in sorted(self.actions):\n            r += \"{0}\\n\".format(act)\n        return r\n\n    def as_lines(self):\n        \"\"\"A generator function that returns the unsorted manifest\n        contents as lines of text.\"\"\"\n\n        if \"pkg.fmri\" not in self.attributes and self.fmri is not None:\n            yield \"set name=pkg.fmri value={0}\\n\".format(self.fmri)\n\n        for act in self.actions:\n            yield \"{0}\\n\".format(act)\n\n    def tostr_unsorted(self):\n        return \"\".join((l for l in self.as_lines()))\n\n    def difference(\n        self,\n        origin,\n        origin_exclude=EmptyI,\n        self_exclude=EmptyI,\n        pkgplan=None,\n        cmp_policy=None,\n    ):\n        \"\"\"Return three lists of action pairs representing origin and\n        destination actions.  The first list contains the pairs\n        representing additions, the second list contains the pairs\n        representing updates, and the third list contains the pairs\n        representing removals.  All three lists are in the order in\n        which they should be executed.\"\"\"\n        # XXX Do we need to find some way to assert that the keys are\n        # all unique?\n\n        if isinstance(origin, EmptyFactoredManifest):\n            # No origin was provided, so nothing has been changed or\n            # removed; only added.  In addition, this doesn't need\n            # to be sorted since the caller likely already does\n            # (such as pkgplan/imageplan).\n            return ManifestDifference(\n                [(None, a) for a in self.gen_actions(excludes=self_exclude)],\n                [],\n                [],\n            )\n\n        def hashify(v):\n            \"\"\"handle key values that may be lists\"\"\"\n            if type(v) is not list:\n                return v\n            return tuple(v)\n\n        def dictify(mf, excludes):\n            # Transform list of actions into a dictionary keyed by\n            # action key attribute, key attribute and mediator, or\n            # id if there is no key attribute.\n            for a in mf.gen_actions(excludes=excludes):\n                if (a.name == \"link\" or a.name == \"hardlink\") and a.attrs.get(\n                    \"mediator\"\n                ):\n                    akey = (\n                        a.name,\n                        tuple(\n                            [\n                                a.attrs[a.key_attr],\n                                a.attrs.get(\"mediator-version\"),\n                                a.attrs.get(\"mediator-implementation\"),\n                            ]\n                        ),\n                    )\n                else:\n                    akey = (a.name, hashify(a.attrs.get(a.key_attr, id(a))))\n                yield (akey, a)\n\n        sdict = dict(dictify(self, self_exclude))\n        odict = dict(dictify(origin, origin_exclude))\n\n        sset = set(sdict.keys())\n        oset = set(odict.keys())\n\n        added = [(None, sdict[i]) for i in sset - oset]\n        removed = [(odict[i], None) for i in oset - sset]\n        changed = [\n            (odict[i], sdict[i])\n            for i in oset & sset\n            if odict[i].different(\n                sdict[i], pkgplan=pkgplan, cmp_policy=cmp_policy\n            )\n        ]\n\n        # XXX Do changed actions need to be sorted at all?  This is\n        # likely to be the largest list, so we might save significant\n        # time by not sorting.  Should we sort above?  Insert into a\n        # sorted list?\n\n        # singlesort = lambda x: x[0] or x[1]\n        addsort = itemgetter(1)\n        remsort = itemgetter(0)\n        removed.sort(key=remsort, reverse=True)\n        added.sort(key=addsort)\n        changed.sort(key=addsort)\n\n        return ManifestDifference(added, changed, removed)\n\n    @staticmethod\n    def comm(compare_m, cmp_policy=None):\n        \"\"\"Like the unix utility comm, except that this function\n        takes an arbitrary number of manifests and compares them,\n        returning a tuple consisting of each manifest's actions\n        that are not the same for all manifests, followed by a\n        list of actions that are the same in each manifest.\n\n        Content hashes for action payloads may be present in\n        both signature-included and signature-excluded\n        variants. In most cases (cmp_policy=None), we only\n        want to compare the signature-included variants. When\n        no-signature-included comparison is requested, simply\n        pass cmp_policy=CMP_UNSIGNED through to Action.different().\n        \"\"\"\n\n        # Must specify at least one manifest.\n        assert compare_m\n        dups = []\n\n        # construct list of dictionaries of actions in each\n        # manifest, indexed by unique key and variant combination\n        m_dicts = []\n        for m in compare_m:\n            m_dict = {}\n            for a in m.gen_actions():\n                # The unique key for each action is based on its\n                # type, key attribute, and unique variants set\n                # on the action.\n                try:\n                    key_val = a.attrlist(a.key_attr)\n                    # For dependencies include the type\n                    # for the key, or the value of\n                    # predicate with conditional.\n                    if a.name == \"depend\":\n                        ktype = a.attrs.get(\"type\")\n                        if ktype == \"conditional\":\n                            ktype = a.attrs.get(\"predicate\")\n                        key = {\n                            \"{0}->{1}\".format(\",\".join(sorted(key_val)), ktype)\n                        }\n                    else:\n                        key = set(key_val)\n\n                    if (\n                        a.name == \"link\" or",
+      "total_lines": 2106
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 1790,
+      "start_line": 1770,
+      "end_line": 1810,
+      "matched_line": "                        a",
+      "excerpt": "1770:                 os.rmdir(cache_root)\n1771:             except:\n1772:                 pass\n1773:         except EnvironmentError as e:\n1774:             if e.errno != errno.ENOENT:\n1775:                 # Only raise error if failure wasn't due to\n1776:                 # cache directory not existing.\n1777:                 raise apx._convert_error(e)\n1778: \n1779:     def __load_cached_data(self, name):\n1780:         \"\"\"Private helper function for loading arbitrary cached manifest\n1781:         data.\n1782:         \"\"\"\n1783: \n1784:         mpath = self.__cache_path(name)\n1785:         if os.path.exists(mpath):\n1786:             # we have cached copy on disk; use it\n1787:             try:\n1788:                 with open(mpath, \"r\") as f:\n1789:                     self._cache[name] = [\n1790:                         a\n1791:                         for a in (actions.fromstr(s.rstrip()) for s in f)\n1792:                         if not self.excludes\n1793:                         or a.include_this(\n1794:                             self.excludes, publisher=self.publisher\n1795:                         )\n1796:                     ]\n1797:                 return\n1798:             except EnvironmentError as e:\n1799:                 raise apx._convert_error(e)\n1800:             except actions.ActionError as e:\n1801:                 # Cache file is malformed; hopefully due to bugs\n1802:                 # that have been resolved (as opposed to actual\n1803:                 # corruption).  Assume we should just ignore the\n1804:                 # cache and load action data.\n1805:                 try:\n1806:                     self.clear_cache(self.__cache_root)\n1807:                 except Exception as e:\n1808:                     # Ignore errors encountered during cache\n1809:                     # dump for this specific case.\n1810:                     pass"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__load_cached_data",
+      "start_line": 1779,
+      "end_line": 1816,
+      "source": "    def __load_cached_data(self, name):\n        \"\"\"Private helper function for loading arbitrary cached manifest\n        data.\n        \"\"\"\n\n        mpath = self.__cache_path(name)\n        if os.path.exists(mpath):\n            # we have cached copy on disk; use it\n            try:\n                with open(mpath, \"r\") as f:\n                    self._cache[name] = [\n                        a\n                        for a in (actions.fromstr(s.rstrip()) for s in f)\n                        if not self.excludes\n                        or a.include_this(\n                            self.excludes, publisher=self.publisher\n                        )\n                    ]\n                return\n            except EnvironmentError as e:\n                raise apx._convert_error(e)\n            except actions.ActionError as e:\n                # Cache file is malformed; hopefully due to bugs\n                # that have been resolved (as opposed to actual\n                # corruption).  Assume we should just ignore the\n                # cache and load action data.\n                try:\n                    self.clear_cache(self.__cache_root)\n                except Exception as e:\n                    # Ignore errors encountered during cache\n                    # dump for this specific case.\n                    pass\n\n        # no cached copy\n        if not self.loaded:\n            # need to load from disk\n            self.__load()\n        assert self.loaded"
+    },
+    "imports": {
+      "imports": [
+        "collections:namedtuple",
+        "collections:defaultdict",
+        "functools:reduce",
+        "errno",
+        "fnmatch",
+        "hashlib",
+        "os",
+        "re",
+        "tempfile",
+        "itertools:groupby",
+        "itertools:chain",
+        "itertools:product",
+        "itertools:repeat",
+        "operator:itemgetter",
+        "pkg.actions",
+        "pkg.client.api_errors",
+        "pkg.facet",
+        "pkg.fmri",
+        "pkg.misc",
+        "pkg.portable",
+        "pkg.variant",
+        "pkg.version",
+        "pkg.misc:EmptyDict",
+        "pkg.misc:EmptyI",
+        "pkg.misc:expanddirs",
+        "pkg.misc:PKG_FILE_MODE",
+        "pkg.misc:PKG_DIR_MODE",
+        "pkg.actions.attribute:AttributeAction",
+        "pkg.actions.directory:DirectoryAction"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/omniosorg/pkg5/master/README.md",
+      "content_excerpt": "This is the OmniOS child of pkg(7)\n\nBranches:\n\nmaster\n\n\tThis is the default development branch for OmniOS now. Besides\n\tongoing development, this branch may be refreshed with merges from\n\tthe \"oi\" branch from upstream. Commits in this branch are able to\n\tbe cherry-picked by any upstream branch that wants them. Just follow\n\tthe CDDL and give credit where due.\n\nr151XXX\n\n\tAs we issue releases, we branch for each release.\n\nIf you wish to discuss development here, join the discussion on\n[Gitter](https://gitter.im/omniosorg/Lobby)\n\n## Testing\n\nIn order to run the test-suite with 8 jobs in parallel:\n\n```terminal\n$ cd src\n$ pfexec make test JOBS=8\n```\n\nReplace `pfexec` with `sudo` if that's your preference.\n\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__load_cached_data test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__load_cached_data(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "manifest.py",
+          "path": "src/modules/manifest.py",
+          "sha": "9a73faa762b8643531b7d2c6df5c0efe9bbf2319",
+          "html_url": "https://github.com/omniosorg/pkg5/blob/e8eeeb18097a971721dff7e3f298da3395165de8/src/modules/manifest.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/modules",
+      "count": 40,
+      "entries": [
+        {
+          "name": "Makefile",
+          "path": "src/modules/Makefile",
+          "type": "file"
+        },
+        {
+          "name": "Makefile.ext",
+          "path": "src/modules/Makefile.ext",
+          "type": "file"
+        },
+        {
+          "name": "Makefile.mod",
+          "path": "src/modules/Makefile.mod",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/modules/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_misc.c",
+          "path": "src/modules/_misc.c",
+          "type": "file"
+        },
+        {
+          "name": "_varcet.c",
+          "path": "src/modules/_varcet.c",
+          "type": "file"
+        },
+        {
+          "name": "actions",
+          "path": "src/modules/actions",
+          "type": "dir"
+        },
+        {
+          "name": "altroot.py",
+          "path": "src/modules/altroot.py",
+          "type": "file"
+        },
+        {
+          "name": "api_common.py",
+          "path": "src/modules/api_common.py",
+          "type": "file"
+        },
+        {
+          "name": "arch.py",
+          "path": "src/modules/arch.py",
+          "type": "file"
+        },
+        {
+          "name": "bundle",
+          "path": "src/modules/bundle",
+          "type": "dir"
+        },
+        {
+          "name": "catalog.py",
+          "path": "src/modules/catalog.py",
+          "type": "file"
+        },
+        {
+          "name": "cfgfiles.py",
+          "path": "src/modules/cfgfiles.py",
+          "type": "file"
+        },
+        {
+          "name": "choose.py",
+          "path": "src/modules/choose.py",
+          "type": "file"
+        },
+        {
+          "name": "client",
+          "path": "src/modules/client",
+          "type": "dir"
+        },
+        {
+          "name": "config.py",
+          "path": "src/modules/config.py",
+          "type": "file"
+        },
+        {
+          "name": "cpiofile.py",
+          "path": "src/modules/cpiofile.py",
+          "type": "file"
+        },
+        {
+          "name": "dependency.py",
+          "path": "src/modules/dependency.py",
+          "type": "file"
+        },
+        {
+          "name": "depotcontroller.py",
+          "path": "src/modules/depotcontroller.py",
+          "type": "file"
+        },
+        {
+          "name": "digest.py",
+          "path": "src/modules/digest.py",
+          "type": "file"
+        },
+        {
+          "name": "elf.c",
+          "path": "src/modules/elf.c",
+          "type": "file"
+        },
+        {
+          "name": "elfextract.c",
+          "path": "src/modules/elfextract.c",
+          "type": "file"
+        },
+        {
+          "name": "elfextract.h",
+          "path": "src/modules/elfextract.h",
+          "type": "file"
+        },
+        {
+          "name": "facet.py",
+          "path": "src/modules/facet.py",
+          "type": "file"
+        },
+        {
+          "name": "file_layout",
+          "path": "src/modules/file_layout",
+          "type": "dir"
+        },
+        {
+          "name": "flavor",
+          "path": "src/modules/flavor",
+          "type": "dir"
+        },
+        {
+          "name": "fmri.py",
+          "path": "src/modules/fmri.py",
+          "type": "file"
+        },
+        {
+          "name": "gui",
+          "path": "src/modules/gui",
+          "type": "dir"
+        },
+        {
+          "name": "indexer.py",
+          "path": "src/modules/indexer.py",
+          "type": "file"
+        },
+        {
+          "name": "json_wrapper.py",
+          "path": "src/modules/json_wrapper.py",
+          "type": "file"
+        },
+        {
+          "name": "liblist.c",
+          "path": "src/modules/liblist.c",
+          "type": "file"
+        },
+        {
+          "name": "liblist.h",
+          "path": "src/modules/liblist.h",
+          "type": "file"
+        },
+        {
+          "name": "lint",
+          "path": "src/modules/lint",
+          "type": "dir"
+        },
+        {
+          "name": "lockfile.py",
+          "path": "src/modules/lockfile.py",
+          "type": "file"
+        },
+        {
+          "name": "manifest.py",
+          "path": "src/modules/manifest.py",
+          "type": "file"
+        },
+        {
+          "name": "mediator.py",
+          "path": "src/modules/mediator.py",
+          "type": "file"
+        },
+        {
+          "name": "misc.py",
+          "path": "src/modules/misc.py",
+          "type": "file"
+        },
+        {
+          "name": "mogrify.py",
+          "path": "src/modules/mogrify.py",
+          "type": "file"
+        },
+        {
+          "name": "nrlock.py",
+          "path": "src/modules/nrlock.py",
+          "type": "file"
+        },
+        {
+          "name": "p5i.py",
+          "path": "src/modules/p5i.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "Makefile",
+          "path": "src/modules/Makefile"
+        },
+        {
+          "name": "Makefile.ext",
+          "path": "src/modules/Makefile.ext"
+        },
+        {
+          "name": "Makefile.mod",
+          "path": "src/modules/Makefile.mod"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/modules/__init__.py"
+        },
+        {
+          "name": "_misc.c",
+          "path": "src/modules/_misc.c"
+        },
+        {
+          "name": "_varcet.c",
+          "path": "src/modules/_varcet.c"
+        },
+        {
+          "name": "altroot.py",
+          "path": "src/modules/altroot.py"
+        },
+        {
+          "name": "api_common.py",
+          "path": "src/modules/api_common.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/modules/manifest.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "9182a02ef154b770ec891c40aec2d2c662e9fba8",
+          "html_url": "https://github.com/omniosorg/pkg5/commit/9182a02ef154b770ec891c40aec2d2c662e9fba8",
+          "message": "37532419 fix typos throughout the IPS gate (excluding tests)",
+          "author": "Jakub Kulik",
+          "date": "2025-02-03T18:45:49Z"
+        },
+        {
+          "sha": "e1ee66000792b7e99f16c599fafccd01ad2a4c65",
+          "html_url": "https://github.com/omniosorg/pkg5/commit/e1ee66000792b7e99f16c599fafccd01ad2a4c65",
+          "message": "36752252 fix several real errors reported by pylint",
+          "author": "Jakub Kulik",
+          "date": "2024-06-20T11:41:22Z"
+        },
+        {
+          "sha": "e69593f95b792f164a5e4a793a36205af5104a7e",
+          "html_url": "https://github.com/omniosorg/pkg5/commit/e69593f95b792f164a5e4a793a36205af5104a7e",
+          "message": "36214035 tell() method on files opened in text mode has poor performance",
+          "author": "Jakub Kulik",
+          "date": "2024-02-13T14:41:50Z"
+        },
+        {
+          "sha": "182755f761eca60cb8f7b47218556371c05ba04e",
+          "html_url": "https://github.com/omniosorg/pkg5/commit/182755f761eca60cb8f7b47218556371c05ba04e",
+          "message": "More split string fixes",
+          "author": "Andy Fiddaman",
+          "date": "2024-02-11T17:37:49Z"
+        },
+        {
+          "sha": "a437b4b29df467cc2b897096d00c929b7730cce7",
+          "html_url": "https://github.com/omniosorg/pkg5/commit/a437b4b29df467cc2b897096d00c929b7730cce7",
+          "message": "Programmatically fix up ==/!= to is/is not",
+          "author": "Andy Fiddaman",
+          "date": "2024-02-10T22:32:49Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__load_cached_data consider process file names",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/modules/manifest.py",
+      "satd_line": 1790,
+      "last_commit": {
+        "sha": "9182a02ef154b770ec891c40aec2d2c662e9fba8",
+        "html_url": "https://github.com/omniosorg/pkg5/commit/9182a02ef154b770ec891c40aec2d2c662e9fba8",
+        "message": "37532419 fix typos throughout the IPS gate (excluding tests)",
+        "author": "Jakub Kulik",
+        "date": "2025-02-03T18:45:49Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__load_cached_data",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

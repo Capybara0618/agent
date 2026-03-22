@@ -1,0 +1,268 @@
+{
+  "task_id": "554",
+  "repo_owner": "gramps-project",
+  "repo_name": "gramps",
+  "file_path": "gramps/gen/merge/diff.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T19:13:53+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T19:14:00+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T19:14:05+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "gramps/gen/merge/diff.py",
+    "original_code": "def setitem_from_path(self, path, value, trans=None):\n    \"\"\"\n    Given a path to a struct part, set the last part to value.\n\n    >>> Struct(struct).setitem_from_path([\"primary_name\", \"surname_list\", \"[0]\", \"surname\"], \"Smith\", transaction)\n    \"\"\"\n    path, item = path[:-1], path[-1]\n    struct = self.struct\n    # FIXME: handle assignment on join on HandleClass\n    for p in range(len(path)):\n        part = path[p]\n        if part.startswith(\"[\"): # getitem\n            struct = struct[eval(part[1:-1])] # for int or string use\n        else:                    # getattr\n            struct = struct[part]\n        if struct is None:       # invalid part to set, skip\n            return\n    # struct is set\n    if isinstance(struct, (list, tuple)):\n        pos = int(item)\n        if pos < len(struct):\n            struct[int(item)] = value\n    elif isinstance(struct, dict):\n        if item in struct.keys():\n            struct[item] = value\n    elif hasattr(struct, item):\n        setattr(struct, item, value)\n    else:\n        return\n    self.update_db(trans)",
+    "satd_comment": "# FIXME: handle assignment on join on HandleClass",
+    "target_file": {
+      "ok": true,
+      "path": "gramps/gen/merge/diff.py",
+      "sha": "1ee75e1180debfdb957bf5e803be9c8544f46f73",
+      "download_url": "https://raw.githubusercontent.com/gramps-project/gramps/master/gramps/gen/merge/diff.py",
+      "content_excerpt": "#\n# Gramps - a GTK+/GNOME based genealogy program\n#\n# Copyright (C) 2012,2024  Doug Blank <doug.blank@gmail.com>\n#\n# This program is free software; you can redistribute it and/or modify\n# it under the terms of the GNU General Public License as published by\n# the Free Software Foundation; either version 2 of the License, or\n# (at your option) any later version.\n#\n# This program is distributed in the hope that it will be useful,\n# but WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n# GNU General Public License for more details.\n#\n# You should have received a copy of the GNU General Public License along\n# with this program; if not, see <https://www.gnu.org/licenses/>.\n#\n\n\"\"\"\nThis package implements an object difference engine.\n\"\"\"\n\nimport json\n\nfrom ..db.utils import import_as_dict\nfrom ..lib.json_utils import object_to_dict\nfrom ..const import GRAMPS_LOCALE as glocale\n\n_ = glocale.translation.gettext\n\n\ndef diff_dates(json1, json2):\n    \"\"\"\n    Compare two json date objects. Returns True if different.\n    \"\"\"\n    if json1 == json2:  # if same, then Not Different\n        return False  # else, they still might be Not Different\n    elif isinstance(json1, dict) and isinstance(json2, dict):\n        if json1[\"calendar\"] != json2[\"calendar\"]:\n            return True\n        elif json1[\"modifier\"] != json2[\"modifier\"]:\n            return True\n        elif json1[\"quality\"] != json2[\"quality\"]:\n            return True\n        elif json1[\"dateval\"] == json2[\"dateval\"] and json2[\"dateval\"] != 0:\n            return False\n        elif json1[\"text\"] == json2[\"text\"]:\n            return False\n        else:\n            return True\n    else:\n        return True\n\n\ndef diff_items(path, json1, json2):\n    \"\"\"\n    Compare two json objects. Returns True if different.\n    \"\"\"\n    if json1 == json2:\n        return False\n    elif isinstance(json1, list) and isinstance(json2, list):\n        if len(json1) != len(json2):\n            return True\n        else:\n            pos = 0\n            for v1, v2 in zip(json1, json2):\n                result = diff_items(path + (\"[%d]\" % pos), v1, v2)\n                if result:\n                    return True\n                pos += 1\n            return False\n    elif isinstance(json1, dict) and isinstance(json2, dict):\n        for key in json1.keys():\n            if key == \"change\":\n                continue  # don't care about time differences, only data changes\n            elif key == \"date\":\n                result = diff_dates(json1[\"date\"], json2[\"date\"])\n                if result:\n                    # print(\"different dates\", path)\n                    # print(\"   old:\", json1[\"date\"])\n                    # print(\"   new:\", json2[\"date\"])\n                    return True\n            else:\n                result = diff_items(path + \".\" + key, json1[key], json2[key])\n                if result:\n                    return True\n        return False\n    else:\n        # print(\"different values\", path)\n        # print(\"   old:\", json1)\n        # print(\"   new:\", json2)\n        return True\n\n\ndef diff_dbs(db1, db2, user):\n    \"\"\"\n    1. new objects => mark for insert\n    2. deleted objects, no change locally after delete date => mark\n       for deletion\n    3. deleted objects, change locally => mark for user confirm for\n       deletion\n    4. updated objects => do a diff on differences, mark origin\n       values as new data\n    \"\"\"\n    missing_from_old = []\n    missing_from_new = []\n    diffs = []\n    with user.progress(_(\"Family Tree Differences\"), _(\"Searching...\"), 10) as step:\n        for item in [\n            \"Person\",\n            \"Family\",\n            \"Source\",\n            \"Citation\",\n            \"Event\",\n            \"Media\",\n            \"Place\",\n            \"Repository\",\n            \"Note\",\n            \"Tag\",\n        ]:\n            step()\n\n            handles_func1 = db1.method(\"get_%s_handles\", item)\n            handles_func2 = db2.method(\"get_%s_handles\", item)\n            handle_func1 = db1.method(\"get_%s_from_handle\", item)\n            handle_func2 = db2.method(\"get_%s_from_handle\", item)\n\n            handles1 = sorted([handle for handle in handles_func1()])\n            handles2 = sorted([handle for handle in handles_func2()])\n            p1 = 0\n            p2 = 0\n            while p1 < len(handles1) and p2 < len(handles2):\n                if handles1[p1] == handles2[p2]:  # in both\n                    item1 = handle_func1(handles1[p1])\n                    item2 = handle_func2(handles2[p2])\n                    diff = diff_items(\n                        item, object_to_dict(item1), object_to_dict(item2)\n                    )\n                    if diff:\n                        diffs += [(item, item1, item2)]\n                    # else same!\n                    p1 += 1\n                    p2 += 1\n                elif handles1[p1] < handles2[p2]:  # p1 is mssing in p2\n                    item1 = handle_func1(handles1[p1])\n                    missing_from_new += [(item, item1)]\n                    p1 += 1\n                elif handles1[p1] > handles2[p2]:  # p2 is mssing in p1\n                    item2 = handle_func2(handles2[p2])\n                    missing_from_old += [(item, item2)]\n                    p2 += 1\n            while p1 < len(handles1):\n                item1 = handle_func1(handles1[p1])\n                missing_from_new += [(item, item1)]\n                p1 += 1\n            while p2 < len(handles2):\n                item2 = handle_func2(handles2[p2])\n                missing_from_old += [(item, item2)]\n                p2 += 1\n    return diffs, missing_from_old, missing_from_new\n\n\ndef diff_db_to_file(old_db, filename, user):\n    # First, get data as a InMemoryDB\n    new_db = import_as_dict(filename, user, user)\n    if new_db is not None:\n        # Next get differences:\n        diffs, m_old, m_new = diff_dbs(old_db, new_db, user)\n        return diffs, m_old, m_new\n",
+      "total_lines": 170
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "db.utils:import_as_dict",
+        "lib.json_utils:object_to_dict",
+        "const:GRAMPS_LOCALE"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/gramps-project/gramps/master/README.md",
+      "content_excerpt": "[The Gramps Project](https://gramps-project.org)\n===================\n[![GitHub CI](https://github.com/gramps-project/gramps/actions/workflows/gramps-ci.yml/badge.svg?event=push&branch=maintenance/gramps60)](https://github.com/gramps-project/gramps/actions/workflows/gramps-ci.yml?query=branch%3Amaintenance/gramps60)\n[![codecov.io](https://codecov.io/github/gramps-project/gramps/coverage.svg?branch=maintenance/gramps60)](https://app.codecov.io/gh/gramps-project/gramps/branch/maintenance/gramps60)\n[![Translation status](https://hosted.weblate.org/widgets/gramps-project/-/gramps/svg-badge.svg)](https://hosted.weblate.org/engage/gramps-project)\n\nWe strive to produce a genealogy program that is both intuitive for hobbyists and feature-complete for professional genealogists.\n\nPlease read the [**COPYING**](https://github.com/gramps-project/gramps/blob/maintenance/gramps60/COPYING) file first.\n\nPlease read the [**INSTALL**](https://github.com/gramps-project/gramps/blob/maintenance/gramps60/INSTALL) file if you intend to build from source.\n\nRequirements\n============\nThe following packages **MUST** be installed in order for Gramps to work:\n\n* [**Python**](https://www.python.org/) 3.9 or greater - The programming language used by Gramps.\n* [**GTK**](http://www.gtk.org/) 3.24 or greater - A cross-platform widget toolkit for creating graphical user interfaces.\n* [**pygobject**](https://wiki.gnome.org/Projects/PyGObject) 3.12 or greater - Python Bindings for GLib/GObject/GIO/GTK+\n\nThe following three packages with GObject Introspection bindings (the gi packages)\n\n* [**cairo**](http://cair"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "setitem_from_path test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"setitem_from_path(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "gramps/gen/merge",
+      "count": 12,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "gramps/gen/merge/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "diff.py",
+          "path": "gramps/gen/merge/diff.py",
+          "type": "file"
+        },
+        {
+          "name": "mergecitationquery.py",
+          "path": "gramps/gen/merge/mergecitationquery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergeeventquery.py",
+          "path": "gramps/gen/merge/mergeeventquery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergefamilyquery.py",
+          "path": "gramps/gen/merge/mergefamilyquery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergemediaquery.py",
+          "path": "gramps/gen/merge/mergemediaquery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergenotequery.py",
+          "path": "gramps/gen/merge/mergenotequery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergepersonquery.py",
+          "path": "gramps/gen/merge/mergepersonquery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergeplacequery.py",
+          "path": "gramps/gen/merge/mergeplacequery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergerepositoryquery.py",
+          "path": "gramps/gen/merge/mergerepositoryquery.py",
+          "type": "file"
+        },
+        {
+          "name": "mergesourcequery.py",
+          "path": "gramps/gen/merge/mergesourcequery.py",
+          "type": "file"
+        },
+        {
+          "name": "test",
+          "path": "gramps/gen/merge/test",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "gramps/gen/merge/__init__.py"
+        },
+        {
+          "name": "mergecitationquery.py",
+          "path": "gramps/gen/merge/mergecitationquery.py"
+        },
+        {
+          "name": "mergeeventquery.py",
+          "path": "gramps/gen/merge/mergeeventquery.py"
+        },
+        {
+          "name": "mergefamilyquery.py",
+          "path": "gramps/gen/merge/mergefamilyquery.py"
+        },
+        {
+          "name": "mergemediaquery.py",
+          "path": "gramps/gen/merge/mergemediaquery.py"
+        },
+        {
+          "name": "mergenotequery.py",
+          "path": "gramps/gen/merge/mergenotequery.py"
+        },
+        {
+          "name": "mergepersonquery.py",
+          "path": "gramps/gen/merge/mergepersonquery.py"
+        },
+        {
+          "name": "mergeplacequery.py",
+          "path": "gramps/gen/merge/mergeplacequery.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "gramps/gen/merge/diff.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "48726bb166840c33573ae787f74c6ace9b2c35ab",
+          "html_url": "https://github.com/gramps-project/gramps/commit/48726bb166840c33573ae787f74c6ace9b2c35ab",
+          "message": "Don't ignore calendar, modifier and quality in diff_dates",
+          "author": "David Straub",
+          "date": "2025-11-22T20:58:17Z"
+        },
+        {
+          "sha": "d82eb0f460325702037e1f32ac9bc156f85dce2c",
+          "html_url": "https://github.com/gramps-project/gramps/commit/d82eb0f460325702037e1f32ac9bc156f85dce2c",
+          "message": "Update GPL2+ license text",
+          "author": "Nick Hall",
+          "date": "2025-09-25T16:32:54Z"
+        },
+        {
+          "sha": "5ecbc169f30f55fdcf66795a621308ab4fc4a368",
+          "html_url": "https://github.com/gramps-project/gramps/commit/5ecbc169f30f55fdcf66795a621308ab4fc4a368",
+          "message": "Use orjson with a hand-coded encoder/decoder\n\nAssumes orjson is installed.\n\nTests shows that this is 60% faster for db.iter_people()\non a 40k person table.\n\nCo-authored-by: Nick Hall <nick-h@gramps-project.org>\nCo-authored-by: stevenyoungs <steve@youngs.cc>",
+          "author": "Doug Blank",
+          "date": "2025-01-26T08:40:21Z"
+        },
+        {
+          "sha": "81d1e01ace5a22afdab07cd4fd2dc1d59f45cf1b",
+          "html_url": "https://github.com/gramps-project/gramps/commit/81d1e01ace5a22afdab07cd4fd2dc1d59f45cf1b",
+          "message": "Switch from pickled blobs to JSON data (#1786)\n\nThis PR made the following changes:\r\n\r\n* Database format 21: add JSON, remove pickle\r\n* Rename new column to json_data\r\n* Added to_dict, from_dict\r\n* Refactor for upgrade uses\r\n* Refactor serializers to classes\r\n* Updated libgedcom\r\n* Apply suggestions",
+          "author": "Douglas Blank",
+          "date": "2024-12-08T15:26:40Z"
+        },
+        {
+          "sha": "41720c5a7e736587088d25140f7eee7af540f668",
+          "html_url": "https://github.com/gramps-project/gramps/commit/41720c5a7e736587088d25140f7eee7af540f668",
+          "message": "Migrate code style to Black",
+          "author": "Nick Hall",
+          "date": "2023-07-31T13:40:59Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "setitem_from_path FIXME handle assignment join HandleClass",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "gramps/gen/merge/diff.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "48726bb166840c33573ae787f74c6ace9b2c35ab",
+        "html_url": "https://github.com/gramps-project/gramps/commit/48726bb166840c33573ae787f74c6ace9b2c35ab",
+        "message": "Don't ignore calendar, modifier and quality in diff_dates",
+        "author": "David Straub",
+        "date": "2025-11-22T20:58:17Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

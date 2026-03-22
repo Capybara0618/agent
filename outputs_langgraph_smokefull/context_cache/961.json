@@ -1,0 +1,384 @@
+{
+  "task_id": "961",
+  "repo_owner": "ckan",
+  "repo_name": "ckan",
+  "file_path": "ckan/lib/helpers.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T02:30:27+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T02:30:34+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T02:30:37+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "ckan/lib/helpers.py",
+    "original_code": "def subnav_named_route(text, routename, **kwargs):\n    \"\"\" Generate a subnav element based on a named route \"\"\"\n    # FIXME this is the same as _nav_named_link\n    # they should be combined\n    class_ = _link_class(kwargs)\n    return link_to(\n        text,\n        url_for(str(routename), **kwargs),\n        class_=class_\n    )",
+    "satd_comment": "# FIXME this is the same as _nav_named_link\n# they should be combined",
+    "target_file": {
+      "ok": true,
+      "path": "ckan/lib/helpers.py",
+      "sha": "82031a0bd3e3e2d0ddfa9bed2dcb2b217bec0405",
+      "download_url": "https://raw.githubusercontent.com/ckan/ckan/master/ckan/lib/helpers.py",
+      "content_excerpt": "# encoding: utf-8\n\n'''Helper functions\n\nConsists of functions to typically be used within templates, but also\navailable to Controllers. This module is available to templates as 'h'.\n'''\nfrom __future__ import annotations\n\nimport email.utils\nimport datetime\nimport logging\nimport re\nimport os\nimport pytz\nimport tzlocal\nimport pprint\nimport contextlib\nimport copy\nimport uuid\nimport functools\nimport unicodedata\n\nfrom collections import defaultdict\nfrom typing import (\n    Any, Callable, Match, NoReturn, cast, Dict,\n    Iterable, Optional, TypeVar, Union)\n\n\nimport dominate.tags as dom_tags\nfrom dominate.util import raw as raw_dom_tags\nfrom markdown import markdown\nfrom bleach import clean as bleach_clean, ALLOWED_TAGS, ALLOWED_ATTRIBUTES\nfrom ckan.common import asbool, config, current_user\nfrom flask import flash, has_request_context, current_app\nfrom flask import get_flashed_messages as _flask_get_flashed_messages\nfrom flask import redirect as _flask_redirect\nfrom flask import url_for as _flask_default_url_for\nfrom werkzeug.routing import BuildError as FlaskRouteBuildError\nfrom ckan.lib import i18n\nfrom ckan.plugins.core import plugin_loaded\n\nfrom urllib.parse import (\n    urlencode, quote, unquote, urlparse, urlunparse\n)\n\nimport ckan.config\nimport ckan.exceptions\nimport ckan.model as model\nimport ckan.lib.formatters as formatters\nimport ckan.lib.datapreview as datapreview\nimport ckan.logic as logic\nimport ckan.authz as authz\nimport ckan.plugins as p\nimport ckan\n\n\nfrom ckan.lib.pagination import Page  # type: ignore # noqa\nfrom ckan.common import _, g, request, json\n\nfrom ckan.lib.webassets_tools import include_asset, render_assets\nfrom markupsafe import Markup, escape\nfrom textwrap import shorten\nfrom ckan.types import Context, Response\n\nT = TypeVar(\"T\")\nHelper = TypeVar(\"Helper\", bound=Callable[..., Any])\n\nlog = logging.getLogger(__name__)\n\nMARKDOWN_TAGS = set([\n    'del', 'dd', 'dl', 'dt', 'h1', 'h2',\n    'h3', 'img', 'kbd', 'p', 'pre', 's',\n    'sup', 'sub', 'strike', 'br', 'hr'\n]).union(ALLOWED_TAGS)\n\nMARKDOWN_ATTRIBUTES = copy.deepcopy(ALLOWED_ATTRIBUTES)\nMARKDOWN_ATTRIBUTES.setdefault('img', []).extend(['src', 'alt', 'title'])\n\nLEGACY_ROUTE_NAMES = {\n    'home': 'home.index',\n    'about': 'home.about',\n    'search': 'dataset.search',\n    'dataset_read': 'dataset.read',\n    'dataset_groups': 'dataset.groups',\n    'group_index': 'group.index',\n    'group_about': 'group.about',\n    'group_read': 'group.read',\n    'organizations_index': 'organization.index',\n    'organization_read': 'organization.read',\n    'organization_about': 'organization.about',\n\n    # Deprecated since v2.10\n    'dataset_activity': 'activity.package_activity',\n    'dataset.activity': 'activity.package_activity',\n    'group_activity': 'activity.group_activity',\n    'group.activity': 'activity.group_activity',\n    'organization_activity': 'activity.organization_activity',\n    'organization.activity': 'activity.organization_activity',\n    \"user.activity\": \"activity.user_activity\",\n    \"dashboard.index\": \"activity.dashboard\",\n    \"dataset.changes_multiple\": \"activity.package_changes_multiple\",\n    \"dataset.changes\": \"activity.package_changes\",\n    \"group.changes_multiple\": \"activity.group_changes_multiple\",\n    \"group.changes\": \"activity.group_changes\",\n    \"organization.changes_multiple\": \"activity.organization_changes_multiple\",\n    \"organization.changes\": \"activity.organization_changes\",\n\n}\n\n\nclass HelperAttributeDict(Dict[str, Callable[..., Any]]):\n    \"\"\"Collection of CKAN native and extension-provided helpers.\n    \"\"\"\n    def __missing__(self, key: str) -> NoReturn:\n        raise ckan.exceptions.HelperError(\n            'Helper \\'{key}\\' has not been defined.'.format(\n                key=key\n            )\n        )\n\n    def __getattr__(self, key: str) -> Callable[..., Any]:\n        try:\n            return self[key]\n        except ckan.exceptions.HelperError as e:\n            raise AttributeError(e)\n\n    def __repr__(self) -> str:\n        return '<template helper functions>'\n\n\n# Builtin helper functions.\n_builtin_functions: dict[str, Callable[..., Any]] = {}\nhelper_functions = HelperAttributeDict()\n\n\nclass literal(Markup):  # noqa\n    \"\"\"Represents an HTML literal.\n\n    \"\"\"\n    __slots__ = ()\n\n    @classmethod\n    def escape(cls, s: Optional[str]) -> Markup:\n        if s is None:\n            return Markup(u\"\")\n        return super(literal, cls).escape(s)\n\n\ndef core_helper(f: Helper, name: Optional[str] = None) -> Helper:\n    \"\"\"\n    Register a function as a builtin helper method.\n    \"\"\"\n    def _get_name(func_or_class: Union[Callable[..., Any], type]) -> str:\n        # Handles both methods and class instances.\n        try:\n            return func_or_class.__name__\n        except AttributeError:\n            return cast(type, func_or_class.__class__).__name__\n\n    _builtin_functions[name or _get_name(f)] = f\n    return f\n\n\ndef _is_chained_helper(func: Callable[..., Any]) -> bool:\n    return getattr(func, 'chained_helper', False)\n\n\ndef chained_helper(func: Helper) -> Helper:\n    '''Decorator function allowing helper functions to be chained.\n\n    This chain starts with the first chained helper to be registered and\n    ends with the original helper (or a non-chained plugin override\n    version). Chained helpers must accept an extra parameter,\n    specifically the next helper in the chain, for example::\n\n            helper(next_helper, *args, **kwargs).\n\n    The chained helper function may call the next_helper function,\n    optionally passing different values, handling exceptions,\n    returning different values and/or raising different exceptions\n    to the caller.\n\n    Usage::\n\n        from ckan.plugins.toolkit import chained_helper\n\n        @chained_helper\n        def ckan_version(next_func, **kw):\n\n            return next_func(**kw)\n\n    :param func: chained helper function\n    :type func: callable\n\n    :returns: chained helper function\n    :rtype: callable\n\n    '''\n    # type_ignore_reason: custom attribute\n    func.chained_helper = True  # type: ignore\n    return func\n\n\ndef _datestamp_to_datetime(datetime_: Any) -> Optional[datetime.datetime]:\n    ''' Converts a datestamp to a datetime.  If a datetime is provided it\n    just gets returned.\n\n    :param datetime_: the timestamp\n    :type datetime_: string or datetime\n\n    :rtype: datetime\n    '''\n    if isinstance(datetime_, str):\n        try:\n            datetime_ = date_str_to_datetime(datetime_)\n        except TypeError:\n            return None\n        except ValueError:\n            return None\n    # check we are now a datetime\n    if not isinstance(datetime_, datetime.datetime):\n        return None\n\n    if datetime_.tzinfo is not None:\n        return datetime_\n\n    # all dates are considered UTC internally,\n    # change output if `ckan.display_timezone` is available\n    datetime_ = datetime_.replace(tzinfo=pytz.utc)\n    datetime_ = datetime_.astimezone(get_display_timezone())\n\n    return datetime_\n\n\n@core_helper\ndef redirect_to(*args: Any, **kw: Any) -> Response:\n    '''Issue a redirect: return an HTTP response with a ``302 Moved`` header.\n\n    This is a wrapper for :py:func:`flask.redirect` that maintains the\n    user's selected language when redirecting.\n\n    The arguments to this function identify the route to redirect to, they're\n    the same arguments as :py:func:`ckan.plugins.toolkit.url_for` accepts,\n    for example::\n\n        import ckan.plugins.toolkit as toolkit\n\n        # Redirect to /dataset/my_dataset.\n        return toolkit.redirect_to('dataset.read',\n                            id='my_dataset')\n\n    Or, using a named route::\n\n        return toolkit.redirect_to('dataset.read', id='changed')\n\n    If given a single string as argument, this redirects without url parsing\n\n        return toolkit.redirect_to('http://example.com')\n        return toolkit.redirect_to('/dataset')\n        return toolkit.redirect_to('/some/other/path')\n\n    '''\n    # Routes router doesn't like unicode args\n    uargs = [str(arg) if isinstance(arg, str) else arg for arg in args]\n\n    _url = ''\n    skip_url_parsing = False\n    parse_url = kw.pop('parse_url', False)\n    if uargs and len(uargs) == 1 and isinstance(uargs[0], str) \\\n            and (uargs[0].startswith('/') or is_url(uargs[0])) \\\n            and parse_url is False:\n        skip_url_parsing = True\n        _url = uargs[0]\n\n    if skip_url_parsing is False:\n        _url = url_for(*uargs, **kw)\n\n    if _url.startswith('/'):\n        _url = str(config['ckan.site_url'].rstrip('/') + _url)\n\n    return cast(Response, _flask_redirect(_url))\n\n\n@core_helper\ndef get_site_protocol_and_host() -> Union[tuple[str, str], tuple[None, None]]:\n    '''Return the protocol and host of the configured `ckan.site_url`.\n    This is needed to generate valid, full-qualified URLs.\n\n    If `ckan.site_url` is set like this::\n\n        ckan.site_url = http://example.com\n\n    Then this function would return a tuple `('http', 'example.com')`\n    If the setting is missing, `(None, None)` is returned instead.\n\n    '''\n    site_url = config.get('ckan.site_url')\n    if site_url is not None:\n        parsed_url = urlparse(site_url)\n        return (parsed_url.scheme, parsed_url.netloc)\n    return (None, None)\n\n\ndef _get_auto_flask_context():\n    '''\n    Provides a Flask test request context if we are outside the context\n    of a web request (tests or CLI)\n    '''\n\n    from ckan.config.middleware import _internal_test_request_context\n\n    # This is a normal web request, there is a request context present\n    if has_request_context():\n        return None\n\n    # We are outside a web request. A test web application was created\n    # (and with it a test request context with the relevant configuration)\n    if _internal_test_request_context:\n        return _internal_test_request_context\n\n    from ckan.tests.pytest_ckan.ckan_setup import _tests_test_request_context\n    if _tests_test_request_context:\n        return _tests_test_request_context\n\n\n@core_helper\ndef url_for(*args: Any, **kw: Any) -> str:\n    '''Return the URL for an endpoint given some parameters.\n\n    This is a wrapper for :py:func:`flask.url_for`\n    and :py:func:`routes.url_for` that adds some extra features that CKAN\n    needs.\n\n    To build a URL for a Flask view, pass the name of the blueprint and the\n    view function separated by a period ``.``, plus any URL parameters::\n\n        url_for('api.action', ver=3, logic_function='status_show')\n        # Returns /api/3/action/status_show\n\n    For a fully qualified URL pass the ``_external=True`` parameter. This\n    takes the ``ckan.site_url`` and ``ckan.root_path`` settings into account::\n\n        url_for('api.action', ver=3, logic_function='status_show',\n                _external=True)\n        # Returns http://example.com/api/3/action/status_show\n\n    URLs built by Pylons use the Routes syntax::\n\n        url_for(controller='my_ctrl', action='my_action', id='my_dataset')\n        # Returns '/dataset/my_dataset'\n\n    Or, using a named route::\n\n        url_for('dataset.read', id='changed')\n        # Returns '/dataset/changed'\n\n    Use ``qualified=True`` for a fully qualified URL when targeting a Pylons\n    endpoint.\n\n    For backwards compatibility, an effort is made to support the Pylons syntax\n    when building a Flask URL, but this support might be dropped in the future,\n    so calls should be updated.\n    '''\n    # Get the actual string code for the locale\n    locale = kw.pop('locale', None)\n    if locale and isinstance(locale, i18n.Locale):\n        locale = i18n.get_identifier_from_locale_class(locale)\n\n    # remove __ckan_no_root and add after to not pollute url\n    no_root = kw.pop('__ckan_no_root', False)\n\n    _auto_flask_context = _get_auto_flask_context()\n    try:\n        if _auto_flask_context:\n            _auto_flask_context.push()\n\n        # First try to build the URL with the Flask router\n        # Temporary mapping for pylons to flask route names\n        if len(args):\n            args = (map_pylons_to_flask_route_name(args[0]),",
+      "total_lines": 2939
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "email.utils",
+        "datetime",
+        "logging",
+        "re",
+        "os",
+        "pytz",
+        "tzlocal",
+        "pprint",
+        "contextlib",
+        "copy",
+        "uuid",
+        "functools",
+        "unicodedata",
+        "collections:defaultdict",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Match",
+        "typing:NoReturn",
+        "typing:cast",
+        "typing:Dict",
+        "typing:Iterable",
+        "typing:Optional",
+        "typing:TypeVar",
+        "typing:Union",
+        "dominate.tags",
+        "dominate.util:raw",
+        "markdown:markdown",
+        "bleach:clean",
+        "bleach:ALLOWED_TAGS"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ckan/ckan/master/README.rst",
+      "content_excerpt": "CKAN: The Open Source Data Portal Software\n==========================================\n\n.. image:: https://img.shields.io/badge/license-AGPL-blue.svg?style=flat\n    :target: https://opensource.org/licenses/AGPL-3.0\n    :alt: License\n\n.. image:: https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat\n    :target: https://docs.ckan.org\n    :alt: Documentation\n.. image:: https://img.shields.io/badge/support-StackOverflow-yellowgreen.svg?style=flat\n    :target: https://stackoverflow.com/questions/tagged/ckan\n    :alt: Support on StackOverflow\n\n.. image:: https://github.com/ckan/ckan/actions/workflows/test.yml/badge.svg\n    :target: https://github.com/ckan/ckan/actions/workflows/test.yml\n    :alt: GitHub Actions Build Status\n\n.. image:: https://codecov.io/github/ckan/ckan/graph/badge.svg?token=aXdmn98Yu2\n :target: https://codecov.io/github/ckan/ckan\n\n.. image:: https://badges.gitter.im/gitterHQ/gitter.svg\n    :target: https://gitter.im/ckan/chat\n    :alt: Chat on Gitter\n\n**CKAN is the world’s leading open-source data portal platform**.\nCKAN makes it easy to publish, share and work with data. It's a data management\nsystem that provides a powerful platform for cataloging, storing and accessing\ndatasets with a rich front-end, full API (for both data and catalog), visualization\ntools and more. Read more at `ckan.org <https://ckan.org/>`_.\n\n\nInstallation\n------------\n\nSee the `CKAN Documentation <https://docs.ckan.org>`_ for installation instructions.\n\n\nSupport\n-------\nIf you need help with CKAN or want to ask a question, use either the\n`ckan-dev`_ mailing list, the `CKAN "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "subnav_named_route test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"subnav_named_route(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "ckan/lib",
+      "count": 30,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "ckan/lib/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "api_token.py",
+          "path": "ckan/lib/api_token.py",
+          "type": "file"
+        },
+        {
+          "name": "app_globals.py",
+          "path": "ckan/lib/app_globals.py",
+          "type": "file"
+        },
+        {
+          "name": "authenticator.py",
+          "path": "ckan/lib/authenticator.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "ckan/lib/base.py",
+          "type": "file"
+        },
+        {
+          "name": "captcha.py",
+          "path": "ckan/lib/captcha.py",
+          "type": "file"
+        },
+        {
+          "name": "config_tool.py",
+          "path": "ckan/lib/config_tool.py",
+          "type": "file"
+        },
+        {
+          "name": "create_test_data.py",
+          "path": "ckan/lib/create_test_data.py",
+          "type": "file"
+        },
+        {
+          "name": "datapreview.py",
+          "path": "ckan/lib/datapreview.py",
+          "type": "file"
+        },
+        {
+          "name": "dictization",
+          "path": "ckan/lib/dictization",
+          "type": "dir"
+        },
+        {
+          "name": "extract.py",
+          "path": "ckan/lib/extract.py",
+          "type": "file"
+        },
+        {
+          "name": "flask_multistatic.py",
+          "path": "ckan/lib/flask_multistatic.py",
+          "type": "file"
+        },
+        {
+          "name": "formatters.py",
+          "path": "ckan/lib/formatters.py",
+          "type": "file"
+        },
+        {
+          "name": "helpers.py",
+          "path": "ckan/lib/helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "i18n.py",
+          "path": "ckan/lib/i18n.py",
+          "type": "file"
+        },
+        {
+          "name": "io.py",
+          "path": "ckan/lib/io.py",
+          "type": "file"
+        },
+        {
+          "name": "jinja_extensions.py",
+          "path": "ckan/lib/jinja_extensions.py",
+          "type": "file"
+        },
+        {
+          "name": "jobs.py",
+          "path": "ckan/lib/jobs.py",
+          "type": "file"
+        },
+        {
+          "name": "lazyjson.py",
+          "path": "ckan/lib/lazyjson.py",
+          "type": "file"
+        },
+        {
+          "name": "mailer.py",
+          "path": "ckan/lib/mailer.py",
+          "type": "file"
+        },
+        {
+          "name": "maintain.py",
+          "path": "ckan/lib/maintain.py",
+          "type": "file"
+        },
+        {
+          "name": "munge.py",
+          "path": "ckan/lib/munge.py",
+          "type": "file"
+        },
+        {
+          "name": "navl",
+          "path": "ckan/lib/navl",
+          "type": "dir"
+        },
+        {
+          "name": "pagination.py",
+          "path": "ckan/lib/pagination.py",
+          "type": "file"
+        },
+        {
+          "name": "plugins.py",
+          "path": "ckan/lib/plugins.py",
+          "type": "file"
+        },
+        {
+          "name": "redis.py",
+          "path": "ckan/lib/redis.py",
+          "type": "file"
+        },
+        {
+          "name": "search",
+          "path": "ckan/lib/search",
+          "type": "dir"
+        },
+        {
+          "name": "signals.py",
+          "path": "ckan/lib/signals.py",
+          "type": "file"
+        },
+        {
+          "name": "uploader.py",
+          "path": "ckan/lib/uploader.py",
+          "type": "file"
+        },
+        {
+          "name": "webassets_tools.py",
+          "path": "ckan/lib/webassets_tools.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "ckan/lib/__init__.py"
+        },
+        {
+          "name": "api_token.py",
+          "path": "ckan/lib/api_token.py"
+        },
+        {
+          "name": "app_globals.py",
+          "path": "ckan/lib/app_globals.py"
+        },
+        {
+          "name": "authenticator.py",
+          "path": "ckan/lib/authenticator.py"
+        },
+        {
+          "name": "base.py",
+          "path": "ckan/lib/base.py"
+        },
+        {
+          "name": "captcha.py",
+          "path": "ckan/lib/captcha.py"
+        },
+        {
+          "name": "config_tool.py",
+          "path": "ckan/lib/config_tool.py"
+        },
+        {
+          "name": "create_test_data.py",
+          "path": "ckan/lib/create_test_data.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "ckan/lib/helpers.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f9fa942debf022a0b359b61391d1d4a48b056dc9",
+          "html_url": "https://github.com/ckan/ckan/commit/f9fa942debf022a0b359b61391d1d4a48b056dc9",
+          "message": "chore: set default for get_param_int to 0",
+          "author": "Sergey Motornyuk",
+          "date": "2026-03-02T23:06:03Z"
+        },
+        {
+          "sha": "1ec6adbe29b0f401d16b8b0968d9066fd26bde13",
+          "html_url": "https://github.com/ckan/ckan/commit/1ec6adbe29b0f401d16b8b0968d9066fd26bde13",
+          "message": "chore: do not use global variable for facet limits",
+          "author": "Sergey Motornyuk",
+          "date": "2026-03-02T23:05:31Z"
+        },
+        {
+          "sha": "50de1def17440365304f80e45a6a50f6f1fc3a32",
+          "html_url": "https://github.com/ckan/ckan/commit/50de1def17440365304f80e45a6a50f6f1fc3a32",
+          "message": "chore: simplify has_more_facets",
+          "author": "Sergey Motornyuk",
+          "date": "2026-03-02T22:31:08Z"
+        },
+        {
+          "sha": "027824f647b52fa41d86c0a59ba7fa7be9382cb4",
+          "html_url": "https://github.com/ckan/ckan/commit/027824f647b52fa41d86c0a59ba7fa7be9382cb4",
+          "message": "Merge branch 'master' into remove-locale-root-path-helpers",
+          "author": "Jari Voutilainen",
+          "date": "2026-02-13T12:49:05Z"
+        },
+        {
+          "sha": "81ba3ab2783d1f21283c3fc0f8af760a1d6389aa",
+          "html_url": "https://github.com/ckan/ckan/commit/81ba3ab2783d1f21283c3fc0f8af760a1d6389aa",
+          "message": "Complete missing docstring",
+          "author": "amercader",
+          "date": "2026-02-10T14:21:57Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "subnav_named_route FIXME this same _nav_named_link they",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "ckan/lib/helpers.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "f9fa942debf022a0b359b61391d1d4a48b056dc9",
+        "html_url": "https://github.com/ckan/ckan/commit/f9fa942debf022a0b359b61391d1d4a48b056dc9",
+        "message": "chore: set default for get_param_int to 0",
+        "author": "Sergey Motornyuk",
+        "date": "2026-03-02T23:06:03Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

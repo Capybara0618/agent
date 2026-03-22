@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import ast
 import io
@@ -26,6 +26,12 @@ class AnalysisResult:
     decision: str
     repairable: bool
     repairability_score: float
+    intent_clarity: float
+    change_locality: float
+    semantic_risk: float
+    context_sufficiency: float
+    verifiability: float
+    analyze_score: float
     confidence: float
     satd_type: str
     reason: str
@@ -58,10 +64,15 @@ class ReviewResult:
     round_id: int
     approved: bool
     review_score: float
+    problem_alignment: float
+    minimality: float
+    semantic_preservation: float
+    internal_consistency: float
     issues: list[str]
     revision_advice: str
     reject_type: str | None
     rationale: str
+    softened_gate_used: bool = False
 
 
 @dataclass

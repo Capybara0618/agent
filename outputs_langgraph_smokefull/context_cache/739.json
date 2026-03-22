@@ -1,0 +1,334 @@
+{
+  "task_id": "739",
+  "repo_owner": "databiosphere",
+  "repo_name": "toil",
+  "file_path": "src/toil/batchSystems/singleMachine.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:19:36+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:19:45+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:19:54+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/toil/batchSystems/singleMachine.py",
+    "original_code": "def _startChild(self, jobCommand, jobID, coreFractions, jobMemory, jobDisk, environment):\n    \"\"\"\n    Start a child process for the given job.\n\n    Allocate its required resources and save it and save it in our bookkeeping structures.\n\n    If the job is started, returns its PID.\n    If the job fails to start, reports it as failed and returns False.\n    If the job cannot get the resources it needs to start, returns None.\n    \"\"\"\n\n    # We fill this in if we manage to actually start the child.\n    popen = None\n\n    # This is when we started working on the job.\n    startTime = time.time()\n\n    # See if we can fit the job in our resource pools right now.\n    if self.coreFractions.acquireNow(coreFractions):\n        # We got some cores\n        if self.memory.acquireNow(jobMemory):\n            # We got some memory\n            if self.disk.acquireNow(jobDisk):\n                # We got the final resource, disk.\n                # Actually run the job.\n                # When it finishes we will release what it was using.\n                # So it is important to not lose track of the child process.\n\n                try:\n                    # Launch the job\n                    popen = subprocess.Popen(jobCommand,\n                                             shell=True,\n                                             env=dict(os.environ, **environment))\n                except Exception:\n                    # If the job can't start, make sure we release resources now\n                    self.coreFractions.release(coreFractions)\n                    self.memory.release(jobMemory)\n                    self.disk.release(jobDisk)\n\n                    log.error('Could not start job %s: %s', jobID, traceback.format_exc())\n\n                    # Report as failed.\n                    # TODO: what should the exit code be?\n                    self.outputQueue.put((jobID, -1, 0))\n\n                    # Free resources\n                    self.coreFractions.release(coreFractions)\n                    self.memory.release(jobMemory)\n                    self.disk.release(jobDisk)\n\n                    # Complain it broke.\n                    return False\n                else:\n                    # If the job did start, record it\n                    self.children[popen.pid] = popen\n                    # Make sure we can look it up by PID later\n                    self.childToJob[popen.pid] = jobID\n                    # Record that the job is running, and the resources it is using\n                    info = Info(startTime, popen, (coreFractions, jobMemory, jobDisk), killIntended=False)\n                    self.runningJobs[jobID] = info\n\n                    log.debug('Launched job %s as child %d', jobID, popen.pid)\n\n                    # Report success starting the job\n                    # Note that if a PID were somehow 0 it would look like False\n                    assert popen.pid != 0\n                    return popen.pid\n            else:\n                # We can't get disk, so free cores and memory\n                self.coreFractions.release(coreFractions)\n                self.memory.release(jobMemory)\n                log.debug('Not enough disk to run job %s', jobID)\n        else:\n            # Free cores, since we can't get memory\n            self.coreFractions.release(coreFractions)\n            log.debug('Not enough memory to run job %s', jobID)\n    else:\n        log.debug('Not enough cores to run job %s', jobID)\n\n    # If we get here, we didn't succeed or fail starting the job.\n    # We didn't manage to get the resources.\n    # Report that.\n    return None",
+    "satd_comment": "# TODO: what should the exit code be?",
+    "target_file": {
+      "ok": true,
+      "path": "src/toil/batchSystems/singleMachine.py",
+      "sha": "2389e9d371c285b0caaa05c28360d04a3d6a4f54",
+      "download_url": "https://raw.githubusercontent.com/DataBiosphere/toil/master/src/toil/batchSystems/singleMachine.py",
+      "content_excerpt": "# Copyright (C) 2015-2021 Regents of the University of California\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\nimport datetime\nimport logging\nimport math\nimport os\nimport signal\nimport subprocess\nimport time\nimport traceback\nfrom argparse import ArgumentParser, _ArgumentGroup\nfrom collections.abc import Sequence\nfrom queue import Empty, Queue\nfrom threading import Event, Lock, Thread\n\nimport toil\nfrom toil import worker as toil_worker\nfrom toil.batchSystems.abstractBatchSystem import (\n    EXIT_STATUS_UNAVAILABLE_VALUE,\n    BatchSystemSupport,\n    InsufficientSystemResources,\n    ResourcePool,\n    ResourceSet,\n    UpdatedBatchJobInfo,\n)\nfrom toil.batchSystems.options import OptionSetter\nfrom toil.bus import ExternalBatchIdMessage\nfrom toil.common import Config, Toil\nfrom toil.job import (\n    AcceleratorRequirement,\n    JobDescription,\n    Requirer,\n    accelerator_satisfies,\n)\nfrom toil.lib.accelerators import (\n    get_individual_local_accelerators,\n    get_restrictive_environment_for_local_accelerators,\n)\nfrom toil.lib.threading import cpu_count\nfrom toil.options.common import SYS_MAX_SIZE, make_open_interval_action\n\nlogger = logging.getLogger(__name__)\n\n\nclass SingleMachineBatchSystem(BatchSystemSupport):\n    \"\"\"\n    The interface for running jobs on a single machine, runs all the jobs you\n    give it as they come in, but in parallel.\n\n    Uses a single \"daddy\" thread to manage a fleet of child processes.\n\n    Communication with the daddy thread happens via two queues: one queue of\n    jobs waiting to be run (the input queue), and one queue of jobs that are\n    finished/stopped and need to be returned by getUpdatedBatchJob (the output\n    queue).\n\n    When the batch system is shut down, the daddy thread is stopped.\n\n    If running in debug-worker mode, jobs are run immediately as they are sent\n    to the batch system, in the sending thread, and the daddy thread is not\n    run. But the queues are still used.\n    \"\"\"\n\n    @classmethod\n    def supportsAutoDeployment(cls):\n        return False\n\n    @classmethod\n    def supportsWorkerCleanup(cls):\n        return True\n\n    numCores = cpu_count()\n\n    minCores = 0.1\n    \"\"\"\n    The minimal fractional CPU. Tasks with a smaller core requirement will be rounded up to this\n    value.\n    \"\"\"\n    physicalMemory = toil.physicalMemory()\n\n    def __init__(\n        self,\n        config: Config,\n        maxCores: float,\n        maxMemory: float,\n        maxDisk: int,\n        max_jobs: int | None = None,\n    ) -> None:\n        self.config = config\n\n        if max_jobs is None:\n            # Use the main limit for jobs from the config\n            self.max_jobs = self.config.max_jobs\n        else:\n            # Use the override (probably because we are the local batch system\n            # and not the main one).\n            self.max_jobs = max_jobs\n\n        # Limit to the smaller of the user-imposed limit and what we actually\n        # have on this machine for each resource.\n        #\n        # If we don't have up to the limit of the resource (and the resource\n        # isn't the inlimited sentinel), warn.\n        if maxCores > self.numCores:\n            if maxCores != SYS_MAX_SIZE and maxCores != float(\"inf\"):\n                # We have an actually specified limit and not the default\n                logger.warning(\n                    \"Not enough cores! User limited to %i but we only have %i.\",\n                    maxCores,\n                    self.numCores,\n                )\n            maxCores = self.numCores\n        if maxMemory > self.physicalMemory:\n            if (\n                maxMemory < SYS_MAX_SIZE\n            ):  # todo: looks like humans2bytes converts SYS_MAX_SIZE to SYS_MAX_SIZE+1\n                # We have an actually specified limit and not the default\n                logger.warning(\n                    \"Not enough memory! User limited to %i bytes but we only have %i bytes.\",\n                    maxMemory,\n                    self.physicalMemory,\n                )\n            maxMemory = self.physicalMemory\n\n        workdir = Toil.getLocalWorkflowDir(\n            config.workflowID, config.workDir\n        )  # config.workDir may be None; this sets a real directory\n        self.physicalDisk = toil.physicalDisk(workdir)\n        if maxDisk > self.physicalDisk:\n            if maxDisk < SYS_MAX_SIZE:  # same as maxMemory logger.warning\n                # We have an actually specified limit and not the default\n                logger.warning(\n                    \"Not enough disk space! User limited to %i bytes but we only have %i bytes.\",\n                    maxDisk,\n                    self.physicalDisk,\n                )\n            maxDisk = self.physicalDisk\n\n        super().__init__(config, maxCores, maxMemory, maxDisk)\n        assert self.maxCores >= self.minCores\n        assert self.maxMemory >= 1\n\n        # The scale allows the user to apply a factor to each task's cores requirement, thereby\n        # squeezing more tasks onto each core (scale < 1) or stretching tasks over more cores\n        # (scale > 1).\n        self.scale = config.scale\n\n        if config.badWorker > 0 and config.debugWorker:\n            # We can't throw SIGUSR1 at the worker because it is also going to\n            # be the leader and/or test harness.\n            raise RuntimeError(\n                \"Cannot use badWorker and debugWorker together; \"\n                \"worker would have to kill the leader\"\n            )\n\n        self.debugWorker = config.debugWorker\n\n        # A counter to generate job IDs and a lock to guard it.\n        # We make sure to start this at 1 so that job IDs are never falsy.\n        self.jobIndex = 1\n        self.jobIndexLock = Lock()\n\n        # A dictionary mapping batch system IDs of submitted jobs to the command line\n        self.jobs: dict[int, JobDescription] = {}\n\n        # A queue of jobs waiting to be executed. Consumed by the daddy thread.\n        self.inputQueue = Queue()\n\n        # A queue of finished jobs. Produced by the daddy thread.\n        self.outputQueue = Queue()\n\n        # A dictionary mapping batch system IDs of currently running jobs to their Info objects\n        self.runningJobs: dict[int, Info] = {}\n\n        # These next two are only used outside debug-worker mode\n\n        # A dict mapping PIDs to Popen objects for running jobs.\n        # Jobs that don't fork are executed one at a time in the main thread.\n        self.children: dict[int, subprocess.Popen] = {}\n        # A dict mapping child PIDs to the Job IDs they are supposed to be running.\n        self.childToJob: dict[int, str] = {}\n\n        # For accelerators, we need a collection of what each accelerator is, and an acquirable set of them.\n        self.accelerator_identities = get_individual_local_accelerators()\n\n        # Put them all organized by resource type\n        self.resource_sources = [\n            # A pool representing available job slots\n            ResourcePool(self.max_jobs, \"job slots\"),\n            # A pool representing available CPU in units of minCores\n            ResourcePool(int(self.maxCores / self.minCores), \"cores\"),\n            # A pool representing available memory in bytes\n            ResourcePool(self.maxMemory, \"memory\"),\n            # A pool representing the available space in bytes\n            ResourcePool(self.maxDisk, \"disk\"),\n            # And a set for acquiring individual accelerators\n            ResourceSet(set(range(len(self.accelerator_identities))), \"accelerators\"),\n        ]\n\n        # If we can't schedule something, we fill this in with a reason why\n        self.schedulingStatusMessage = None\n\n        # We use this event to signal shutdown\n        self.shuttingDown = Event()\n\n        # A thread in charge of managing all our child processes.\n        # Also takes care of resource accounting.\n        self.daddyThread = None\n        # If it breaks it will fill this in\n        self.daddyException: Exception | None = None\n\n        if self.debugWorker:\n            logger.debug(\"Started batch system %s in worker debug mode.\", id(self))\n        else:\n            self.daddyThread = Thread(target=self.daddy, daemon=True)\n            self.daddyThread.start()\n            logger.debug(\"Started batch system %s in normal mode.\", id(self))\n\n    def daddy(self):\n        \"\"\"\n        Be the \"daddy\" thread.\n\n        Our job is to look at jobs from the input queue.\n\n        If a job fits in the available resources, we allocate resources for it\n        and kick off a child process.\n\n        We also check on our children.\n\n        When a child finishes, we reap it, release its resources, and put its\n        information in the output queue.\n        \"\"\"\n\n        try:\n            logger.debug(\"Started daddy thread for batch system %s.\", id(self))\n\n            while not self.shuttingDown.is_set():\n                # Main loop\n\n                while not self.shuttingDown.is_set():\n                    # Try to start as many jobs as we can try to start\n                    try:\n                        # Grab something from the input queue if available.\n                        args = self.inputQueue.get_nowait()\n                        (\n                            jobCommand,\n                            jobID,\n                            jobCores,\n                            jobMemory,\n                            jobDisk,\n                            job_accelerators,\n                            environment,\n                        ) = args\n\n                        coreFractions = int(jobCores / self.minCores)\n\n                        # Try to start the child\n                        result = self._startChild(\n                            jobCommand,\n                            jobID,\n                            coreFractions,\n                            jobMemory,\n                            jobDisk,\n                            job_accelerators,\n                            environment,\n                        )\n\n                        if result is None:\n                            # We did not get the resources to run this job.\n                            # Requeue last, so we can look at the next job.\n                            # TODO: Have some kind of condition the job can wait on,\n                            # but without threads (queues for jobs needing\n                            # cores/memory/disk individually)?\n                            self.inputQueue.put(args)\n                            break\n                        elif result is not False:\n                            # Result is a PID\n\n                            if self._outbox is not None:\n                                # Annotate the job with the PID generated.\n                                self._outbox.publish(\n                                    ExternalBatchIdMessage(\n                                        jobID, str(result), self.__class__.__name__\n                                    )\n                                )\n\n                        # Otherwise False\n\n                    except Empty:\n                        # Nothing to run. Stop looking in the queue.\n                        break\n\n                # Now check on our children.\n                for done_pid in self._pollForDoneChildrenIn(self.children):\n                    # A child has actually finished.\n                    # Clean up after it.\n                    self._handleChild(done_pid)\n\n                # Then loop again: start and collect more jobs.\n                # TODO: It would be good to be able to wai",
+      "total_lines": 1041
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "datetime",
+        "logging",
+        "math",
+        "os",
+        "signal",
+        "subprocess",
+        "time",
+        "traceback",
+        "argparse:ArgumentParser",
+        "argparse:_ArgumentGroup",
+        "collections.abc:Sequence",
+        "queue:Empty",
+        "queue:Queue",
+        "threading:Event",
+        "threading:Lock",
+        "threading:Thread",
+        "toil",
+        "toil:worker",
+        "toil.batchSystems.abstractBatchSystem:EXIT_STATUS_UNAVAILABLE_VALUE",
+        "toil.batchSystems.abstractBatchSystem:BatchSystemSupport",
+        "toil.batchSystems.abstractBatchSystem:InsufficientSystemResources",
+        "toil.batchSystems.abstractBatchSystem:ResourcePool",
+        "toil.batchSystems.abstractBatchSystem:ResourceSet",
+        "toil.batchSystems.abstractBatchSystem:UpdatedBatchJobInfo",
+        "toil.batchSystems.options:OptionSetter",
+        "toil.bus:ExternalBatchIdMessage",
+        "toil.common:Config",
+        "toil.common:Toil",
+        "toil.job:AcceleratorRequirement",
+        "toil.job:JobDescription"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/DataBiosphere/toil/master/README.rst",
+      "content_excerpt": ".. image:: https://flat.badgen.net/https/ucsc-ci.com/api/v4/projects/3/jobs/artifacts/master/raw/badges1.2/required.json%3Fjob=cwl_badge%26search_recent_successful_pipelines=true?icon=commonwl&label=CWL%201.2%20Conformance\n   :alt: Toil CWL 1.2 Conformance Badge\n   :target: https://github.com/common-workflow-language/cwl-v1.2/blob/main/CONFORMANCE_TESTS.md\n\n.. image:: https://badges.gitter.im/bd2k-genomics-toil/Lobby.svg\n   :alt: Join the chat at https://gitter.im/bd2k-genomics-toil/Lobby\n   :target: https://gitter.im/bd2k-genomics-toil/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge\n\nToil is a scalable, efficient, cross-platform (Linux & macOS) pipeline management system,\nwritten entirely in Python, and designed around the principles of functional\nprogramming. It supports running workflows written in either Common Workflow Language (`CWL`_) 1.0-1.2 or \nWorkflow Description Language (`WDL`_) 1.0-1.1, as well as having its own rich Python API for writing workflows against. \nIt supports running workflows locally on your system (e.g. a laptop), on an HPC cluster, or in the cloud. \n\n* Check the `website`_ for a description of Toil and its features.\n* Full documentation for the latest stable release can be found at\n  `Read the Docs`_.\n* Please subscribe to low-volume `announce`_ mailing list so we keep you informed\n* Google Groups discussion `forum`_\n* See our occasional `blog`_ for tutorials. \n* Use `biostars`_ channel for discussion.\n\n.. _website: http://toil.ucsc-cgl.org/\n.. _Read the Docs: https://toil.readthedocs.io/en/latest\n.. _announce: ht"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_startChild test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_startChild(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "singleMachine.py",
+          "path": "src/toil/batchSystems/singleMachine.py",
+          "sha": "2389e9d371c285b0caaa05c28360d04a3d6a4f54",
+          "html_url": "https://github.com/DataBiosphere/toil/blob/1bc3266e92f26171cec997e79360167675c66f5e/src/toil/batchSystems/singleMachine.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/toil/batchSystems",
+      "count": 18,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/toil/batchSystems/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "abstractBatchSystem.py",
+          "path": "src/toil/batchSystems/abstractBatchSystem.py",
+          "type": "file"
+        },
+        {
+          "name": "abstractGridEngineBatchSystem.py",
+          "path": "src/toil/batchSystems/abstractGridEngineBatchSystem.py",
+          "type": "file"
+        },
+        {
+          "name": "awsBatch.py",
+          "path": "src/toil/batchSystems/awsBatch.py",
+          "type": "file"
+        },
+        {
+          "name": "cleanup_support.py",
+          "path": "src/toil/batchSystems/cleanup_support.py",
+          "type": "file"
+        },
+        {
+          "name": "contained_executor.py",
+          "path": "src/toil/batchSystems/contained_executor.py",
+          "type": "file"
+        },
+        {
+          "name": "gridengine.py",
+          "path": "src/toil/batchSystems/gridengine.py",
+          "type": "file"
+        },
+        {
+          "name": "htcondor.py",
+          "path": "src/toil/batchSystems/htcondor.py",
+          "type": "file"
+        },
+        {
+          "name": "kubernetes.py",
+          "path": "src/toil/batchSystems/kubernetes.py",
+          "type": "file"
+        },
+        {
+          "name": "local_support.py",
+          "path": "src/toil/batchSystems/local_support.py",
+          "type": "file"
+        },
+        {
+          "name": "lsf.py",
+          "path": "src/toil/batchSystems/lsf.py",
+          "type": "file"
+        },
+        {
+          "name": "lsfHelper.py",
+          "path": "src/toil/batchSystems/lsfHelper.py",
+          "type": "file"
+        },
+        {
+          "name": "mesos",
+          "path": "src/toil/batchSystems/mesos",
+          "type": "dir"
+        },
+        {
+          "name": "options.py",
+          "path": "src/toil/batchSystems/options.py",
+          "type": "file"
+        },
+        {
+          "name": "registry.py",
+          "path": "src/toil/batchSystems/registry.py",
+          "type": "file"
+        },
+        {
+          "name": "singleMachine.py",
+          "path": "src/toil/batchSystems/singleMachine.py",
+          "type": "file"
+        },
+        {
+          "name": "slurm.py",
+          "path": "src/toil/batchSystems/slurm.py",
+          "type": "file"
+        },
+        {
+          "name": "torque.py",
+          "path": "src/toil/batchSystems/torque.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/toil/batchSystems/__init__.py"
+        },
+        {
+          "name": "abstractBatchSystem.py",
+          "path": "src/toil/batchSystems/abstractBatchSystem.py"
+        },
+        {
+          "name": "abstractGridEngineBatchSystem.py",
+          "path": "src/toil/batchSystems/abstractGridEngineBatchSystem.py"
+        },
+        {
+          "name": "awsBatch.py",
+          "path": "src/toil/batchSystems/awsBatch.py"
+        },
+        {
+          "name": "cleanup_support.py",
+          "path": "src/toil/batchSystems/cleanup_support.py"
+        },
+        {
+          "name": "contained_executor.py",
+          "path": "src/toil/batchSystems/contained_executor.py"
+        },
+        {
+          "name": "gridengine.py",
+          "path": "src/toil/batchSystems/gridengine.py"
+        },
+        {
+          "name": "htcondor.py",
+          "path": "src/toil/batchSystems/htcondor.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/toil/batchSystems/singleMachine.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "e08b52cf3a8e0eb0ca8eee7b1f0223ba08c4a2ac",
+          "html_url": "https://github.com/DataBiosphere/toil/commit/e08b52cf3a8e0eb0ca8eee7b1f0223ba08c4a2ac",
+          "message": "mass reformat & upgrade to Python 3.10+ syntax",
+          "author": "Michael R. Crusoe",
+          "date": "2025-11-19T15:29:41Z"
+        },
+        {
+          "sha": "d2ff731c8544407f8b9f4afd8616dadc41a2aefb",
+          "html_url": "https://github.com/DataBiosphere/toil/commit/d2ff731c8544407f8b9f4afd8616dadc41a2aefb",
+          "message": "GitLab CI: speed up execution (#5235)\n\n* gitlab-ci: add collapsable sections (with recorded durations)\n\nhttps://docs.gitlab.com/ci/jobs/job_logs/#custom-collapsible-sections\n\n* gitlab-ci: increase test threads to 4\n\n* gitlab-ci: standalone tests only need one test thread\n\n* gitlab-ci: use worksteal ",
+          "author": "Michael R. Crusoe",
+          "date": "2025-04-10T15:46:40Z"
+        },
+        {
+          "sha": "49d99f17799aa4a4235126bbdfb45f85e6499b27",
+          "html_url": "https://github.com/DataBiosphere/toil/commit/49d99f17799aa4a4235126bbdfb45f85e6499b27",
+          "message": "make format",
+          "author": "Michael R. Crusoe",
+          "date": "2024-10-19T08:59:56Z"
+        },
+        {
+          "sha": "a307a57651296e576d55f9159869dc9130da2b7c",
+          "html_url": "https://github.com/DataBiosphere/toil/commit/a307a57651296e576d55f9159869dc9130da2b7c",
+          "message": "sort_imports",
+          "author": "Michael R. Crusoe",
+          "date": "2024-10-19T08:45:05Z"
+        },
+        {
+          "sha": "1c6217e11a2815476ede1cc3ee584d5da3d5242a",
+          "html_url": "https://github.com/DataBiosphere/toil/commit/1c6217e11a2815476ede1cc3ee584d5da3d5242a",
+          "message": "remove_unused_import",
+          "author": "Michael R. Crusoe",
+          "date": "2024-10-19T08:44:23Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_startChild TODO what should exit code",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/toil/batchSystems/singleMachine.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "e08b52cf3a8e0eb0ca8eee7b1f0223ba08c4a2ac",
+        "html_url": "https://github.com/DataBiosphere/toil/commit/e08b52cf3a8e0eb0ca8eee7b1f0223ba08c4a2ac",
+        "message": "mass reformat & upgrade to Python 3.10+ syntax",
+        "author": "Michael R. Crusoe",
+        "date": "2025-11-19T15:29:41Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "Existing error handling for job failures",
+        "Defined behavior for job execution",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function _startChild",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

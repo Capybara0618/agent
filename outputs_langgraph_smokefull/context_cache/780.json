@@ -1,0 +1,422 @@
+{
+  "task_id": "780",
+  "repo_owner": "pantsbuild",
+  "repo_name": "pants",
+  "file_path": "src/python/pants/engine/rules.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:34:21+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:34:33+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:34:38+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/python/pants/engine/rules.py",
+    "original_code": "def full_graph(self):\n  \"\"\"Produces a full graph based on the root subjects and all of the products produced by rules.\"\"\"\n  full_root_rules = set()\n  full_dependency_edges = {}\n  full_unfulfillable_rules = {}\n  for root_subject_type, selector_fn in self.root_subject_selector_fns.items():\n    for product in sorted(self.nodebuilder.all_produced_product_types(root_subject_type)):\n      root_rule = RootRule(root_subject_type, selector_fn(product))\n      # TODO consider passing the current edge set through as a perf improvement.\n      root_dependencies, rule_dependency_edges, unfulfillable_rules = self._construct_graph(root_rule)\n      full_root_rules.update(root_dependencies)\n      full_dependency_edges.update(rule_dependency_edges)\n      full_unfulfillable_rules.update(unfulfillable_rules)\n\n  rules_in_graph = set(entry.rule for entry in full_dependency_edges.keys())\n  rules_eliminated_during_construction = set(entry.rule for entry in full_unfulfillable_rules.keys())\n\n  declared_rules = self.nodebuilder.all_rules()\n  unreachable_rules = declared_rules.difference(rules_in_graph,\n                                                rules_eliminated_during_construction)\n  for rule in sorted(unreachable_rules):\n    full_unfulfillable_rules[UnreachableRule(rule)] = [Diagnostic(None, 'Unreachable')]\n\n  return RuleGraph(self.root_subject_selector_fns,\n                       list(full_root_rules),\n                       full_dependency_edges,\n                       full_unfulfillable_rules)",
+    "satd_comment": "# TODO consider passing the current edge set through as a perf improvement.",
+    "target_file": {
+      "ok": true,
+      "path": "src/python/pants/engine/rules.py",
+      "sha": "a17e757a86032a85a596730e8de99197364be0b5",
+      "download_url": "https://raw.githubusercontent.com/pantsbuild/pants/main/src/python/pants/engine/rules.py",
+      "content_excerpt": "# Copyright 2016 Pants project contributors (see CONTRIBUTORS.md).\n# Licensed under the Apache License, Version 2.0 (see LICENSE).\n\nfrom __future__ import annotations\n\nimport functools\nimport inspect\nimport sys\nfrom collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence\nfrom dataclasses import dataclass\nfrom enum import Enum\nfrom types import FrameType, ModuleType\nfrom typing import (\n    Any,\n    NotRequired,\n    Protocol,\n    TypedDict,\n    TypeVar,\n    Unpack,\n    cast,\n    get_type_hints,\n    overload,\n)\n\nfrom typing_extensions import ParamSpec\n\nfrom pants.engine.engine_aware import SideEffecting\nfrom pants.engine.internals.rule_visitor import collect_awaitables\nfrom pants.engine.internals.selectors import AwaitableConstraints, Call\nfrom pants.engine.internals.selectors import concurrently as concurrently  # noqa: F401\nfrom pants.engine.unions import UnionRule\nfrom pants.util.frozendict import FrozenDict\nfrom pants.util.logging import LogLevel\nfrom pants.util.ordered_set import FrozenOrderedSet, OrderedSet\nfrom pants.util.strutil import softwrap\n\nPANTS_RULES_MODULE_KEY = \"__pants_rules__\"\n\n\ndef implicitly(*args) -> dict[str, Any]:\n    # NB: This function does not have a `TypedDict` return type, because the `@rule` decorator\n    # cannot adjust the type of the `@rule` function to include a keyword argument (keyword\n    # arguments are not supported by PEP-612).\n    return {\"__implicitly\": args}\n\n\nclass RuleType(Enum):\n    rule = \"rule\"\n    goal_rule = \"goal_rule\"\n    uncacheable_rule = \"_uncacheable_rule\"\n\n\nP = ParamSpec(\"P\")\nR = TypeVar(\"R\")\nSyncRuleT = Callable[P, R]\nAsyncRuleT = Callable[P, Coroutine[Any, Any, R]]\nRuleDecorator = Callable[[SyncRuleT | AsyncRuleT], AsyncRuleT]\n\n\ndef _rule_call_trampoline(\n    rule_id: str, output_type: type[Any], func: Callable[P, R]\n) -> Callable[P, R]:\n    @functools.wraps(func)  # type: ignore\n    async def wrapper(*args, __implicitly: Sequence[Any] = (), **kwargs):\n        call = Call(rule_id, output_type, args, *__implicitly)\n        return await call\n\n    return cast(Callable[P, R], wrapper)\n\n\ndef _make_rule(\n    func_id: str,\n    rule_type: RuleType,\n    return_type: type[Any],\n    parameter_types: dict[str, type[Any]],\n    masked_types: Iterable[type[Any]],\n    *,\n    cacheable: bool,\n    polymorphic: bool,\n    canonical_name: str,\n    desc: str | None,\n    level: LogLevel,\n) -> RuleDecorator:\n    \"\"\"A @decorator that declares that a particular static function may be used as a TaskRule.\n\n    :param rule_type: The specific decorator used to declare the rule.\n    :param return_type: The return/output type for the Rule. This must be a concrete Python type.\n    :param parameter_types: A sequence of types that matches the number and order of arguments to\n                            the decorated function.\n    :param cacheable: Whether the results of executing the Rule should be cached as keyed by all of\n                      its inputs.\n    :param polymorphic: Whether the rule is an abstract base method for polymorphic dispatch via\n                        a union type.\n    \"\"\"\n\n    is_goal_cls = getattr(return_type, \"__goal__\", False)\n    if rule_type == RuleType.rule and is_goal_cls:\n        raise TypeError(\n            \"An `@rule` that returns a `Goal` must instead be declared with `@goal_rule`.\"\n        )\n    if rule_type == RuleType.goal_rule and not is_goal_cls:\n        raise TypeError(\"An `@goal_rule` must return a subclass of `engine.goal.Goal`.\")\n\n    def wrapper(original_func):\n        if not inspect.isfunction(original_func):\n            raise ValueError(\"The @rule decorator must be applied innermost of all decorators.\")\n\n        # Set our own custom `__line_number__` dunder so that the engine may visualize the line number.\n        original_func.__line_number__ = original_func.__code__.co_firstlineno\n        original_func.rule_id = canonical_name\n\n        awaitables = FrozenOrderedSet(collect_awaitables(original_func))\n\n        validate_requirements(func_id, parameter_types, awaitables, cacheable)\n        func = _rule_call_trampoline(canonical_name, return_type, original_func)\n\n        # NB: The named definition of the rule ends up wrapped in a trampoline to handle memoization\n        # and implicit arguments for direct by-name calls. But the `TaskRule` takes a reference to\n        # the original unwrapped function, which avoids the need for a special protocol when the\n        # engine invokes a @rule under memoization.\n        func.rule = TaskRule(\n            return_type,\n            FrozenDict(parameter_types),\n            awaitables,\n            masked_types,\n            original_func,\n            canonical_name=canonical_name,\n            desc=desc,\n            level=level,\n            cacheable=cacheable,\n            polymorphic=polymorphic,\n        )\n        return func\n\n    return wrapper\n\n\nclass InvalidTypeAnnotation(TypeError):\n    \"\"\"Indicates an incorrect type annotation for an `@rule`.\"\"\"\n\n\nclass UnrecognizedRuleArgument(TypeError):\n    \"\"\"Indicates an unrecognized keyword argument to a `@rule`.\"\"\"\n\n\nclass MissingTypeAnnotation(TypeError):\n    \"\"\"Indicates a missing type annotation for an `@rule`.\"\"\"\n\n\nclass MissingReturnTypeAnnotation(InvalidTypeAnnotation):\n    \"\"\"Indicates a missing return type annotation for an `@rule`.\"\"\"\n\n\nclass MissingParameterTypeAnnotation(InvalidTypeAnnotation):\n    \"\"\"Indicates a missing parameter type annotation for an `@rule`.\"\"\"\n\n\nclass DuplicateRuleError(TypeError):\n    \"\"\"Invalid to overwrite `@rule`s using the same name in the same module.\"\"\"\n\n\ndef _ensure_type_annotation(\n    *,\n    type_annotation: type[Any] | None,\n    name: str,\n    raise_type: type[InvalidTypeAnnotation],\n) -> type[Any]:\n    if type_annotation is None:\n        raise raise_type(f\"{name} is missing a type annotation.\")\n    if not isinstance(type_annotation, type):\n        raise raise_type(\n            f\"The annotation for {name} must be a type, got {type_annotation} of type {type(type_annotation)}.\"\n        )\n    return type_annotation\n\n\nPUBLIC_RULE_DECORATOR_ARGUMENTS = {\n    \"canonical_name\",\n    \"canonical_name_suffix\",\n    \"desc\",\n    \"level\",\n    \"polymorphic\",\n}\n# We aren't sure if these'll stick around or be removed at some point, so they are \"private\"\n# and should only be used in Pants' codebase.\nPRIVATE_RULE_DECORATOR_ARGUMENTS = {\n    # Allows callers to override the type Pants will use for the params listed.\n    #\n    # It is assumed (but not enforced) that the provided type is a subclass of the annotated type.\n    # (We assume but not enforce since this is likely to be used with unions, which has the same\n    # assumption between the union base and its members).\n    \"_param_type_overrides\",\n    # Allows callers to prevent the given list of types from being included in the identity of\n    # a @rule. Although the type may be in scope for callers, it will not be consumable in the\n    # `@rule` which declares the type masked.\n    \"_masked_types\",\n}\n# We don't want @rule-writers to use 'rule_type' or 'cacheable' as kwargs directly,\n# but rather set them implicitly based on the rule annotation.\n# So we leave it out of PUBLIC_RULE_DECORATOR_ARGUMENTS.\nIMPLICIT_PRIVATE_RULE_DECORATOR_ARGUMENTS = {\"rule_type\", \"cacheable\"}\n\n\nclass RuleDecoratorKwargs(TypedDict):\n    \"\"\"Public-facing @rule kwargs used in the codebase.\"\"\"\n\n    canonical_name: NotRequired[str]\n\n    canonical_name_suffix: NotRequired[str]\n\n    desc: NotRequired[str]\n    \"\"\"The rule's description as it appears in stacktraces/debugging. For goal rules, defaults to the goal name.\"\"\"\n\n    level: NotRequired[LogLevel]\n    \"\"\"The logging level applied to this rule. Defaults to TRACE.\"\"\"\n\n    polymorphic: NotRequired[bool]\n    \"\"\"Whether this rule represents an abstract method for a union.\n\n    A polymorphic rule can only be called by name, and must have a single input type that is a\n    union base type (plus other non-union arguments as needed). Execution will be dispatched to the\n    @rule with the same signature with the union base type replaced by one of its member types.\n\n    E.g., given\n\n    ```\n    @rule(polymorphic=True)\n    async def base_rule(arg: UnionBase, other_arg: OtherType) -> OutputType\n        ...\n\n    @rule(polymorphic=True)\n    async def derived_rule(arg: UnionMember, other_arg: OtherType) -> OutputType\n       ...\n\n    ```\n\n    And an arg of type UnionMember, then\n\n    `await base_rule(arg, other_arg)`\n\n    will invoke `derived_rule(arg, other_arg)`\n    \"\"\"\n\n    _masked_types: NotRequired[Iterable[type[Any]]]\n    \"\"\"Unstable. Internal Pants usage only.\"\"\"\n\n    _param_type_overrides: NotRequired[dict[str, type[Any]]]\n    \"\"\"Unstable. Internal Pants usage only.\"\"\"\n\n\nclass _RuleDecoratorKwargs(RuleDecoratorKwargs):\n    \"\"\"Internal/Implicit @rule kwargs (not for use outside rules.py)\"\"\"\n\n    rule_type: RuleType\n    \"\"\"The decorator used to declare the rule (see rules.py:_make_rule(...))\"\"\"\n\n    cacheable: bool\n    \"\"\"Whether the results of this rule should be cached.\n    Typically true for rules, false for goal_rules (see rules.py:_make_rule(...))\n    \"\"\"\n\n\ndef rule_decorator(\n    func: SyncRuleT | AsyncRuleT, **kwargs: Unpack[_RuleDecoratorKwargs]\n) -> AsyncRuleT:\n    if not inspect.isfunction(func):\n        raise ValueError(\"The @rule decorator expects to be placed on a function.\")\n\n    if (\n        len(\n            set(kwargs)\n            - PUBLIC_RULE_DECORATOR_ARGUMENTS\n            - PRIVATE_RULE_DECORATOR_ARGUMENTS\n            - IMPLICIT_PRIVATE_RULE_DECORATOR_ARGUMENTS\n        )\n        != 0\n    ):\n        raise UnrecognizedRuleArgument(\n            f\"`@rule`s and `@goal_rule`s only accept the following keyword arguments: {PUBLIC_RULE_DECORATOR_ARGUMENTS}\"\n        )\n\n    rule_type = kwargs[\"rule_type\"]\n    cacheable = kwargs[\"cacheable\"]\n    polymorphic = kwargs.get(\"polymorphic\", False)\n    masked_types: tuple[type, ...] = tuple(kwargs.get(\"_masked_types\", ()))\n    param_type_overrides: dict[str, type] = kwargs.get(\"_param_type_overrides\", {})\n\n    func_id = f\"@rule {func.__module__}:{func.__name__}\"\n    type_hints = get_type_hints(func)\n    return_type = _ensure_type_annotation(\n        type_annotation=type_hints.get(\"return\"),\n        name=f\"{func_id} return\",\n        raise_type=MissingReturnTypeAnnotation,\n    )\n\n    func_params = inspect.signature(func).parameters\n    for parameter in param_type_overrides:\n        if parameter not in func_params:\n            raise ValueError(\n                f\"Unknown parameter name in `param_type_overrides`: {parameter}.\"\n                + f\" Parameter names: '{', '.join(func_params)}'\"\n            )\n\n    parameter_types = {\n        parameter: _ensure_type_annotation(\n            type_annotation=param_type_overrides.get(parameter, type_hints.get(parameter)),\n            name=f\"{func_id} parameter {parameter}\",\n            raise_type=MissingParameterTypeAnnotation,\n        )\n        for parameter in func_params\n    }\n    is_goal_cls = getattr(return_type, \"__goal__\", False)\n\n    # Set a default canonical name if one is not explicitly provided to the module and name of the\n    # function that implements it, plus an optional suffix. This is used as the workunit name.\n    # The suffix is a convenient way to disambiguate multiple rules registered dynamically from the\n    # same static code (by overriding the inferred param types in the @rule decorator).\n    # TODO: It is not yet clear how dynamically registered rules whose names are generated\n    #  with a suffix will work in practice with the new call-by-name semantics.\n    #  For now the suffix serves to ensure unique names. Whether they are useful is another matter.\n    suffix = kwargs.get(\"canonical_name_suffix\", \"\")\n    effective_name = kwargs.get(\n        \"canonical_name\",\n        f\"{func.__module__}.{func.__qualname__}{('_' + suffix) if suffix else ''}\".replace(\n            \".<locals>\", \"\"\n        ),\n    )\n\n    # Set a default description, which is used in the dynamic UI and stacktraces.\n    effective_desc = kwarg",
+      "total_lines": 627
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "functools",
+        "inspect",
+        "sys",
+        "collections.abc:Callable",
+        "collections.abc:Coroutine",
+        "collections.abc:Iterable",
+        "collections.abc:Mapping",
+        "collections.abc:Sequence",
+        "dataclasses:dataclass",
+        "enum:Enum",
+        "types:FrameType",
+        "types:ModuleType",
+        "typing:Any",
+        "typing:NotRequired",
+        "typing:Protocol",
+        "typing:TypedDict",
+        "typing:TypeVar",
+        "typing:Unpack",
+        "typing:cast",
+        "typing:get_type_hints",
+        "typing:overload",
+        "typing_extensions:ParamSpec",
+        "pants.engine.engine_aware:SideEffecting",
+        "pants.engine.internals.rule_visitor:collect_awaitables",
+        "pants.engine.internals.selectors:AwaitableConstraints",
+        "pants.engine.internals.selectors:Call",
+        "pants.engine.internals.selectors:concurrently",
+        "pants.engine.unions:UnionRule",
+        "pants.util.frozendict:FrozenDict"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pantsbuild/pants/main/README.md",
+      "content_excerpt": "# Pants Build System\n\n[![Coverage Status](https://coveralls.io/repos/github/pantsbuild/pants/badge.svg?branch=main)](https://coveralls.io/github/pantsbuild/pants?branch=main)\n\nPants is a scalable build system for _monorepos_: codebases containing \nmultiple projects, often using multiple programming languages and frameworks, \nin a single unified code repository.\n\nSome noteworthy features include:\n\n* Explicit dependency modeling.\n* Fine-grained invalidation.\n* Shared result caching.\n* Concurrent execution.\n* Remote execution.\n* Unified interface for multiple tools and languages.\n* Extensibility and customizability via a plugin API.\n\nDocumentation: [www.pantsbuild.org](https://www.pantsbuild.org/).\n\n# Getting started\n\nSee the [getting started](https://www.pantsbuild.org/stable/docs/getting-started) documentation.\n\n# Credits\n\nmacOS CI resources provided by [MacStadium](https://www.macstadium.com/).\n\n<img width=\"150\" height=\"61\" src=\"https://uploads-ssl.webflow.com/5ac3c046c82724970fc60918/5c019d917bba312af7553b49_MacStadium-developerlogo.png\">\n\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "full_graph test",
+      "count": 1,
+      "items": [
+        {
+          "name": "rules_test.py",
+          "path": "src/python/pants/engine/rules_test.py",
+          "sha": "e15ef7673d2a78634a44d0da56873c53dc47a271",
+          "html_url": "https://github.com/pantsbuild/pants/blob/06fac3bc61b8233330844bc54058b5e1bd9ba4d5/src/python/pants/engine/rules_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"full_graph(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "rules_test.py",
+          "path": "src/python/pants/engine/rules_test.py",
+          "sha": "e15ef7673d2a78634a44d0da56873c53dc47a271",
+          "html_url": "https://github.com/pantsbuild/pants/blob/06fac3bc61b8233330844bc54058b5e1bd9ba4d5/src/python/pants/engine/rules_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/python/pants/engine",
+      "count": 34,
+      "entries": [
+        {
+          "name": "BUILD",
+          "path": "src/python/pants/engine/BUILD",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/python/pants/engine/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "addresses.py",
+          "path": "src/python/pants/engine/addresses.py",
+          "type": "file"
+        },
+        {
+          "name": "collection.py",
+          "path": "src/python/pants/engine/collection.py",
+          "type": "file"
+        },
+        {
+          "name": "collection_test.py",
+          "path": "src/python/pants/engine/collection_test.py",
+          "type": "file"
+        },
+        {
+          "name": "console.py",
+          "path": "src/python/pants/engine/console.py",
+          "type": "file"
+        },
+        {
+          "name": "desktop.py",
+          "path": "src/python/pants/engine/desktop.py",
+          "type": "file"
+        },
+        {
+          "name": "download_file.py",
+          "path": "src/python/pants/engine/download_file.py",
+          "type": "file"
+        },
+        {
+          "name": "download_file_integration_test.py",
+          "path": "src/python/pants/engine/download_file_integration_test.py",
+          "type": "file"
+        },
+        {
+          "name": "engine_aware.py",
+          "path": "src/python/pants/engine/engine_aware.py",
+          "type": "file"
+        },
+        {
+          "name": "env_vars.py",
+          "path": "src/python/pants/engine/env_vars.py",
+          "type": "file"
+        },
+        {
+          "name": "environment.py",
+          "path": "src/python/pants/engine/environment.py",
+          "type": "file"
+        },
+        {
+          "name": "environment_test.py",
+          "path": "src/python/pants/engine/environment_test.py",
+          "type": "file"
+        },
+        {
+          "name": "explorer.py",
+          "path": "src/python/pants/engine/explorer.py",
+          "type": "file"
+        },
+        {
+          "name": "fs.py",
+          "path": "src/python/pants/engine/fs.py",
+          "type": "file"
+        },
+        {
+          "name": "fs_test.py",
+          "path": "src/python/pants/engine/fs_test.py",
+          "type": "file"
+        },
+        {
+          "name": "goal.py",
+          "path": "src/python/pants/engine/goal.py",
+          "type": "file"
+        },
+        {
+          "name": "goal_integration_test.py",
+          "path": "src/python/pants/engine/goal_integration_test.py",
+          "type": "file"
+        },
+        {
+          "name": "goal_test.py",
+          "path": "src/python/pants/engine/goal_test.py",
+          "type": "file"
+        },
+        {
+          "name": "internals",
+          "path": "src/python/pants/engine/internals",
+          "type": "dir"
+        },
+        {
+          "name": "intrinsics.py",
+          "path": "src/python/pants/engine/intrinsics.py",
+          "type": "file"
+        },
+        {
+          "name": "native_engine_logging_integration_test.py",
+          "path": "src/python/pants/engine/native_engine_logging_integration_test.py",
+          "type": "file"
+        },
+        {
+          "name": "platform.py",
+          "path": "src/python/pants/engine/platform.py",
+          "type": "file"
+        },
+        {
+          "name": "platform_test.py",
+          "path": "src/python/pants/engine/platform_test.py",
+          "type": "file"
+        },
+        {
+          "name": "process.py",
+          "path": "src/python/pants/engine/process.py",
+          "type": "file"
+        },
+        {
+          "name": "process_test.py",
+          "path": "src/python/pants/engine/process_test.py",
+          "type": "file"
+        },
+        {
+          "name": "rules.py",
+          "path": "src/python/pants/engine/rules.py",
+          "type": "file"
+        },
+        {
+          "name": "rules_test.py",
+          "path": "src/python/pants/engine/rules_test.py",
+          "type": "file"
+        },
+        {
+          "name": "streaming_workunit_handler.py",
+          "path": "src/python/pants/engine/streaming_workunit_handler.py",
+          "type": "file"
+        },
+        {
+          "name": "streaming_workunit_handler_integration_test.py",
+          "path": "src/python/pants/engine/streaming_workunit_handler_integration_test.py",
+          "type": "file"
+        },
+        {
+          "name": "target.py",
+          "path": "src/python/pants/engine/target.py",
+          "type": "file"
+        },
+        {
+          "name": "target_test.py",
+          "path": "src/python/pants/engine/target_test.py",
+          "type": "file"
+        },
+        {
+          "name": "unions.py",
+          "path": "src/python/pants/engine/unions.py",
+          "type": "file"
+        },
+        {
+          "name": "unions_test.py",
+          "path": "src/python/pants/engine/unions_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "BUILD",
+          "path": "src/python/pants/engine/BUILD"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/python/pants/engine/__init__.py"
+        },
+        {
+          "name": "addresses.py",
+          "path": "src/python/pants/engine/addresses.py"
+        },
+        {
+          "name": "collection.py",
+          "path": "src/python/pants/engine/collection.py"
+        },
+        {
+          "name": "collection_test.py",
+          "path": "src/python/pants/engine/collection_test.py"
+        },
+        {
+          "name": "console.py",
+          "path": "src/python/pants/engine/console.py"
+        },
+        {
+          "name": "desktop.py",
+          "path": "src/python/pants/engine/desktop.py"
+        },
+        {
+          "name": "download_file.py",
+          "path": "src/python/pants/engine/download_file.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/python/pants/engine/rules.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "79c60a6cffbe15f49feb56e7ddb8ae20928e0b7f",
+          "html_url": "https://github.com/pantsbuild/pants/commit/79c60a6cffbe15f49feb56e7ddb8ae20928e0b7f",
+          "message": "Delete more Get-related cruft (#23068)",
+          "author": "Benjy Weinberger",
+          "date": "2026-02-02T14:45:53Z"
+        },
+        {
+          "sha": "c1a42ead0dfe57e87b60a734add7c1b70028bdba",
+          "html_url": "https://github.com/pantsbuild/pants/commit/c1a42ead0dfe57e87b60a734add7c1b70028bdba",
+          "message": "Remove support for Get (#23062)\n\nDelete the bulk of the code needed to\nsupport `Get` (and `Effect`).\n\nFollow up changes will further trim code\nthat is no longer needed, but this\nis already a big enough step for now.",
+          "author": "Benjy Weinberger",
+          "date": "2026-02-01T23:36:29Z"
+        },
+        {
+          "sha": "89e424102f362a8ae1d88c9e44d14909a00fd037",
+          "html_url": "https://github.com/pantsbuild/pants/commit/89e424102f362a8ae1d88c9e44d14909a00fd037",
+          "message": "Remove MultiGet from the codebase (#23057)\n\nRemoves the migration goal. Anyone migrating needs to\nbe on 2.31 or earlier. \n\nRemoves the migration guide, and switches references to\nit to point to the version in the 2.30 docs in perpetuity.\n\nAlso gets rid of the \"await in loop\" custom flake8 check, \nas",
+          "author": "Benjy Weinberger",
+          "date": "2026-01-31T02:22:09Z"
+        },
+        {
+          "sha": "2fa5796d2437d825e20316ae827b3100eea51fcf",
+          "html_url": "https://github.com/pantsbuild/pants/commit/2fa5796d2437d825e20316ae827b3100eea51fcf",
+          "message": "Decouple Subsystem and options bootstrapping. (#22599)\n\n- Splits BootstrapOptions out of global_options.py into its own source file.\n- Moves some utility rules out of global_options.py into util_rules/misc.py.\n- Introduces an OptionsParsingSettings type, which distills everything\noptions parsing nee",
+          "author": "Benjy Weinberger",
+          "date": "2025-08-31T05:13:46Z"
+        },
+        {
+          "sha": "91a90a0706c13dcb13ae36500ccb3671092f407b",
+          "html_url": "https://github.com/pantsbuild/pants/commit/91a90a0706c13dcb13ae36500ccb3671092f407b",
+          "message": "Support for polymorphic rules (#22375)\n\nAn `@rule` can be annotated with `polymorphic=True`, in which\ncase, if it has a param of a union base type B, then calling it by\nname with an instance of M which is a member type of B, \nwill dispatch to a `@rule` with the same output type\nand a param of type M",
+          "author": "Benjy Weinberger",
+          "date": "2025-06-30T15:40:50Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "full_graph TODO consider passing current edge",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/python/pants/engine/rules.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "79c60a6cffbe15f49feb56e7ddb8ae20928e0b7f",
+        "html_url": "https://github.com/pantsbuild/pants/commit/79c60a6cffbe15f49feb56e7ddb8ae20928e0b7f",
+        "message": "Delete more Get-related cruft (#23068)",
+        "author": "Benjy Weinberger",
+        "date": "2026-02-02T14:45:53Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying a performance improvement",
+        "code snippet is self-contained within a single function",
+        "no external dependencies or complex architecture changes indicated",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

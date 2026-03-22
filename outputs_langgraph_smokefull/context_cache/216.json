@@ -1,0 +1,394 @@
+{
+  "task_id": "216",
+  "repo_owner": "windelbouwman",
+  "repo_name": "ppci",
+  "file_path": "ppci/lang/c/codegenerator.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T16:56:21+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T16:56:36+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T16:56:42+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "ppci/lang/c/codegenerator.py",
+    "original_code": "def get_type(self, names):\n    \"\"\" Retrieve a type by name \"\"\"\n    assert isinstance(names, list)\n    return nodes.IdentifierType(names)\n    return nodes.IntegerType('int')\n    # TODO: retrieve a nice type somehow?\n    for type_specifier in names:\n        if type_specifier == 'int':\n            typ = nodes.IntegerType('int')\n        elif type_specifier == 'void':\n            typ = nodes.VoidType()\n        elif type_specifier == 'char':\n            typ = nodes.IntegerType('char')\n        elif type_specifier == 'float':\n            typ = nodes.FloatingPointType('float')\n        elif type_specifier == 'double':\n            typ = nodes.FloatingPointType('double')\n        elif type_specifier == 'unsigned':\n            typ = nodes.IntegerType('int')\n        elif type_specifier == 'signed':\n            typ = nodes.IntegerType('int')\n        elif type_specifier == 'short':\n            typ = nodes.IntegerType('int')\n        elif type_specifier == 'long':\n            typ = nodes.IntegerType('int')\n        else:\n            raise NotImplementedError(str(type_specifier))\n    print(typ)",
+    "satd_comment": "# TODO: retrieve a nice type somehow?",
+    "target_file": {
+      "ok": true,
+      "path": "ppci/lang/c/codegenerator.py",
+      "sha": "ebe00b737e957cb7ce015ef82e246900b11c2812",
+      "download_url": "https://raw.githubusercontent.com/windelbouwman/ppci/master/ppci/lang/c/codegenerator.py",
+      "content_excerpt": "\"\"\"IR-code generation.\n\nWalks over the AST of the C sourcecode and generates IR-code.\n\nMost errors and warnings are already detected during the parsing / semantics\nphase.\n\n\"\"\"\n\nimport logging\n\nfrom ... import ir, irutils\nfrom ...binutils import debuginfo\nfrom ...common import CompilerError\nfrom ...utils.bitfun import bits_to_bytes, value_to_bits\nfrom .eval import ConstantExpressionEvaluator\nfrom .nodes import declarations, expressions, statements, types\nfrom .nodes.types import BasicType\nfrom .scope import RootScope\nfrom .utils import required_padding\n\n\nclass CCodeGenerator:\n    \"\"\"Converts parsed C code to ir-code\"\"\"\n\n    logger = logging.getLogger(\"ccodegen\")\n\n    def __init__(self, context):\n        self.context = context\n        self._root_scope = RootScope()\n        self.builder = None\n        self.debug_db = None\n        self.ir_var_map = {}\n        self.break_block_stack = []  # A stack of while or switch loops\n        self.continue_block_stack = []  # A stack of for loops\n        self.labeled_blocks = {}\n        self.switch_options = None\n        self.static_counter = 0  # Unique number to make static vars unique\n        int_types = {2: ir.i16, 4: ir.i32, 8: ir.i64}\n        uint_types = {2: ir.i16, 4: ir.u32, 8: ir.u64}\n        int_size = self.context.arch_info.get_size(\"int\")\n        long_size = self.context.arch_info.get_size(\"long\")\n        self.ptr_size = self.context.arch_info.get_size(\"ptr\")\n        self.ir_type_map = {\n            BasicType.CHAR: (ir.i8, 1),\n            BasicType.UCHAR: (ir.u8, 1),\n            BasicType.SHORT: (ir.i16, 2),\n            BasicType.USHORT: (ir.u16, 2),\n            BasicType.INT: (int_types[int_size], int_size),\n            BasicType.UINT: (uint_types[int_size], int_size),\n            BasicType.LONG: (int_types[long_size], long_size),\n            BasicType.ULONG: (uint_types[long_size], long_size),\n            BasicType.LONGLONG: (ir.i64, 8),\n            BasicType.ULONGLONG: (ir.u64, 8),\n            BasicType.FLOAT: (ir.f32, 4),\n            BasicType.DOUBLE: (ir.f64, 8),\n            BasicType.LONGDOUBLE: (ir.f64, 8),  # TODO: is this correct?\n            BasicType.VA_LIST: (ir.ptr, self.ptr_size),\n        }\n        self._constant_evaluator = LinkTimeExpressionEvaluator(self)\n\n    def get_label_block(self, name):\n        \"\"\"Get the ir block for a given label, and create it if necessary\"\"\"\n        if name in self.labeled_blocks:\n            block = self.labeled_blocks[name]\n        else:\n            block = self.builder.new_block()\n            self.labeled_blocks[name] = block  # TODO: use name\n        return block\n\n    def gen_code(self, compile_unit):\n        \"\"\"Initial entry point for the code generator\"\"\"\n        self.builder = irutils.Builder()\n        self.ir_var_map = {}\n        self.logger.debug(\"Generating IR-code\")\n        self.debug_db = debuginfo.DebugDb()\n        ir_mod = ir.Module(\"main\", debug_db=self.debug_db)\n        self.builder.module = ir_mod\n\n        # Split declaration into functions and variables:\n        functions = []\n        variables = []\n        for declaration in compile_unit.declarations:\n            assert isinstance(declaration, declarations.CDeclaration)\n\n            if isinstance(\n                declaration,\n                (declarations.Typedef, declarations.EnumConstantDeclaration),\n            ):\n                pass\n            elif isinstance(declaration, declarations.FunctionDeclaration):\n                functions.append(declaration)\n            elif isinstance(declaration, declarations.VariableDeclaration):\n                variables.append(declaration)\n            else:  # pragma: no cover\n                raise NotImplementedError(str(declaration))\n\n        # Generate code:\n        for variable in variables:\n            self.gen_global_variable(variable)\n\n        for function in functions:\n            self.create_function(function)\n\n        for function in functions:\n            self.gen_function(function)\n\n        self.logger.info(\"Finished IR-code generation\")\n        return ir_mod\n\n    def emit(self, instruction):\n        \"\"\"Helper function to emit a single instruction\"\"\"\n        return self.builder.emit(instruction)\n\n    def emit_alloca(self, typ):\n        \"\"\"Helper function to reserve some room on the stack.\"\"\"\n        size, alignment = self.data_layout(typ)\n        name = \"alloca\"\n        # Store here, to place them all at the beginning of the function:\n        ir_var = ir.Alloc(name, size, alignment)\n        self._allocs.append(ir_var)\n        ir_var = ir.AddressOf(ir_var, name + \"_addr\")\n        self._allocs.append(ir_var)\n        return ir_var\n\n    def emit_global_variable(self, name, binding, typ, ivalue):\n        \"\"\"Helper to emit a global variable.\"\"\"\n        size, alignment = self.data_layout(typ)\n        ir_var = ir.Variable(name, binding, size, alignment, value=ivalue)\n        self.builder.module.add_variable(ir_var)\n        return ir_var\n\n    def emit_const(self, value, ctyp):\n        \"\"\"Small helper to emit a constant.\"\"\"\n        ir_typ = self.get_ir_type(ctyp)\n        return self.builder.emit_const(value, ir_typ)\n\n    def warning(self, message):\n        self.logger.warning(message)\n\n    def error(self, message, location):\n        \"\"\"Trigger an error at the given node\"\"\"\n        raise CompilerError(message, loc=location)\n\n    def gen_global_variable(self, var_decl):\n        \"\"\"Generate code for a global variable\"\"\"\n        assert isinstance(var_decl, declarations.VariableDeclaration)\n        if var_decl.storage_class == \"extern\" and not var_decl.is_definition():\n            # create an external variable:\n            ir_var = ir.ExternalVariable(var_decl.name)\n            self.builder.module.add_external(ir_var)\n            self.ir_var_map[var_decl] = ir_var\n        else:\n            if var_decl.initial_value:\n                ivalue = self.gen_global_ival(\n                    var_decl.typ, var_decl.initial_value\n                )\n            else:\n                ivalue = None\n            name = var_decl.name\n            if var_decl.storage_class == \"static\":\n                binding = ir.Binding.LOCAL\n            else:\n                binding = ir.Binding.GLOBAL\n            ir_var = self.emit_global_variable(\n                name, binding, var_decl.typ, ivalue\n            )\n            self.ir_var_map[var_decl] = ir_var\n\n    def gen_global_ival(self, typ, ival):\n        \"\"\"Create memory image for initial value of global variable\"\"\"\n        # Check initial value type:\n        if not isinstance(ival, expressions.CExpression):\n            raise TypeError(\"ival must be an Expression\")\n\n        if isinstance(typ, types.ArrayType):\n            mem = self.gen_global_initialize_array(typ, ival)\n        elif isinstance(typ, types.StructType):\n            mem = self.gen_global_initialize_struct(typ, ival)\n        elif isinstance(typ, types.UnionType):\n            mem = self.gen_global_initialize_union(typ, ival)\n        elif isinstance(\n            typ, (types.BasicType, types.PointerType, types.EnumType)\n        ):\n            mem = self.gen_global_initialize_expression(typ, ival)\n        else:  # pragma: no cover\n            raise NotImplementedError(str(typ))\n        assert isinstance(mem, tuple)\n        return mem\n\n    def gen_global_initialize_expression(self, typ, expr):\n        \"\"\"Generate memory slab for global expression.\"\"\"\n        cval = self._constant_evaluator.eval_expr(expr)\n\n        if isinstance(cval, tuple):\n            assert cval[0] is ir.ptr and len(cval) == 2\n            mem = (cval,)\n        else:\n            mem = (self.context.pack(typ, cval),)\n        return mem\n\n    def gen_global_string_constant(self, expr):\n        \"\"\"Create a new global variable holding string literal data.\"\"\"\n        value_data = expr.to_bytes()\n        amount = len(value_data)\n        alignment = 1\n        name = f\"__txt_const_{self.static_counter}\"\n        self.static_counter += 1\n        text_var = ir.Variable(\n            name, ir.Binding.LOCAL, amount, alignment, value=value_data\n        )\n        self.builder.module.add_variable(text_var)\n        return text_var\n\n    def gen_global_compound_literal(self, expr: expressions.CompoundLiteral):\n        \"\"\"Generate a global variable for a compound literal.\n\n        See also:\n        - https://en.cppreference.com/w/c/language/compound_literal\n        \"\"\"\n\n        value_data = self.gen_global_ival(expr.typ, expr.init)\n\n        # Create name:\n        name = f\"__compound_{self.static_counter}\"\n        self.static_counter += 1\n\n        compound_literal_variable = self.emit_global_variable(\n            name, ir.Binding.LOCAL, expr.typ, value_data\n        )\n        return compound_literal_variable\n\n    def gen_global_initialize_array(self, typ, ival):\n        \"\"\"Properly fill an array with initial values\"\"\"\n        assert isinstance(ival, expressions.ArrayInitializer)\n        assert ival.typ is typ\n\n        element_size = self.sizeof(typ.element_type)\n        implicit_value = (bytes([0] * element_size),)\n\n        mem = ()\n        for value in ival.values:\n            # TODO: handle alignment\n            if value is None:\n                element_mem = implicit_value\n            else:\n                element_mem = self.gen_global_ival(typ.element_type, value)\n            mem = mem + element_mem\n\n        array_size = self.context.eval_expr(typ.size)\n\n        if len(ival.values) < array_size:\n            extra_implicit = array_size - len(ival.values)\n            mem = mem + implicit_value * extra_implicit\n        elif len(ival.values) > array_size:\n            mem = mem[:array_size]\n\n        return mem\n\n    def gen_global_initialize_union(self, typ, ival):\n        \"\"\"Initialize a union type\"\"\"\n        assert isinstance(ival, expressions.UnionInitializer)\n        assert ival.typ is typ\n        mem = ()\n        # Initialize the first field!\n        field = ival.field\n        mem = mem + self.gen_global_ival(field.typ, ival.value)\n        size = self.sizeof(typ)\n        filling = size - self.mem_len(mem)\n        assert filling >= 0\n        mem = mem + (bytes([0] * filling),)\n        return mem\n\n    def gen_global_initialize_struct(self, typ, ival):\n        \"\"\"Properly fill global struct variable with content\"\"\"\n        assert isinstance(ival, expressions.StructInitializer)\n        assert ival.typ is typ\n        mem = ()\n        bits = []  # A working list of bytes\n\n        field_offsets = self.context.get_field_offsets(typ)[1]\n        for field in typ.fields:\n            if field.is_bitfield:\n                # Special case for bitfields\n                if field in ival.values:\n                    value = ival.values[field]\n                    cval = self.context.eval_expr(value)\n                else:\n                    cval = 0\n                bitsize = self.context.eval_expr(field.bitsize)\n                new_bits = value_to_bits(cval, bitsize)\n                bits.extend(new_bits)\n            else:\n                # Flush bits:\n                if bits:\n                    mem = mem + (bits_to_bytes(bits),)\n                    bits.clear()\n                # Apply some padding:\n                field_offset = field_offsets[field] // 8\n                # TODO: how to handle bit fields?\n                mem_len = self.mem_len(mem)\n                if mem_len < field_offset:\n                    padding_count = field_offset - mem_len\n                    mem = mem + (bytes([0] * padding_count),)\n\n                # Add field data, if any:\n                if field in ival.values:\n                    value = ival.values[field]\n                    mem = mem + self.gen_global_ival(field.typ, value)\n                else:\n                    field_size = self.sizeof(field.typ)\n                    mem = mem + (bytes([0] * field_size),)\n\n        # Purge last remaining bits:\n        if bits:\n            mem = mem + (bits_to_bytes(bits),)\n            bits.clear()\n        return mem\n\n    def mem_len(self, mem):\n        \"\"\"Determine the bytesize of a memory slab\"\"\"\n    ",
+      "total_lines": 1763
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "logging",
+        ":ir",
+        ":irutils",
+        "binutils:debuginfo",
+        "common:CompilerError",
+        "utils.bitfun:bits_to_bytes",
+        "utils.bitfun:value_to_bits",
+        "eval:ConstantExpressionEvaluator",
+        "nodes:declarations",
+        "nodes:expressions",
+        "nodes:statements",
+        "nodes:types",
+        "nodes.types:BasicType",
+        "scope:RootScope",
+        "utils:required_padding"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "readme.rst",
+      "download_url": "https://raw.githubusercontent.com/windelbouwman/ppci/master/readme.rst",
+      "content_excerpt": "\nIntroduction\n============\n\nThe PPCI (Pure Python Compiler Infrastructure) project is a compiler\nwritten entirely in the `Python <https://www.python.org/>`_ programming\nlanguage. It contains front-ends for various programming languages as\nwell as machine code generation functionality. With this library you can\ngenerate (working!) machine code using Python (and thus very easy to\nexplore, extend, etc.)!\n\nThe project contains:\n\n- Language frontends for C, Python, Pascal, Basic and Brainfuck\n- Code generation for several architectures: 6500, arm, avr, m68k, microblaze, msp430, openrisc, risc-v, stm8, x86_64, xtensa\n- Command line utilities, such as ppci-cc, ppci-ld and ppci-opt\n- WebAssembly, JVM, OCaml support\n- Support for ELF, EXE, S-record and hexfile formats\n- An intermediate representation (IR) which can be serialized in json\n- The project can be used as a library so you can script the compilation process\n\nInstallation\n------------\n\nSince the compiler is a python package, you can install it with pip:\n\n.. code:: bash\n\n    $ pip install ppci\n\nUsage\n-----\n\nAn example of commandline usage:\n\n.. code:: bash\n\n    $ cd examples/linux64/hello-make\n    $ ppci-cc -c -O1 -o hello.o hello.c\n    ...\n    $ ppci-ld --entry main --layout linux64.ld hello.o -o hello\n    ...\n    $ ./hello\n    Hello, World!\n\nAPI example to compile C code:\n\n.. code-block:: python\n\n    >>> import io\n    >>> from ppci.api import cc, link\n    >>> source_file = io.StringIO(\"\"\"\n    ...  int printf(char* fmt) { }\n    ...  \n    ...  void main() {\n    ...     printf(\"Hello world!\\n\");\n    ...  }\n    ... \"\"\")\n    >>> "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "get_type test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_c3.py",
+          "path": "test/lang/test_c3.py",
+          "sha": "8b4020f940e280800ab57945ac8a5f6dc1e7f001",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/lang/test_c3.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_various.py",
+          "path": "test/wasm/test_various.py",
+          "sha": "0bd58745133c011fe9a5bcaf64a7c112cb4160b3",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/test/wasm/test_various.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"get_type(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "context.py",
+          "path": "ppci/lang/c3/context.py",
+          "sha": "096ceaa01479c93a9a08e7a766273f13b5192203",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/c3/context.py",
+          "score": 1.0
+        },
+        {
+          "name": "typechecker.py",
+          "path": "ppci/lang/c3/typechecker.py",
+          "sha": "7bb0ba1a56b78b7b52e5c18fee086871de118a12",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/c3/typechecker.py",
+          "score": 1.0
+        },
+        {
+          "name": "codegenerator.py",
+          "path": "ppci/lang/c3/codegenerator.py",
+          "sha": "25d94682518a4de9d7a2e10ad2b7a7481cf1d91a",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/c3/codegenerator.py",
+          "score": 1.0
+        },
+        {
+          "name": "semantics.py",
+          "path": "ppci/lang/c/semantics.py",
+          "sha": "c228f20718e0b97919473c25cc43c8a8aa7ec0d6",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/c/semantics.py",
+          "score": 1.0
+        },
+        {
+          "name": "parser.py",
+          "path": "ppci/lang/pascal/parser.py",
+          "sha": "7d735e36d1bd790fc17772dab410b111dcf76d1c",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/pascal/parser.py",
+          "score": 1.0
+        },
+        {
+          "name": "io.py",
+          "path": "ppci/irutils/io.py",
+          "sha": "a2aeeefb54f6961b5109b66678c3a771130e43b5",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/irutils/io.py",
+          "score": 1.0
+        },
+        {
+          "name": "debuginfo.py",
+          "path": "ppci/binutils/debuginfo.py",
+          "sha": "b5a1f7b48e1b552c5203cc140c6b63ee3dc69973",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/binutils/debuginfo.py",
+          "score": 1.0
+        },
+        {
+          "name": "context.py",
+          "path": "ppci/lang/pascal/context.py",
+          "sha": "5895ee02a7ed0a767fa1e97d3056175841d8d5d4",
+          "html_url": "https://github.com/windelbouwman/ppci/blob/f0e9aa0bd83dd96aae876e73051f2263dea390bc/ppci/lang/pascal/context.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "ppci/lang/c",
+      "count": 20,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "ppci/lang/c/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "ppci/lang/c/api.py",
+          "type": "file"
+        },
+        {
+          "name": "builder.py",
+          "path": "ppci/lang/c/builder.py",
+          "type": "file"
+        },
+        {
+          "name": "castxml.py",
+          "path": "ppci/lang/c/castxml.py",
+          "type": "file"
+        },
+        {
+          "name": "codegenerator.py",
+          "path": "ppci/lang/c/codegenerator.py",
+          "type": "file"
+        },
+        {
+          "name": "context.py",
+          "path": "ppci/lang/c/context.py",
+          "type": "file"
+        },
+        {
+          "name": "eval.py",
+          "path": "ppci/lang/c/eval.py",
+          "type": "file"
+        },
+        {
+          "name": "init.py",
+          "path": "ppci/lang/c/init.py",
+          "type": "file"
+        },
+        {
+          "name": "lexer.py",
+          "path": "ppci/lang/c/lexer.py",
+          "type": "file"
+        },
+        {
+          "name": "macro.py",
+          "path": "ppci/lang/c/macro.py",
+          "type": "file"
+        },
+        {
+          "name": "nodes",
+          "path": "ppci/lang/c/nodes",
+          "type": "dir"
+        },
+        {
+          "name": "options.py",
+          "path": "ppci/lang/c/options.py",
+          "type": "file"
+        },
+        {
+          "name": "parser.py",
+          "path": "ppci/lang/c/parser.py",
+          "type": "file"
+        },
+        {
+          "name": "preprocessor.py",
+          "path": "ppci/lang/c/preprocessor.py",
+          "type": "file"
+        },
+        {
+          "name": "printer.py",
+          "path": "ppci/lang/c/printer.py",
+          "type": "file"
+        },
+        {
+          "name": "scope.py",
+          "path": "ppci/lang/c/scope.py",
+          "type": "file"
+        },
+        {
+          "name": "semantics.py",
+          "path": "ppci/lang/c/semantics.py",
+          "type": "file"
+        },
+        {
+          "name": "synthesize.py",
+          "path": "ppci/lang/c/synthesize.py",
+          "type": "file"
+        },
+        {
+          "name": "token.py",
+          "path": "ppci/lang/c/token.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "ppci/lang/c/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "ppci/lang/c/__init__.py"
+        },
+        {
+          "name": "api.py",
+          "path": "ppci/lang/c/api.py"
+        },
+        {
+          "name": "builder.py",
+          "path": "ppci/lang/c/builder.py"
+        },
+        {
+          "name": "castxml.py",
+          "path": "ppci/lang/c/castxml.py"
+        },
+        {
+          "name": "context.py",
+          "path": "ppci/lang/c/context.py"
+        },
+        {
+          "name": "eval.py",
+          "path": "ppci/lang/c/eval.py"
+        },
+        {
+          "name": "init.py",
+          "path": "ppci/lang/c/init.py"
+        },
+        {
+          "name": "lexer.py",
+          "path": "ppci/lang/c/lexer.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "ppci/lang/c/codegenerator.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "082fdbb4422f45ea0f1dcac2117c2ea10b81b2c2",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/082fdbb4422f45ea0f1dcac2117c2ea10b81b2c2",
+          "message": "Use pathlib in preprocessor.",
+          "author": "Windel Bouwman",
+          "date": "2025-08-17T15:00:35Z"
+        },
+        {
+          "sha": "1c6ac9db5b4964ac961bb6cdc548a9927e4e58bd",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/1c6ac9db5b4964ac961bb6cdc548a9927e4e58bd",
+          "message": "Use max line length.",
+          "author": "Windel Bouwman",
+          "date": "2025-08-16T10:19:52Z"
+        },
+        {
+          "sha": "58a6289691593fb67973767fafa91e7f5e89b568",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/58a6289691593fb67973767fafa91e7f5e89b568",
+          "message": "Process suggestions of flake8-comprehensions",
+          "author": "Windel Bouwman",
+          "date": "2025-08-15T20:36:43Z"
+        },
+        {
+          "sha": "868767d5c7e2e1e7fc55a17a85ea2e4e90dae0cd",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/868767d5c7e2e1e7fc55a17a85ea2e4e90dae0cd",
+          "message": "Use f-strings at more places.",
+          "author": "Windel Bouwman",
+          "date": "2025-08-15T18:54:27Z"
+        },
+        {
+          "sha": "c4fd0cfeaa70b23fd8b4f6b549a51ac05984e7bc",
+          "html_url": "https://github.com/windelbouwman/ppci/commit/c4fd0cfeaa70b23fd8b4f6b549a51ac05984e7bc",
+          "message": "Enable ruff bugbear",
+          "author": "Windel Bouwman",
+          "date": "2025-08-14T15:19:49Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "get_type TODO retrieve nice type somehow",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "ppci/lang/c/codegenerator.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "082fdbb4422f45ea0f1dcac2117c2ea10b81b2c2",
+        "html_url": "https://github.com/windelbouwman/ppci/commit/082fdbb4422f45ea0f1dcac2117c2ea10b81b2c2",
+        "message": "Use pathlib in preprocessor.",
+        "author": "Windel Bouwman",
+        "date": "2025-08-17T15:00:35Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "function is self-contained",
+        "clear mapping of type specifiers",
+        "no external dependencies blocking repair",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

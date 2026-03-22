@@ -1,0 +1,450 @@
+{
+  "task_id": "788",
+  "repo_owner": "pricingassistant",
+  "repo_name": "mrq",
+  "file_path": "mrq/job.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-21T20:37:34+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 7,
+    "call_sites_count": 6,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-21T20:37:49+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-21T20:37:54+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "mrq/job.py",
+    "original_code": "def requeue(self, queue=None):\n\n  if not queue:\n    if not self.data or not self.data.get(\"queue\"):\n      self.fetch(full_data=True)  # TODO only fetch queue?\n    queue = self.data[\"queue\"]\n\n  self.save_status(\"queued\", queue=queue)\n\n  # Between these two lines, jobs can become \"lost\" too.\n\n  Queue(queue).enqueue_job_ids([str(self.id)])",
+    "satd_comment": "# TODO only fetch queue?",
+    "target_file": {
+      "ok": true,
+      "path": "mrq/job.py",
+      "sha": "a4aee07214319015abfdc3b29de2773ff2e795a3",
+      "download_url": "https://raw.githubusercontent.com/pricingassistant/mrq/master/mrq/job.py",
+      "content_excerpt": "from future import standard_library\nstandard_library.install_aliases()\nfrom future.builtins import str, object\nimport datetime\nfrom bson import ObjectId\nfrom redis.exceptions import LockError\nimport time\nfrom .exceptions import RetryInterrupt, MaxRetriesInterrupt, AbortInterrupt, MaxConcurrencyInterrupt\nfrom .utils import load_class_by_path, group_iter\nimport gevent\nimport objgraph\nimport random\nimport gc\nfrom collections import defaultdict\nimport traceback\nimport sys\nimport urllib.parse\nimport re\nimport linecache\nimport fnmatch\nimport encodings\nimport copyreg\nfrom . import context\n\n\nFINAL_STATUSES = {\"timeout\", \"abort\", \"failed\", \"success\", \"interrupt\", \"retry\", \"maxretries\", \"maxconcurrency\"}\nTRANSIENT_STATUSES = {\"cancel\", \"queued\", \"started\"}\n\n\nclass Job(object):\n\n    timeout = None\n    result_ttl = None\n    abort_ttl = None\n    cancel_ttl = None\n    max_retries = None\n    retry_delay = None\n\n    # All values above can be overrided from the TASKS config\n\n    progress = 0\n\n    _memory_stop = 0\n    _memory_start = 0\n\n    _current_io = None\n\n    # Has this job been inserted in MongoDB yet?\n    stored = None\n\n    # List of statuses that don't trigger a storage of this task in MongoDB on raw queues.\n    # In task config, use (\"started\", \"success\") to avoid storing successful raw tasks at all\n    statuses_no_storage = None\n\n    def __init__(self, job_id, queue=None, start=False, fetch=False):\n        self.worker = context.get_current_worker()\n        self.queue = queue\n        self.datestarted = None\n\n        self.collection = context.connections.mongodb_jobs.mrq_jobs\n\n        if job_id is None:\n            self.id = None\n        else:\n            if isinstance(job_id, bytes):\n                self.id = ObjectId(job_id.decode('utf-8'))\n            else:\n                self.id = ObjectId(job_id)\n\n        self.data = None\n        self.saved = True\n\n        self.task = None\n        self.greenlet_switches = 0\n        self.greenlet_time = 0\n\n        self._trace_mongodb = defaultdict(int)\n\n        if start:\n            self.fetch(start=True, full_data=False)\n        elif fetch:\n            self.fetch(start=False, full_data=False)\n\n    @property\n    def redis_max_concurrency_key(self):\n        \"\"\" Returns the global redis key used to control job concurrency \"\"\"\n        return \"%s:c:%s\" % (context.get_current_config()[\"redis_prefix\"], self.data[\"path\"])\n\n    def exists(self):\n        \"\"\" Returns True if a job with the current _id exists in MongoDB. \"\"\"\n        return bool(self.collection.find_one({\"_id\": self.id}, projection={\"_id\": 1}))\n\n    def fetch(self, start=False, full_data=True):\n        \"\"\" Get the current job data and possibly flag it as started. \"\"\"\n\n        if self.id is None:\n            return self\n\n        if full_data is True:\n            fields = None\n        elif isinstance(full_data, dict):\n            fields = full_data\n        else:\n            fields = {\n                \"_id\": 0,\n                \"path\": 1,\n                \"params\": 1,\n                \"status\": 1,\n                \"retry_count\": 1,\n            }\n\n        if start:\n            self.datestarted = datetime.datetime.utcnow()\n            self.set_data(self.collection.find_and_modify(\n                {\n                    \"_id\": self.id,\n                    \"status\": {\"$nin\": [\"cancel\", \"abort\", \"maxretries\"]}\n                },\n                {\"$set\": {\n                    \"status\": \"started\",\n                    \"datestarted\": self.datestarted,\n                    \"worker\": self.worker.id\n                },\n                \"$unset\": {\n                    \"dateexpires\": 1 # we don't want started jobs to expire unexpectedly\n                }},\n                projection=fields)\n            )\n\n            context.metric(\"jobs.status.started\")\n\n        else:\n            self.set_data(self.collection.find_one({\n                \"_id\": self.id\n            }, projection=fields))\n\n        if self.data is None:\n            context.log.info(\n                \"Job %s not found in MongoDB or status was cancelled!\" %\n                self.id)\n\n        self.stored = True\n\n        return self\n\n    def get_task_config(self):\n        cfg = context.get_current_config()\n        return cfg.get(\"tasks\", {}).get(\n            self.data[\"path\"]\n        ) or {}\n\n    def set_data(self, data):\n        self.data = data\n        if self.data is None:\n            return\n\n        if \"path\" in self.data:\n            cfg = context.get_current_config()\n            task_def = self.get_task_config()\n\n            self.timeout = task_def.get(\"timeout\", cfg[\"default_job_timeout\"])\n            self.default_ttl = task_def.get(\"default_ttl\", cfg[\"default_job_ttl\"])\n            self.result_ttl = task_def.get(\"result_ttl\", cfg[\"default_job_result_ttl\"]) # success ttl\n            self.abort_ttl = task_def.get(\"abort_ttl\", cfg[\"default_job_abort_ttl\"])\n            self.cancel_ttl = task_def.get(\"cancel_ttl\", cfg[\"default_job_cancel_ttl\"])\n            self.max_retries = task_def.get(\"max_retries\", cfg[\"default_job_max_retries\"])\n            self.retry_delay = task_def.get(\"retry_delay\", cfg[\"default_job_retry_delay\"])\n\n    def set_progress(self, ratio, save=False):\n        self.data[\"progress\"] = ratio\n        self.saved = False\n\n        # If not saved, will be updated in the next worker report\n        if save:\n            self.save()\n\n    def save(self):\n        \"\"\" Persists the current job metadata to MongoDB. Will be called at each worker report. \"\"\"\n\n        if not self.saved and self.data and \"progress\" in self.data:\n            # TODO should we save more fields?\n            self.collection.update({\"_id\": self.id}, {\"$set\": {\n                \"progress\": self.data[\"progress\"]\n            }})\n            self.saved = True\n\n    @classmethod\n    def insert(cls, jobs_data, queue=None, statuses_no_storage=None, return_jobs=True, w=None, j=None):\n        \"\"\" Insert a job into MongoDB \"\"\"\n\n        now = datetime.datetime.utcnow()\n        for data in jobs_data:\n            if data[\"status\"] == \"started\":\n                data[\"datestarted\"] = now\n\n        no_storage = (statuses_no_storage is not None) and (\"started\" in statuses_no_storage)\n        if no_storage and return_jobs:\n            for data in jobs_data:\n                data[\"_id\"] = ObjectId()  # Give the job a temporary ID\n        else:\n            inserted = context.connections.mongodb_jobs.mrq_jobs.insert(\n                jobs_data,\n                manipulate=True,\n                w=w,\n                j=j\n            )\n\n        if return_jobs:\n            jobs = []\n            for data in jobs_data:\n                job = cls(data[\"_id\"], queue=queue)\n                job.set_data(data)\n                job.statuses_no_storage = statuses_no_storage\n                job.stored = (not no_storage)\n                if data[\"status\"] == \"started\":\n                    job.datestarted = data[\"datestarted\"]\n                jobs.append(job)\n\n            return jobs\n        else:\n            return inserted\n\n    def _attach_original_exception(self, exc):\n        \"\"\" Often, a retry will be raised inside an \"except\" block.\n            This Keep track of the first exception for debugging purposes \"\"\"\n\n        original_exception = sys.exc_info()\n        if original_exception[0] is not None:\n            exc.original_exception = original_exception\n\n    def retry(self, queue=None, delay=None, max_retries=None):\n        \"\"\" Marks the current job as needing to be retried. Interrupts it. \"\"\"\n\n        max_retries = max_retries\n        if max_retries is None:\n            max_retries = self.max_retries\n\n        if self.data.get(\"retry_count\", 0) >= max_retries:\n            raise MaxRetriesInterrupt()\n\n        exc = RetryInterrupt()\n\n        exc.queue = queue or self.queue or self.data.get(\"queue\") or \"default\"\n        exc.retry_count = self.data.get(\"retry_count\", 0) + 1\n        exc.delay = delay\n        if exc.delay is None:\n            exc.delay = self.retry_delay\n\n        self._attach_original_exception(exc)\n\n        raise exc\n\n    def abort(self):\n        \"\"\" Aborts the current task mid-excution. \"\"\"\n        exc = AbortInterrupt()\n        self._attach_original_exception(exc)\n        raise exc\n\n    def cancel(self):\n        \"\"\" Markes the current job as cancelled. Doesn't interrupt it. \"\"\"\n        self._save_status(\"cancel\")\n\n    def requeue(self, queue=None, retry_count=0):\n        \"\"\" Requeues the current job. Doesn't interrupt it \"\"\"\n\n        if not queue:\n            if not self.data or not self.data.get(\"queue\"):\n                self.fetch(full_data={\"_id\": 0, \"queue\": 1, \"path\": 1})\n            queue = self.data[\"queue\"]\n\n        self._save_status(\"queued\", updates={\n            \"queue\": queue,\n            \"datequeued\": datetime.datetime.utcnow(),\n            \"retry_count\": retry_count\n        })\n\n    def perform(self):\n        \"\"\" Loads and starts the main task for this job, the saves the result. \"\"\"\n\n        if self.data is None:\n            return\n\n        context.log.debug(\"Starting %s(%s)\" % (self.data[\"path\"], self.data[\"params\"]))\n        task_class = load_class_by_path(self.data[\"path\"])\n\n        self.task = task_class()\n\n        self.task.is_main_task = True\n\n        if not self.task.max_concurrency:\n\n            result = self.task.run_wrapped(self.data[\"params\"])\n\n        else:\n\n            if self.task.max_concurrency > 1:\n                raise NotImplementedError()\n\n            lock = None\n            try:\n\n                # TODO: implement a semaphore\n                lock = context.connections.redis.lock(self.redis_max_concurrency_key, timeout=self.timeout + 5)\n                if not lock.acquire(blocking=True, blocking_timeout=0):\n                    raise MaxConcurrencyInterrupt()\n\n                result = self.task.run_wrapped(self.data[\"params\"])\n\n            finally:\n                try:\n                    if lock:\n                        lock.release()\n                except LockError:\n                    pass\n\n        self.save_success(result)\n\n        if context.get_current_config().get(\"trace_greenlets\"):\n\n            # TODO: this is not the exact greenlet_time measurement because it doesn't\n            # take into account the last switch's time. This is why we force a last switch.\n            # This does cause a performance overhead. Instead, we should print the\n            # last timing directly from the trace() function in context?\n\n            # pylint: disable=protected-access\n\n            gevent.sleep(0)\n            current_greenlet = gevent.getcurrent()\n            t = (datetime.datetime.utcnow() - self.datestarted).total_seconds()\n\n            context.log.debug(\n                \"Job %s success: %0.6fs total, %0.6fs in greenlet, %s switches\" %\n                (self.id,\n                 t,\n                 current_greenlet._trace_time,\n                 current_greenlet._trace_switches - 1)\n            )\n\n        else:\n            context.log.debug(\"Job %s success: %0.6fs total\" % (\n                self.id, (datetime.datetime.utcnow() -\n                          self.datestarted).total_seconds()\n            ))\n\n        return result\n\n    def wait(self, poll_interval=1, timeout=None, full_data=False):\n        \"\"\" Wait for this job to finish. \"\"\"\n\n        end_time = None\n        if timeout:\n            end_time = time.time() + timeout\n\n        while end_time is None or time.time() < end_time:\n\n            job_data = self.collection.find_one({\n                \"_id\": ObjectId(self.id),\n                \"status\": {\"$nin\": [\"started\", \"queued\"]}\n            }, projection=({\n                \"_id\": 0,\n                \"result\": 1,\n                \"status\": 1\n            } if not full_data else None))\n\n            if job_data:\n                return job_data\n\n            time.sleep(poll_interval)\n        raise Exception(\"Waited for job result for %s seconds, timeout.\" % timeout)\n\n    def kill(self, block=False, reason=\"unknown\"):\n        \"\"\" Forcefully kill all greenlets associated with this",
+      "total_lines": 719
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "future:standard_library",
+        "future.builtins:str",
+        "future.builtins:object",
+        "datetime",
+        "bson:ObjectId",
+        "redis.exceptions:LockError",
+        "time",
+        "exceptions:RetryInterrupt",
+        "exceptions:MaxRetriesInterrupt",
+        "exceptions:AbortInterrupt",
+        "exceptions:MaxConcurrencyInterrupt",
+        "utils:load_class_by_path",
+        "utils:group_iter",
+        "gevent",
+        "objgraph",
+        "random",
+        "gc",
+        "collections:defaultdict",
+        "traceback",
+        "sys",
+        "urllib.parse",
+        "re",
+        "linecache",
+        "fnmatch",
+        "encodings",
+        "copyreg",
+        ":context",
+        "queue:Queue",
+        "queue:Queue"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pricingassistant/mrq/master/README.md",
+      "content_excerpt": "# MRQ\n\n[![Build Status](https://travis-ci.org/pricingassistant/mrq.svg?branch=master)](https://travis-ci.org/pricingassistant/mrq) [![MIT License](https://img.shields.io/github/license/pricingassistant/mrq.svg)](LICENSE)\n\n[MRQ](http://pricingassistant.github.io/mrq) is a distributed task queue for python built on top of mongo, redis and gevent.\n\nFull documentation is available on [readthedocs](http://mrq.readthedocs.org/en/latest/)\n\n# Why?\n\nMRQ is an opinionated task queue. It aims to be simple and beautiful like [RQ](http://python-rq.org) while having performances close to [Celery](http://celeryproject.org)\n\nMRQ was first developed at [Pricing Assistant](http://pricingassistant.com) and its initial feature set matches the needs of worker queues with heterogenous jobs (IO-bound & CPU-bound, lots of small tasks & a few large ones).\n\n# Main Features\n\n * **Simple code:** We originally switched from Celery to RQ because Celery's code was incredibly complex and obscure ([Slides](http://www.slideshare.net/sylvinus/why-and-how-pricing-assistant-migrated-from-celery-to-rq-parispy-2)). MRQ should be as easy to understand as RQ and even easier to extend.\n * **Great [dashboard](http://mrq.readthedocs.org/en/latest/dashboard/):** Have visibility and control on everything: queued jobs, current jobs, worker status, ...\n * **Per-job logs:** Get the log output of each task separately in the dashboard\n * **Gevent worker:** IO-bound tasks can be done in parallel in the same UNIX process for maximum throughput\n * **Supervisord integration:** CPU-bound tasks can be split across several UNIX pr"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "requeue test",
+      "count": 7,
+      "items": [
+        {
+          "name": "test_jobaction.py",
+          "path": "tests/test_jobaction.py",
+          "sha": "448a883dcec08c9a43f5730ba8918228ea4a3dbb",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_jobaction.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_general.py",
+          "path": "tests/test_general.py",
+          "sha": "d7feb4f2d2f52adf09daae5eb98dd29c5e6c71fa",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_general.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_queuesize.py",
+          "path": "tests/test_queuesize.py",
+          "sha": "e84755a08ea8902268c8534c3ca02638b92745ee",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_queuesize.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_retry.py",
+          "path": "tests/test_retry.py",
+          "sha": "b945c8b76d57b9eb31904f091d6656a3c7f61382",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_retry.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_performance.py",
+          "path": "tests/test_performance.py",
+          "sha": "fb9f0f03617771bab4cfaf7fd95cad5cde0b9faa",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_performance.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_raw.py",
+          "path": "tests/test_raw.py",
+          "sha": "df8dbaf0579f3c6b2dcfa59b5ba9d14f51b9a9bd",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_raw.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_interrupts.py",
+          "path": "tests/test_interrupts.py",
+          "sha": "1f7dc3dbac57b3decd9f97a44e503c9e4e81b594",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_interrupts.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"requeue(\"",
+      "count": 6,
+      "items": [
+        {
+          "name": "cleaning.py",
+          "path": "mrq/basetasks/cleaning.py",
+          "sha": "94198872f0898c1467c38d469971712402a6411e",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/mrq/basetasks/cleaning.py",
+          "score": 1.0
+        },
+        {
+          "name": "job.py",
+          "path": "mrq/job.py",
+          "sha": "a4aee07214319015abfdc3b29de2773ff2e795a3",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/mrq/job.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_queuesize.py",
+          "path": "tests/test_queuesize.py",
+          "sha": "e84755a08ea8902268c8534c3ca02638b92745ee",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_queuesize.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_general.py",
+          "path": "tests/test_general.py",
+          "sha": "d7feb4f2d2f52adf09daae5eb98dd29c5e6c71fa",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_general.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_raw.py",
+          "path": "tests/test_raw.py",
+          "sha": "df8dbaf0579f3c6b2dcfa59b5ba9d14f51b9a9bd",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_raw.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_performance.py",
+          "path": "tests/test_performance.py",
+          "sha": "fb9f0f03617771bab4cfaf7fd95cad5cde0b9faa",
+          "html_url": "https://github.com/pricingassistant/mrq/blob/5a1154dc6a60d8b6d6423937f6569ce8fb0347b6/tests/test_performance.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "mrq",
+      "count": 24,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "mrq/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "agent.py",
+          "path": "mrq/agent.py",
+          "type": "file"
+        },
+        {
+          "name": "basetasks",
+          "path": "mrq/basetasks",
+          "type": "dir"
+        },
+        {
+          "name": "bin",
+          "path": "mrq/bin",
+          "type": "dir"
+        },
+        {
+          "name": "config.py",
+          "path": "mrq/config.py",
+          "type": "file"
+        },
+        {
+          "name": "context.py",
+          "path": "mrq/context.py",
+          "type": "file"
+        },
+        {
+          "name": "dashboard",
+          "path": "mrq/dashboard",
+          "type": "dir"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "mrq/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "helpers.py",
+          "path": "mrq/helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "job.py",
+          "path": "mrq/job.py",
+          "type": "file"
+        },
+        {
+          "name": "logger.py",
+          "path": "mrq/logger.py",
+          "type": "file"
+        },
+        {
+          "name": "monkey.py",
+          "path": "mrq/monkey.py",
+          "type": "file"
+        },
+        {
+          "name": "processes.py",
+          "path": "mrq/processes.py",
+          "type": "file"
+        },
+        {
+          "name": "queue.py",
+          "path": "mrq/queue.py",
+          "type": "file"
+        },
+        {
+          "name": "queue_raw.py",
+          "path": "mrq/queue_raw.py",
+          "type": "file"
+        },
+        {
+          "name": "queue_regular.py",
+          "path": "mrq/queue_regular.py",
+          "type": "file"
+        },
+        {
+          "name": "redishelpers.py",
+          "path": "mrq/redishelpers.py",
+          "type": "file"
+        },
+        {
+          "name": "scheduler.py",
+          "path": "mrq/scheduler.py",
+          "type": "file"
+        },
+        {
+          "name": "subpool.py",
+          "path": "mrq/subpool.py",
+          "type": "file"
+        },
+        {
+          "name": "supervisor.py",
+          "path": "mrq/supervisor.py",
+          "type": "file"
+        },
+        {
+          "name": "task.py",
+          "path": "mrq/task.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "mrq/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "version.py",
+          "path": "mrq/version.py",
+          "type": "file"
+        },
+        {
+          "name": "worker.py",
+          "path": "mrq/worker.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "mrq/__init__.py"
+        },
+        {
+          "name": "agent.py",
+          "path": "mrq/agent.py"
+        },
+        {
+          "name": "config.py",
+          "path": "mrq/config.py"
+        },
+        {
+          "name": "context.py",
+          "path": "mrq/context.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "mrq/exceptions.py"
+        },
+        {
+          "name": "helpers.py",
+          "path": "mrq/helpers.py"
+        },
+        {
+          "name": "logger.py",
+          "path": "mrq/logger.py"
+        },
+        {
+          "name": "monkey.py",
+          "path": "mrq/monkey.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "mrq/job.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ecb6e4b94c7a1e397e5da4c76ac7ebff0393bff4",
+          "html_url": "https://github.com/pricingassistant/mrq/commit/ecb6e4b94c7a1e397e5da4c76ac7ebff0393bff4",
+          "message": "Add Job.kill() and make sure we have no leftovers",
+          "author": "Sylvain Zimmer",
+          "date": "2019-01-07T11:04:54Z"
+        },
+        {
+          "sha": "9827b2dbc961999c32b79c8a1a34c5183b34b5cf",
+          "html_url": "https://github.com/pricingassistant/mrq/commit/9827b2dbc961999c32b79c8a1a34c5183b34b5cf",
+          "message": "fix edge cases",
+          "author": "maelorn",
+          "date": "2018-10-09T15:14:25Z"
+        },
+        {
+          "sha": "63c519bb79d02635dde0fd43d4d3b2962cae7c0c",
+          "html_url": "https://github.com/pricingassistant/mrq/commit/63c519bb79d02635dde0fd43d4d3b2962cae7c0c",
+          "message": "fix perf tests",
+          "author": "maelorn",
+          "date": "2018-10-08T13:49:34Z"
+        },
+        {
+          "sha": "f43a89136ad82df5de3f7630ce52a3a07e7e7e10",
+          "html_url": "https://github.com/pricingassistant/mrq/commit/f43a89136ad82df5de3f7630ce52a3a07e7e7e10",
+          "message": "fix data inconsistencies",
+          "author": "maelorn",
+          "date": "2018-10-02T10:09:05Z"
+        },
+        {
+          "sha": "2474c243f8e8356a3bb9baf861942acfbadfa20e",
+          "html_url": "https://github.com/pricingassistant/mrq/commit/2474c243f8e8356a3bb9baf861942acfbadfa20e",
+          "message": "fix timeout test",
+          "author": "maelorn",
+          "date": "2018-10-02T07:56:36Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "requeue TODO only fetch queue",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "mrq/job.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "ecb6e4b94c7a1e397e5da4c76ac7ebff0393bff4",
+        "html_url": "https://github.com/pricingassistant/mrq/commit/ecb6e4b94c7a1e397e5da4c76ac7ebff0393bff4",
+        "message": "Add Job.kill() and make sure we have no leftovers",
+        "author": "Sylvain Zimmer",
+        "date": "2019-01-07T11:04:54Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment indicating optimization",
+        "code snippet shows fetch call with full_data=True",
+        "method requeue is self-contained",
+        "no complex dependencies or architecture changes",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 7,
+      "call_sites_count": 6,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function requeue",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

@@ -1,0 +1,272 @@
+{
+  "task_id": "345",
+  "repo_owner": "jbarlow83",
+  "repo_name": "ocrmypdf",
+  "file_path": "src/ocrmypdf/pdfinfo/info.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T05:23:31+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__init__",
+    "satd_line": 405,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T05:23:43+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T05:23:48+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/ocrmypdf/pdfinfo/info.py",
+    "original_code": "def _pdf_pageinfo_sync_init(infile: Path, pdfminer_loglevel):\n    global worker_pdf  # pylint: disable=global-statement\n    pikepdf_enable_mmap()\n\n    logging.getLogger('pdfminer').setLevel(pdfminer_loglevel)\n\n    # If this function is called as a thread initializer, we need a messy hack\n    # to close worker_pdf. If called as a process, it will be released when the\n    # process is terminated.\n    worker_pdf = pikepdf.open(infile)",
+    "satd_comment": "# If this function is called as a thread initializer, we need a messy hack\n# to close worker_pdf. If called as a process, it will be released when the\n# process is terminated.",
+    "target_file": {
+      "ok": true,
+      "path": "src/ocrmypdf/pdfinfo/info.py",
+      "sha": "c10c295a4a38e1c71581d0121510619d69c12ed6",
+      "download_url": "https://raw.githubusercontent.com/ocrmypdf/OCRmyPDF/main/src/ocrmypdf/pdfinfo/info.py",
+      "content_excerpt": "#!/usr/bin/env python3\n\n# SPDX-FileCopyrightText: 2022 James R. Barlow\n# SPDX-License-Identifier: MPL-2.0\n\"\"\"Extract information about the content of a PDF.\"\"\"\n\nfrom __future__ import annotations\n\nimport logging\nimport statistics\nfrom collections.abc import Callable, Container, Iterable, Iterator\nfrom contextlib import nullcontext\nfrom decimal import Decimal\nfrom os import PathLike\nfrom pathlib import Path\nfrom typing import NamedTuple\n\nfrom pdfminer.layout import LTPage, LTTextBox\nfrom pikepdf import Name, Page, Pdf\n\nfrom ocrmypdf._concurrent import Executor, SerialExecutor\nfrom ocrmypdf.exceptions import EncryptedPdfError\nfrom ocrmypdf.helpers import Resolution\nfrom ocrmypdf.pdfinfo._contentstream import TextboxInfo, TextMarker, VectorMarker\nfrom ocrmypdf.pdfinfo._image import ImageInfo, _process_content_streams\nfrom ocrmypdf.pdfinfo._types import FloatRect\nfrom ocrmypdf.pdfinfo._worker import _pdf_pageinfo_concurrent\nfrom ocrmypdf.pdfinfo.layout import (\n    LTStateAwareChar,\n    PdfMinerState,\n    get_text_boxes,\n)\n\nlogger = logging.getLogger()\n\n\ndef _page_has_text(text_blocks: Iterable[FloatRect], page_width, page_height) -> bool:\n    \"\"\"Smarter text detection that ignores text in margins.\"\"\"\n    pw, ph = float(page_width), float(page_height)  # pylint: disable=invalid-name\n\n    margin_ratio = 0.125\n    interior_bbox = (\n        margin_ratio * pw,  # left\n        (1 - margin_ratio) * ph,  # top\n        (1 - margin_ratio) * pw,  # right\n        margin_ratio * ph,  # bottom  (first quadrant: bottom < top)\n    )\n\n    def rects_intersect(a: FloatRect, b: FloatRect) -> bool:\n        \"\"\"Check if two 4-tuple rects intersect.\n\n        Where (a,b) are 4-tuple rects (left-0, top-1, right-2, bottom-3)\n        https://stackoverflow.com/questions/306316/determine-if-two-rectangles-overlap-each-other\n        Formula assumes all boxes are in first quadrant.\n        \"\"\"\n        return a[0] < b[2] and a[2] > b[0] and a[1] > b[3] and a[3] < b[1]\n\n    has_text = False\n    for bbox in text_blocks:\n        if rects_intersect(bbox, interior_bbox):\n            has_text = True\n            break\n    return has_text\n\n\ndef simplify_textboxes(\n    miner_page: LTPage, textbox_getter: Callable[[LTPage], Iterator[LTTextBox]]\n) -> Iterator[TextboxInfo]:\n    \"\"\"Extract only limited content from text boxes.\n\n    We do this to save memory and ensure that our objects are pickleable.\n    \"\"\"\n    for box in textbox_getter(miner_page):\n        first_line = box._objs[0]  # pylint: disable=protected-access\n        first_char = first_line._objs[0]  # pylint: disable=protected-access\n        if not isinstance(first_char, LTStateAwareChar):\n            continue\n        visible = first_char.rendermode != 3\n        corrupt = first_char.get_text() == '\\ufffd'\n        yield TextboxInfo(box.bbox, visible, corrupt)\n\n\nclass PageResolutionProfile(NamedTuple):\n    \"\"\"Information about the resolutions of a page.\"\"\"\n\n    weighted_dpi: float\n    \"\"\"The weighted average DPI of the page, weighted by the area of each image.\"\"\"\n\n    max_dpi: float\n    \"\"\"The maximum DPI of an image on the page.\"\"\"\n\n    average_to_max_dpi_ratio: float\n    \"\"\"The average DPI of the page divided by the maximum DPI of the page.\n\n    This indicates the intensity of the resolution variation on the page.\n\n    If the average is 1.0 or close to 1.0, has all of its content at a uniform\n    resolution. If the average is much lower than 1.0, some content is at a\n    higher resolution than the rest of the page.\n    \"\"\"\n\n    area_ratio: float\n    \"\"\"The maximum-DPI area of the page divided by the total drawn area.\n\n    This indicates the prevalence of high-resolution content on the page.\n    \"\"\"\n\n\nclass PageInfo:\n    \"\"\"Information about type of contents on each page in a PDF.\"\"\"\n\n    _has_text: bool | None\n    _has_vector: bool | None\n    _images: list[ImageInfo] = []\n\n    def __init__(\n        self,\n        pdf: Pdf,\n        pageno: int,\n        infile: PathLike,\n        check_pages: Container[int],\n        detailed_analysis: bool = False,\n        miner_state: PdfMinerState | None = None,\n    ):\n        \"\"\"Initialize a PageInfo object.\"\"\"\n        self._pageno = pageno\n        self._infile = infile\n        self._detailed_analysis = detailed_analysis\n        self._gather_pageinfo(\n            pdf, pageno, infile, check_pages, detailed_analysis, miner_state\n        )\n\n    def _gather_pageinfo(\n        self,\n        pdf: Pdf,\n        pageno: int,\n        infile: PathLike,\n        check_pages: Container[int],\n        detailed_analysis: bool,\n        miner_state: PdfMinerState | None,\n    ):\n        page: Page = pdf.pages[pageno]\n        mediabox = [Decimal(d) for d in page.mediabox.as_list()]\n        width_pt = mediabox[2] - mediabox[0]\n        height_pt = mediabox[3] - mediabox[1]\n\n        self._artbox = [float(d) for d in page.artbox.as_list()]\n        self._bleedbox = [float(d) for d in page.bleedbox.as_list()]\n        self._cropbox = [float(d) for d in page.cropbox.as_list()]\n        self._mediabox = [float(d) for d in page.mediabox.as_list()]\n        self._trimbox = [float(d) for d in page.trimbox.as_list()]\n\n        check_this_page = pageno in check_pages\n\n        if check_this_page and detailed_analysis:\n            page_analysis = miner_state.get_page_analysis(pageno)\n            if page_analysis is not None:\n                self._textboxes = list(\n                    simplify_textboxes(page_analysis, get_text_boxes)\n                )\n            else:\n                self._textboxes = []\n            bboxes = (box.bbox for box in self._textboxes)\n\n            self._has_text = _page_has_text(bboxes, width_pt, height_pt)\n        else:\n            self._textboxes = []\n            self._has_text = None  # i.e. \"no information\"\n\n        userunit = page.get(Name.UserUnit, Decimal(1.0))\n        if not isinstance(userunit, Decimal):\n            userunit = Decimal(userunit)\n        self._userunit = userunit\n        self._width_inches = width_pt * userunit / Decimal(72.0)\n        self._height_inches = height_pt * userunit / Decimal(72.0)\n        self._rotate = int(getattr(page.obj, 'Rotate', 0))\n\n        userunit_shorthand = (userunit, 0, 0, userunit, 0, 0)\n\n        if check_this_page:\n            self._has_vector = False\n            self._has_text = False\n            self._images = []\n            for info in _process_content_streams(\n                pdf=pdf, container=page, shorthand=userunit_shorthand\n            ):\n                if isinstance(info, VectorMarker):\n                    self._has_vector = True\n                elif isinstance(info, TextMarker):\n                    self._has_text = True\n                elif isinstance(info, ImageInfo):\n                    self._images.append(info)\n                else:\n                    raise NotImplementedError()\n        else:\n            self._has_vector = None  # i.e. \"no information\"\n            self._has_text = None\n            self._images = []\n\n        self._dpi = None\n        if self._images:\n            dpi = Resolution(0.0, 0.0).take_max(\n                image.dpi for image in self._images if image.renderable\n            )\n            self._dpi = dpi\n            self._width_pixels = int(round(dpi.x * float(self._width_inches)))\n            self._height_pixels = int(round(dpi.y * float(self._height_inches)))\n\n    @property\n    def pageno(self) -> int:\n        \"\"\"Return page number (0-based).\"\"\"\n        return self._pageno\n\n    @property\n    def has_text(self) -> bool:\n        \"\"\"Return True if page has text, False if not or unknown.\"\"\"\n        return bool(self._has_text)\n\n    @property\n    def has_corrupt_text(self) -> bool:\n        \"\"\"Return True if page has corrupt text, False if not or unknown.\"\"\"\n        if not self._detailed_analysis:\n            raise NotImplementedError('Did not do detailed analysis')\n        return any(tbox.is_corrupt for tbox in self._textboxes)\n\n    @property\n    def has_vector(self) -> bool:\n        \"\"\"Return True if page has vector graphics, False if not or unknown.\n\n        Vector graphics are sometimes used to draw fonts, so it may not be\n        obvious on visual inspection whether a page has text or not.\n        \"\"\"\n        return bool(self._has_vector)\n\n    @property\n    def width_inches(self) -> Decimal:\n        \"\"\"Return width of page in inches.\"\"\"\n        return self._width_inches\n\n    @property\n    def height_inches(self) -> Decimal:\n        \"\"\"Return height of page in inches.\"\"\"\n        return self._height_inches\n\n    @property\n    def width_pixels(self) -> int:\n        \"\"\"Return width of page in pixels.\"\"\"\n        return int(round(float(self.width_inches) * self.dpi.x))\n\n    @property\n    def height_pixels(self) -> int:\n        \"\"\"Return height of page in pixels.\"\"\"\n        return int(round(float(self.height_inches) * self.dpi.y))\n\n    @property\n    def rotation(self) -> int:\n        \"\"\"Return rotation of page in degrees.\n\n        Will only be a multiple of 90.\n        \"\"\"\n        return self._rotate\n\n    @rotation.setter\n    def rotation(self, value):\n        if value in (0, 90, 180, 270, 360, -90, -180, -270):\n            self._rotate = value\n        else:\n            raise ValueError(\"rotation must be a cardinal angle\")\n\n    @property\n    def cropbox(self) -> FloatRect:\n        \"\"\"Return cropbox of page in PDF coordinates.\"\"\"\n        return self._cropbox\n\n    @property\n    def mediabox(self) -> FloatRect:\n        \"\"\"Return mediabox of page in PDF coordinates.\"\"\"\n        return self._mediabox\n\n    @property\n    def trimbox(self) -> FloatRect:\n        \"\"\"Return trimbox of page in PDF coordinates.\"\"\"\n        return self._trimbox\n\n    @property\n    def artbox(self) -> FloatRect:\n        \"\"\"Return artbox of page in PDF coordinates.\"\"\"\n        return self._artbox\n\n    @property\n    def bleedbox(self) -> FloatRect:\n        \"\"\"Return bleedbox of page in PDF coordinates.\"\"\"\n        return self._bleedbox\n\n    @property\n    def images(self) -> list[ImageInfo]:\n        \"\"\"Return images.\"\"\"\n        return self._images\n\n    def get_textareas(self, visible: bool | None = None, corrupt: bool | None = None):\n        \"\"\"Return textareas bounding boxes in PDF coordinates on the page.\"\"\"\n\n        def predicate(\n            obj: TextboxInfo, want_visible: bool | None, want_corrupt: bool | None\n        ) -> bool:\n            result = True\n            if want_visible is not None and obj.is_visible != want_visible:\n                result = False\n            if want_corrupt is not None and obj.is_corrupt != want_corrupt:\n                result = False\n            return result\n\n        if not self._textboxes:\n            if visible is not None and corrupt is not None:\n                raise NotImplementedError('Incomplete information on textboxes')\n            return self._textboxes\n\n        return (obj.bbox for obj in self._textboxes if predicate(obj, visible, corrupt))\n\n    @property\n    def dpi(self) -> Resolution:\n        \"\"\"Return DPI needed to render all images on the page.\"\"\"\n        if self._dpi is None:\n            return Resolution(0.0, 0.0)\n        return self._dpi\n\n    @property\n    def userunit(self) -> Decimal:\n        \"\"\"Return user unit of page.\"\"\"\n        return self._userunit\n\n    @property\n    def min_version(self) -> str:\n        \"\"\"Return minimum PDF version needed to render this page.\"\"\"\n        if self.userunit is not None:\n            return '1.6'\n        else:\n            return '1.5'\n\n    def page_dpi_profile(self) -> PageResolutionProfile | None:\n        \"\"\"Return information about the DPIs of the page.\n\n        This is useful to detect pages with a small proportion of high-resolution\n        content that is forcing us to use a high DPI for the whole page. The ratio\n        is weighted by the area of each image. If images overlap, the overlapped\n        area counts.\n\n        Vector graphics and text are ignored.\n\n        Returns None if there is no meaningful DPI for the page.\n        \"\"\"\n        image_dpis = []\n        image_areas = []\n        for image i",
+      "total_lines": 531
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 405,
+      "start_line": 385,
+      "end_line": 425,
+      "matched_line": "        *,",
+      "excerpt": "385:         )\n386: \n387: \n388: DEFAULT_EXECUTOR = SerialExecutor()\n389: \n390: \n391: class PdfInfo:\n392:     \"\"\"Extract summary information about a PDF without retaining the PDF itself.\n393: \n394:     Crucially this lets us get the information in a pure Python format so that\n395:     it can be pickled and passed to a worker process.\n396:     \"\"\"\n397: \n398:     _has_acroform: bool = False\n399:     _has_signature: bool = False\n400:     _needs_rendering: bool = False\n401: \n402:     def __init__(\n403:         self,\n404:         infile: Path,\n405:         *,\n406:         detailed_analysis: bool = False,\n407:         progbar: bool = False,\n408:         max_workers: int | None = None,\n409:         use_threads: bool = True,\n410:         check_pages=None,\n411:         executor: Executor = DEFAULT_EXECUTOR,\n412:     ):\n413:         \"\"\"Initialize.\"\"\"\n414:         self._infile = infile\n415:         if check_pages is None:\n416:             check_pages = range(0, 1_000_000_000)\n417: \n418:         with Pdf.open(infile) as pdf:\n419:             if pdf.is_encrypted:\n420:                 raise EncryptedPdfError()  # Triggered by encryption with empty passwd\n421:             pscript5_mode = str(pdf.docinfo.get(Name.Creator, \"\")).startswith(\n422:                 'PScript5'\n423:             )\n424:             self._miner_state = (\n425:                 PdfMinerState(infile, pscript5_mode)"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__init__",
+      "start_line": 402,
+      "end_line": 451,
+      "source": "    def __init__(\n        self,\n        infile: Path,\n        *,\n        detailed_analysis: bool = False,\n        progbar: bool = False,\n        max_workers: int | None = None,\n        use_threads: bool = True,\n        check_pages=None,\n        executor: Executor = DEFAULT_EXECUTOR,\n    ):\n        \"\"\"Initialize.\"\"\"\n        self._infile = infile\n        if check_pages is None:\n            check_pages = range(0, 1_000_000_000)\n\n        with Pdf.open(infile) as pdf:\n            if pdf.is_encrypted:\n                raise EncryptedPdfError()  # Triggered by encryption with empty passwd\n            pscript5_mode = str(pdf.docinfo.get(Name.Creator, \"\")).startswith(\n                'PScript5'\n            )\n            self._miner_state = (\n                PdfMinerState(infile, pscript5_mode)\n                if detailed_analysis\n                else nullcontext()\n            )\n            with self._miner_state as miner_state:\n                self._pages = _pdf_pageinfo_concurrent(\n                    pdf,\n                    executor,\n                    max_workers,\n                    use_threads,\n                    infile,\n                    progbar,\n                    check_pages=check_pages,\n                    detailed_analysis=detailed_analysis,\n                    miner_state=miner_state,\n                )\n            self._needs_rendering = pdf.Root.get(Name.NeedsRendering, False)\n            if Name.AcroForm in pdf.Root:\n                if (\n                    len(pdf.Root.AcroForm.get(Name.Fields, [])) > 0\n                    or Name.XFA in pdf.Root.AcroForm\n                ):\n                    self._has_acroform = True\n                self._has_signature = bool(pdf.Root.AcroForm.get(Name.SigFlags, 0) & 1)\n            self._is_tagged = bool(\n                pdf.Root.get(Name.MarkInfo, {}).get(Name.Marked, False)\n            )"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "logging",
+        "statistics",
+        "collections.abc:Callable",
+        "collections.abc:Container",
+        "collections.abc:Iterable",
+        "collections.abc:Iterator",
+        "contextlib:nullcontext",
+        "decimal:Decimal",
+        "os:PathLike",
+        "pathlib:Path",
+        "typing:NamedTuple",
+        "pdfminer.layout:LTPage",
+        "pdfminer.layout:LTTextBox",
+        "pikepdf:Name",
+        "pikepdf:Page",
+        "pikepdf:Pdf",
+        "ocrmypdf._concurrent:Executor",
+        "ocrmypdf._concurrent:SerialExecutor",
+        "ocrmypdf.exceptions:EncryptedPdfError",
+        "ocrmypdf.helpers:Resolution",
+        "ocrmypdf.pdfinfo._contentstream:TextboxInfo",
+        "ocrmypdf.pdfinfo._contentstream:TextMarker",
+        "ocrmypdf.pdfinfo._contentstream:VectorMarker",
+        "ocrmypdf.pdfinfo._image:ImageInfo",
+        "ocrmypdf.pdfinfo._image:_process_content_streams",
+        "ocrmypdf.pdfinfo._types:FloatRect",
+        "ocrmypdf.pdfinfo._worker:_pdf_pageinfo_concurrent",
+        "ocrmypdf.pdfinfo.layout:LTStateAwareChar",
+        "ocrmypdf.pdfinfo.layout:PdfMinerState"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/ocrmypdf/OCRmyPDF/main/README.md",
+      "content_excerpt": "<!-- SPDX-FileCopyrightText: 2014 Julien Pfefferkorn -->\n<!-- SPDX-FileCopyrightText: 2015 James R. Barlow -->\n<!-- SPDX-License-Identifier: CC-BY-SA-4.0 -->\n\n<img src=\"docs/images/logo.svg\" width=\"240\" alt=\"OCRmyPDF\">\n\n[![Build Status](https://github.com/ocrmypdf/OCRmyPDF/actions/workflows/build.yml/badge.svg)](https://github.com/ocrmypdf/OCRmyPDF/actions/workflows/build.yml) [![PyPI version][pypi]](https://pypi.org/project/ocrmypdf/) ![Homebrew version][homebrew] ![ReadTheDocs][docs] ![Python versions][pyversions]\n\n[pypi]: https://img.shields.io/pypi/v/ocrmypdf.svg \"PyPI version\"\n[homebrew]: https://img.shields.io/homebrew/v/ocrmypdf.svg \"Homebrew version\"\n[docs]: https://readthedocs.org/projects/ocrmypdf/badge/?version=latest \"RTD\"\n[pyversions]: https://img.shields.io/pypi/pyversions/ocrmypdf \"Supported Python versions\"\n\nOCRmyPDF adds an OCR text layer to scanned PDF files, allowing them to be searched or copy-pasted.\n\n```bash\nocrmypdf                      # it's a scriptable command line program\n   -l eng+fra                 # it supports multiple languages\n   --rotate-pages             # it can fix pages that are misrotated\n   --deskew                   # it can deskew crooked PDFs!\n   --title \"My PDF\"           # it can change output metadata\n   --jobs 4                   # it uses multiple cores by default\n   --output-type pdfa         # it produces PDF/A by default\n   input_scanned.pdf          # takes PDF input (or images)\n   output_searchable.pdf      # produces validated PDF output\n```\n\n[See the release notes for details on the latest changes](https://ocrmypdf.re"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/ocrmypdf/pdfinfo",
+      "count": 7,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/ocrmypdf/pdfinfo/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_contentstream.py",
+          "path": "src/ocrmypdf/pdfinfo/_contentstream.py",
+          "type": "file"
+        },
+        {
+          "name": "_image.py",
+          "path": "src/ocrmypdf/pdfinfo/_image.py",
+          "type": "file"
+        },
+        {
+          "name": "_types.py",
+          "path": "src/ocrmypdf/pdfinfo/_types.py",
+          "type": "file"
+        },
+        {
+          "name": "_worker.py",
+          "path": "src/ocrmypdf/pdfinfo/_worker.py",
+          "type": "file"
+        },
+        {
+          "name": "info.py",
+          "path": "src/ocrmypdf/pdfinfo/info.py",
+          "type": "file"
+        },
+        {
+          "name": "layout.py",
+          "path": "src/ocrmypdf/pdfinfo/layout.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/ocrmypdf/pdfinfo/__init__.py"
+        },
+        {
+          "name": "_contentstream.py",
+          "path": "src/ocrmypdf/pdfinfo/_contentstream.py"
+        },
+        {
+          "name": "_image.py",
+          "path": "src/ocrmypdf/pdfinfo/_image.py"
+        },
+        {
+          "name": "_types.py",
+          "path": "src/ocrmypdf/pdfinfo/_types.py"
+        },
+        {
+          "name": "_worker.py",
+          "path": "src/ocrmypdf/pdfinfo/_worker.py"
+        },
+        {
+          "name": "layout.py",
+          "path": "src/ocrmypdf/pdfinfo/layout.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/ocrmypdf/pdfinfo/info.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "5acf21651fda1ef900968c4803bf953ee2b89501",
+          "html_url": "https://github.com/ocrmypdf/OCRmyPDF/commit/5acf21651fda1ef900968c4803bf953ee2b89501",
+          "message": "ruff lint and format",
+          "author": "James R. Barlow",
+          "date": "2026-01-13T09:50:57Z"
+        },
+        {
+          "sha": "be425e7405f265f7d48ba1f37ab02bba26c6af32",
+          "html_url": "https://github.com/ocrmypdf/OCRmyPDF/commit/be425e7405f265f7d48ba1f37ab02bba26c6af32",
+          "message": "Refactor pdfinfo: split info.py into focused modules\n\nSplit the 1288-line info.py into smaller, single-responsibility modules:\n- _types.py: Enums, type aliases, lookup dictionaries\n- _contentstream.py: PDF content stream parsing, DPI calculation\n- _image.py: ImageInfo class and image finding functio",
+          "author": "James R. Barlow",
+          "date": "2025-12-22T09:27:23Z"
+        },
+        {
+          "sha": "57e26005669f226f64ae00d89eb81683b5e46412",
+          "html_url": "https://github.com/ocrmypdf/OCRmyPDF/commit/57e26005669f226f64ae00d89eb81683b5e46412",
+          "message": "Also process art and bleed boxes",
+          "author": "James R. Barlow",
+          "date": "2025-02-12T20:49:26Z"
+        },
+        {
+          "sha": "1f493ba78980affb4c762df201ae46e6881001b3",
+          "html_url": "https://github.com/ocrmypdf/OCRmyPDF/commit/1f493ba78980affb4c762df201ae46e6881001b3",
+          "message": "refactor: post-AI code cleanup",
+          "author": "James R. Barlow",
+          "date": "2025-12-12T00:54:23Z"
+        },
+        {
+          "sha": "f77f701a50d23d344ee7e0cb8ad04a53b5a1d903",
+          "html_url": "https://github.com/ocrmypdf/OCRmyPDF/commit/f77f701a50d23d344ee7e0cb8ad04a53b5a1d903",
+          "message": "Fix quadratic time performance regression on scanning pages",
+          "author": "James R. Barlow",
+          "date": "2024-10-28T04:57:53Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "__init__ this function called thread initializer",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/ocrmypdf/pdfinfo/info.py",
+      "satd_line": 405,
+      "last_commit": {
+        "sha": "5acf21651fda1ef900968c4803bf953ee2b89501",
+        "html_url": "https://github.com/ocrmypdf/OCRmyPDF/commit/5acf21651fda1ef900968c4803bf953ee2b89501",
+        "message": "ruff lint and format",
+        "author": "James R. Barlow",
+        "date": "2026-01-13T09:50:57Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear SATD comment describing the problem",
+        "small, localized function",
+        "no conflicting repo history",
+        "no external dependency blocking",
+        "code uses global variable indicating limited scope"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

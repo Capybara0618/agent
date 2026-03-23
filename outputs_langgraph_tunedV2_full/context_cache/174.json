@@ -1,0 +1,256 @@
+{
+  "task_id": "174",
+  "repo_owner": "crown-commercial-service",
+  "repo_name": "digitalmarketplace-supplier-frontend",
+  "file_path": "app/main/views/frameworks.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T04:24:52+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 24,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T04:25:00+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T04:25:09+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "app/main/views/frameworks.py",
+    "original_code": "def upload_framework_agreement(framework_slug):\n    framework = data_api_client.get_framework(framework_slug)['frameworks']\n    if framework['status'] not in ['standstill', 'live']:\n        abort(404)\n\n    supplier_framework = data_api_client.get_supplier_framework_info(\n        current_user.supplier_id, framework_slug\n    )['frameworkInterest']\n    if not supplier_framework['onFramework']:\n        abort(404)\n\n    template_data = main.config['BASE_TEMPLATE_DATA']\n\n    upload_error = None\n    if not file_is_less_than_5mb(request.files['agreement']):\n        upload_error = \"Document must be less than 5Mb\"\n    elif file_is_empty(request.files['agreement']):\n        upload_error = \"Document must not be empty\"\n\n    if upload_error is not None:\n        return render_template(\n            \"frameworks/agreement.html\",\n            framework=framework,\n            supplier_framework=supplier_framework,\n            upload_error=upload_error,\n            **template_data\n        ), 400\n\n    agreements_bucket = s3.S3(current_app.config['DM_AGREEMENTS_BUCKET'])\n    extension = get_extension(request.files['agreement'].filename)\n\n    # TODO: get rid of this; rewrite `.get_agreement_document_path()` function in dmutils\n    path = '{0}/agreements/{1}/{1}-signed-framework-agreement{2}'.format(\n        framework_slug,\n        current_user.supplier_id,\n        extension\n    )\n    agreements_bucket.save(\n        path,\n        request.files['agreement'],\n        acl='private',\n        download_filename='{}-{}-signed-framework-agreement{}'.format(\n            sanitise_supplier_name(current_user.supplier_name),\n            current_user.supplier_id,\n            extension\n        )\n    )\n\n    data_api_client.register_framework_agreement_returned(\n        current_user.supplier_id, framework_slug, current_user.email_address)\n\n    try:\n        email_body = render_template(\n            'emails/framework_agreement_uploaded.html',\n            framework_name=framework['name'],\n            supplier_name=current_user.supplier_name,\n            supplier_id=current_user.supplier_id,\n            user_name=current_user.name\n        )\n        send_email(\n            current_app.config['DM_FRAMEWORK_AGREEMENTS_EMAIL'],\n            email_body,\n            current_app.config['DM_MANDRILL_API_KEY'],\n            '{} framework agreement'.format(framework['name']),\n            current_user.email_address,\n            '{} Supplier'.format(framework['name']),\n            ['{}-framework-agreement'.format(framework_slug)]\n        )\n    except MandrillException as e:\n        current_app.logger.error(\n            \"Framework agreement email failed to send. \"\n            \"error {error} supplier_id {supplier_id} email_hash {email_hash}\",\n            extra={'error': six.text_type(e),\n                   'supplier_id': current_user.supplier_id,\n                   'email_hash': hash_email(current_user.email_address)})\n        abort(503, \"Framework agreement email failed to send\")\n\n    return redirect(url_for('.framework_agreement', framework_slug=framework_slug))",
+    "satd_comment": "# TODO: get rid of this; rewrite `.get_agreement_document_path()` function in dmutils",
+    "target_file": {
+      "ok": true,
+      "path": "app/main/views/frameworks.py",
+      "sha": "ca8fa08a8c1a1db009a72feb6364b71af8664e1d",
+      "download_url": "https://raw.githubusercontent.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/main/app/main/views/frameworks.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\nfrom collections import OrderedDict\nfrom datetime import datetime, timedelta\n\nfrom dmutils.errors import render_error_page\nfrom itertools import chain\n\nfrom dmutils.forms.errors import govuk_errors\nfrom flask import Markup, request, abort, flash, redirect, url_for, current_app, session\nfrom flask_login import current_user\n\nfrom dmapiclient import APIError, HTTPError\nfrom dmapiclient.audit import AuditTypes\nfrom dmcontent import govuk_frontend\nfrom dmcontent.questions import ContentQuestion\nfrom dmcontent.errors import ContentNotFoundError\nfrom dmcontent.html import to_summary_list_row\nfrom dmcontent.utils import count_unanswered_questions\nfrom dmutils import s3\nfrom dmutils.dates import update_framework_with_formatted_dates\nfrom dmutils.documents import (\n    RESULT_LETTER_FILENAME, get_document_path, degenerate_document_path_and_return_doc_name, get_signed_url,\n    upload_declaration_documents\n)\nfrom dmutils.email.dm_notify import DMNotifyClient\nfrom dmutils.email.exceptions import EmailError\nfrom dmutils.email.helpers import hash_string\nfrom dmutils.flask import timed_render_template as render_template\nfrom dmutils.formats import datetimeformat, displaytimeformat, monthyearformat, dateformat\nfrom dmutils.forms.helpers import get_errors_from_wtform, govuk_options\nfrom dmutils.timing import logged_duration\n\nfrom ... import data_api_client\nfrom ...main import main, content_loader\nfrom ..helpers import login_required\nfrom ..helpers.frameworks import (\n    count_drafts_by_lot,\n    EnsureApplicationCompanyDetailsHaveBeenConfirmed,\n    get_declaration_status,\n    get_declaration_status_from_info,\n    get_framework_and_lot_or_404,\n    get_framework_for_reuse,\n    get_framework_or_404,\n    get_framework_or_500,\n    get_last_modified_from_first_matching_file,\n    get_statuses_for_lot,\n    get_supplier_framework_info,\n    get_supplier_on_framework_from_info,\n    get_supplier_registered_name_from_declaration,\n    register_interest_in_framework,\n    return_supplier_framework_info_if_on_framework_or_abort,\n    returned_agreement_email_recipients,\n    return_404_if_applications_closed,\n    check_framework_supports_e_signature_or_404,\n    get_completed_lots, get_framework_contract_title,\n    question_references,\n)\nfrom ..helpers.services import (\n    get_drafts,\n    get_lot_drafts,\n    get_signed_document_url,\n)\nfrom ..helpers.suppliers import supplier_company_details_are_complete, get_company_details_from_supplier\nfrom ..helpers.validation import get_validator\nfrom ..forms.frameworks import (AcceptAgreementVariationForm,\n                                ReuseDeclarationForm,\n                                LegalAuthorityForm,\n                                SignFrameworkAgreementForm)\n\nCLARIFICATION_QUESTION_NAME = 'clarification_question'\n\n\nMESSAGE_SENT_QS_OPEN_MESSAGE = (\n    \"Your clarification question has been sent. Answers to all clarification questions will be published on this page.\"\n)\n\nAGREEMENT_RETURNED_MESSAGE = (\n    \"Your framework agreement has been returned to the Crown Commercial Service to be countersigned.\"\n)\n\nCUSTOM_DIMENSION_IDENTIFIERS = {\n    \"supplierFrameworkApplicationStage\": 29\n}\n\n\n@main.route('/frameworks/<framework_slug>', methods=['GET', 'POST'])\n@login_required\ndef framework_dashboard(framework_slug):\n    framework = get_framework_or_404(data_api_client, framework_slug)\n    framework_slug = framework['slug']  # cleaned slug from the API response that strips reserved characters\n    update_framework_with_formatted_dates(framework)\n    custom_dimensions, custom_dimension_stage = [], None\n    if framework[\"status\"] == \"open\":\n        session[\"currently_applying_to\"] = framework_slug\n\n    framework_urls = content_loader.get_message(framework_slug, 'urls')\n\n    if request.method == 'POST':\n        register_interest_in_framework(data_api_client, framework_slug)\n        supplier_users = data_api_client.find_users_iter(supplier_id=current_user.supplier_id)\n\n        notify_client = DMNotifyClient()\n\n        for address in [user['emailAddress'] for user in supplier_users if user['active']]:\n            notify_client.send_email(\n                to_email_address=address,\n                template_name_or_id=notify_client.templates[\"framework-application-started\"],\n                personalisation={\n                    'framework_name': framework['name'],\n                    'framework_applications_close_date': framework['applicationsCloseAt'],\n                    'framework_clarification_questions_close_date': framework['clarificationsCloseAt'],\n                },\n                reply_to_address_id=current_app.config['DM_ENQUIRIES_EMAIL_ADDRESS_UUID']\n            )\n\n    drafts, complete_drafts = get_drafts(data_api_client, framework_slug)\n\n    supplier_framework_info = get_supplier_framework_info(data_api_client, framework_slug)\n    declaration_status = get_declaration_status_from_info(supplier_framework_info)\n    supplier_is_on_framework = get_supplier_on_framework_from_info(supplier_framework_info)\n    supplier = data_api_client.get_supplier(current_user.supplier_id)['suppliers']\n\n    # Do not show a framework dashboard for earlier G-Cloud iterations\n    if declaration_status == 'unstarted' and framework['status'] == 'live':\n        abort(404)\n\n    application_company_details_confirmed = (\n        supplier_framework_info and supplier_framework_info['applicationCompanyDetailsConfirmed']\n    )\n    application_made = (\n        supplier_is_on_framework or (\n            len(complete_drafts) > 0\n            and declaration_status == 'complete'\n            and application_company_details_confirmed\n        )\n    )\n    lots_with_completed_drafts = [lot for lot in framework['lots'] if count_drafts_by_lot(complete_drafts, lot['slug'])]\n\n    # GA custom dimension stages for the application\n    if supplier_framework_info and not supplier_framework_info['applicationCompanyDetailsConfirmed']:\n        custom_dimension_stage = \"application_started\"\n    if application_company_details_confirmed:\n        custom_dimension_stage = \"company_details_confirmed\"\n    if declaration_status == 'complete':\n        custom_dimension_stage = \"declaration_confirmed\"\n    if complete_drafts:\n        # At least one service has been confirmed\n        custom_dimension_stage = \"services_confirmed\"\n    if application_made:\n        custom_dimension_stage = \"application_confirmed\"\n\n    if custom_dimension_stage:\n        custom_dimensions = [{\n            'data_id': CUSTOM_DIMENSION_IDENTIFIERS['supplierFrameworkApplicationStage'],\n            'data_value': custom_dimension_stage\n        }]\n\n    # filenames\n    result_letter_filename = RESULT_LETTER_FILENAME\n\n    countersigned_agreement_file = None\n    if supplier_framework_info and supplier_framework_info['countersignedPath']:\n        countersigned_agreement_file = degenerate_document_path_and_return_doc_name(\n            supplier_framework_info['countersignedPath']\n        )\n\n    signed_agreement_document_name = None\n    if supplier_is_on_framework and supplier_framework_info['agreementReturned']:\n        # Frameworks supporting e-signature will not have agreementPath\n        if supplier_framework_info['agreementPath']:\n            signed_agreement_document_name = degenerate_document_path_and_return_doc_name(\n                supplier_framework_info['agreementPath']\n            )\n\n    communications_folder = \"{}/communications\".format(framework_slug)\n    key_list = s3.S3(current_app.config['DM_COMMUNICATIONS_BUCKET']).list(communications_folder, load_timestamps=True)\n    key_list.reverse()\n\n    base_communications_files = {\n        \"invitation\": {\n            \"path\": \"communications/\",\n            \"filename\": \"{}-invitation.pdf\".format(framework_slug),\n        },\n        \"proposed_agreement\": {\n            \"path\": \"communications/\",\n            \"filename\": \"{}-proposed-framework-agreement.pdf\".format(framework_slug),\n        },\n        \"final_agreement\": {\n            \"path\": \"communications/\",\n            \"filename\": \"{}-final-framework-agreement.pdf\".format(framework_slug),\n        },\n        \"proposed_call_off\": {\n            \"path\": \"communications/\",\n            \"filename\": \"{}-proposed-call-off.pdf\".format(framework_slug),\n        },\n        \"final_call_off\": {\n            \"path\": \"communications/\",\n            \"filename\": \"{}-final-call-off.pdf\".format(framework_slug),\n        },\n        \"reporting_template\": {\n            \"path\": \"communications/\",\n            \"filename\": \"{}-reporting-template.xls\".format(framework_slug),\n        },\n        \"supplier_updates\": {\n            \"path\": \"communications/updates/\",\n        },\n    }\n    # now we annotate these with last_modified information which also tells us whether the file exists\n    communications_files = {\n        label: dict(\n            d,\n            last_modified=get_last_modified_from_first_matching_file(\n                key_list,\n                framework_slug,\n                d[\"path\"] + d.get(\"filename\", \"\"),\n            ),\n        )\n        for label, d in base_communications_files.items()\n    }\n    contract_title = get_framework_contract_title(framework)\n\n    return render_template(\n        \"frameworks/dashboard.html\",\n        application_made=application_made,\n        communications_files=communications_files,\n        completed_lots=tuple(\n            dict(lot, complete_count=count_drafts_by_lot(complete_drafts, lot['slug']))\n            for lot in lots_with_completed_drafts\n        ),\n        countersigned_agreement_file=countersigned_agreement_file,\n        counts={\n            \"draft\": len(drafts),\n            \"complete\": len(complete_drafts)\n        },\n        declaration_status=declaration_status,\n        signed_agreement_document_name=signed_agreement_document_name,\n        framework=framework,\n        framework_urls=framework_urls,\n        result_letter_filename=result_letter_filename,\n        supplier_framework=supplier_framework_info,\n        supplier_is_on_framework=supplier_is_on_framework,\n        supplier_company_details_complete=supplier_company_details_are_complete(supplier),\n        application_company_details_confirmed=application_company_details_confirmed,\n        custom_dimensions=custom_dimensions,\n        contract_title=contract_title\n    ), 200\n\n\n@main.route('/frameworks/<framework_slug>/submissions', methods=['GET'])\n@login_required\n@EnsureApplicationCompanyDetailsHaveBeenConfirmed(data_api_client)\ndef framework_submission_lots(framework_slug):\n    framework = get_framework_or_404(data_api_client, framework_slug)\n\n    drafts, complete_drafts = get_drafts(data_api_client, framework_slug)\n    declaration_status = get_declaration_status(data_api_client, framework_slug)\n    application_made = len(complete_drafts) > 0 and declaration_status == 'complete'\n    if framework['status'] not in [\"open\", \"pending\", \"standstill\"]:\n        abort(404)\n\n    lots = [\n        dict(lot,\n             draft_count=count_drafts_by_lot(drafts, lot['slug']),\n             complete_count=count_drafts_by_lot(complete_drafts, lot['slug']))\n        for lot in framework['lots']]\n\n    lot_question = {\n        option[\"value\"]: option\n        for option in ContentQuestion(content_loader.get_question(framework_slug, 'services', 'lot')).get('options')\n    }\n\n    lots = [{\n        \"title\": lot_question[lot['slug']]['label'] if framework[\"status\"] == \"open\" else lot[\"name\"],\n        \"slug\": lot['slug'],\n        'body': lot_question[lot['slug']]['description'],\n        \"link\": url_for('.framework_submission_services', framework_slug=framework_slug, lot_slug=lot['slug']),\n        \"statuses\": get_statuses_for_lot(\n            lot['oneServiceLimit'],\n            lot['draft_count'],\n            lot['complete_count'],\n            declaration_status,\n            framework['status'],\n            lot['name'],\n            lot['unitSingular'],\n            lot['unitPlural']\n        ),\n    } for lot in lots if framework[\"status\"] == \"open\" or (lot['draft_count'] + lot['complete_count']) > 0]\n\n  ",
+      "total_lines": 1291
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 24,
+      "start_line": 4,
+      "end_line": 44,
+      "matched_line": ")",
+      "excerpt": "4: \n5: from dmutils.errors import render_error_page\n6: from itertools import chain\n7: \n8: from dmutils.forms.errors import govuk_errors\n9: from flask import Markup, request, abort, flash, redirect, url_for, current_app, session\n10: from flask_login import current_user\n11: \n12: from dmapiclient import APIError, HTTPError\n13: from dmapiclient.audit import AuditTypes\n14: from dmcontent import govuk_frontend\n15: from dmcontent.questions import ContentQuestion\n16: from dmcontent.errors import ContentNotFoundError\n17: from dmcontent.html import to_summary_list_row\n18: from dmcontent.utils import count_unanswered_questions\n19: from dmutils import s3\n20: from dmutils.dates import update_framework_with_formatted_dates\n21: from dmutils.documents import (\n22:     RESULT_LETTER_FILENAME, get_document_path, degenerate_document_path_and_return_doc_name, get_signed_url,\n23:     upload_declaration_documents\n24: )\n25: from dmutils.email.dm_notify import DMNotifyClient\n26: from dmutils.email.exceptions import EmailError\n27: from dmutils.email.helpers import hash_string\n28: from dmutils.flask import timed_render_template as render_template\n29: from dmutils.formats import datetimeformat, displaytimeformat, monthyearformat, dateformat\n30: from dmutils.forms.helpers import get_errors_from_wtform, govuk_options\n31: from dmutils.timing import logged_duration\n32: \n33: from ... import data_api_client\n34: from ...main import main, content_loader\n35: from ..helpers import login_required\n36: from ..helpers.frameworks import (\n37:     count_drafts_by_lot,\n38:     EnsureApplicationCompanyDetailsHaveBeenConfirmed,\n39:     get_declaration_status,\n40:     get_declaration_status_from_info,\n41:     get_framework_and_lot_or_404,\n42:     get_framework_for_reuse,\n43:     get_framework_or_404,\n44:     get_framework_or_500,"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "imports": {
+      "imports": [
+        "collections:OrderedDict",
+        "datetime:datetime",
+        "datetime:timedelta",
+        "dmutils.errors:render_error_page",
+        "itertools:chain",
+        "dmutils.forms.errors:govuk_errors",
+        "flask:Markup",
+        "flask:request",
+        "flask:abort",
+        "flask:flash",
+        "flask:redirect",
+        "flask:url_for",
+        "flask:current_app",
+        "flask:session",
+        "flask_login:current_user",
+        "dmapiclient:APIError",
+        "dmapiclient:HTTPError",
+        "dmapiclient.audit:AuditTypes",
+        "dmcontent:govuk_frontend",
+        "dmcontent.questions:ContentQuestion",
+        "dmcontent.errors:ContentNotFoundError",
+        "dmcontent.html:to_summary_list_row",
+        "dmcontent.utils:count_unanswered_questions",
+        "dmutils:s3",
+        "dmutils.dates:update_framework_with_formatted_dates",
+        "dmutils.documents:RESULT_LETTER_FILENAME",
+        "dmutils.documents:get_document_path",
+        "dmutils.documents:degenerate_document_path_and_return_doc_name",
+        "dmutils.documents:get_signed_url",
+        "dmutils.documents:upload_declaration_documents"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/main/README.md",
+      "content_excerpt": "# Digital Marketplace Supplier Frontend\n\n![Python 3.9](https://img.shields.io/badge/python-3.9-blue.svg)\n\nFrontend application for the Digital Marketplace.\n\n- Python app, based on the [Flask framework](http://flask.pocoo.org/)\n\nThis app contains:\n\n- the supplier dashboard\n- the supplier framework application journey\n\n## Quickstart\n\nIt's recommended to use the [DM Runner](https://github.com/Crown-Commercial-Service/digitalmarketplace-runner)\ntool, which will install and run the app as part of the full suite of apps.\n\nIf you want to run the app as a stand-alone process, clone the repo then run:\n\n```\nmake run-all\n```\n\nThis command will install dependencies and start the app.\n\nBy default, the app will be served at [http://127.0.0.1:5003/suppliers](http://127.0.0.1:5003/suppliers).\n\n\n### API dependencies\n\n(If you are using DM Runner you can skip this section.)\n\nThe Supplier Frontend app requires access to the [API app](https://github.com/Crown-Commercial-Service/digitalmarketplace-api). The location and access token for\nthis service are set with environment variables in `config.py`.\n\nFor development, you can either point the environment variables to use the\npreview environment's `API` box, or use a local API instance if you have one running:\n\n```\nexport DM_DATA_API_URL=http://localhost:5000\nexport DM_DATA_API_AUTH_TOKEN=<auth_token_accepted_by_api>\n```\n\nWhere `DM_DATA_API_AUTH_TOKEN` is a token accepted by the Data API instance pointed to by `DM_API_URL`.\n\nNote: The login is handled in the [User Frontend app](https://github.com/Crown-Commercial-Service/digitalmarketplace-user-fr"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "upload_framework_agreement test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"upload_framework_agreement(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "app/main/views",
+      "count": 6,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "app/main/views/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "frameworks.py",
+          "path": "app/main/views/frameworks.py",
+          "type": "file"
+        },
+        {
+          "name": "login.py",
+          "path": "app/main/views/login.py",
+          "type": "file"
+        },
+        {
+          "name": "services.py",
+          "path": "app/main/views/services.py",
+          "type": "file"
+        },
+        {
+          "name": "suppliers.py",
+          "path": "app/main/views/suppliers.py",
+          "type": "file"
+        },
+        {
+          "name": "users.py",
+          "path": "app/main/views/users.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "app/main/views/__init__.py"
+        },
+        {
+          "name": "login.py",
+          "path": "app/main/views/login.py"
+        },
+        {
+          "name": "services.py",
+          "path": "app/main/views/services.py"
+        },
+        {
+          "name": "suppliers.py",
+          "path": "app/main/views/suppliers.py"
+        },
+        {
+          "name": "users.py",
+          "path": "app/main/views/users.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "app/main/views/frameworks.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "6bfb8f7800752ac560d210da538d6ba53114e5b2",
+          "html_url": "https://github.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/commit/6bfb8f7800752ac560d210da538d6ba53114e5b2",
+          "message": "Change URL stored for declaration documents\n\nDeclaration documents are stored in the documents bucket, the contents of which are already public. So we don't need to go via supplier frontend to access the files. As far as I can tell, this functionality was added as a bug fix. It copied existing code ",
+          "author": "Benjamin Gill",
+          "date": "2021-06-09T14:46:27Z"
+        },
+        {
+          "sha": "72bc66f1db635dff93ab06bf704bcdc92def422c",
+          "html_url": "https://github.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/commit/72bc66f1db635dff93ab06bf704bcdc92def422c",
+          "message": "Add clause to message logic\n\nPreviously, we were not checking if an individual question was prefilled - we were just applying messages\nto all questions in a section. This checks if the question itself has been prefilled.",
+          "author": "BRETT KYLE",
+          "date": "2021-04-01T16:32:25Z"
+        },
+        {
+          "sha": "2da04d42b826a3bfd9e6de0d6cb8673440ab4408",
+          "html_url": "https://github.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/commit/2da04d42b826a3bfd9e6de0d6cb8673440ab4408",
+          "message": "Create helper method for adjusting question params\n\nPreviously, this was breaking when the question was type: multiquestion, since we were expecting a dict.\n\nThis recurses through a list if present.",
+          "author": "BRETT KYLE",
+          "date": "2021-03-29T14:26:40Z"
+        },
+        {
+          "sha": "2e105d7b203caa786a941e2897150c6d3f09e313",
+          "html_url": "https://github.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/commit/2e105d7b203caa786a941e2897150c6d3f09e313",
+          "message": "Add styling for custom elements\n\nWe're hacking the error message for our custom notice message at the moment, so let's add some styling to\ncreate the blue look we're going for.\n\nAdditionally, we need to add some styling for numbered questions.",
+          "author": "BRETT KYLE",
+          "date": "2021-03-05T12:04:30Z"
+        },
+        {
+          "sha": "74b587a983ab1ed16e4fc6b21f89be9ae6e2200e",
+          "html_url": "https://github.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/commit/74b587a983ab1ed16e4fc6b21f89be9ae6e2200e",
+          "message": "Use from_question and render for edit declaration section\n\nWe want to keep the question references, question numbers, and prefill\nmessages that are unique to our forms; at least for now.\n\nRather than adding a lot of complex stuff to the content loader we can\ndo this in the view, because we don't use",
+          "author": "Laurence de Bruxelles",
+          "date": "2021-03-05T09:59:43Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "upload_framework_agreement TODO this rewrite get_agreement_document_path function",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "app/main/views/frameworks.py",
+      "satd_line": 24,
+      "last_commit": {
+        "sha": "6bfb8f7800752ac560d210da538d6ba53114e5b2",
+        "html_url": "https://github.com/Crown-Commercial-Service/digitalmarketplace-supplier-frontend/commit/6bfb8f7800752ac560d210da538d6ba53114e5b2",
+        "message": "Change URL stored for declaration documents\n\nDeclaration documents are stored in the documents bucket, the contents of which are already public. So we don't need to go via supplier frontend to access the files. As far as I can tell, this functionality was added as a bug fix. It copied existing code ",
+        "author": "Benjamin Gill",
+        "date": "2021-06-09T14:46:27Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

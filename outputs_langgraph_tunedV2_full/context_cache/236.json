@@ -1,0 +1,713 @@
+{
+  "task_id": "236",
+  "repo_owner": "pytorch",
+  "repo_name": "pytorch",
+  "file_path": "test/jit/test_backend_nnapi.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T04:46:47+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 20,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T04:47:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T04:47:10+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "test/jit/test_backend_nnapi.py",
+    "original_code": "def setUp(self):\n    super().setUp()\n\n    # Save default dtype\n    module = torch.nn.PReLU()\n    self.default_dtype = module.weight.dtype\n    # Change dtype to float32 (since a different unit test changed dtype to float64,\n    # which is not supported by the Android NNAPI delegate)\n    # Float32 should typically be the default in other files.\n    torch.set_default_dtype(torch.float32)\n\n    # Load nnapi delegate library\n    torch.ops.load_library(str(lib_path))\n\n    # Disable execution tests, only test lowering modules\n    # TODO: Re-enable execution tests after the Nnapi delegate is complete\n    super().set_can_run_nnapi(False)",
+    "satd_comment": "# TODO: Re-enable execution tests after the Nnapi delegate is complete",
+    "target_file": {
+      "ok": true,
+      "path": "test/jit/test_backend_nnapi.py",
+      "sha": "3e79b257131a99e7fb47f0cf5ea7d148bd3f6f93",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/test/jit/test_backend_nnapi.py",
+      "content_excerpt": "# Owner(s): [\"oncall: jit\"]\n\nimport os\nimport sys\nimport unittest\nfrom pathlib import Path\n\nimport torch\nimport torch._C\nfrom torch.testing._internal.common_utils import (\n    IS_FBCODE,\n    raise_on_run_directly,\n    skipIfTorchDynamo,\n)\n\n\n# hacky way to skip these tests in fbcode:\n# during test execution in fbcode, test_nnapi is available during test discovery,\n# but not during test execution. So we can't try-catch here, otherwise it'll think\n# it sees tests but then fails when it tries to actually run them.\nif not IS_FBCODE:\n    from test_nnapi import TestNNAPI\n\n    HAS_TEST_NNAPI = True\nelse:\n    from torch.testing._internal.common_utils import TestCase as TestNNAPI\n\n    HAS_TEST_NNAPI = False\n\n\n# Make the helper files in test/ importable\npytorch_test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))\nsys.path.append(pytorch_test_dir)\n\n\"\"\"\nUnit Tests for Nnapi backend with delegate\nInherits most tests from TestNNAPI, which loads Android NNAPI models\nwithout the delegate API.\n\"\"\"\n# First skip is needed for IS_WINDOWS or IS_MACOS to skip the tests.\ntorch_root = Path(__file__).resolve().parents[2]\nlib_path = torch_root / \"build\" / \"lib\" / \"libnnapi_backend.so\"\n\n\n@skipIfTorchDynamo(\"weird py38 failures\")\n@unittest.skipIf(\n    not os.path.exists(lib_path),\n    \"Skipping the test as libnnapi_backend.so was not found\",\n)\n@unittest.skipIf(IS_FBCODE, \"test_nnapi.py not found\")\nclass TestNnapiBackend(TestNNAPI):\n    def setUp(self):\n        super().setUp()\n\n        # Save default dtype\n        module = torch.nn.PReLU()\n        self.default_dtype = module.weight.dtype\n        # Change dtype to float32 (since a different unit test changed dtype to float64,\n        # which is not supported by the Android NNAPI delegate)\n        # Float32 should typically be the default in other files.\n        torch.set_default_dtype(torch.float32)\n\n        # Load nnapi delegate library\n        torch.ops.load_library(str(lib_path))\n\n    # Override\n    def call_lowering_to_nnapi(self, traced_module, args):\n        compile_spec = {\"forward\": {\"inputs\": args}}\n        return torch._C._jit_to_backend(\"nnapi\", traced_module, compile_spec)\n\n    def test_tensor_input(self):\n        # Lower a simple module\n        args = torch.tensor([[1.0, -1.0, 2.0, -2.0]]).unsqueeze(-1).unsqueeze(-1)\n        module = torch.nn.PReLU()\n        traced = torch.jit.trace(module, args)\n\n        # Argument input is a single Tensor\n        self.call_lowering_to_nnapi(traced, args)\n        # Argument input is a Tensor in a list\n        self.call_lowering_to_nnapi(traced, [args])\n\n    # Test exceptions for incorrect compile specs\n    def test_compile_spec_santiy(self):\n        args = torch.tensor([[1.0, -1.0, 2.0, -2.0]]).unsqueeze(-1).unsqueeze(-1)\n        module = torch.nn.PReLU()\n        traced = torch.jit.trace(module, args)\n\n        errorMsgTail = r\"\"\"\nmethod_compile_spec should contain a Tensor or Tensor List which bundles input parameters: shape, dtype, quantization, and dimorder.\nFor input shapes, use 0 for run/load time flexible input.\nmethod_compile_spec must use the following format:\n{\"forward\": {\"inputs\": at::Tensor}} OR {\"forward\": {\"inputs\": c10::List<at::Tensor>}}\"\"\"\n\n        # No forward key\n        compile_spec = {\"backward\": {\"inputs\": args}}\n        with self.assertRaisesRegex(\n            RuntimeError,\n            'method_compile_spec does not contain the \"forward\" key.' + errorMsgTail,\n        ):\n            torch._C._jit_to_backend(\"nnapi\", traced, compile_spec)\n\n        # No dictionary under the forward key\n        compile_spec = {\"forward\": 1}\n        with self.assertRaisesRegex(\n            RuntimeError,\n            'method_compile_spec does not contain a dictionary with an \"inputs\" key, '\n            'under it\\'s \"forward\" key.' + errorMsgTail,\n        ):\n            torch._C._jit_to_backend(\"nnapi\", traced, compile_spec)\n\n        # No inputs key (in the dictionary under the forward key)\n        compile_spec = {\"forward\": {\"not inputs\": args}}\n        with self.assertRaisesRegex(\n            RuntimeError,\n            'method_compile_spec does not contain a dictionary with an \"inputs\" key, '\n            'under it\\'s \"forward\" key.' + errorMsgTail,\n        ):\n            torch._C._jit_to_backend(\"nnapi\", traced, compile_spec)\n\n        # No Tensor or TensorList under the inputs key\n        compile_spec = {\"forward\": {\"inputs\": 1}}\n        with self.assertRaisesRegex(\n            RuntimeError,\n            'method_compile_spec does not contain either a Tensor or TensorList, under it\\'s \"inputs\" key.'\n            + errorMsgTail,\n        ):\n            torch._C._jit_to_backend(\"nnapi\", traced, compile_spec)\n        compile_spec = {\"forward\": {\"inputs\": [1]}}\n        with self.assertRaisesRegex(\n            RuntimeError,\n            'method_compile_spec does not contain either a Tensor or TensorList, under it\\'s \"inputs\" key.'\n            + errorMsgTail,\n        ):\n            torch._C._jit_to_backend(\"nnapi\", traced, compile_spec)\n\n    def tearDown(self):\n        # Change dtype back to default (Otherwise, other unit tests will complain)\n        torch.set_default_dtype(self.default_dtype)\n\n\nif __name__ == \"__main__\":\n    raise_on_run_directly(\"test/test_jit.py\")\n",
+      "total_lines": 142
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "os",
+        "sys",
+        "unittest",
+        "pathlib:Path",
+        "torch",
+        "torch._C",
+        "torch.testing._internal.common_utils:IS_FBCODE",
+        "torch.testing._internal.common_utils:raise_on_run_directly",
+        "torch.testing._internal.common_utils:skipIfTorchDynamo",
+        "test_nnapi:TestNNAPI",
+        "torch.testing._internal.common_utils:TestCase"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/README.md",
+      "content_excerpt": "![PyTorch Logo](https://github.com/pytorch/pytorch/raw/main/docs/source/_static/img/pytorch-logo-dark.png)\n\n--------------------------------------------------------------------------------\n\nPyTorch is a Python package that provides two high-level features:\n- Tensor computation (like NumPy) with strong GPU acceleration\n- Deep neural networks built on a tape-based autograd system\n\nYou can reuse your favorite Python packages such as NumPy, SciPy, and Cython to extend PyTorch when needed.\n\nOur trunk health (Continuous Integration signals) can be found at [hud.pytorch.org](https://hud.pytorch.org/ci/pytorch/pytorch/main).\n\n<!-- toc -->\n\n- [More About PyTorch](#more-about-pytorch)\n  - [A GPU-Ready Tensor Library](#a-gpu-ready-tensor-library)\n  - [Dynamic Neural Networks: Tape-Based Autograd](#dynamic-neural-networks-tape-based-autograd)\n  - [Python First](#python-first)\n  - [Imperative Experiences](#imperative-experiences)\n  - [Fast and Lean](#fast-and-lean)\n  - [Extensions Without Pain](#extensions-without-pain)\n- [Installation](#installation)\n  - [Binaries](#binaries)\n    - [NVIDIA Jetson Platforms](#nvidia-jetson-platforms)\n  - [From Source](#from-source)\n    - [Prerequisites](#prerequisites)\n      - [NVIDIA CUDA Support](#nvidia-cuda-support)\n      - [AMD ROCm Support](#amd-rocm-support)\n      - [Intel GPU Support](#intel-gpu-support)\n    - [Get the PyTorch Source](#get-the-pytorch-source)\n    - [Install Dependencies](#install-dependencies)\n    - [Install PyTorch](#install-pytorch)\n      - [Adjust Build Options (Optional)](#adjust-build-options-optional)\n  - [Docker Image](#d"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "setUp test",
+      "count": 8,
+      "items": [
+        {
+          "name": "tests_setup.py",
+          "path": "test/cpp/jit/tests_setup.py",
+          "sha": "954a0f0919acb773c4d6725062146eb3654f229f",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/cpp/jit/tests_setup.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_net_min_base.py",
+          "path": "test/fx/test_net_min_base.py",
+          "sha": "7e164e72629021b4cd7d42bbe5bad4a47fe15984",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/fx/test_net_min_base.py",
+          "score": 1.0
+        },
+        {
+          "name": "e2e_test_base.h",
+          "path": "test/cpp/rpc/e2e_test_base.h",
+          "sha": "f972a8f6a34b2720485dc1b407b5d1040994d61d",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/cpp/rpc/e2e_test_base.h",
+          "score": 1.0
+        },
+        {
+          "name": "test_debug.py",
+          "path": "test/distributed/test_debug.py",
+          "sha": "1533b27806799720e3da7db66c748450b21fd0b8",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/distributed/test_debug.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_inplacing_pass.py",
+          "path": "test/inductor/test_inplacing_pass.py",
+          "sha": "10de5116151d2ff0732709fa792fc6d82daf722b",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/inductor/test_inplacing_pass.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_cutlass_fallback.py",
+          "path": "test/inductor/test_cutlass_fallback.py",
+          "sha": "8de87bb02e574a428e2c589ac8228ff72fc4cdb7",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/inductor/test_cutlass_fallback.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_lazy_graph_executor.cpp",
+          "path": "test/cpp/lazy/test_lazy_graph_executor.cpp",
+          "sha": "ae9ec1fa7d99db9c4fd8e3561d06d443c4ae67ab",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/cpp/lazy/test_lazy_graph_executor.cpp",
+          "score": 1.0
+        },
+        {
+          "name": "test_opaque_obj_v2.py",
+          "path": "test/test_opaque_obj_v2.py",
+          "sha": "33bb6c33a15e9810af13cf1baed62939860905fa",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/test/test_opaque_obj_v2.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"setUp(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "build_with_debinfo.py",
+          "path": "tools/build_with_debinfo.py",
+          "sha": "d2e0fefa61ac254e1589630dd30ba978f179f156",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/tools/build_with_debinfo.py",
+          "score": 1.0
+        },
+        {
+          "name": "_storage_utils.py",
+          "path": "torch/distributed/checkpoint/_storage_utils.py",
+          "sha": "261dab2a314a56cac2a1f01f04ca642f9c0f500b",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/torch/distributed/checkpoint/_storage_utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "factory.py",
+          "path": "benchmarks/fastrnns/factory.py",
+          "sha": "1d8e419af27d2cbba57e9fff25d40d67eb601efe",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/benchmarks/fastrnns/factory.py",
+          "score": 1.0
+        },
+        {
+          "name": "__main__.py",
+          "path": "torch/_inductor/compile_worker/__main__.py",
+          "sha": "6ca0f1e5a4fb2a6aeb1224285d76e78a05a0f499",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/torch/_inductor/compile_worker/__main__.py",
+          "score": 1.0
+        },
+        {
+          "name": "setup.py",
+          "path": "benchmarks/operator_benchmark/pt_extension/setup.py",
+          "sha": "06bd8bdf23506faa3dc4d9330e95419d063b97a3",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/benchmarks/operator_benchmark/pt_extension/setup.py",
+          "score": 1.0
+        },
+        {
+          "name": "cache_hit_microbenchmarks.py",
+          "path": "benchmarks/dynamo/microbenchmarks/cache_hit_microbenchmarks.py",
+          "sha": "57fae90952bf4b21d5d915a4a8e6843848b7e29e",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/benchmarks/dynamo/microbenchmarks/cache_hit_microbenchmarks.py",
+          "score": 1.0
+        },
+        {
+          "name": "server.py",
+          "path": "benchmarks/inference/server.py",
+          "sha": "7cf7b940687fcc6abdb79caeee84c3651b4ccec4",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/benchmarks/inference/server.py",
+          "score": 1.0
+        },
+        {
+          "name": "torch.compiler_custom_backends.md",
+          "path": "docs/source/user_guide/torch_compiler/torch.compiler_custom_backends.md",
+          "sha": "a00f8e45147a899185c0f74e7e275223604b7c15",
+          "html_url": "https://github.com/pytorch/pytorch/blob/3f14378080012bafc834a927560b6a1555b5bf80/docs/source/user_guide/torch_compiler/torch.compiler_custom_backends.md",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "test/jit",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "test/jit/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_imported_class_test",
+          "path": "test/jit/_imported_class_test",
+          "type": "dir"
+        },
+        {
+          "name": "fixtures",
+          "path": "test/jit/fixtures",
+          "type": "dir"
+        },
+        {
+          "name": "fixtures_srcs",
+          "path": "test/jit/fixtures_srcs",
+          "type": "dir"
+        },
+        {
+          "name": "mydecorator.py",
+          "path": "test/jit/mydecorator.py",
+          "type": "file"
+        },
+        {
+          "name": "myexception.py",
+          "path": "test/jit/myexception.py",
+          "type": "file"
+        },
+        {
+          "name": "myfunction_a.py",
+          "path": "test/jit/myfunction_a.py",
+          "type": "file"
+        },
+        {
+          "name": "myfunction_b.py",
+          "path": "test/jit/myfunction_b.py",
+          "type": "file"
+        },
+        {
+          "name": "test_alias_analysis.py",
+          "path": "test/jit/test_alias_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "test_async.py",
+          "path": "test/jit/test_async.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aten_pow.py",
+          "path": "test/jit/test_aten_pow.py",
+          "type": "file"
+        },
+        {
+          "name": "test_attr.py",
+          "path": "test/jit/test_attr.py",
+          "type": "file"
+        },
+        {
+          "name": "test_autodiff.py",
+          "path": "test/jit/test_autodiff.py",
+          "type": "file"
+        },
+        {
+          "name": "test_autodiff_subgraph_slicing.py",
+          "path": "test/jit/test_autodiff_subgraph_slicing.py",
+          "type": "file"
+        },
+        {
+          "name": "test_await.py",
+          "path": "test/jit/test_await.py",
+          "type": "file"
+        },
+        {
+          "name": "test_backend_nnapi.py",
+          "path": "test/jit/test_backend_nnapi.py",
+          "type": "file"
+        },
+        {
+          "name": "test_backends.py",
+          "path": "test/jit/test_backends.py",
+          "type": "file"
+        },
+        {
+          "name": "test_batch_mm.py",
+          "path": "test/jit/test_batch_mm.py",
+          "type": "file"
+        },
+        {
+          "name": "test_builtins.py",
+          "path": "test/jit/test_builtins.py",
+          "type": "file"
+        },
+        {
+          "name": "test_class_type.py",
+          "path": "test/jit/test_class_type.py",
+          "type": "file"
+        },
+        {
+          "name": "test_complex.py",
+          "path": "test/jit/test_complex.py",
+          "type": "file"
+        },
+        {
+          "name": "test_complexity.py",
+          "path": "test/jit/test_complexity.py",
+          "type": "file"
+        },
+        {
+          "name": "test_concrete_module_type.py",
+          "path": "test/jit/test_concrete_module_type.py",
+          "type": "file"
+        },
+        {
+          "name": "test_convert_activation.py",
+          "path": "test/jit/test_convert_activation.py",
+          "type": "file"
+        },
+        {
+          "name": "test_cuda.py",
+          "path": "test/jit/test_cuda.py",
+          "type": "file"
+        },
+        {
+          "name": "test_custom_operators.py",
+          "path": "test/jit/test_custom_operators.py",
+          "type": "file"
+        },
+        {
+          "name": "test_data_parallel.py",
+          "path": "test/jit/test_data_parallel.py",
+          "type": "file"
+        },
+        {
+          "name": "test_dataclasses.py",
+          "path": "test/jit/test_dataclasses.py",
+          "type": "file"
+        },
+        {
+          "name": "test_dce.py",
+          "path": "test/jit/test_dce.py",
+          "type": "file"
+        },
+        {
+          "name": "test_decorator.py",
+          "path": "test/jit/test_decorator.py",
+          "type": "file"
+        },
+        {
+          "name": "test_device_analysis.py",
+          "path": "test/jit/test_device_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "test_dtype_analysis.py",
+          "path": "test/jit/test_dtype_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "test_enum.py",
+          "path": "test/jit/test_enum.py",
+          "type": "file"
+        },
+        {
+          "name": "test_exception.py",
+          "path": "test/jit/test_exception.py",
+          "type": "file"
+        },
+        {
+          "name": "test_freezing.py",
+          "path": "test/jit/test_freezing.py",
+          "type": "file"
+        },
+        {
+          "name": "test_functional_blocks.py",
+          "path": "test/jit/test_functional_blocks.py",
+          "type": "file"
+        },
+        {
+          "name": "test_fuser_common.py",
+          "path": "test/jit/test_fuser_common.py",
+          "type": "file"
+        },
+        {
+          "name": "test_generator.py",
+          "path": "test/jit/test_generator.py",
+          "type": "file"
+        },
+        {
+          "name": "test_graph_rewrite_passes.py",
+          "path": "test/jit/test_graph_rewrite_passes.py",
+          "type": "file"
+        },
+        {
+          "name": "test_hash.py",
+          "path": "test/jit/test_hash.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "test/jit/__init__.py"
+        },
+        {
+          "name": "mydecorator.py",
+          "path": "test/jit/mydecorator.py"
+        },
+        {
+          "name": "myexception.py",
+          "path": "test/jit/myexception.py"
+        },
+        {
+          "name": "myfunction_a.py",
+          "path": "test/jit/myfunction_a.py"
+        },
+        {
+          "name": "myfunction_b.py",
+          "path": "test/jit/myfunction_b.py"
+        },
+        {
+          "name": "test_alias_analysis.py",
+          "path": "test/jit/test_alias_analysis.py"
+        },
+        {
+          "name": "test_async.py",
+          "path": "test/jit/test_async.py"
+        },
+        {
+          "name": "test_aten_pow.py",
+          "path": "test/jit/test_aten_pow.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "test/jit/test_backend_nnapi.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "695cb0d342f67db563fb57ce1a5f3261b073b790",
+          "html_url": "https://github.com/pytorch/pytorch/commit/695cb0d342f67db563fb57ce1a5f3261b073b790",
+          "message": "[2/N][Fix] Fix typo in test folder  (#166374)\n\nFix typo in test folder.\n\n_typos.toml\n```bash\n[default.extend-words]\nnd = \"nd\"\narange = \"arange\"\nNd = \"Nd\"\nGLOBALs = \"GLOBALs\"\nhte = \"hte\"\niy = \"iy\"\nPN = \"PN\"\nDout = \"Dout\"\noptin = \"optin\"\ngam = \"gam\"\nPTD = \"PTD\"\n```\n\nPull Request resolved: https://gith",
+          "author": "linhaifeng",
+          "date": "2025-10-29T03:02:03Z"
+        },
+        {
+          "sha": "bf7e290854b7f0ab3fb89251d0100821f1b3a70e",
+          "html_url": "https://github.com/pytorch/pytorch/commit/bf7e290854b7f0ab3fb89251d0100821f1b3a70e",
+          "message": "Add __main__ guards to jit tests (#154725)\n\nThis PR is part of a series attempting to re-submit https://github.com/pytorch/pytorch/pull/134592 as smaller PRs.\n\nIn jit tests:\n\n- Add and use a common raise_on_run_directly method for when a user runs a test file directly which should not be run this wa",
+          "author": "Anthony Barbier",
+          "date": "2025-06-16T10:28:45Z"
+        },
+        {
+          "sha": "20912673a6c0e6a54f279699681a6754fb1e90f6",
+          "html_url": "https://github.com/pytorch/pytorch/commit/20912673a6c0e6a54f279699681a6754fb1e90f6",
+          "message": "Revert \"Add __main__ guards to jit tests (#154725)\"\n\nThis reverts commit 1a55fb0ee87eaa8b376aaa82d95d213fe0fbe64b.\n\nReverted https://github.com/pytorch/pytorch/pull/154725 on behalf of https://github.com/malfet due to This added 2nd copy of raise_on_run to common_utils.py which caused lint failures,",
+          "author": "PyTorch MergeBot",
+          "date": "2025-06-04T15:42:52Z"
+        },
+        {
+          "sha": "1a55fb0ee87eaa8b376aaa82d95d213fe0fbe64b",
+          "html_url": "https://github.com/pytorch/pytorch/commit/1a55fb0ee87eaa8b376aaa82d95d213fe0fbe64b",
+          "message": "Add __main__ guards to jit tests (#154725)\n\nThis PR is part of a series attempting to re-submit https://github.com/pytorch/pytorch/pull/134592 as smaller PRs.\n\nIn jit tests:\n\n- Add and use a common raise_on_run_directly method for when a user runs a test file directly which should not be run this wa",
+          "author": "Anthony Barbier",
+          "date": "2025-06-04T14:44:04Z"
+        },
+        {
+          "sha": "99f2491af9133ae3dd1ee9dae7110c3d97b9ca49",
+          "html_url": "https://github.com/pytorch/pytorch/commit/99f2491af9133ae3dd1ee9dae7110c3d97b9ca49",
+          "message": "Revert \"Use absolute path `path.resolve()` -> `path.absolute()` (#129409)\"\n\nThis reverts commit 45411d1fc9a2b6d2f891b6ab0ae16409719e09fc.\n\nReverted https://github.com/pytorch/pytorch/pull/129409 on behalf of https://github.com/jeanschmidt due to Breaking internal CI, @albanD please help get this PR ",
+          "author": "PyTorch MergeBot",
+          "date": "2025-01-04T14:17:20Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "setUp TODO enable execution tests after",
+      "count": 20,
+      "items": [
+        {
+          "number": 171600,
+          "title": "[precompile] e2e cross precompilation",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/171600",
+          "is_pull_request": true
+        },
+        {
+          "number": 160266,
+          "title": "Support of dtensor redistribute with device order",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/160266",
+          "is_pull_request": true
+        },
+        {
+          "number": 140979,
+          "title": "Implement cuda graphs implementation of torch.cond and torch.while_loop",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/140979",
+          "is_pull_request": true
+        },
+        {
+          "number": 136033,
+          "title": "Add support for `contextmanager` in Dynamo",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/136033",
+          "is_pull_request": true
+        },
+        {
+          "number": 134124,
+          "title": "[ARM][feat]: Add 4 bit dynamic quantization matmuls & KleidiAI Backend",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/134124",
+          "is_pull_request": true
+        },
+        {
+          "number": 126129,
+          "title": "[WIP] Warn on future divergent behavior for conditional views",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/126129",
+          "is_pull_request": true
+        },
+        {
+          "number": 117907,
+          "title": "[traced-graph][sparse] propagate sparsity metadata into traced graph",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/117907",
+          "is_pull_request": true
+        },
+        {
+          "number": 113538,
+          "title": "[dynamo] Automatically convert loop bodies to function calls",
+          "state": "closed",
+          "html_url": "https://github.com/pytorch/pytorch/pull/113538",
+          "is_pull_request": true
+        }
+      ]
+    },
+    "issue_comments": [],
+    "related_pr_files": [
+      {
+        "ok": true,
+        "number": 171600,
+        "count": 8,
+        "files": [
+          {
+            "filename": "test/dynamo/test_aot_compile.py",
+            "status": "modified",
+            "additions": 548,
+            "deletions": 0,
+            "changes": 548
+          },
+          {
+            "filename": "torch/_dynamo/aot_compile.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1
+          },
+          {
+            "filename": "torch/_dynamo/functional_export.py",
+            "status": "modified",
+            "additions": 23,
+            "deletions": 4,
+            "changes": 27
+          },
+          {
+            "filename": "torch/_dynamo/guards.py",
+            "status": "modified",
+            "additions": 8,
+            "deletions": 1,
+            "changes": 9
+          },
+          {
+            "filename": "torch/_functorch/_aot_autograd/autograd_cache.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 2,
+            "changes": 9
+          },
+          {
+            "filename": "torch/_functorch/_aot_autograd/frontend_utils.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 4,
+            "changes": 11
+          },
+          {
+            "filename": "torch/_functorch/_aot_autograd/schemas.py",
+            "status": "modified",
+            "additions": 10,
+            "deletions": 0,
+            "changes": 10
+          },
+          {
+            "filename": "torch/_functorch/aot_autograd.py",
+            "status": "modified",
+            "additions": 60,
+            "deletions": 7,
+            "changes": 67
+          }
+        ]
+      },
+      {
+        "ok": true,
+        "number": 160266,
+        "count": 8,
+        "files": [
+          {
+            "filename": "test/distributed/tensor/debug/test_debug_mode.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 6,
+            "changes": 12
+          },
+          {
+            "filename": "test/distributed/tensor/test_api.py",
+            "status": "modified",
+            "additions": 415,
+            "deletions": 2,
+            "changes": 417
+          },
+          {
+            "filename": "test/distributed/tensor/test_dtensor_ops.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 2,
+            "changes": 4
+          },
+          {
+            "filename": "test/distributed/tensor/test_pointwise_ops.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2
+          },
+          {
+            "filename": "test/distributed/tensor/test_redistribute.py",
+            "status": "modified",
+            "additions": 336,
+            "deletions": 0,
+            "changes": 336
+          },
+          {
+            "filename": "torch/distributed/device_mesh.py",
+            "status": "modified",
+            "additions": 11,
+            "deletions": 0,
+            "changes": 11
+          },
+          {
+            "filename": "torch/distributed/tensor/_api.py",
+            "status": "modified",
+            "additions": 387,
+            "deletions": 57,
+            "changes": 444
+          },
+          {
+            "filename": "torch/distributed/tensor/_dtensor_spec.py",
+            "status": "modified",
+            "additions": 168,
+            "deletions": 10,
+            "changes": 178
+          }
+        ]
+      }
+    ],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "test/jit/test_backend_nnapi.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "695cb0d342f67db563fb57ce1a5f3261b073b790",
+        "html_url": "https://github.com/pytorch/pytorch/commit/695cb0d342f67db563fb57ce1a5f3261b073b790",
+        "message": "[2/N][Fix] Fix typo in test folder  (#166374)\n\nFix typo in test folder.\n\n_typos.toml\n```bash\n[default.extend-words]\nnd = \"nd\"\narange = \"arange\"\nNd = \"Nd\"\nGLOBALs = \"GLOBALs\"\nhte = \"hte\"\niy = \"iy\"\nPN = \"PN\"\nDout = \"Dout\"\noptin = \"optin\"\ngam = \"gam\"\nPTD = \"PTD\"\n```\n\nPull Request resolved: https://gith",
+        "author": "linhaifeng",
+        "date": "2025-10-29T03:02:03Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

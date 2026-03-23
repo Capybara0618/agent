@@ -1,0 +1,372 @@
+{
+  "task_id": "20",
+  "repo_owner": "codecov",
+  "repo_name": "worker",
+  "file_path": "services/report/languages/node.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T02:52:56+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T02:53:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T02:53:09+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "services/report/languages/node.py",
+    "original_code": "def matches_content(self, content, first_line, name):\n    return True  # TODO: fix this",
+    "satd_comment": "# TODO: fix this",
+    "target_file": {
+      "ok": true,
+      "path": "services/report/languages/node.py",
+      "sha": "323377a97b5cd52b9712988d19cbef48cc58ab77",
+      "download_url": "https://raw.githubusercontent.com/codecov/worker/main/services/report/languages/node.py",
+      "content_excerpt": "from collections import defaultdict\nfrom fractions import Fraction\n\nimport sentry_sdk\nfrom shared.reports.resources import ReportFile\nfrom shared.utils.merge import partials_to_line\n\nfrom services.report.languages.base import BaseLanguageProcessor\nfrom services.report.report_builder import CoverageType, ReportBuilderSession\n\n\nclass NodeProcessor(BaseLanguageProcessor):\n    def matches_content(self, content: dict, first_line: str, name: str) -> bool:\n        return isinstance(content, dict) and all(\n            isinstance(data, dict) for data in content.values()\n        )\n\n    @sentry_sdk.trace\n    def process(\n        self, content: dict, report_builder_session: ReportBuilderSession\n    ) -> None:\n        return from_json(content, report_builder_session)\n\n\ndef get_line_coverage(location, cov, line_type):\n    if location.get(\"skip\"):\n        return None, None, None\n\n    sl, sc, el, ec = get_location(location)\n\n    if not sl or (sc + 1 == ec and sl == el):\n        return None, None, None\n\n    if line_type != \"m\" and sl == el and sc != 0:\n        partial = [sc, ec, cov]\n    else:\n        partial = None\n\n    return sl, cov, partial\n\n\ndef get_location(node):\n    try:\n        if \"loc\" in node:\n            return (\n                node[\"loc\"][\"start\"][\"line\"],\n                node[\"loc\"][\"start\"][\"column\"],\n                node[\"loc\"][\"end\"][\"line\"],\n                node[\"loc\"][\"end\"][\"column\"],\n            )\n        elif \"start\" in node:\n            return (\n                node[\"start\"][\"line\"],\n                node[\"start\"][\"column\"],\n                node[\"end\"][\"line\"],\n                node[\"end\"][\"column\"],\n            )\n        else:\n            return (\n                node[\"locations\"][0][\"start\"][\"line\"],\n                node[\"locations\"][0][\"start\"][\"column\"],\n                node[\"locations\"][-1][\"end\"][\"line\"],\n                node[\"locations\"][-1][\"end\"][\"column\"],\n            )\n    except Exception:\n        return (None, None, None, None)\n\n\ndef must_be_dict(value):\n    if not isinstance(value, dict):\n        return {}\n    else:\n        return value\n\n\ndef next_from_json(\n    report_dict: dict, report_builder_session: ReportBuilderSession\n) -> None:\n    path_fixer = report_builder_session.path_fixer\n\n    for filename, data in report_dict.items():\n        filename = path_fixer(filename) or path_fixer(\n            filename.replace(\"lib/\", \"src/\", 1)\n        )\n        if filename is None:\n            continue\n        _file = report_builder_session.create_coverage_file(filename, do_fix_path=False)\n\n        if \"lineData\" in data:\n            jscoverage(_file, data, report_builder_session)\n            report_builder_session.append(_file)\n            continue\n\n        if data.get(\"data\"):\n            # why. idk. node is like that.\n            data = data[\"data\"]\n\n        ifs = {}\n        _ifends = {}\n        for bid, branch in must_be_dict(data.get(\"branchMap\")).items():\n            if branch.get(\"skip\") is True:\n                continue\n            if branch.get(\"type\") == \"if\":\n                # first skip ifs\n                sl, sc, el, ec = get_location(branch)\n                ifs[sl] = (sc, el, ec)\n\n            else:\n                line_parts = defaultdict(list)\n                line_cov = defaultdict(list)\n                for lid, location in enumerate(branch[\"locations\"]):\n                    ln, cov, partials = get_line_coverage(\n                        location, data[\"b\"][bid][lid], \"b\"\n                    )\n                    if ln:\n                        line_parts[ln].append(partials)\n                        line_cov[ln].append(cov)\n                        if ln == location[\"end\"][\"line\"]:\n                            _ifends[location[\"end\"][\"line\"]] = location[\"end\"][\"column\"]\n\n                for ln, partials in line_parts.items():\n                    partials = list(filter(None, partials))\n                    if len(partials) > 1:\n                        branches = [\n                            str(i)\n                            for i, partial in enumerate(partials)\n                            if partial and partial[2] == 0\n                        ]\n                        cov = \"%d/%d\" % (\n                            len(partials) - len(branches),\n                            len(partials),\n                        )\n                        partials = sorted(partials, key=lambda p: p[0])\n                    else:\n                        branches = None\n                        cov = line_cov[ln][0]\n                        partials = None\n\n                    _file.append(\n                        ln,\n                        report_builder_session.create_coverage_line(\n                            cov,\n                            CoverageType.branch,\n                            partials=partials,\n                            missing_branches=branches,\n                        ),\n                    )\n\n        # statements\n        inlines = {}\n        line_parts = defaultdict(list)\n        line_cov = defaultdict(list)\n        for sid, statement in must_be_dict(data.get(\"statementMap\")).items():\n            if statement.get(\"skip\") is True:\n                continue\n\n            ln, cov, partials = get_line_coverage(statement, data[\"s\"][sid], None)\n            if ln:\n                sl, sc, el, ec = get_location(statement)\n                if ifs.get(ln) == (sc, el, ec):\n                    # we will chop it of later\n                    if partials:\n                        inlines[ln] = partials\n\n                else:\n                    line_parts[ln].append(partials)\n                    line_cov[ln].append(cov)\n\n        for ln, partials in line_parts.items():\n            partials = sorted(filter(None, partials), key=lambda p: p[0])\n            cov = line_cov[ln][0]\n            line = _file.get(ln)\n            if line and line.sessions[0].partials is not None:\n                continue\n            else:\n                _file.append(\n                    ln,\n                    report_builder_session.create_coverage_line(\n                        cov,\n                        partials=partials,\n                    ),\n                )\n\n        # NOTE: All the modifications done here rely on *overwriting* the given line record using index notation.\n        # Using `.append` in this block of code will lead to wrong results as it would *merge* the records.\n        for bid, branch in must_be_dict(data.get(\"branchMap\")).items():\n            # single stmt ifs only\n            if branch.get(\"skip\") is True or branch.get(\"type\") != \"if\":\n                continue\n\n            sl, sc, el, ec = get_location(branch)\n            if sl:\n                branches = data[\"b\"][bid]\n                tb = len(branches)\n                cov = \"%s/%s\" % (tb - branches.count(0), tb)\n                mb = [str(i) for i, b in enumerate(branches) if b == 0]\n\n                line = _file.get(sl)\n                if line:\n                    inline_part = inlines.pop(sl, None)\n                    if inline_part:\n                        cur_partials = line.sessions[-1].partials\n                        if not cur_partials:\n                            _, cov, partials = get_line_coverage(branch, cov, \"b\")\n                            _file[sl] = report_builder_session.create_coverage_line(\n                                cov,\n                                CoverageType.branch,\n                                missing_branches=mb,\n                                partials=partials,\n                            )\n                            continue\n\n                        sc, ec = sc + 4, cur_partials[0][0] - 2\n                        _isc, iec, icov = inline_part\n                        if sc > ec:\n                            cur_partials.append([cur_partials[-1][1] + 2, iec, icov])\n                            _file[sl] = report_builder_session.create_coverage_line(\n                                cov,\n                                CoverageType.branch,\n                                missing_branches=mb,\n                                partials=cur_partials,\n                            )\n                        else:\n                            partials = [[sc, ec, cov]]\n                            for p in cur_partials:\n                                if (p[0], p[1]) != (ec + 2, iec):\n                                    # add these partials\n                                    partials.append(p)\n                                elif p[2] == 0 or isinstance(p[2], str):\n                                    # dont add trimmed, this part was missed\n                                    partials.append(p)\n                                else:\n                                    partials.append([ec + 2, iec, icov])\n                            _file[sl] = report_builder_session.create_coverage_line(\n                                cov,\n                                CoverageType.branch,\n                                missing_branches=mb,\n                                partials=sorted(partials, key=lambda p: p[0]),\n                            )\n\n                    else:\n                        # if ( exp && expr )\n                        # change to branch\n                        _file[sl] = report_builder_session.create_coverage_line(\n                            cov,\n                            CoverageType.branch,\n                            missing_branches=mb,\n                            partials=_file[sl].sessions[-1].partials,\n                        )\n\n                else:\n                    _file.append(\n                        sl,\n                        report_builder_session.create_coverage_line(\n                            cov,\n                            CoverageType.branch,\n                            missing_branches=mb,\n                        ),\n                    )\n\n        for fid, func in must_be_dict(data[\"fnMap\"]).items():\n            if func.get(\"skip\") is not True:\n                ln, cov, partials = get_line_coverage(func, data[\"f\"][fid], \"m\")\n                if ln:\n                    _file.append(\n                        ln,\n                        report_builder_session.create_coverage_line(\n                            cov,\n                            CoverageType.method,\n                        ),\n                    )\n\n        report_builder_session.append(_file)\n\n\ndef _location_to_int(location: dict) -> int | None:\n    if \"loc\" in location:\n        location = location[\"loc\"]\n\n    if location.get(\"skip\"):\n        return None\n\n    elif location[\"start\"].get(\"line\", 0) == 0:\n        return None\n\n    return int(location[\"start\"][\"line\"])\n\n\ndef _jscoverage_eval_partial(partial):\n    return [\n        partial[\"position\"],\n        partial[\"position\"] + partial[\"nodeLength\"],\n        Fraction(\n            \"{0}/2\".format(\n                (1 if partial[\"evalTrue\"] else 0) + (1 if partial[\"evalFalse\"] else 0)\n            )\n        ),\n        # It seems like the above line on Python2 would make something in `partials_to_line` always return True\n    ]\n\n\ndef jscoverage(\n    _file: ReportFile, data: dict, report_builder_session: ReportBuilderSession\n):\n    branches = {\n        ln: map(_jscoverage_eval_partial, branchData[1:])\n        for ln, branchData in must_be_dict(data[\"branchData\"]).items()\n    }\n\n    for ln, coverage in enumerate(data[\"lineData\"]):\n        if coverage is not None:\n            partials = branches.get(str(ln))\n            if partials:\n                partials = list(partials)\n                coverage = partials_to_line(partials)\n            _file.append(\n                ln,\n                report_builder_session.create_coverage_line(\n                    coverage,\n                    CoverageType.branch if partials else CoverageType.line,\n                    partials=partials,\n                ),\n            )\n\n\ndef from_json(report_dict: dict, report_builder_session: ReportBuilderSession) -> None:\n    enable_partials = report_builder_session.yaml_field(\n        (\"parsers\", \"j",
+      "total_lines": 404
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "collections:defaultdict",
+        "fractions:Fraction",
+        "sentry_sdk",
+        "shared.reports.resources:ReportFile",
+        "shared.utils.merge:partials_to_line",
+        "services.report.languages.base:BaseLanguageProcessor",
+        "services.report.report_builder:CoverageType",
+        "services.report.report_builder:ReportBuilderSession"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/codecov/worker/main/README.md",
+      "content_excerpt": "# PHASED OUT\n\nThis project has been moved to [the `apps/worker` folder in our `umbrella` repository](https://github.com/codecov/umbrella/tree/main/apps/worker). Please contribute there instead.\n\n# worker\n\n![Actions](https://github.com/codecov/worker/actions/workflows/ci.yml/badge.svg)\n[![worker](https://codecov.io/github/codecov/worker/coverage.svg?branch=master&token=BWTOrjBaE5)](https://codecov.io/github/codecov/worker)\n\n> We believe that everyone should have access to quality software (like Sentry), that’s why we have always offered Codecov for free to open source maintainers.\n>\n> By making our code public, we’re not only joining the community that’s supported us from the start — but also want to make sure that every developer can contribute to and build on the Codecov experience.\n\nCode for Background Workers of Codecov. This is built on top of the `celery` async framework\n\n## Quickstart\n\n### Setting Virtual Env\n\nThis repo is set up with `direnv`, which will automatically\ncreate a virtualenv in `.venv` and activate the environment\nwhen you `cd` into the directory in your console.\n\nPlease take a look at [direnv](https://github.com/direnv/direnv/blob/master/docs/installation.md)\nfor more installation information.\n\n### Installing dependencies\n\nMake sure to:\n\n- Install rust. See https://www.rust-lang.org/tools/install\n- Have access to any private codecov repos listed in the requirements.txt file. See [here](https://codecovio.atlassian.net/wiki/spaces/ENG/pages/1270743045/Setup) for help on getting that set up.\n\nTo install the dependencies, run\n\n```\nuv sync\n```\n\n### Environme"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "matches_content test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"matches_content(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "services/report/languages",
+      "count": 32,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "services/report/languages/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "services/report/languages/base.py",
+          "type": "file"
+        },
+        {
+          "name": "bullseye.py",
+          "path": "services/report/languages/bullseye.py",
+          "type": "file"
+        },
+        {
+          "name": "clover.py",
+          "path": "services/report/languages/clover.py",
+          "type": "file"
+        },
+        {
+          "name": "cobertura.py",
+          "path": "services/report/languages/cobertura.py",
+          "type": "file"
+        },
+        {
+          "name": "coveralls.py",
+          "path": "services/report/languages/coveralls.py",
+          "type": "file"
+        },
+        {
+          "name": "csharp.py",
+          "path": "services/report/languages/csharp.py",
+          "type": "file"
+        },
+        {
+          "name": "dlst.py",
+          "path": "services/report/languages/dlst.py",
+          "type": "file"
+        },
+        {
+          "name": "elm.py",
+          "path": "services/report/languages/elm.py",
+          "type": "file"
+        },
+        {
+          "name": "flowcover.py",
+          "path": "services/report/languages/flowcover.py",
+          "type": "file"
+        },
+        {
+          "name": "gap.py",
+          "path": "services/report/languages/gap.py",
+          "type": "file"
+        },
+        {
+          "name": "gcov.py",
+          "path": "services/report/languages/gcov.py",
+          "type": "file"
+        },
+        {
+          "name": "go.py",
+          "path": "services/report/languages/go.py",
+          "type": "file"
+        },
+        {
+          "name": "helpers.py",
+          "path": "services/report/languages/helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "jacoco.py",
+          "path": "services/report/languages/jacoco.py",
+          "type": "file"
+        },
+        {
+          "name": "jetbrainsxml.py",
+          "path": "services/report/languages/jetbrainsxml.py",
+          "type": "file"
+        },
+        {
+          "name": "lcov.py",
+          "path": "services/report/languages/lcov.py",
+          "type": "file"
+        },
+        {
+          "name": "lua.py",
+          "path": "services/report/languages/lua.py",
+          "type": "file"
+        },
+        {
+          "name": "mono.py",
+          "path": "services/report/languages/mono.py",
+          "type": "file"
+        },
+        {
+          "name": "node.py",
+          "path": "services/report/languages/node.py",
+          "type": "file"
+        },
+        {
+          "name": "pycoverage.py",
+          "path": "services/report/languages/pycoverage.py",
+          "type": "file"
+        },
+        {
+          "name": "rlang.py",
+          "path": "services/report/languages/rlang.py",
+          "type": "file"
+        },
+        {
+          "name": "salesforce.py",
+          "path": "services/report/languages/salesforce.py",
+          "type": "file"
+        },
+        {
+          "name": "scala.py",
+          "path": "services/report/languages/scala.py",
+          "type": "file"
+        },
+        {
+          "name": "scoverage.py",
+          "path": "services/report/languages/scoverage.py",
+          "type": "file"
+        },
+        {
+          "name": "simplecov.py",
+          "path": "services/report/languages/simplecov.py",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "services/report/languages/tests",
+          "type": "dir"
+        },
+        {
+          "name": "v1.py",
+          "path": "services/report/languages/v1.py",
+          "type": "file"
+        },
+        {
+          "name": "vb.py",
+          "path": "services/report/languages/vb.py",
+          "type": "file"
+        },
+        {
+          "name": "vb2.py",
+          "path": "services/report/languages/vb2.py",
+          "type": "file"
+        },
+        {
+          "name": "xcode.py",
+          "path": "services/report/languages/xcode.py",
+          "type": "file"
+        },
+        {
+          "name": "xcodeplist.py",
+          "path": "services/report/languages/xcodeplist.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "services/report/languages/__init__.py"
+        },
+        {
+          "name": "base.py",
+          "path": "services/report/languages/base.py"
+        },
+        {
+          "name": "bullseye.py",
+          "path": "services/report/languages/bullseye.py"
+        },
+        {
+          "name": "clover.py",
+          "path": "services/report/languages/clover.py"
+        },
+        {
+          "name": "cobertura.py",
+          "path": "services/report/languages/cobertura.py"
+        },
+        {
+          "name": "coveralls.py",
+          "path": "services/report/languages/coveralls.py"
+        },
+        {
+          "name": "csharp.py",
+          "path": "services/report/languages/csharp.py"
+        },
+        {
+          "name": "dlst.py",
+          "path": "services/report/languages/dlst.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "services/report/languages/node.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ab427f8311ee1d9306f692f531c67e3897786faf",
+          "html_url": "https://github.com/codecov/worker/commit/ab427f8311ee1d9306f692f531c67e3897786faf",
+          "message": "Unify `ReportBuilderSession` usage within `LanguageProcessor`s (#684)",
+          "author": "Arpad Borsos",
+          "date": "2024-09-10T08:46:19Z"
+        },
+        {
+          "sha": "66ca059dae182a7b3e169748d0bc0ff718a00eb1",
+          "html_url": "https://github.com/codecov/worker/commit/66ca059dae182a7b3e169748d0bc0ff718a00eb1",
+          "message": "Improve typing of `LanguageProcessor`s (#666)",
+          "author": "Arpad Borsos",
+          "date": "2024-09-02T07:58:56Z"
+        },
+        {
+          "sha": "099e19006369c19d6bd3d58ef6548e163dbede5f",
+          "html_url": "https://github.com/codecov/worker/commit/099e19006369c19d6bd3d58ef6548e163dbede5f",
+          "message": "dev: Add E, PLC, and PLE ruff rules (#505)",
+          "author": "ajay-sentry",
+          "date": "2024-06-20T17:34:48Z"
+        },
+        {
+          "sha": "f2ce06f9ba38a390df0a986a6cf3f98969d09229",
+          "html_url": "https://github.com/codecov/worker/commit/f2ce06f9ba38a390df0a986a6cf3f98969d09229",
+          "message": "Remove unused import with ruff (#423)\n\nIn particular, I was interested in F401. This should clean up all unused imports in the repo.\nWe have to be careful with celery tasks because they don't get picked up if they are not \"imported\" anywhere.\nI've added an annotation on the `__init__` files that imp",
+          "author": "michelletran-codecov",
+          "date": "2024-05-08T13:25:48Z"
+        },
+        {
+          "sha": "5a415c2213bc7ff548323b444aba34017892d739",
+          "html_url": "https://github.com/codecov/worker/commit/5a415c2213bc7ff548323b444aba34017892d739",
+          "message": "Fixing Node column check\n\nOn Node we currently have the logic:\n\n```\nif not sl or sc + 1 == ec:\n    return None, None, None\n```\n\nwhich essentially says \"If there is no start line, or the end column is only one more than the the start column, ignore this statement\"\n\nWhich feels reasonable, since one-c",
+          "author": "Thiago Ramos",
+          "date": "2022-11-07T17:27:41Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "matches_content TODO this",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "services/report/languages/node.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "ab427f8311ee1d9306f692f531c67e3897786faf",
+        "html_url": "https://github.com/codecov/worker/commit/ab427f8311ee1d9306f692f531c67e3897786faf",
+        "message": "Unify `ReportBuilderSession` usage within `LanguageProcessor`s (#684)",
+        "author": "Arpad Borsos",
+        "date": "2024-09-10T08:46:19Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

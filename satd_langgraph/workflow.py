@@ -239,12 +239,12 @@ class LangGraphSATDWorkflow:
         fieldnames = [
             "task_id", "project", "file_path", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
-            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
+            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_primary_context_sufficiency", "analysis_external_context_support", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_change_compactness", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_change_compactness", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -279,6 +279,8 @@ class LangGraphSATDWorkflow:
             "analysis_change_locality": analysis.get("change_locality"),
             "analysis_semantic_risk": analysis.get("semantic_risk"),
             "analysis_context_sufficiency": analysis.get("context_sufficiency"),
+            "analysis_primary_context_sufficiency": analysis.get("primary_context_sufficiency"),
+            "analysis_external_context_support": analysis.get("external_context_support"),
             "analysis_verifiability": analysis.get("verifiability"),
             "analysis_analyze_score": analysis.get("analyze_score"),
             "analysis_context_score": analysis.get("context_score"),
@@ -310,6 +312,7 @@ class LangGraphSATDWorkflow:
             row[f"round_{round_id}_review_minimality"] = review.get("minimality")
             row[f"round_{round_id}_review_semantic_preservation"] = review.get("semantic_preservation")
             row[f"round_{round_id}_review_internal_consistency"] = review.get("internal_consistency")
+            row[f"round_{round_id}_review_change_compactness"] = review.get("change_compactness")
             row[f"round_{round_id}_review_softened_gate_used"] = review.get("softened_gate_used")
             row[f"round_{round_id}_review_reject_type"] = review.get("reject_type")
             row[f"round_{round_id}_review_issues"] = " | ".join(review.get("issues", [])) if review else None
@@ -345,12 +348,12 @@ class LangGraphSATDWorkflow:
         fieldnames = [
             "task_id", "project", "file_path", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
-            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
+            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_primary_context_sufficiency", "analysis_external_context_support", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_change_compactness", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_change_compactness", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -377,6 +380,8 @@ class LangGraphSATDWorkflow:
                     "analysis_change_locality": analysis.get("change_locality"),
                     "analysis_semantic_risk": analysis.get("semantic_risk"),
                     "analysis_context_sufficiency": analysis.get("context_sufficiency"),
+                    "analysis_primary_context_sufficiency": analysis.get("primary_context_sufficiency"),
+                    "analysis_external_context_support": analysis.get("external_context_support"),
                     "analysis_verifiability": analysis.get("verifiability"),
                     "analysis_analyze_score": analysis.get("analyze_score"),
                     "analysis_context_score": analysis.get("context_score"),
@@ -408,7 +413,7 @@ class LangGraphSATDWorkflow:
                     writer.writerow(row)
 
     def _write_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "change_compactness", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -507,12 +512,12 @@ class LangGraphSATDWorkflow:
         fieldnames = [
             "task_id", "project", "file_path", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
-            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
+            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_primary_context_sufficiency", "analysis_external_context_support", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_change_compactness", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_change_compactness", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         rows = [self._trajectory_row(trace) for trace in traces]
         self._append_csv_rows(path, fieldnames, rows)
@@ -521,7 +526,7 @@ class LangGraphSATDWorkflow:
         fieldnames = [
             "task_id", "project", "file_path", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
-            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
+            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_primary_context_sufficiency", "analysis_external_context_support", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
@@ -574,7 +579,7 @@ class LangGraphSATDWorkflow:
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "change_compactness", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
         rows = []
         for trace in traces:
             for review in trace.reviews:
@@ -754,6 +759,14 @@ class LangGraphSATDWorkflow:
             decision="drop",
             repairable=False,
             repairability_score=0.0,
+            intent_clarity=0.0,
+            change_locality=0.0,
+            semantic_risk=1.0,
+            context_sufficiency=0.0,
+            primary_context_sufficiency=0.0,
+            external_context_support=0.0,
+            verifiability=0.0,
+            analyze_score=0.0,
             confidence=0.0,
             satd_type="content_filtered",
             reason="Analyzer prompt was blocked by provider content filtering.",
@@ -786,10 +799,16 @@ class LangGraphSATDWorkflow:
             round_id=state["round_id"],
             approved=False,
             review_score=0.0,
+            problem_alignment=0.0,
+            minimality=0.0,
+            semantic_preservation=0.0,
+            internal_consistency=0.0,
+            change_compactness=0.0,
             issues=["Reviewer prompt was blocked by provider content filtering."],
             revision_advice="Stop automatic approval for this SATD because reviewer prompting was content-filtered.",
             reject_type="content_filter",
             rationale="Reviewer prompt was blocked by provider content filtering.",
+            softened_gate_used=False,
         )
 
     def _log(self, message: str) -> None:

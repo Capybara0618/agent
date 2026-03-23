@@ -1,0 +1,254 @@
+{
+  "task_id": "59",
+  "repo_owner": "cyverse",
+  "repo_name": "atmosphere",
+  "file_path": "service/accounts/openstack_manager.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T03:05:46+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "KeystoneNotFound",
+    "satd_line": 21,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T03:06:01+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T03:06:14+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "service/accounts/openstack_manager.py",
+    "original_code": "def hashpass(self, username):\n    \"\"\"\n    Create a unique password using 'Username' as the wored\n    and the SECRET_KEY as your salt\n    \"\"\"\n    #FIXME: Switch to new password and then remove this line!\n    return self.old_hashpass(username)\n    secret_salt = settings.SECRET_KEY.translate(None, string.punctuation)\n    password = crypt.crypt(username, secret_salt)\n    if not password:\n        raise Exception(\"Failed to hash password, check the secret_salt\")\n    return password",
+    "satd_comment": "#FIXME: Switch to new password and then remove this line!",
+    "target_file": {
+      "ok": true,
+      "path": "service/accounts/openstack_manager.py",
+      "sha": "e1a718816965c6534076ff3ed541f65a22b77fb1",
+      "download_url": "https://raw.githubusercontent.com/cyverse/atmosphere/master/service/accounts/openstack_manager.py",
+      "content_excerpt": "\"\"\"\nUserManager:\n  Remote Openstack Admin controls..\n\"\"\"\nimport time\nimport string\nfrom urlparse import urlparse\nimport glanceclient\nfrom django.db.models import ObjectDoesNotExist\nfrom rtwo.exceptions import (\n    NovaOverLimit, KeystoneUnauthorized, NeutronClientException,\n    GlanceClientException, GlanceForbidden\n)\n\n# FIXME: Add this exception to rtwo before merge.\ntry:\n    from keystoneclient.exceptions import NotFound as KeystoneNotFound\nexcept:\n\n    class KeystoneNotFound(Exception):\n        pass\n\n\nfrom rtwo.drivers.common import _connect_to_keystone_v2, _connect_to_glance_by_auth\n\nimport core.models\nimport core.plugins\nfrom service.exceptions import AccountCreationConflict\nfrom keystoneauth1.exceptions.http import Unauthorized as KeystoneauthUnauthorized\nfrom requests.exceptions import ConnectionError\nfrom hashlib import sha256\n\nfrom threepio import logger\nfrom rtwo.drivers.common import _connect_to_openstack_sdk\nfrom rtwo.drivers.openstack_network import NetworkManager\nfrom rtwo.drivers.openstack_user import UserManager\nfrom chromogenic.drivers.openstack import ImageManager\n\nfrom django.conf import settings\n\nfrom core.models.identity import Identity\n\nfrom service.accounts.base import BaseAccountDriver\nfrom service.networking import get_topology_cls, ExternalRouter\nfrom service.exceptions import TimeoutError\n\nfrom atmosphere.settings import DEFAULT_PASSWORD_UPDATE, DEFAULT_RULES\n\n\ndef timeout_after(seconds):\n    def real_timeout(func):\n        def wrapper(*args, **kwargs):\n            import signal\n\n            def handler(signum, frame):\n                raise TimeoutError()\n\n            # set the timeout handler\n            signal.signal(signal.SIGALRM, handler)\n            signal.alarm(seconds)\n            try:\n                result = func(*args, **kwargs)\n            except TimeoutError:\n                raise\n            finally:\n                signal.alarm(0)\n\n            return result\n\n        return wrapper\n\n    return real_timeout\n\n\nclass AccountDriver(BaseAccountDriver):\n    user_manager = None\n    image_manager = None\n    network_manager = None\n    core_provider = None\n    cloud_config = {}\n\n    @classmethod\n    def generate_openrc(cls, identity, filename=None):\n        export_data = cls.export_identity(identity)\n        str_builder = \"\"\n        for key, val in export_data.iteritems():\n            str_builder += \"export %s=%s\\n\" % (key, val)\n        if filename:\n            with open(filename, 'w') as the_file:\n                the_file.write(str_builder)\n        return str_builder\n\n    @classmethod\n    def export_identity(cls, identity):\n        \"\"\"\n        Returns the dict required to generate an openrc.\n        This can be used to verify cloud connectivity\n        via external CLI tools.\n        \"\"\"\n        all_creds = identity.get_all_credentials()\n        tenant_name = all_creds.get('ex_project_name', \"<PROJECT MISSING>\")\n        username = all_creds.get('key', \"<USERNAME MISSING>\")\n        password = all_creds.get('secret', \"<PASSWORD MISSING>\")\n        project_domain = all_creds.get('project_domain', 'default')\n        user_domain = all_creds.get('user_domain', 'default')\n        region_name = all_creds.get('region_name', 'RegionOne')\n        keystone_auth_version = all_creds.get(\n            'ex_force_auth_version', '2.0_password'\n        ).replace('/v2.0/tokens', '')\n        is_v2 = '2' in keystone_auth_version\n        is_v3 = '3' in keystone_auth_version\n        version_prefix = \"/v2.0\" if is_v2 else '/v3'\n        #auth_url = all_creds.get('auth_url', '<AUTH URL MISSING>') + version_prefix\n        admin_url = all_creds.get('admin_url', '<ADMIN URL MISSING>'\n                                 ).replace('/v2.0/tokens', '') + version_prefix\n        export_data = {\n            \"OS_REGION_NAME\": region_name,\n            \"OS_AUTH_URL\": admin_url,\n            \"OS_USERNAME\": username,\n            \"OS_PASSWORD\": password,\n            \"OS_TENANT_NAME\": tenant_name,\n        }\n        if is_v3:\n            export_data.update(\n                {\n                    \"OS_IDENTITY_API_VERSION\": 3,\n                    \"OS_PROJECT_NAME\": tenant_name,\n                    \"OS_PROJECT_DOMAIN_NAME\": project_domain,\n                    \"OS_USER_DOMAIN_NAME\": user_domain,\n                }\n            )\n        return export_data\n\n    def add_owner_to_machine(self, cloud_machines, cloud_machines_dict):\n        for warlock_image in cloud_machines:\n            glance_img_match = [\n                glance_img for glance_img in cloud_machines_dict\n                if glance_img['id'] == warlock_image.id\n            ]\n            if not glance_img_match:\n                logger.warn(\n                    \"Image list mismatch: %s exists in glance-v2 \"\n                    \"and not in glance-v1..\" % warlock_image.id\n                )\n                continue\n            warlock_image.owner = glance_img_match[0].get('owner', '')\n\n    def clear_cache(self):\n        self.admin_driver.provider.machineCls.invalidate_provider_cache(\n            self.admin_driver.provider\n        )\n        return self.admin_driver\n\n    def _init_by_provider(self, provider, *args, **kwargs):\n        from service.driver import get_esh_driver\n\n        self.core_provider = provider\n        self.project_name = provider.get_admin_identity().project_name()\n\n        provider_creds = provider.get_credentials()\n        self.cloud_config = provider.cloud_config\n        self.provider_creds = provider_creds\n        if not provider.admin:\n            raise Exception(\n                \"Cannot create an account driver yet - A provider admin account has not been created\"\n            )\n        admin_identity = provider.admin\n        admin_creds = admin_identity.get_credentials()\n        self.admin_driver = get_esh_driver(admin_identity)\n        admin_creds = self._libcloud_to_openstack(admin_creds)\n        all_creds = {'location': provider.get_location()}\n        all_creds.update(admin_creds)\n        all_creds.update(provider_creds)\n        return all_creds\n\n    def __init__(self, provider, *args, **kwargs):\n        super(AccountDriver, self).__init__()\n\n        all_creds = self._init_by_provider(provider, *args, **kwargs)\n\n        if 'cloud_config' in all_creds:\n            self.cloud_config = all_creds['cloud_config']\n        if not self.cloud_config:\n            self.cloud_config = {}\n\n        if 'location' in all_creds:\n            self.namespace = \"Atmosphere_OpenStack:%s\" % all_creds['location']\n        else:\n            logger.info(\n                \"Using default namespace.. Could cause conflicts if \"\n                \"switching between providers. To avoid ambiguity, \"\n                \"provide the kwarg: location='provider_prefix'\"\n            )\n        # Build credentials for each manager\n        self.credentials = all_creds\n\n        ex_auth_version = all_creds.get(\"ex_force_auth_version\", '2.0_password')\n        if ex_auth_version.startswith('2'):\n            self.identity_version = 2\n        elif ex_auth_version.startswith('3'):\n            self.identity_version = 3\n        else:\n            raise Exception(\n                \"Could not determine identity_version of %s\" % ex_auth_version\n            )\n\n        user_creds = self._build_user_creds(all_creds)\n        image_creds = self._build_image_creds(all_creds)\n        net_creds = self._build_network_creds(all_creds)\n        sdk_creds = self._build_sdk_creds(all_creds)\n\n        # Initialize logging\n        self._initialize_loggers()\n        # Initialize managers with respective credentials\n        self.user_manager = UserManager(**user_creds)\n        self.user_manager.keystone.username = user_creds.get('username')\n        self.image_manager = ImageManager(**image_creds)\n        self.network_manager = NetworkManager(**net_creds)\n        self.openstack_sdk = _connect_to_openstack_sdk(**sdk_creds)\n\n    def _initialize_loggers(self):\n        from keystoneauth1 import _utils\n        session_logger = _utils.get_logger('keystoneauth1.session')\n        session_logger.setLevel(settings.DEP_LOGGING_LEVEL)\n        auth1_logger = _utils.get_logger('keystoneauth1')\n        auth1_logger.setLevel(settings.DEP_LOGGING_LEVEL)\n        ksauth_logger = _utils.get_logger('keystoneauth')\n        ksauth_logger.setLevel(settings.DEP_LOGGING_LEVEL)\n        ks_identity_logger = _utils.get_logger('keystoneauth.identity.v3.base')\n        ks_identity_logger.setLevel(settings.DEP_LOGGING_LEVEL)\n        ostack_logger = _utils.get_logger('openstack')\n        ostack_logger.setLevel(settings.DEP_LOGGING_LEVEL)\n        ostack_session_logger = _utils.get_logger('openstack.session')\n        ostack_session_logger.setLevel(settings.DEP_LOGGING_LEVEL)\n\n    def get_config(self, section, config_key, default_value):\n        try:\n            value = self.cloud_config[section][config_key]\n        except (KeyError, TypeError):\n            logger.error(\n                \"Cloud config ['%s']['%s'] is missing -- using default value (%s)\"\n                % (section, config_key, default_value)\n            )\n            value = default_value\n        return value\n\n    def create_account(\n        self,\n        account_user,\n        group_name,\n        username,\n        password=None,\n        project_name=None,\n        role_name=None,\n        quota=None,\n        is_leader=False,\n        max_quota=False\n    ):\n        \"\"\"\n        Create (And Update \"latest changes\") to an account\n\n        \"\"\"\n        if not self.core_provider:\n            raise Exception(\n                \"AccountDriver not initialized by provider,\"\n                \" cannot create identity. For account creation use\"\n                \" build_account()\"\n            )\n\n        try:\n            # Don't try to create an identity on the provider if the AtmosphereUser does not exist.\n            user = core.models.AtmosphereUser.objects.get_by_natural_key(\n                account_user\n            )\n            assert isinstance(user, core.models.AtmosphereUser)\n        except Exception as e:\n            logger.exception(\n                'Do not create an account on for username \"%s\" because the user does not exist',\n                account_user\n            )\n            raise AccountCreationConflict(\n                'AccountDriver tried to create an account for ({}), but {}'.\n                format(account_user, e)\n            )\n\n        if username in self.core_provider.list_admin_names():\n            return\n        try:\n            (username, password, project) = self.build_account(\n                username, password, project_name, role_name, max_quota\n            )\n        except (KeystoneUnauthorized, KeystoneauthUnauthorized) as exc:\n            logger.exception(\"Encountered error creating account - %s\" % exc)\n            raise AccountCreationConflict(\n                \"AccountDriver is trying to create an account, (%s)\"\n                \"but the password does not match. \"\n                \"This conflict should be addressed by hand.\" % (username, )\n            )\n\n        try:\n            has_allocations = core.plugins.AllocationSourcePluginManager.ensure_user_allocation_sources(\n                user\n            )\n            if not has_allocations:\n                raise ValueError(\n                    'User \"{}\" has no valid allocations'.format(user)\n                )\n        except Exception as e:\n            logger.exception(\n                'Encountered error while ensuring user has valid Allocation Sources: \"%s\"',\n                user\n            )\n            raise AccountCreationConflict(\n                'AccountDriver is trying to create an account: {} '\n                'but while ensuring user has valid Allocation Sources there was a problem: {}'\n                .format(user, e)\n            )\n\n        ident = self.create_identity(\n            account_user,\n            group_name,\n            username,\n            password,\n            project.name,\n            quota=quota,\n            max_quota=max_quota,\n            is_leader=is_leader\n        )\n      ",
+      "total_lines": 1508
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 21,
+      "start_line": 1,
+      "end_line": 41,
+      "matched_line": "        pass",
+      "excerpt": "1: \"\"\"\n2: UserManager:\n3:   Remote Openstack Admin controls..\n4: \"\"\"\n5: import time\n6: import string\n7: from urlparse import urlparse\n8: import glanceclient\n9: from django.db.models import ObjectDoesNotExist\n10: from rtwo.exceptions import (\n11:     NovaOverLimit, KeystoneUnauthorized, NeutronClientException,\n12:     GlanceClientException, GlanceForbidden\n13: )\n14: \n15: # FIXME: Add this exception to rtwo before merge.\n16: try:\n17:     from keystoneclient.exceptions import NotFound as KeystoneNotFound\n18: except:\n19: \n20:     class KeystoneNotFound(Exception):\n21:         pass\n22: \n23: \n24: from rtwo.drivers.common import _connect_to_keystone_v2, _connect_to_glance_by_auth\n25: \n26: import core.models\n27: import core.plugins\n28: from service.exceptions import AccountCreationConflict\n29: from keystoneauth1.exceptions.http import Unauthorized as KeystoneauthUnauthorized\n30: from requests.exceptions import ConnectionError\n31: from hashlib import sha256\n32: \n33: from threepio import logger\n34: from rtwo.drivers.common import _connect_to_openstack_sdk\n35: from rtwo.drivers.openstack_network import NetworkManager\n36: from rtwo.drivers.openstack_user import UserManager\n37: from chromogenic.drivers.openstack import ImageManager\n38: \n39: from django.conf import settings\n40: \n41: from core.models.identity import Identity"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "ClassDef",
+      "symbol_name": "KeystoneNotFound",
+      "start_line": 20,
+      "end_line": 21,
+      "source": "    class KeystoneNotFound(Exception):\n        pass"
+    },
+    "imports": {
+      "imports": [
+        "time",
+        "string",
+        "urlparse:urlparse",
+        "glanceclient",
+        "django.db.models:ObjectDoesNotExist",
+        "rtwo.exceptions:NovaOverLimit",
+        "rtwo.exceptions:KeystoneUnauthorized",
+        "rtwo.exceptions:NeutronClientException",
+        "rtwo.exceptions:GlanceClientException",
+        "rtwo.exceptions:GlanceForbidden",
+        "rtwo.drivers.common:_connect_to_keystone_v2",
+        "rtwo.drivers.common:_connect_to_glance_by_auth",
+        "core.models",
+        "core.plugins",
+        "service.exceptions:AccountCreationConflict",
+        "keystoneauth1.exceptions.http:Unauthorized",
+        "requests.exceptions:ConnectionError",
+        "hashlib:sha256",
+        "threepio:logger",
+        "rtwo.drivers.common:_connect_to_openstack_sdk",
+        "rtwo.drivers.openstack_network:NetworkManager",
+        "rtwo.drivers.openstack_user:UserManager",
+        "chromogenic.drivers.openstack:ImageManager",
+        "django.conf:settings",
+        "core.models.identity:Identity",
+        "service.accounts.base:BaseAccountDriver",
+        "service.networking:get_topology_cls",
+        "service.networking:ExternalRouter",
+        "service.exceptions:TimeoutError",
+        "atmosphere.settings:DEFAULT_PASSWORD_UPDATE"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/cyverse/atmosphere/master/README.md",
+      "content_excerpt": "# THIS REPOSITORY IS READONLY AND NO LONGER ACTIVE\n\n# atmosphere :cloud:\n\n[![Build Status](https://travis-ci.org/cyverse/atmosphere.svg?branch=master)](https://travis-ci.org/cyverse/atmosphere)\n[![Coverage](https://coveralls.io/repos/github/cyverse/atmosphere/badge.svg?branch=master)](https://coveralls.io/github/cyverse/atmosphere?branch=master)\n[![Code Health](https://landscape.io/github/cyverse/atmosphere/master/landscape.svg?style=flat)](https://landscape.io/github/cyverse/atmosphere/master)\n\nAtmosphere addresses the growing needs for highly configurable and customized computational resources to support research efforts in plant sciences. Atmosphere is an integrative, private, self-service cloud computing platform designed to provide easy access to preconfigured, frequently used analysis routines, relevant algorithms, and data sets in an available-on-demand environment designed to accommodate computationally and data-intensive bioinformatics tasks.\n\n## Installation\n\nInstall the required python packages\n```\npip install -r requirements.txt\n```\n\nA separate environment is provided for developers\n```\npip install -r dev_requirements.txt\n```\n\nThe `*requirements.txt` files are generated using\n[pip-tools](https://github.com/jazzband/pip-tools). See\n[REQUIREMENTS.md](REQUIREMENTS.md) for instructions on using pip-tools and\nupgrading packages in Atmosphere.\n\n## Some Features\n\n+ A powerful web client for management and administration of virtual machines\n+ A fully RESTful API service for integrating with existing infrastructure components\n+ Virtual machine images preconfigured for co"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "KeystoneNotFound test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"KeystoneNotFound(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "service/accounts",
+      "count": 5,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "service/accounts/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aws.py",
+          "path": "service/accounts/aws.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "service/accounts/base.py",
+          "type": "file"
+        },
+        {
+          "name": "eucalyptus.py",
+          "path": "service/accounts/eucalyptus.py",
+          "type": "file"
+        },
+        {
+          "name": "openstack_manager.py",
+          "path": "service/accounts/openstack_manager.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 4,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "service/accounts/__init__.py"
+        },
+        {
+          "name": "aws.py",
+          "path": "service/accounts/aws.py"
+        },
+        {
+          "name": "base.py",
+          "path": "service/accounts/base.py"
+        },
+        {
+          "name": "eucalyptus.py",
+          "path": "service/accounts/eucalyptus.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "service/accounts/openstack_manager.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "a123cf8fdea427a1e495d24986432d1c79679bbf",
+          "html_url": "https://github.com/cyverse/atmosphere/commit/a123cf8fdea427a1e495d24986432d1c79679bbf",
+          "message": "Remove dead code\n\nEach of the items removed here were not referenced more than once in the code.\nMost of these are class and method definitions that were not in use.\n\nI ignored all serializer method fields which appear to not be used but are,\nand ignored stuff like admin panel classes",
+          "author": "Connor Osborn",
+          "date": "2018-10-02T16:57:02Z"
+        },
+        {
+          "sha": "2e4ebf3d72964b37b2961bfe01fa84c30adfced1",
+          "html_url": "https://github.com/cyverse/atmosphere/commit/2e4ebf3d72964b37b2961bfe01fa84c30adfced1",
+          "message": "Format the codebase with yapf",
+          "author": "Connor Mcformatter",
+          "date": "2018-09-14T23:42:58Z"
+        },
+        {
+          "sha": "f20912d099e5e2ebd8202b0ad53e8a1a33a21cce",
+          "html_url": "https://github.com/cyverse/atmosphere/commit/f20912d099e5e2ebd8202b0ad53e8a1a33a21cce",
+          "message": "Fix reference to deleted model\n\nWhen ProviderDNSServerIP was removed, provider.dns_server_ips still referenced\nthe relationship. This model is safe to delete, we just need to ensure the dns\nname servers are included instead in a provider's config",
+          "author": "Connor Osborn",
+          "date": "2018-09-18T15:11:37Z"
+        },
+        {
+          "sha": "9bf3ad924824848ef2069b6599b8f7ef052fe129",
+          "html_url": "https://github.com/cyverse/atmosphere/commit/9bf3ad924824848ef2069b6599b8f7ef052fe129",
+          "message": "Fix [F841(pyflakes), None] local variable 'auth_version' is assigned to but never used",
+          "author": "Connor Osborn",
+          "date": "2018-09-10T16:19:28Z"
+        },
+        {
+          "sha": "efdca2c9a8facb6e0047153f32203b327b9e585a",
+          "html_url": "https://github.com/cyverse/atmosphere/commit/efdca2c9a8facb6e0047153f32203b327b9e585a",
+          "message": "Fix [F841(pyflakes), None] local variable 'identity_creds' is assigned to but never used",
+          "author": "Connor Osborn",
+          "date": "2018-09-10T16:19:22Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "KeystoneNotFound FIXME Switch password then remove",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "service/accounts/openstack_manager.py",
+      "satd_line": 21,
+      "last_commit": {
+        "sha": "a123cf8fdea427a1e495d24986432d1c79679bbf",
+        "html_url": "https://github.com/cyverse/atmosphere/commit/a123cf8fdea427a1e495d24986432d1c79679bbf",
+        "message": "Remove dead code\n\nEach of the items removed here were not referenced more than once in the code.\nMost of these are class and method definitions that were not in use.\n\nI ignored all serializer method fields which appear to not be used but are,\nand ignored stuff like admin panel classes",
+        "author": "Connor Osborn",
+        "date": "2018-10-02T16:57:02Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear FIXME comment with actionable intent",
+        "function is self-contained",
+        "no call sites found (low impact)",
+        "related imports and settings available",
+        "no conflicting repo history"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "none",
+      "symbol_name": "KeystoneNotFound",
+      "symbol_type": "ClassDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

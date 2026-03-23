@@ -1,0 +1,336 @@
+{
+  "task_id": "186",
+  "repo_owner": "opentrons",
+  "repo_name": "opentrons",
+  "file_path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T04:28:42+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 5,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T04:28:50+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T04:28:52+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+    "original_code": "async def save_offset(self):\n    cur_pt = await self._get_current_point()\n    if self.current_state == State.joggingToDeck:\n        self._z_height_reference = cur_pt.z\n    elif self._current_state == State.savingPointOne:\n        # TODO: save pipette offset\n        pass",
+    "satd_comment": "# TODO: save pipette offset",
+    "target_file": {
+      "ok": true,
+      "path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+      "sha": "d754e623de31dc8f587554f0563f05e45f89d8e4",
+      "download_url": "https://raw.githubusercontent.com/Opentrons/opentrons/edge/robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+      "content_excerpt": "import logging\nfrom typing import (\n    Any,\n    Awaitable,\n    Callable,\n    Dict,\n    List,\n    NoReturn,\n    Optional,\n    Tuple,\n    Union,\n    cast,\n)\n\nfrom opentrons.calibration_storage import (\n    helpers,\n)\nfrom opentrons.calibration_storage.ot2 import (\n    delete_pipette_offset_file,\n    get_pipette_offset,\n    load_tip_length_calibration,\n    models,\n    save_pipette_calibration,\n)\nfrom opentrons.calibration_storage.types import (\n    TipLengthCalNotFound,\n)\nfrom opentrons.hardware_control import CriticalPoint, HardwareControlAPI, Pipette\nfrom opentrons.protocol_api import labware\nfrom opentrons.protocol_api.core.legacy.deck import Deck\nfrom opentrons.protocols.api_support.deck_type import (\n    guess_from_global_config as guess_deck_type_from_global_config,\n)\nfrom opentrons.types import Location, Mount, Point\nfrom opentrons_shared_data.labware.types import LabwareDefinition2\nfrom opentrons_shared_data.pipette.types import LabwareUri\n\nfrom ..errors import CalibrationError\nfrom ..helper_classes import AttachedPipette, RequiredLabware, SupportedCommands\nfrom .constants import (\n    TIP_RACK_SLOT,\n)\nfrom .constants import (\n    PipetteOffsetCalibrationState as POCState,\n)\nfrom .constants import (\n    PipetteOffsetWithTipLengthCalibrationState as POWTState,\n)\nfrom .state_machine import (\n    PipetteOffsetCalibrationStateMachine,\n    PipetteOffsetWithTipLengthStateMachine,\n)\nfrom robot_server.robot.calibration import util\nfrom robot_server.robot.calibration.constants import (\n    CAL_BLOCK_SETUP_BY_MOUNT,\n    JOG_TO_DECK_SLOT,\n    MOVE_TO_DECK_SAFETY_BUFFER,\n    MOVE_TO_TIP_RACK_SAFETY_BUFFER,\n    POINT_ONE_ID,\n    TIP_RACK_LOOKUP_BY_MAX_VOL,\n)\nfrom robot_server.service.errors import RobotServerError\nfrom robot_server.service.session.models.command_definitions import CalibrationCommand\n\nMODULE_LOG = logging.getLogger(__name__)\n\n\"\"\"\nA collection of functions that allow a consumer to prepare and update\ncalibration data associated with the position of a specific physical\npipette attached to the gantry, in relation to the deck\n\"\"\"\n\n# TODO: BC 2020-07-08: type all command logic here with actual Model type\nCOMMAND_HANDLER = Callable[..., Awaitable[None]]\n\nCOMMAND_MAP = Dict[str, COMMAND_HANDLER]\nPipetteOffsetStateMachine = Union[\n    PipetteOffsetCalibrationStateMachine, PipetteOffsetWithTipLengthStateMachine\n]\nPipetteOffsetState = Union[POWTState, POCState]\n\n\nclass PipetteOffsetCalibrationUserFlow:\n    def __init__(\n        self,\n        hardware: HardwareControlAPI,\n        mount: Mount = Mount.RIGHT,\n        recalibrate_tip_length: bool = False,\n        has_calibration_block: bool = False,\n        tip_rack_def: Optional[LabwareDefinition2] = None,\n    ) -> None:\n        self._hardware = hardware\n        self._mount = mount\n\n        pip = self._hardware.hardware_instruments[mount]\n        if not pip:\n            raise RobotServerError(\n                definition=CalibrationError.NO_PIPETTE_ON_MOUNT, mount=mount\n            )\n        self._hw_pipette = pip\n\n        self._deck = Deck(guess_deck_type_from_global_config())\n\n        self._saved_offset_this_session = False\n\n        point_one_pos = self._deck.get_calibration_position(POINT_ONE_ID).position\n        self._cal_ref_point = Point(*point_one_pos)\n\n        self._tip_origin_pt: Optional[Point] = None\n        self._nozzle_height_at_reference: Optional[float] = None\n\n        self._using_default_tiprack = False\n\n        existing_offset_calibration = self._get_stored_pipette_offset_cal()\n        self._load_tip_rack(tip_rack_def, existing_offset_calibration)\n\n        existing_tip_length_calibration = self._get_stored_tip_length_cal()\n        perform_tip_length = (\n            recalibrate_tip_length or not existing_tip_length_calibration\n        )\n\n        if perform_tip_length and has_calibration_block:\n            self._load_calibration_block()\n            self._has_calibration_block: bool = has_calibration_block\n        else:\n            self._has_calibration_block = False\n\n        self._has_calibrated_tip_length: bool = (\n            self._get_stored_tip_length_cal() is not None or self._using_default_tiprack\n        )\n\n        self._sm = self._determine_state_machine(perform_tip_length)\n\n        self._current_state = self._sm.state.sessionStarted\n\n        self._should_perform_tip_length = perform_tip_length\n\n        self._command_map: COMMAND_MAP = {\n            CalibrationCommand.load_labware: self.load_labware,\n            CalibrationCommand.move_to_reference_point: self.move_to_reference_point,\n            CalibrationCommand.jog: self.jog,\n            CalibrationCommand.pick_up_tip: self.pick_up_tip,\n            CalibrationCommand.invalidate_tip: self.invalidate_tip,\n            CalibrationCommand.save_offset: self.save_offset,\n            CalibrationCommand.move_to_tip_rack: self.move_to_tip_rack,\n            CalibrationCommand.move_to_deck: self.move_to_deck,\n            CalibrationCommand.move_to_point_one: self.move_to_point_one,\n            CalibrationCommand.set_has_calibration_block: self.set_has_calibration_block,\n            CalibrationCommand.exit: self.exit_session,\n            CalibrationCommand.invalidate_last_action: self.invalidate_last_action,\n        }\n\n        self._hw_pipette.reset_pipette_offset(self._mount, to_default=True)\n        self._default_tipracks = util.get_default_tipracks(\n            cast(List[LabwareUri], self.hw_pipette.liquid_class.default_tipracks)\n        )\n        self._supported_commands = SupportedCommands(namespace=\"calibration\")\n        self._supported_commands.loadLabware = True\n\n    @property\n    def deck(self) -> Deck:\n        return self._deck\n\n    @property\n    def mount(self) -> Mount:\n        return self._mount\n\n    @property\n    def hardware(self) -> HardwareControlAPI:\n        return self._hardware\n\n    @property\n    def hw_pipette(self) -> Pipette:\n        return self._hw_pipette\n\n    @property\n    def current_state(self) -> PipetteOffsetState:\n        # Currently, mypy can't interpret enum\n        # values being saved as variables. Although\n        # using python's built-in typing methods\n        # correctly reveals that this is an enum,\n        # mypy believes it is a string.\n        return self._sm.current_state\n\n    @property\n    def has_calibrated_tip_length(self) -> bool:\n        return self._has_calibrated_tip_length\n\n    @property\n    def should_perform_tip_length(self) -> bool:\n        return self._should_perform_tip_length\n\n    @should_perform_tip_length.setter\n    def should_perform_tip_length(self, value: bool) -> None:\n        self._should_perform_tip_length = value\n\n    def get_pipette(self) -> AttachedPipette:\n        # TODO(mc, 2020-09-17): s/tip_length/tipLength\n        return AttachedPipette(\n            model=self._hw_pipette.model,\n            name=self._hw_pipette.name,\n            tipLength=self._hw_pipette.active_tip_settings.default_tip_length,\n            mount=str(self._mount),\n            serial=self._hw_pipette.pipette_id,\n            defaultTipracks=self._default_tipracks,\n        )\n\n    def get_required_labware(self) -> List[RequiredLabware]:\n        slots = self._deck.get_non_fixture_slots()\n        lw_by_slot = {s: self._deck[s] for s in slots if self._deck[s]}\n        return [\n            RequiredLabware.from_lw(lw, s)  # type: ignore\n            for s, lw in lw_by_slot.items()\n        ]\n\n    async def set_has_calibration_block(self, hasBlock: bool) -> None:\n        if self._has_calibration_block and not hasBlock:\n            self._remove_calibration_block()\n        elif hasBlock and not self._has_calibration_block:\n            self._load_calibration_block()\n        self._has_calibration_block = hasBlock\n\n    def _get_tip_rack_lw(self) -> labware.Labware:\n        pip_vol = self._hw_pipette.liquid_class.max_volume\n        lw_load_name = TIP_RACK_LOOKUP_BY_MAX_VOL[str(pip_vol)].load_name\n        return labware.load(lw_load_name, self._deck.position_for(TIP_RACK_SLOT))\n\n    async def handle_command(self, name: Any, data: Dict[Any, Any]) -> None:\n        \"\"\"\n        Handle a client command\n\n        :param name: Name of the command\n        :param data: Data supplied in command\n        :return: None\n        \"\"\"\n        # Here we need to get the current state in the state machine's\n        # state enum because otherwise mypy will confuse which type\n        # the state is.\n        state = getattr(self._sm.state, self._sm.current_state)\n        next_state = self._sm.get_next_state(state, name)\n\n        handler = self._command_map.get(name)\n        if handler is not None:\n            await handler(**data)\n        self._sm.set_state(\n            # This `type: ignore` is because self._sm can be one of two types.\n            # This should be safe in practice since we got next_state from self._sm.\n            next_state  # type: ignore[arg-type]\n        )\n        MODULE_LOG.debug(\n            f\"PipetteOffsetCalUserFlow handled command {name}, transitioned\"\n            f\"from {self._sm.current_state} to {next_state}\"\n        )\n\n    @property\n    def critical_point_override(self) -> Optional[CriticalPoint]:\n        return (\n            CriticalPoint.FRONT_NOZZLE\n            if self._hw_pipette.config.channels == 8\n            else None\n        )\n\n    async def get_current_point(self, critical_point: Optional[CriticalPoint]) -> Point:\n        return await self._hardware.gantry_position(self._mount, critical_point)\n\n    async def load_labware(\n        self,\n        # tiprackDefinition comes from the HTTP client and is not validated by the time\n        # it reaches here, hence us calling labware.verify_definition() below.\n        tiprackDefinition: Optional[LabwareDefinition2] = None,\n    ) -> None:\n        self._supported_commands.loadLabware = False\n        if tiprackDefinition:\n            verified_definition = labware.verify_definition(tiprackDefinition)\n            # todo(mm, 2025-02-13): Move schema validation to the FastAPI layer and turn\n            # this schemaVersion assertion into a proper HTTP API 422 error.\n            # https://opentrons.atlassian.net/browse/EXEC-1230\n            assert verified_definition[\"schemaVersion\"] == 2\n            existing_offset_calibration = self._get_stored_pipette_offset_cal()\n            self._load_tip_rack(verified_definition, existing_offset_calibration)\n\n    async def jog(self, vector: tuple[float, float, float]) -> None:\n        await self._hardware.move_rel(mount=self._mount, delta=Point(*vector))\n\n    @property\n    def tip_origin(self) -> Point:\n        if self._tip_origin_pt:\n            return self._tip_origin_pt\n        else:\n            return (\n                self._tip_rack.wells()[0].top().point + MOVE_TO_TIP_RACK_SAFETY_BUFFER\n            )\n\n    @tip_origin.setter\n    def tip_origin(self, new_val: Point) -> None:\n        self._tip_origin_pt = new_val\n\n    def reset_tip_origin(self) -> None:\n        self._tip_origin_pt = None\n\n    @property\n    def supported_commands(self) -> List[str]:\n        return self._supported_commands.supported()\n\n    async def move_to_tip_rack(self) -> None:\n        if (\n            self._sm.current_state == self._sm.state.labwareLoaded\n            and not self.has_calibrated_tip_length\n            and not self.should_perform_tip_length\n        ):\n            self._flag_unmet_transition_req(\n                command_handler=\"move_to_tip_rack\",\n                unmet_condition=\"not performing tip length calibration\",\n            )\n        await self._move(Location(self.tip_origin, None))\n\n    @staticmethod\n    def _determine_state_machine(perform_tip_length: bool) -> PipetteOffsetStateMachine:\n        if perform_tip_length:\n            return PipetteOffsetWithTipLengthStateMachine()\n        else:\n            return PipetteOffsetCalibrationStateMachine()\n\n    def _get_stored_tip_length_cal(self) -> Optional[float]:\n        try:\n            definition = self._tip_rack._core.get_definition()\n            # Assert for type checking. This should always pass because\n        ",
+      "total_lines": 563
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "logging",
+        "typing:Any",
+        "typing:Awaitable",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:List",
+        "typing:NoReturn",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:Union",
+        "typing:cast",
+        "opentrons.calibration_storage:helpers",
+        "opentrons.calibration_storage.ot2:delete_pipette_offset_file",
+        "opentrons.calibration_storage.ot2:get_pipette_offset",
+        "opentrons.calibration_storage.ot2:load_tip_length_calibration",
+        "opentrons.calibration_storage.ot2:models",
+        "opentrons.calibration_storage.ot2:save_pipette_calibration",
+        "opentrons.calibration_storage.types:TipLengthCalNotFound",
+        "opentrons.hardware_control:CriticalPoint",
+        "opentrons.hardware_control:HardwareControlAPI",
+        "opentrons.hardware_control:Pipette",
+        "opentrons.protocol_api:labware",
+        "opentrons.protocol_api.core.legacy.deck:Deck",
+        "opentrons.protocols.api_support.deck_type:guess_from_global_config",
+        "opentrons.types:Location",
+        "opentrons.types:Mount",
+        "opentrons.types:Point",
+        "opentrons_shared_data.labware.types:LabwareDefinition2",
+        "opentrons_shared_data.pipette.types:LabwareUri",
+        "errors:CalibrationError"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/Opentrons/opentrons/edge/README.md",
+      "content_excerpt": "# Opentrons Platform\n\n[![Codecov][codecov-badge]][codecov]\n\n## Overview\n\nOpentrons makes robots for biologists.\n\nOur mission is to provide the scientific community with a common platform to easily share protocols and reproduce each other's work. Our robots automate experiments that would otherwise be done by hand, allowing our users to spend more time pursuing answers to the 21st century’s most important questions, and less time pipetting.\n\nThis repository contains the source code for the Opentrons API and OT App. We'd love for you to to explore, hack, and build upon them!\n\n## Opentrons API\n\nThe Opentrons API is a simple framework designed to make writing automated biology lab protocols easy.\n\nWe've designed it in a way we hope is accessible to anyone with basic computer and wetlab skills. As a bench scientist, you should be able to code your automated protocols in a way that reads like a lab notebook.\n\n```python\npipette.aspirate(location=trough['A1'], volume=30)\npipette.dispense(location=well_plate['A1'], volume=30)\n```\n\nThis example tells the Opentrons OT-2 to pipette 30 µL of liquid from a trough to well plate. Learn more here:\n\n- [Documentation](http://docs.opentrons.com)\n- [Source code](./api)\n\n## Opentrons App\n\nEasily upload a protocol, calibrate positions, and run your experiment from your computer.\n\n- [Download Here](https://opentrons.com/ot-app)\n- [Documentation](https://support.opentrons.com/)\n- [Source code](./app)\n\n![The Opentrons App, showing a sortable list of four protocols on the Protocols page. Each entry shows a small map of the OT-2 deck and lists the pro"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "save_offset test",
+      "count": 5,
+      "items": [
+        {
+          "name": "test_user_flow.py",
+          "path": "robot-server/tests/robot/calibration/tip_length/test_user_flow.py",
+          "sha": "2f17a1e81d8dd24384d3201e1f309d155a411723",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/tip_length/test_user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_state_machine.py",
+          "path": "robot-server/tests/robot/calibration/deck/test_state_machine.py",
+          "sha": "ce4867ad179ad46e831d9944e60aa1efcc9a44c8",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/deck/test_state_machine.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_user_flow.py",
+          "path": "robot-server/tests/robot/calibration/deck/test_user_flow.py",
+          "sha": "e27cf2baf93d234def8507c8aa1234d0a0879f2b",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/deck/test_user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_state_machine.py",
+          "path": "robot-server/tests/robot/calibration/pipette_offset/test_state_machine.py",
+          "sha": "9d826f4593103a56cad44283a13243cb83341b3c",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/pipette_offset/test_state_machine.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_user_flow.py",
+          "path": "robot-server/tests/robot/calibration/pipette_offset/test_user_flow.py",
+          "sha": "cfe3d28bcfe84133c8afad79dc37416eb6a63bf2",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/pipette_offset/test_user_flow.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"save_offset(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "gripper_handler.py",
+          "path": "api/src/opentrons/hardware_control/instruments/ot3/gripper_handler.py",
+          "sha": "5e0be4b07cad75794fa9239b790eab2edb936395",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/api/src/opentrons/hardware_control/instruments/ot3/gripper_handler.py",
+          "score": 1.0
+        },
+        {
+          "name": "gripper.py",
+          "path": "api/src/opentrons/hardware_control/instruments/ot3/gripper.py",
+          "sha": "03af7881f1ffb4cdc7edf740dc20b3a657116aaa",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/api/src/opentrons/hardware_control/instruments/ot3/gripper.py",
+          "score": 1.0
+        },
+        {
+          "name": "user_flow.py",
+          "path": "robot-server/robot_server/robot/calibration/deck/user_flow.py",
+          "sha": "81de8df0f4c511df7b09700b93ff81a7ec6e694f",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/robot_server/robot/calibration/deck/user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "user_flow.py",
+          "path": "robot-server/robot_server/robot/calibration/tip_length/user_flow.py",
+          "sha": "f5db5561742236114f316ea20d91ef825c46404e",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/robot_server/robot/calibration/tip_length/user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "user_flow.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+          "sha": "d754e623de31dc8f587554f0563f05e45f89d8e4",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_user_flow.py",
+          "path": "robot-server/tests/robot/calibration/deck/test_user_flow.py",
+          "sha": "e27cf2baf93d234def8507c8aa1234d0a0879f2b",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/deck/test_user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_user_flow.py",
+          "path": "robot-server/tests/robot/calibration/tip_length/test_user_flow.py",
+          "sha": "2f17a1e81d8dd24384d3201e1f309d155a411723",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/tip_length/test_user_flow.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_user_flow.py",
+          "path": "robot-server/tests/robot/calibration/pipette_offset/test_user_flow.py",
+          "sha": "cfe3d28bcfe84133c8afad79dc37416eb6a63bf2",
+          "html_url": "https://github.com/Opentrons/opentrons/blob/62b2d83d84e3152b893433ad14235b83442b1b5b/robot-server/tests/robot/calibration/pipette_offset/test_user_flow.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "robot-server/robot_server/robot/calibration/pipette_offset",
+      "count": 5,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "models.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/models.py",
+          "type": "file"
+        },
+        {
+          "name": "state_machine.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/state_machine.py",
+          "type": "file"
+        },
+        {
+          "name": "user_flow.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 4,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/__init__.py"
+        },
+        {
+          "name": "constants.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/constants.py"
+        },
+        {
+          "name": "models.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/models.py"
+        },
+        {
+          "name": "state_machine.py",
+          "path": "robot-server/robot_server/robot/calibration/pipette_offset/state_machine.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "abeb177b740b6a58ebabff0a72ffc8c1073ce644",
+          "html_url": "https://github.com/Opentrons/opentrons/commit/abeb177b740b6a58ebabff0a72ffc8c1073ce644",
+          "message": "chore: add python import sorting (#20453)\n\nUsing ruff's https://docs.astral.sh/ruff/settings/#lintisort isort\nintegration we can sort our python imports! Finally!\n\nThe first commit has the settings for this, the rest of the commits just\nadd them.\n\nDraft for circular import reasons.",
+          "author": "Seth Foster",
+          "date": "2026-01-08T20:16:44Z"
+        },
+        {
+          "sha": "5c6417254614c95abf7d754f56148a957e79a4a8",
+          "html_url": "https://github.com/Opentrons/opentrons/commit/5c6417254614c95abf7d754f56148a957e79a4a8",
+          "message": "chore: switch to ruff for python projects (#20451)\n\nRuff ( https://docs.astral.sh/ruff ) is a modern code checking tool that\ncombines many formatting and style/correctness linting tools and is\nreally fast. It has a lot of options for things that have previously\nbeen flake8 plugins or separate tools,",
+          "author": "Seth Foster",
+          "date": "2025-12-24T19:55:16Z"
+        },
+        {
+          "sha": "323909535357c24b2d67043df6d06f9c976db69f",
+          "html_url": "https://github.com/Opentrons/opentrons/commit/323909535357c24b2d67043df6d06f9c976db69f",
+          "message": "refactor(robot-server): Type-check robot_server.robot (#17534)",
+          "author": "Max Marrone",
+          "date": "2025-02-18T16:27:16Z"
+        },
+        {
+          "sha": "41e0f6f4b9a817a88502f2d7fd5215579f075386",
+          "html_url": "https://github.com/Opentrons/opentrons/commit/41e0f6f4b9a817a88502f2d7fd5215579f075386",
+          "message": "refactor(shared-data): Split `TypedDict`-based bindings for labware schemas 2 and 3 (#17517)",
+          "author": "Max Marrone",
+          "date": "2025-02-14T20:48:26Z"
+        },
+        {
+          "sha": "7a7bdf8cb598f8952576f479018c0b1682e57a3b",
+          "html_url": "https://github.com/Opentrons/opentrons/commit/7a7bdf8cb598f8952576f479018c0b1682e57a3b",
+          "message": "refactor(shared-data): remove .dev_types submodules (#15793)\n\n<!--\r\nThanks for taking the time to open a pull request! Please make sure\r\nyou've read the \"Opening Pull Requests\" section of our Contributing\r\nGuide:\r\n\r\n\r\nhttps://github.com/Opentrons/opentrons/blob/edge/CONTRIBUTING.md#opening-pull-requ",
+          "author": "aaron-kulkarni",
+          "date": "2024-07-25T14:36:23Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "save_offset TODO save pipette offset",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "robot-server/robot_server/robot/calibration/pipette_offset/user_flow.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "abeb177b740b6a58ebabff0a72ffc8c1073ce644",
+        "html_url": "https://github.com/Opentrons/opentrons/commit/abeb177b740b6a58ebabff0a72ffc8c1073ce644",
+        "message": "chore: add python import sorting (#20453)\n\nUsing ruff's https://docs.astral.sh/ruff/settings/#lintisort isort\nintegration we can sort our python imports! Finally!\n\nThe first commit has the settings for this, the rest of the commits just\nadd them.\n\nDraft for circular import reasons.",
+        "author": "Seth Foster",
+        "date": "2026-01-08T20:16:44Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 5,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

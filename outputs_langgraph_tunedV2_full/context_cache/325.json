@@ -1,0 +1,287 @@
+{
+  "task_id": "325",
+  "repo_owner": "aio-libs",
+  "repo_name": "aiocache",
+  "file_path": "aiocache/base.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T05:16:22+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_plugins",
+    "satd_line": 90,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T05:16:31+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T05:16:33+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "aiocache/base.py",
+    "original_code": "def _build_key(self, key, namespace=None):\n    # TODO(PY311): Remove str() calls.\n    # str() is needed to ensure consistent results when using enums between\n    # Python 3.11+ and older releases due to changed __format__() method:\n    # https://docs.python.org/3/whatsnew/3.11.html#enum\n    if namespace is not None:\n        return \"{}{}\".format(namespace, str(key))\n    if self.namespace is not None:\n        return \"{}{}\".format(self.namespace, str(key))\n    return key",
+    "satd_comment": "# TODO(PY311): Remove str() calls.\n# str() is needed to ensure consistent results when using enums between\n# Python 3.11+ and older releases due to changed __format__() method:\n# https://docs.python.org/3/whatsnew/3.11.html#enum",
+    "target_file": {
+      "ok": true,
+      "path": "aiocache/base.py",
+      "sha": "8aed65706ebd7332757af6255ef3be040a5b8241",
+      "download_url": "https://raw.githubusercontent.com/aio-libs/aiocache/master/aiocache/base.py",
+      "content_excerpt": "import asyncio\nimport functools\nimport logging\nimport os\nimport time\nfrom abc import ABC, abstractmethod\nfrom enum import Enum\nfrom types import TracebackType\nfrom typing import Callable, Generic, List, Optional, Set, TYPE_CHECKING, Type, TypeVar\n\nfrom aiocache.serializers import StringSerializer\n\nif TYPE_CHECKING:  # pragma: no cover\n    from aiocache.plugins import BasePlugin\n    from aiocache.serializers import BaseSerializer\n\n\nlogger = logging.getLogger(__name__)\n\nSENTINEL = object()\nCacheKeyType = TypeVar(\"CacheKeyType\")\n\n\nclass API:\n\n    CMDS: Set[Callable[..., object]] = set()\n\n    @classmethod\n    def register(cls, func):\n        API.CMDS.add(func)\n        return func\n\n    @classmethod\n    def unregister(cls, func):\n        API.CMDS.discard(func)\n\n    @classmethod\n    def timeout(cls, func):\n        \"\"\"\n        This decorator sets a maximum timeout for a coroutine to execute. The timeout can be both\n        set in the ``self.timeout`` attribute or in the ``timeout`` kwarg of the function call.\n        I.e if you have a function ``get(self, key)``, if its decorated with this decorator, you\n        will be able to call it with ``await get(self, \"my_key\", timeout=4)``.\n\n        Use 0 or None to disable the timeout.\n        \"\"\"\n        NOT_SET = \"NOT_SET\"\n\n        @functools.wraps(func)\n        async def _timeout(self, *args, timeout=NOT_SET, **kwargs):\n            timeout = self.timeout if timeout == NOT_SET else timeout\n            if timeout == 0 or timeout is None:\n                return await func(self, *args, **kwargs)\n            return await asyncio.wait_for(func(self, *args, **kwargs), timeout)\n\n        return _timeout\n\n    @classmethod\n    def aiocache_enabled(cls, fake_return=None):\n        \"\"\"\n        Use this decorator to be able to fake the return of the function by setting the\n        ``AIOCACHE_DISABLE`` environment variable\n        \"\"\"\n\n        def enabled(func):\n            @functools.wraps(func)\n            async def _enabled(*args, **kwargs):\n                if os.getenv(\"AIOCACHE_DISABLE\") == \"1\":\n                    return fake_return\n                return await func(*args, **kwargs)\n\n            return _enabled\n\n        return enabled\n\n    @classmethod\n    def plugins(cls, func):\n        @functools.wraps(func)\n        async def _plugins(self, *args, **kwargs):\n            start = time.monotonic()\n            for plugin in self.plugins:\n                await getattr(plugin, \"pre_{}\".format(func.__name__))(self, *args, **kwargs)\n\n            ret = await func(self, *args, **kwargs)\n\n            end = time.monotonic()\n            for plugin in self.plugins:\n                await getattr(plugin, \"post_{}\".format(func.__name__))(\n                    self, *args, took=end - start, ret=ret, **kwargs\n                )\n            return ret\n\n        return _plugins\n\n\nclass BaseCache(Generic[CacheKeyType], ABC):\n    \"\"\"\n    Base class that agregates the common logic for the different caches that may exist. Cache\n    related available options are:\n\n    :param serializer: obj derived from :class:`aiocache.serializers.BaseSerializer`. Default is\n        :class:`aiocache.serializers.StringSerializer`.\n    :param plugins: list of :class:`aiocache.plugins.BasePlugin` derived classes. Default is empty\n        list.\n    :param namespace: string to use as default prefix for the key used in all operations of\n        the backend. Default is an empty string, \"\".\n    :param key_builder: alternative callable to build the key. Receives the key and the namespace\n        as params and should return a string that can be used as a key by the underlying backend.\n    :param timeout: int or float in seconds specifying maximum timeout for the operations to last.\n        By default its 5. Use 0 or None if you want to disable it.\n    :param ttl: int the expiration time in seconds to use as a default in all operations of\n        the backend. It can be overriden in the specific calls.\n    \"\"\"\n\n    NAME: str\n\n    def __init__(\n        self,\n        serializer: Optional[\"BaseSerializer\"] = None,\n        plugins: Optional[List[\"BasePlugin\"]] = None,\n        namespace: str = \"\",\n        key_builder: Callable[[str, str], str] = lambda k, ns: f\"{ns}{k}\",\n        timeout: Optional[float] = 5,\n        ttl: Optional[float] = None,\n    ):\n        self.timeout = float(timeout) if timeout is not None else None\n        self.ttl = float(ttl) if ttl is not None else None\n\n        self.namespace = namespace\n        self._build_key = key_builder\n\n        self._serializer = serializer or StringSerializer()\n        self._plugins = plugins or []\n\n    @property\n    def serializer(self):\n        return self._serializer\n\n    @serializer.setter\n    def serializer(self, value):\n        self._serializer = value\n\n    @property\n    def plugins(self):\n        return self._plugins\n\n    @plugins.setter\n    def plugins(self, value):\n        self._plugins = value\n\n    @API.register\n    @API.aiocache_enabled(fake_return=True)\n    @API.timeout\n    @API.plugins\n    async def add(self, key, value, ttl=SENTINEL, dumps_fn=None, namespace=None, _conn=None):\n        \"\"\"\n        Stores the value in the given key with ttl if specified. Raises an error if the\n        key already exists.\n\n        :param key: str\n        :param value: obj\n        :param ttl: int the expiration time in seconds. Due to memcached\n            restrictions if you want compatibility use int. In case you\n            need miliseconds, valkey and memory support float ttls\n        :param dumps_fn: callable alternative to use as dumps function\n        :param namespace: str alternative namespace to use\n        :param timeout: int or float in seconds specifying maximum timeout\n            for the operations to last\n        :returns: True if key is inserted\n        :raises:\n            - ValueError if key already exists\n            - :class:`asyncio.TimeoutError` if it lasts more than self.timeout\n        \"\"\"\n        start = time.monotonic()\n        dumps = dumps_fn or self.serializer.dumps\n        ns_key = self.build_key(key, namespace)\n\n        await self._add(ns_key, dumps(value), ttl=self._get_ttl(ttl), _conn=_conn)\n\n        logger.debug(\"ADD %s %s (%.4f)s\", ns_key, True, time.monotonic() - start)\n        return True\n\n    @abstractmethod\n    async def _add(self, key, value, ttl, _conn=None):\n        raise NotImplementedError()\n\n    @API.register\n    @API.aiocache_enabled()\n    @API.timeout\n    @API.plugins\n    async def get(self, key, default=None, loads_fn=None, namespace=None, _conn=None):\n        \"\"\"\n        Get a value from the cache. Returns default if not found.\n\n        :param key: str\n        :param default: obj to return when key is not found\n        :param loads_fn: callable alternative to use as loads function\n        :param namespace: str alternative namespace to use\n        :param timeout: int or float in seconds specifying maximum timeout\n            for the operations to last\n        :returns: obj loaded\n        :raises: :class:`asyncio.TimeoutError` if it lasts more than self.timeout\n        \"\"\"\n        start = time.monotonic()\n        loads = loads_fn or self.serializer.loads\n        ns_key = self.build_key(key, namespace)\n\n        value = loads(await self._get(ns_key, encoding=self.serializer.encoding, _conn=_conn))\n\n        logger.debug(\"GET %s %s (%.4f)s\", ns_key, value is not None, time.monotonic() - start)\n        return value if value is not None else default\n\n    @abstractmethod\n    async def _get(self, key, encoding, _conn=None):\n        raise NotImplementedError()\n\n    @abstractmethod\n    async def _gets(self, key, encoding=\"utf-8\", _conn=None):\n        raise NotImplementedError()\n\n    @API.register\n    @API.aiocache_enabled(fake_return=[])\n    @API.timeout\n    @API.plugins\n    async def multi_get(self, keys, loads_fn=None, namespace=None, _conn=None):\n        \"\"\"\n        Get multiple values from the cache, values not found are Nones.\n\n        :param keys: list of str\n        :param loads_fn: callable alternative to use as loads function\n        :param namespace: str alternative namespace to use\n        :param timeout: int or float in seconds specifying maximum timeout\n            for the operations to last\n        :returns: list of objs\n        :raises: :class:`asyncio.TimeoutError` if it lasts more than self.timeout\n        \"\"\"\n        start = time.monotonic()\n        loads = loads_fn or self.serializer.loads\n\n        ns_keys = [self.build_key(key, namespace) for key in keys]\n        values = [\n            loads(value)\n            for value in await self._multi_get(\n                ns_keys, encoding=self.serializer.encoding, _conn=_conn\n            )\n        ]\n\n        logger.debug(\n            \"MULTI_GET %s %d (%.4f)s\",\n            ns_keys,\n            len([value for value in values if value is not None]),\n            time.monotonic() - start,\n        )\n        return values\n\n    @abstractmethod\n    async def _multi_get(self, keys, encoding, _conn=None):\n        raise NotImplementedError()\n\n    @API.register\n    @API.aiocache_enabled(fake_return=True)\n    @API.timeout\n    @API.plugins\n    async def set(\n        self, key, value, ttl=SENTINEL, dumps_fn=None, namespace=None, _cas_token=None, _conn=None\n    ):\n        \"\"\"\n        Stores the value in the given key with ttl if specified\n\n        :param key: str\n        :param value: obj\n        :param ttl: int the expiration time in seconds. Due to memcached\n            restrictions if you want compatibility use int. In case you\n            need miliseconds, valkey and memory support float ttls\n        :param dumps_fn: callable alternative to use as dumps function\n        :param namespace: str alternative namespace to use\n        :param timeout: int or float in seconds specifying maximum timeout\n            for the operations to last\n        :returns: True if the value was set\n        :raises: :class:`asyncio.TimeoutError` if it lasts more than self.timeout\n        \"\"\"\n        start = time.monotonic()\n        dumps = dumps_fn or self.serializer.dumps\n        ns_key = self.build_key(key, namespace)\n\n        res = await self._set(\n            ns_key, dumps(value), ttl=self._get_ttl(ttl), _cas_token=_cas_token, _conn=_conn\n        )\n\n        logger.debug(\"SET %s %d (%.4f)s\", ns_key, True, time.monotonic() - start)\n        return res\n\n    @abstractmethod\n    async def _set(self, key, value, ttl, _cas_token=None, _conn=None):\n        raise NotImplementedError()\n\n    @API.register\n    @API.aiocache_enabled(fake_return=True)\n    @API.timeout\n    @API.plugins\n    async def multi_set(self, pairs, ttl=SENTINEL, dumps_fn=None, namespace=None, _conn=None):\n        \"\"\"\n        Stores multiple values in the given keys.\n\n        :param pairs: list of two element iterables. First is key and second is value\n        :param ttl: int the expiration time in seconds. Due to memcached\n            restrictions if you want compatibility use int. In case you\n            need miliseconds, valkey and memory support float ttls\n        :param dumps_fn: callable alternative to use as dumps function\n        :param namespace: str alternative namespace to use\n        :param timeout: int or float in seconds specifying maximum timeout\n            for the operations to last\n        :returns: True\n        :raises: :class:`asyncio.TimeoutError` if it lasts more than self.timeout\n        \"\"\"\n        start = time.monotonic()\n        dumps = dumps_fn or self.serializer.dumps\n\n        tmp_pairs = []\n        for key, value in pairs:\n            tmp_pairs.append((self.build_key(key, namespace), dumps(value)))\n\n        await self._multi_set(tmp_pairs, ttl=self._get_ttl(ttl), _conn=_conn)\n\n        logger.debug(\n            \"MULTI_SET %s %d (%.4f)s\",\n            [key for key, value in tmp_pairs],\n            len(tmp_pairs),\n            time.monotonic() - start,\n        )\n        return True\n\n    @abstractmethod\n    async def _multi_set(self, pairs, ttl, _conn=None):\n        raise NotImplementedError()\n\n    @API.register\n   ",
+      "total_lines": 571
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 90,
+      "start_line": 70,
+      "end_line": 110,
+      "matched_line": "                )",
+      "excerpt": "70:                 return await func(*args, **kwargs)\n71: \n72:             return _enabled\n73: \n74:         return enabled\n75: \n76:     @classmethod\n77:     def plugins(cls, func):\n78:         @functools.wraps(func)\n79:         async def _plugins(self, *args, **kwargs):\n80:             start = time.monotonic()\n81:             for plugin in self.plugins:\n82:                 await getattr(plugin, \"pre_{}\".format(func.__name__))(self, *args, **kwargs)\n83: \n84:             ret = await func(self, *args, **kwargs)\n85: \n86:             end = time.monotonic()\n87:             for plugin in self.plugins:\n88:                 await getattr(plugin, \"post_{}\".format(func.__name__))(\n89:                     self, *args, took=end - start, ret=ret, **kwargs\n90:                 )\n91:             return ret\n92: \n93:         return _plugins\n94: \n95: \n96: class BaseCache(Generic[CacheKeyType], ABC):\n97:     \"\"\"\n98:     Base class that agregates the common logic for the different caches that may exist. Cache\n99:     related available options are:\n100: \n101:     :param serializer: obj derived from :class:`aiocache.serializers.BaseSerializer`. Default is\n102:         :class:`aiocache.serializers.StringSerializer`.\n103:     :param plugins: list of :class:`aiocache.plugins.BasePlugin` derived classes. Default is empty\n104:         list.\n105:     :param namespace: string to use as default prefix for the key used in all operations of\n106:         the backend. Default is an empty string, \"\".\n107:     :param key_builder: alternative callable to build the key. Receives the key and the namespace\n108:         as params and should return a string that can be used as a key by the underlying backend.\n109:     :param timeout: int or float in seconds specifying maximum timeout for the operations to last.\n110:         By default its 5. Use 0 or None if you want to disable it."
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "AsyncFunctionDef",
+      "symbol_name": "_plugins",
+      "start_line": 79,
+      "end_line": 91,
+      "source": "        async def _plugins(self, *args, **kwargs):\n            start = time.monotonic()\n            for plugin in self.plugins:\n                await getattr(plugin, \"pre_{}\".format(func.__name__))(self, *args, **kwargs)\n\n            ret = await func(self, *args, **kwargs)\n\n            end = time.monotonic()\n            for plugin in self.plugins:\n                await getattr(plugin, \"post_{}\".format(func.__name__))(\n                    self, *args, took=end - start, ret=ret, **kwargs\n                )\n            return ret"
+    },
+    "imports": {
+      "imports": [
+        "asyncio",
+        "functools",
+        "logging",
+        "os",
+        "time",
+        "abc:ABC",
+        "abc:abstractmethod",
+        "enum:Enum",
+        "types:TracebackType",
+        "typing:Callable",
+        "typing:Generic",
+        "typing:List",
+        "typing:Optional",
+        "typing:Set",
+        "typing:TYPE_CHECKING",
+        "typing:Type",
+        "typing:TypeVar",
+        "aiocache.serializers:StringSerializer",
+        "aiocache.plugins:BasePlugin",
+        "aiocache.serializers:BaseSerializer"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/aio-libs/aiocache/master/README.rst",
+      "content_excerpt": "aiocache\n########\n\nAsyncio cache supporting multiple backends (memory, redis, memcached, etc.).\n\n.. image:: https://codecov.io/gh/aio-libs/aiocache/branch/master/graph/badge.svg\n  :target: https://codecov.io/gh/aio-libs/aiocache\n\n.. image:: https://badge.fury.io/py/aiocache.svg\n  :target: https://pypi.python.org/pypi/aiocache\n\n.. image:: https://img.shields.io/pypi/pyversions/aiocache.svg\n  :target: https://pypi.python.org/pypi/aiocache\n\nThis library aims for simplicity over specialization. All caches contain the same minimum interface which consists on the following functions:\n\n- ``add``: Only adds key/value if key does not exist.\n- ``get``: Retrieve value identified by key.\n- ``set``: Sets key/value.\n- ``multi_get``: Retrieves multiple key/values.\n- ``multi_set``: Sets multiple key/values.\n- ``exists``: Returns True if key exists False otherwise.\n- ``increment``: Increment the value stored in the given key.\n- ``delete``: Deletes key and returns number of deleted items.\n- ``clear``: Clears the items stored.\n- ``raw``: Executes the specified command using the underlying client.\n\n\n.. role:: python(code)\n  :language: python\n\n.. contents::\n\n.. section-numbering:\n\n\nInstalling\n==========\n\n- ``pip install aiocache``\n- ``pip install aiocache[redis]``\n- ``pip install aiocache[memcached]``\n- ``pip install aiocache[redis,memcached]``\n- ``pip install aiocache[msgpack]``\n\n\nUsage\n=====\n\nUsing a cache is as simple as\n\n.. code-block:: python\n\n    >>> import asyncio\n    >>> from aiocache import SimpleMemoryCache\n    >>> cache = SimpleMemoryCache()  # Or RedisCache, MemcachedCache...\n    >>"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_plugins test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_base.py",
+          "path": "tests/ut/test_base.py",
+          "sha": "cfda509e060670e86aea2ecd75eb46be7c93d696",
+          "html_url": "https://github.com/aio-libs/aiocache/blob/dc1700ca879259aa246c807d78b1a4b65c250670/tests/ut/test_base.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_plugins(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "base.py",
+          "path": "aiocache/base.py",
+          "sha": "8aed65706ebd7332757af6255ef3be040a5b8241",
+          "html_url": "https://github.com/aio-libs/aiocache/blob/dc1700ca879259aa246c807d78b1a4b65c250670/aiocache/base.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_base.py",
+          "path": "tests/ut/test_base.py",
+          "sha": "cfda509e060670e86aea2ecd75eb46be7c93d696",
+          "html_url": "https://github.com/aio-libs/aiocache/blob/dc1700ca879259aa246c807d78b1a4b65c250670/tests/ut/test_base.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "aiocache",
+      "count": 9,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "aiocache/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "backends",
+          "path": "aiocache/backends",
+          "type": "dir"
+        },
+        {
+          "name": "base.py",
+          "path": "aiocache/base.py",
+          "type": "file"
+        },
+        {
+          "name": "decorators.py",
+          "path": "aiocache/decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "aiocache/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "lock.py",
+          "path": "aiocache/lock.py",
+          "type": "file"
+        },
+        {
+          "name": "plugins.py",
+          "path": "aiocache/plugins.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "aiocache/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "serializers",
+          "path": "aiocache/serializers",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "aiocache/__init__.py"
+        },
+        {
+          "name": "decorators.py",
+          "path": "aiocache/decorators.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "aiocache/exceptions.py"
+        },
+        {
+          "name": "lock.py",
+          "path": "aiocache/lock.py"
+        },
+        {
+          "name": "plugins.py",
+          "path": "aiocache/plugins.py"
+        },
+        {
+          "name": "py.typed",
+          "path": "aiocache/py.typed"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "aiocache/base.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f364562c843082e9d62cbb361cdcf742f1f7aa6a",
+          "html_url": "https://github.com/aio-libs/aiocache/commit/f364562c843082e9d62cbb361cdcf742f1f7aa6a",
+          "message": "Replace redis with valkey glide client (#975)\n\nSigned-off-by: amirreza <amir.rsf1380@gmail.com>\nCo-authored-by: Sam Bull <git@sambull.org>",
+          "author": "amirreza sohrabi far",
+          "date": "2025-06-17T12:30:37Z"
+        },
+        {
+          "sha": "7909449345aa4206f00823dc5c13755d79582655",
+          "html_url": "https://github.com/aio-libs/aiocache/commit/7909449345aa4206f00823dc5c13755d79582655",
+          "message": "Fix: pairs may not support len (#728)",
+          "author": "zhu",
+          "date": "2023-06-14T17:59:02Z"
+        },
+        {
+          "sha": "d3fb375c66aa591c982756ac5325475a9608f8ad",
+          "html_url": "https://github.com/aio-libs/aiocache/commit/d3fb375c66aa591c982756ac5325475a9608f8ad",
+          "message": "Make BaseCache an ABC (#683)",
+          "author": "pshafer-als",
+          "date": "2023-03-05T01:26:07Z"
+        },
+        {
+          "sha": "642389419e256dcbf721c9fbca559ce15235d850",
+          "html_url": "https://github.com/aio-libs/aiocache/commit/642389419e256dcbf721c9fbca559ce15235d850",
+          "message": "Minor refactor of key_builder (#678)",
+          "author": "Sam Bull",
+          "date": "2023-02-27T20:01:54Z"
+        },
+        {
+          "sha": "2df2056f6320daf91e9bb88f49e102a1707fd25d",
+          "html_url": "https://github.com/aio-libs/aiocache/commit/2df2056f6320daf91e9bb88f49e102a1707fd25d",
+          "message": "Simplify cache namespace and key encoding logic for v1 (#670)\n\nCo-authored-by: Sam Bull <aa6bs0@sambull.org>",
+          "author": "pshafer-als",
+          "date": "2023-02-27T18:23:38Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_plugins TODO PY311 Remove calls needed",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "aiocache/base.py",
+      "satd_line": 90,
+      "last_commit": {
+        "sha": "f364562c843082e9d62cbb361cdcf742f1f7aa6a",
+        "html_url": "https://github.com/aio-libs/aiocache/commit/f364562c843082e9d62cbb361cdcf742f1f7aa6a",
+        "message": "Replace redis with valkey glide client (#975)\n\nSigned-off-by: amirreza <amir.rsf1380@gmail.com>\nCo-authored-by: Sam Bull <git@sambull.org>",
+        "author": "amirreza sohrabi far",
+        "date": "2025-06-17T12:30:37Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_plugins",
+      "symbol_type": "AsyncFunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

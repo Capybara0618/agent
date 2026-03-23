@@ -1,0 +1,358 @@
+{
+  "task_id": "431",
+  "repo_owner": "radio-astro-tools",
+  "repo_name": "spectral-cube",
+  "file_path": "spectral_cube/spectral_cube.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T05:53:15+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T05:53:22+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T05:53:25+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "spectral_cube/spectral_cube.py",
+    "original_code": "def _orient(data, wcs):\n\n    axtypes = wcs.get_axis_types()\n    types = [a['coordinate_type'] for a in axtypes]\n    nums = [None if a['coordinate_type'] != 'celestial' else a['number']\n            for a in axtypes]\n\n    t = [types.index('spectral'), nums.index(1), nums.index(0)]\n    t.extend(set(range(data.ndim)) - set(t))\n    t = [data.ndim - 1 - tt for tt in t]\n\n    # XXX does not handle stokes data properly\n    return np.squeeze(data.transpose(t)), wcs",
+    "satd_comment": "# XXX does not handle stokes data properly",
+    "target_file": {
+      "ok": true,
+      "path": "spectral_cube/spectral_cube.py",
+      "sha": "128669f0920a3f605d74b6a3f5f3aee19755a9ea",
+      "download_url": "https://raw.githubusercontent.com/radio-astro-tools/spectral-cube/main/spectral_cube/spectral_cube.py",
+      "content_excerpt": "\"\"\"\nA class to represent a 3-d position-position-velocity spectral cube.\n\"\"\"\n\nimport warnings\nfrom functools import wraps\nimport operator\nimport re\nimport itertools\nimport copy\nimport tempfile\nimport textwrap\nfrom pathlib import PosixPath\nimport dask.array as da\n\nimport astropy.wcs\nfrom astropy import units as u\nfrom astropy.io.fits import PrimaryHDU, BinTableHDU, Header, Card, HDUList\nfrom astropy import log\nfrom astropy import wcs\nfrom astropy import convolution\nfrom astropy import stats\nfrom astropy.constants import si\nfrom astropy.io.registry import UnifiedReadWriteMethod\nfrom astropy.utils import minversion\nif not minversion('astropy', '8.0.0.dev'):\n    # Astropy 8.0 pins numpy >=2, so this is no longer needed and will raise a\n    # deprecation warning\n    try:\n        from astropy.utils.compat import COPY_IF_NEEDED\n    except ImportError:\n        COPY_IF_NEEDED = False\nelse:\n    COPY_IF_NEEDED = None\n\nimport numpy as np\n\nfrom radio_beam import Beam, Beams\n\nfrom . import cube_utils\nfrom . import wcs_utils\nfrom . import spectral_axis\nfrom .utils import ProgressBar, computed_quantity\nfrom .masks import (LazyMask, LazyComparisonMask, BooleanArrayMask, MaskBase,\n                    is_broadcastable_and_smaller)\nfrom .ytcube import ytCube\nfrom .lower_dimensional_structures import (Projection, Slice, OneDSpectrum,\n                                           LowerDimensionalObject,\n                                           VaryingResolutionOneDSpectrum\n                                          )\nfrom .base_class import (BaseNDClass, SpectralAxisMixinClass,\n                         DOPPLER_CONVENTIONS, SpatialCoordMixinClass,\n                         MaskableArrayMixinClass, MultiBeamMixinClass,\n                         HeaderMixinClass, BeamMixinClass,\n                        )\nfrom .utils import (cached, warn_slow, VarianceWarning, BeamWarning,\n                    UnsupportedIterationStrategyWarning, WCSMismatchWarning,\n                    NotImplementedWarning, SliceWarning, SmoothingWarning,\n                    StokesWarning, ExperimentalImplementationWarning,\n                    BeamAverageWarning, NonFiniteBeamsWarning, BeamWarning,\n                    WCSCelestialError, BeamUnitsError)\nfrom .spectral_axis import (determine_vconv_from_ctype, get_rest_value_from_wcs,\n                            doppler_beta, doppler_gamma, doppler_z)\nfrom .io.core import SpectralCubeRead, SpectralCubeWrite\n\nfrom packaging.version import Version, parse\n\n\n__all__ = ['BaseSpectralCube', 'SpectralCube', 'VaryingResolutionSpectralCube']\n\n# apply_everywhere, world: do not have a valid cube to test on\n__doctest_skip__ = ['BaseSpectralCube._apply_everywhere']\n\ntry:\n    from scipy import ndimage\n    scipyOK = True\nexcept ImportError:\n    scipyOK = False\n\nwarnings.filterwarnings('ignore', category=wcs.FITSFixedWarning, append=True)\n\nSIGMA2FWHM = 2. * np.sqrt(2. * np.log(2.))\n\n# convenience structures to keep track of the reversed index\n# conventions between WCS and numpy\nnp2wcs = {2: 0, 1: 1, 0: 2}\n\n\n_NP_DOC = \"\"\"\nIgnores excluded mask elements.\n\nParameters\n----------\naxis : int (optional)\n   The axis to collapse, or None to perform a global aggregation\nhow : cube | slice | ray | auto\n   How to compute the aggregation. All strategies give the same\n   result, but certain strategies are more efficient depending\n   on data size and layout. Cube/slice/ray iterate over\n   decreasing subsets of the data, to conserve memory.\n   Default='auto'\n\"\"\".replace('\\n', '\\n        ')\n\n\ndef aggregation_docstring(func):\n    @wraps(func)\n    def wrapper(*args, **kwargs):\n        return func(*args, **kwargs)\n\n    wrapper.__doc__ += _NP_DOC\n    return wrapper\n\n\n_PARALLEL_DOC = \"\"\"\n\nOther Parameters\n----------------\nparallel : bool\n    Use joblib to parallelize the operation.\n    If set to ``False``, will force the use of a single core without\n    using ``joblib``.\nnum_cores : int or None\n    The number of cores to use when applying this function in parallel\n    across the cube.\nuse_memmap : bool\n    If specified, a memory mapped temporary file on disk will be\n    written to rather than storing the intermediate spectra in memory.\n\"\"\"\n\n\ndef parallel_docstring(func):\n    @wraps(func)\n    def wrapper(*args, **kwargs):\n        return func(*args, **kwargs)\n\n    line1 = wrapper.__doc__.split(\"\\n\")[1]\n    indentation = \" \"*(len(line1) - len(line1.lstrip()))\n\n    try:\n        wrapper.__doc__ += textwrap.indent(_PARALLEL_DOC, indentation)\n    except AttributeError:\n        # python2.7\n        wrapper.__doc__ = textwrap.dedent(wrapper.__doc__) + _PARALLEL_DOC\n\n    return wrapper\n\ndef _apply_spectral_function(arguments, outcube, function, **kwargs):\n    \"\"\"\n    Helper function to apply a function to a spectrum.\n    Needs to be declared toward the top of the code to allow pickling by\n    joblib.\n    \"\"\"\n    (spec, includemask, ii, jj) = arguments\n\n    if np.any(includemask):\n        outcube[:,jj,ii] = function(spec, **kwargs)\n    else:\n        outcube[:,jj,ii] = spec\n\n\ndef _apply_spatial_function(arguments, outcube, function, **kwargs):\n    \"\"\"\n    Helper function to apply a function to an image.\n    Needs to be declared toward the top of the code to allow pickling by\n    joblib.\n    \"\"\"\n    (img, includemask, ii) = arguments\n\n    if np.any(includemask):\n        outcube[ii, :, :] = function(img, **kwargs)\n    else:\n        outcube[ii, :, :] = img\n\n\nclass BaseSpectralCube(BaseNDClass, MaskableArrayMixinClass,\n                       SpectralAxisMixinClass, SpatialCoordMixinClass,\n                       HeaderMixinClass):\n\n    def __init__(self, data, wcs, mask=None, meta=None, fill_value=np.nan,\n                 header=None, allow_huge_operations=False, wcs_tolerance=0.0):\n\n        # Deal with metadata first because it can affect data reading\n        self._meta = meta or {}\n\n        # must extract unit from data before stripping it\n        if 'BUNIT' in self._meta:\n            self._unit = cube_utils.convert_bunit(self._meta[\"BUNIT\"])\n        elif hasattr(data, 'unit'):\n            self._unit = data.unit\n        else:\n            self._unit = None\n\n        # data must not be a quantity when stored in self._data\n        if hasattr(data, 'unit'):\n            # strip the unit so that it can be treated as cube metadata\n            data = data.value\n\n        # TODO: mask should be oriented? Or should we assume correctly oriented here?\n        self._data, self._wcs = cube_utils._orient(data, wcs)\n        self._wcs_tolerance = wcs_tolerance\n        self._spectral_axis = None\n        self._mask = mask  # specifies which elements to Nan/blank/ignore\n                           # object or array-like object, given that WCS needs\n                           # to be consistent with data?\n        #assert mask._wcs == self._wcs\n        self._fill_value = fill_value\n\n        self._header = Header() if header is None else header\n        if not isinstance(self._header, Header):\n            raise TypeError(\"If a header is given, it must be a fits.Header\")\n\n        # We don't pass the spectral unit via the initializer since the user\n        # should be using ``with_spectral_unit`` if they want to set it.\n        # However, we do want to keep track of what units the spectral axis\n        # should be returned in, otherwise astropy's WCS can change the units,\n        # e.g. km/s -> m/s.\n        # This can be overridden with Header below\n        self._spectral_unit = u.Unit(self._wcs.wcs.cunit[2])\n\n        # This operation is kind of expensive?\n        header_specaxnum = astropy.wcs.WCS(header).wcs.spec\n        header_specaxunit = spectral_axis.unit_from_header(self._header,\n                                                           spectral_axis_number=header_specaxnum+1)\n\n        # Allow the original header spectral axis unit to override the default\n        # unit\n        if header_specaxunit is not None:\n            self._spectral_unit = header_specaxunit\n\n        self._spectral_scale = spectral_axis.wcs_unit_scale(self._spectral_unit)\n\n        self.allow_huge_operations = allow_huge_operations\n\n        self._cache = {}\n\n    @property\n    def _is_huge(self):\n        return cube_utils.is_huge(self)\n\n    @property\n    def _new_thing_with(self):\n        return self._new_cube_with\n\n    def _new_cube_with(self, data=None, wcs=None, mask=None, meta=None,\n                       fill_value=None, spectral_unit=None, unit=None,\n                       wcs_tolerance=None, **kwargs):\n\n        data = self._data if data is None else data\n        if unit is None and hasattr(data, 'unit'):\n            if data.unit != self.unit:\n                raise u.UnitsError(\"New data unit '{0}' does not\"\n                                   \" match cube unit '{1}'.  You can\"\n                                   \" override this by specifying the\"\n                                   \" `unit` keyword.\"\n                                   .format(data.unit, self.unit))\n            unit = data.unit\n        elif unit is not None:\n            # convert string units to Units\n            if not isinstance(unit, u.Unit):\n                unit = u.Unit(unit)\n\n            if hasattr(data, 'unit'):\n                if u.Unit(unit) != data.unit:\n                    raise u.UnitsError(\"The specified new cube unit '{0}' \"\n                                       \"does not match the input unit '{1}'.\"\n                                       .format(unit, data.unit))\n        elif self._unit is not None:\n            unit = self.unit\n\n        wcs = self._wcs if wcs is None else wcs\n        mask = self._mask if mask is None else mask\n        if meta is None:\n            meta = {}\n            meta.update(self._meta)\n        if unit is not None:\n            meta['BUNIT'] = unit.to_string(format='FITS')\n\n        fill_value = self._fill_value if fill_value is None else fill_value\n        spectral_unit = self._spectral_unit if spectral_unit is None else u.Unit(spectral_unit)\n\n        cube = self.__class__(data=data, wcs=wcs, mask=mask, meta=meta,\n                              fill_value=fill_value, header=self._header,\n                              allow_huge_operations=self.allow_huge_operations,\n                              wcs_tolerance=wcs_tolerance or self._wcs_tolerance,\n                              **kwargs)\n        cube._spectral_unit = spectral_unit\n        cube._spectral_scale = spectral_axis.wcs_unit_scale(spectral_unit)\n\n        return cube\n\n    read = UnifiedReadWriteMethod(SpectralCubeRead)\n    write = UnifiedReadWriteMethod(SpectralCubeWrite)\n\n    @property\n    def unit(self):\n        \"\"\" The flux unit \"\"\"\n        if self._unit:\n            return self._unit\n        else:\n            return u.one\n\n    @property\n    def shape(self):\n        \"\"\" Length of cube along each axis \"\"\"\n        return self._data.shape\n\n    @property\n    def size(self):\n        \"\"\" Number of elements in the cube \"\"\"\n        return self._data.size\n\n    @property\n    def base(self):\n        \"\"\" The data type 'base' of the cube - useful for, e.g., joblib \"\"\"\n        return self._data.base\n\n    def __len__(self):\n        return self.shape[0]\n\n    @property\n    def ndim(self):\n        \"\"\" Dimensionality of the data \"\"\"\n        return self._data.ndim\n\n    def __repr__(self):\n        s = \"{1} with shape={0}\".format(self.shape, self.__class__.__name__)\n        if self.unit is u.one:\n            s += \":\\n\"\n        else:\n            s += \" and unit={0}:\\n\".format(self.unit)\n        s += (\" n_x: {0:6d}  type_x: {1:8s}  unit_x: {2:5s}\"\n              \"  range: {3:12.6f}:{4:12.6f}\\n\".format(self.shape[2],\n                                                      self.wcs.wcs.ctype[0],\n                                                      self.wcs.wcs.cunit[0],\n                                                      self.longitude_extrema[0],\n                                                      self.longitude_extrema[1],))\n        s += (\" n_y: {0:6d}  type_y: {1:8s}  unit_y: {2:5s}\"\n              \"  range: {3:12.6f}:{4:12.6f}\\n\".format(self.shape",
+      "total_lines": 4321
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "warnings",
+        "functools:wraps",
+        "operator",
+        "re",
+        "itertools",
+        "copy",
+        "tempfile",
+        "textwrap",
+        "pathlib:PosixPath",
+        "dask.array",
+        "astropy.wcs",
+        "astropy:units",
+        "astropy.io.fits:PrimaryHDU",
+        "astropy.io.fits:BinTableHDU",
+        "astropy.io.fits:Header",
+        "astropy.io.fits:Card",
+        "astropy.io.fits:HDUList",
+        "astropy:log",
+        "astropy:wcs",
+        "astropy:convolution",
+        "astropy:stats",
+        "astropy.constants:si",
+        "astropy.io.registry:UnifiedReadWriteMethod",
+        "astropy.utils:minversion",
+        "numpy",
+        "radio_beam:Beam",
+        "radio_beam:Beams",
+        ":cube_utils",
+        ":wcs_utils",
+        ":spectral_axis"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/radio-astro-tools/spectral-cube/main/README.rst",
+      "content_excerpt": "About\n=====\n\nThis package aims to facilitate the reading, writing, manipulation, and\nanalysis of spectral data cubes. More information is available in the\ndocumentation, avaliable `online at\nreadthedocs.org <http://spectral-cube.rtfd.org>`__.\n\n\n\nCredits\n=======\n\nThis package is developed by:\n\n-  Eric Koch (`@e-koch <https://github.com/e-koch>`__)\n-  Adam Ginsburg (`@keflavich <http://github.com/keflavich>`__)\n-  Thomas Robitaille (`@astrofrog <http://github.com/astrofrog>`__)\n-  Erik Rosolowsky (`@low-sky <http://github.com/low-sky>`__)\n\nOriginal development included substantial contributions from:\n-  Adam Leroy (`@akleroy <http://github.com/akleroy>`__)\n-  Chris Beaumont (`@ChrisBeaumont <http://github.com/ChrisBeaumont>`__)\n\nBuild and coverage status\n=========================\n\n|Build Status| |Coverage Status| |DOI| |Powered by Astropy|\n\n.. |Coverage Status| image:: https://coveralls.io/repos/radio-astro-tools/spectral-cube/badge.svg?branch=master\n   :target: https://coveralls.io/r/radio-astro-tools/spectral-cube?branch=master\n.. |DOI| image:: https://zenodo.org/badge/doi/10.5281/zenodo.11485.svg\n   :target: http://dx.doi.org/10.5281/zenodo.11485\n.. |Powered by Astropy| image:: http://img.shields.io/badge/powered%20by-AstroPy-orange.svg?style=flat\n   :target: https://www.astropy.org/\n.. |Build Status| image:: https://github.com/radio-astro-tools/spectral-cube/actions/workflows/main.yml/badge.svg\n   :target: https://github.com/radio-astro-tools/spectral-cube/actions/workflows/main.yml\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_orient test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_orient(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "casa_image.py",
+          "path": "spectral_cube/io/casa_image.py",
+          "sha": "bfa9c25dca2cf2e3aaf698285c26cb4084eafe8b",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/blob/06f05ed08d2e194d5c5c0f1f2fc89948fd884885/spectral_cube/io/casa_image.py",
+          "score": 1.0
+        },
+        {
+          "name": "fits.py",
+          "path": "spectral_cube/io/fits.py",
+          "sha": "affd7226572633fbdc162c180405f686d9bd08cd",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/blob/06f05ed08d2e194d5c5c0f1f2fc89948fd884885/spectral_cube/io/fits.py",
+          "score": 1.0
+        },
+        {
+          "name": "cube_utils.py",
+          "path": "spectral_cube/cube_utils.py",
+          "sha": "07f01fd25d10323871ae2833ef585a04cad27fd2",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/blob/06f05ed08d2e194d5c5c0f1f2fc89948fd884885/spectral_cube/cube_utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "spectral_cube.py",
+          "path": "spectral_cube/spectral_cube.py",
+          "sha": "128669f0920a3f605d74b6a3f5f3aee19755a9ea",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/blob/06f05ed08d2e194d5c5c0f1f2fc89948fd884885/spectral_cube/spectral_cube.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "spectral_cube",
+      "count": 19,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "spectral_cube/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_moments.py",
+          "path": "spectral_cube/_moments.py",
+          "type": "file"
+        },
+        {
+          "name": "analysis_utilities.py",
+          "path": "spectral_cube/analysis_utilities.py",
+          "type": "file"
+        },
+        {
+          "name": "base_class.py",
+          "path": "spectral_cube/base_class.py",
+          "type": "file"
+        },
+        {
+          "name": "conftest.py",
+          "path": "spectral_cube/conftest.py",
+          "type": "file"
+        },
+        {
+          "name": "cube_utils.py",
+          "path": "spectral_cube/cube_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "dask_spectral_cube.py",
+          "path": "spectral_cube/dask_spectral_cube.py",
+          "type": "file"
+        },
+        {
+          "name": "io",
+          "path": "spectral_cube/io",
+          "type": "dir"
+        },
+        {
+          "name": "lower_dimensional_structures.py",
+          "path": "spectral_cube/lower_dimensional_structures.py",
+          "type": "file"
+        },
+        {
+          "name": "masks.py",
+          "path": "spectral_cube/masks.py",
+          "type": "file"
+        },
+        {
+          "name": "np_compat.py",
+          "path": "spectral_cube/np_compat.py",
+          "type": "file"
+        },
+        {
+          "name": "spectral_axis.py",
+          "path": "spectral_cube/spectral_axis.py",
+          "type": "file"
+        },
+        {
+          "name": "spectral_cube.py",
+          "path": "spectral_cube/spectral_cube.py",
+          "type": "file"
+        },
+        {
+          "name": "stokes_spectral_cube.py",
+          "path": "spectral_cube/stokes_spectral_cube.py",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "spectral_cube/tests",
+          "type": "dir"
+        },
+        {
+          "name": "utils.py",
+          "path": "spectral_cube/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "visualization-tools.py",
+          "path": "spectral_cube/visualization-tools.py",
+          "type": "file"
+        },
+        {
+          "name": "wcs_utils.py",
+          "path": "spectral_cube/wcs_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "ytcube.py",
+          "path": "spectral_cube/ytcube.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "spectral_cube/__init__.py"
+        },
+        {
+          "name": "_moments.py",
+          "path": "spectral_cube/_moments.py"
+        },
+        {
+          "name": "analysis_utilities.py",
+          "path": "spectral_cube/analysis_utilities.py"
+        },
+        {
+          "name": "base_class.py",
+          "path": "spectral_cube/base_class.py"
+        },
+        {
+          "name": "conftest.py",
+          "path": "spectral_cube/conftest.py"
+        },
+        {
+          "name": "cube_utils.py",
+          "path": "spectral_cube/cube_utils.py"
+        },
+        {
+          "name": "dask_spectral_cube.py",
+          "path": "spectral_cube/dask_spectral_cube.py"
+        },
+        {
+          "name": "lower_dimensional_structures.py",
+          "path": "spectral_cube/lower_dimensional_structures.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "spectral_cube/spectral_cube.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f768519f6d81bfa18e0fbf5ee964a4ef667c2a1b",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/commit/f768519f6d81bfa18e0fbf5ee964a4ef667c2a1b",
+          "message": "Avoid deprecation warning with dev astropy/astropy>=8",
+          "author": "Ricky O'Steen",
+          "date": "2026-01-05T17:56:46Z"
+        },
+        {
+          "sha": "cd9b79b9dd923bc830269d2e81b13732620dd0ad",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/commit/cd9b79b9dd923bc830269d2e81b13732620dd0ad",
+          "message": "MAINT: removing skips and workaround for old versions",
+          "author": "Brigitta Sipőcz",
+          "date": "2025-06-11T05:56:40Z"
+        },
+        {
+          "sha": "0e7093839d6b0f45beb45195f22cada3ebfa7881",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/commit/0e7093839d6b0f45beb45195f22cada3ebfa7881",
+          "message": "Fixed compatibility with joblib 1.5+",
+          "author": "Thomas Robitaille",
+          "date": "2025-06-10T11:54:23Z"
+        },
+        {
+          "sha": "2d65289a2043a6d844a1141354f086c27f04dd8f",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/commit/2d65289a2043a6d844a1141354f086c27f04dd8f",
+          "message": "Remove debug statements",
+          "author": "Thomas Robitaille",
+          "date": "2025-06-10T11:47:28Z"
+        },
+        {
+          "sha": "91ffe8e138fbc24e7670e3684b0e91d943b777c9",
+          "html_url": "https://github.com/radio-astro-tools/spectral-cube/commit/91ffe8e138fbc24e7670e3684b0e91d943b777c9",
+          "message": "Fixed compatibility with recent versions of scipy.ndimage",
+          "author": "Thomas Robitaille",
+          "date": "2025-06-10T11:46:30Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_orient does handle stokes data properly",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "spectral_cube/spectral_cube.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "f768519f6d81bfa18e0fbf5ee964a4ef667c2a1b",
+        "html_url": "https://github.com/radio-astro-tools/spectral-cube/commit/f768519f6d81bfa18e0fbf5ee964a4ef667c2a1b",
+        "message": "Avoid deprecation warning with dev astropy/astropy>=8",
+        "author": "Ricky O'Steen",
+        "date": "2026-01-05T17:56:46Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

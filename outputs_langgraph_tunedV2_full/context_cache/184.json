@@ -1,0 +1,288 @@
+{
+  "task_id": "184",
+  "repo_owner": "openstack",
+  "repo_name": "nova",
+  "file_path": "nova/virt/ironic/driver.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T04:28:16+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "prepare_for_spawn",
+    "satd_line": 392,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 2,
+    "call_sites_count": 5,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T04:28:26+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T04:28:30+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "nova/virt/ironic/driver.py",
+    "original_code": "def _get_node(self, node_id):\n    \"\"\"Get a node by its UUID.\n\n       Some methods pass in variables named nodename, but are\n       actually UUID's.\n    \"\"\"\n    node = self.ironic_connection.get_node(node_id, fields=_NODE_FIELDS)\n    # TODO(dustinc): Make consumers use the right fields and remove this\n    node.uuid = node.id\n    node.instance_uuid = node.instance_id\n    node.maintenance = node.is_maintenance\n    return node",
+    "satd_comment": "# TODO(dustinc): Make consumers use the right fields and remove this",
+    "target_file": {
+      "ok": true,
+      "path": "nova/virt/ironic/driver.py",
+      "sha": "292d9965b014ccc0c52644ce109e96193a09536b",
+      "download_url": "https://raw.githubusercontent.com/openstack/nova/master/nova/virt/ironic/driver.py",
+      "content_excerpt": "# Copyright 2014 Red Hat, Inc.\n# Copyright 2013 Hewlett-Packard Development Company, L.P.\n# All Rights Reserved.\n#\n#    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n#    not use this file except in compliance with the License. You may obtain\n#    a copy of the License at\n#\n#         http://www.apache.org/licenses/LICENSE-2.0\n#\n#    Unless required by applicable law or agreed to in writing, software\n#    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n#    License for the specific language governing permissions and limitations\n#    under the License.\n\n\"\"\"\nA driver wrapping the Ironic API, such that Nova may provision\nbare metal resources.\n\"\"\"\n\nimport base64\nimport gzip\nimport shutil\nimport tempfile\nimport time\nfrom urllib import parse as urlparse\n\nfrom openstack.baremetal.v1.node import PowerAction\nfrom openstack import exceptions as sdk_exc\nfrom openstack import utils as sdk_utils\nfrom oslo_log import log as logging\nfrom oslo_serialization import jsonutils\nfrom oslo_service import loopingcall\nfrom oslo_utils import excutils\nfrom tooz import hashring as hash_ring\n\nfrom nova.api.metadata import base as instance_metadata\nfrom nova import block_device\nfrom nova.compute import power_state\nfrom nova.compute import task_states\nfrom nova.compute import vm_states\nimport nova.conf\nfrom nova.console import type as console_type\nfrom nova import context as nova_context\nfrom nova import exception\nfrom nova.i18n import _\nfrom nova import objects\nfrom nova.objects import external_event as external_event_obj\nfrom nova.objects import fields as obj_fields\nfrom nova import servicegroup\nfrom nova import utils\nfrom nova.virt import configdrive\nfrom nova.virt import driver as virt_driver\nfrom nova.virt import hardware\nfrom nova.virt.ironic import ironic_states\nfrom nova.virt.ironic import patcher\nfrom nova.virt import netutils\n\nLOG = logging.getLogger(__name__)\nCONF = nova.conf.CONF\n\n# The API version required by the Ironic driver\nIRONIC_API_VERSION = (1, 46)\n\n_POWER_STATE_MAP = {\n    ironic_states.POWER_ON: power_state.RUNNING,\n    ironic_states.NOSTATE: power_state.NOSTATE,\n    ironic_states.POWER_OFF: power_state.SHUTDOWN,\n}\n\n_UNPROVISION_STATES = (ironic_states.ACTIVE, ironic_states.DEPLOYFAIL,\n                       ironic_states.ERROR, ironic_states.DEPLOYWAIT,\n                       ironic_states.DEPLOYING, ironic_states.DEPLOYHOLD,\n                       ironic_states.RESCUE, ironic_states.RESCUING,\n                       ironic_states.RESCUEWAIT, ironic_states.RESCUEFAIL,\n                       ironic_states.UNRESCUING, ironic_states.UNRESCUEFAIL,\n                       ironic_states.SERVICING, ironic_states.SERVICEWAIT,\n                       ironic_states.SERVICEFAIL, ironic_states.SERVICEHOLD)\n\n_NODE_FIELDS = ('uuid', 'power_state', 'target_power_state', 'provision_state',\n                'target_provision_state', 'last_error', 'maintenance',\n                'properties', 'instance_uuid', 'traits', 'resource_class')\n\n# Console state checking interval in seconds\n_CONSOLE_STATE_CHECKING_INTERVAL = 1\n\n# Number of hash ring partitions per service\n# 5 should be fine for most deployments, as an experimental feature.\n_HASH_RING_PARTITIONS = 2 ** 5\n\n\ndef map_power_state(state):\n    try:\n        return _POWER_STATE_MAP[state]\n    except KeyError:\n        LOG.warning(\"Power state %s not found.\", state)\n        return power_state.NOSTATE\n\n\ndef _get_nodes_supported_instances(cpu_arch=None):\n    \"\"\"Return supported instances for a node.\"\"\"\n    if not cpu_arch:\n        return []\n    return [(cpu_arch,\n             obj_fields.HVType.BAREMETAL,\n             obj_fields.VMMode.HVM)]\n\n\ndef _log_ironic_polling(what, node, instance):\n    power_state = (None if node.power_state is None else\n                   '\"%s\"' % node.power_state)\n    tgt_power_state = (None if node.target_power_state is None else\n                       '\"%s\"' % node.target_power_state)\n    prov_state = (None if node.provision_state is None else\n                  '\"%s\"' % node.provision_state)\n    tgt_prov_state = (None if node.target_provision_state is None else\n                      '\"%s\"' % node.target_provision_state)\n    LOG.debug('Still waiting for ironic node %(node)s to %(what)s: '\n              'power_state=%(power_state)s, '\n              'target_power_state=%(tgt_power_state)s, '\n              'provision_state=%(prov_state)s, '\n              'target_provision_state=%(tgt_prov_state)s',\n              dict(what=what,\n                   node=node.id,\n                   power_state=power_state,\n                   tgt_power_state=tgt_power_state,\n                   prov_state=prov_state,\n                   tgt_prov_state=tgt_prov_state),\n              instance=instance)\n\n\ndef _check_peer_list():\n    # these configs are mutable; need to check at runtime and init\n    if CONF.ironic.conductor_group is not None:\n        peer_list = set(CONF.ironic.peer_list)\n        if not peer_list:\n            LOG.error('FATAL: Peer list is not configured in the '\n                      '[ironic]/peer_list option; cannot map '\n                      'ironic nodes to compute services.')\n            raise exception.InvalidPeerList(host=CONF.host)\n        if CONF.host not in peer_list:\n            LOG.error('FATAL: Peer list does not contain this '\n                      'compute service hostname (%s); add it to '\n                      'the [ironic]/peer_list option.', CONF.host)\n            raise exception.InvalidPeerList(host=CONF.host)\n        if len(peer_list) > 1:\n            LOG.warning('Having multiple compute services in your '\n                        'peer_list is now deprecated. We recommend moving '\n                        'to just a single node in your peer list.')\n\n\nclass IronicDriver(virt_driver.ComputeDriver):\n    \"\"\"Hypervisor driver for Ironic - bare metal provisioning.\"\"\"\n\n    capabilities = {\n        \"has_imagecache\": False,\n        \"supports_evacuate\": False,\n        \"supports_migrate_to_same_host\": False,\n        \"supports_attach_interface\": True,\n        \"supports_multiattach\": False,\n        \"supports_trusted_certs\": False,\n        \"supports_pcpus\": False,\n        \"supports_accelerators\": False,\n        \"supports_remote_managed_ports\": False,\n        \"supports_address_space_passthrough\": False,\n        \"supports_address_space_emulated\": False,\n        \"supports_stateless_firmware\": False,\n        \"supports_virtio_fs\": False,\n        \"supports_mem_backing_file\": False,\n\n        # Image type support flags\n        \"supports_image_type_aki\": False,\n        \"supports_image_type_ami\": True,\n        \"supports_image_type_ari\": False,\n        \"supports_image_type_iso\": False,\n        \"supports_image_type_qcow2\": True,\n        \"supports_image_type_raw\": True,\n        \"supports_image_type_vdi\": False,\n        \"supports_image_type_vhd\": False,\n        \"supports_image_type_vhdx\": False,\n        \"supports_image_type_vmdk\": False,\n        \"supports_image_type_ploop\": False,\n    }\n\n    # This driver is capable of rebalancing nodes between computes.\n    rebalances_nodes = True\n\n    def __init__(self, virtapi, read_only=False):\n        super().__init__(virtapi)\n\n        self.node_cache = {}\n        self.node_cache_time = 0\n        self.servicegroup_api = servicegroup.API()\n\n        self._ironic_connection = None\n\n    @property\n    def ironic_connection(self):\n        if self._ironic_connection is None:\n            # Ask get_sdk_adapter to raise ServiceUnavailable if the baremetal\n            # service isn't ready yet. Consumers of ironic_connection are set\n            # up to handle this and raise VirtDriverNotReady as appropriate.\n            self._ironic_connection = utils.get_sdk_adapter(\n                'baremetal', admin=True, check_service=True)\n        return self._ironic_connection\n\n    def _get_node(self, node_id):\n        \"\"\"Get a node by its UUID.\n\n           Some methods pass in variables named nodename, but are\n           actually UUID's.\n        \"\"\"\n        return self.ironic_connection.get_node(node_id, fields=_NODE_FIELDS)\n\n    def _validate_instance_and_node(self, instance):\n        \"\"\"Get the node associated with the instance.\n\n        Check with the Ironic service that this instance is associated with a\n        node, and return the node.\n        \"\"\"\n        nodes = list(self.ironic_connection.nodes(\n            instance_id=instance.uuid, fields=_NODE_FIELDS))\n        if not nodes:\n            raise exception.InstanceNotFound(instance_id=instance.uuid)\n        if len(nodes) > 1:\n            # This indicates a programming error so fail.\n            raise exception.NovaException(\n                _('Ironic returned more than one node for a query '\n                  'that can only return zero or one: %s') % nodes)\n\n        node = nodes[0]\n        return node\n\n    def _node_resources_unavailable(self, node_obj):\n        \"\"\"Determine whether the node's resources are in an acceptable state.\n\n        Determines whether the node's resources should be presented\n        to Nova for use based on the current power, provision and maintenance\n        state. This is called after _node_resources_used, so any node that\n        is not used and not in AVAILABLE should be considered in a 'bad' state,\n        and unavailable for scheduling. Returns True if unacceptable.\n        \"\"\"\n        bad_power_states = [\n            ironic_states.ERROR, ironic_states.NOSTATE]\n        # keep NOSTATE around for compatibility\n        good_provision_states = [\n            ironic_states.AVAILABLE, ironic_states.NOSTATE]\n        return (node_obj.is_maintenance or\n                node_obj.power_state in bad_power_states or\n                node_obj.provision_state not in good_provision_states)\n\n    def _node_resources_used(self, node_obj):\n        \"\"\"Determine whether the node's resources are currently used.\n\n        Determines whether the node's resources should be considered used\n        or not. A node is used when it is either in the process of putting\n        a new instance on the node, has an instance on the node, or is in\n        the process of cleaning up from a deleted instance. Returns True if\n        used.\n\n        If we report resources as consumed for a node that does not have an\n        instance on it, the resource tracker will notice there's no instances\n        consuming resources and try to correct us. So only nodes with an\n        instance attached should report as consumed here.\n        \"\"\"\n        return node_obj.instance_id is not None\n\n    def _parse_node_properties(self, node):\n        \"\"\"Helper method to parse the node's properties.\"\"\"\n        properties = {}\n\n        for prop in ('cpus', 'memory_mb', 'local_gb'):\n            try:\n                properties[prop] = int(node.properties.get(prop, 0))\n            except (TypeError, ValueError):\n                LOG.warning('Node %(uuid)s has a malformed \"%(prop)s\". '\n                            'It should be an integer.',\n                            {'uuid': node.id, 'prop': prop})\n                properties[prop] = 0\n\n        raw_cpu_arch = node.properties.get('cpu_arch', None)\n        try:\n            cpu_arch = obj_fields.Architecture.canonicalize(raw_cpu_arch)\n        except exception.InvalidArchitectureName:\n            cpu_arch = None\n        if not cpu_arch:\n            LOG.warning(\"cpu_arch not defined for node '%s'\", node.id)\n\n        properties['cpu_arch'] = cpu_arch\n        properties['raw_cpu_arch'] = raw_cpu_arch\n        properties['capabilities'] = node.properties.get('capabilities')\n        return properties\n\n    def _node_resource(self, node):\n        \"\"\"Helper method to create resource dict from node stats.\"\"\"\n        properties = self._parse_node_properties(node)\n\n        raw_cpu_arch = properties['raw_cpu_arch']\n        cpu_arch = properties['cpu_arch']\n\n        nodes_extra_specs = {}\n\n        # NOTE(deva): In Havana and Icehouse, the flavor was requi",
+      "total_lines": 2365
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 392,
+      "start_line": 372,
+      "end_line": 412,
+      "matched_line": "        ):",
+      "excerpt": "372: \n373:     def prepare_for_spawn(self, instance):\n374:         LOG.debug('Preparing to spawn instance %s.', instance.uuid)\n375:         node_id = instance.get('node')\n376:         if not node_id:\n377:             msg = _(\n378:                 \"Ironic node uuid not supplied to \"\n379:                 \"driver for instance %s.\"\n380:             ) % instance.id\n381:             raise exception.NovaException(msg)\n382:         node = self._get_node(node_id)\n383: \n384:         # Its possible this node has just moved from deleting\n385:         # to cleaning. Placement will update the inventory\n386:         # as all reserved, but this instance might have got here\n387:         # before that happened, but after the previous allocation\n388:         # got deleted. We trigger a re-schedule to another node.\n389:         if (\n390:             self._node_resources_used(node) or\n391:             self._node_resources_unavailable(node)\n392:         ):\n393:             msg = \"Chosen ironic node %s is not available\" % node_id\n394:             LOG.info(msg, instance=instance)\n395:             raise exception.ComputeResourcesUnavailable(reason=msg)\n396: \n397:         self._set_instance_id(node, instance)\n398: \n399:     def failed_spawn_cleanup(self, instance):\n400:         LOG.debug('Failed spawn cleanup called for instance',\n401:                   instance=instance)\n402:         try:\n403:             node = self._validate_instance_and_node(instance)\n404:         except exception.InstanceNotFound:\n405:             LOG.warning('Attempt to clean-up from failed spawn of '\n406:                         'instance %s failed due to no instance_uuid '\n407:                         'present on the node.', instance.uuid)\n408:             return\n409:         self._cleanup_deploy(node, instance)\n410: \n411:     def _add_instance_info_to_node(self, node, instance, image_meta, flavor,\n412:                                    metadata, preserve_ephemeral=None,"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "prepare_for_spawn",
+      "start_line": 373,
+      "end_line": 397,
+      "source": "    def prepare_for_spawn(self, instance):\n        LOG.debug('Preparing to spawn instance %s.', instance.uuid)\n        node_id = instance.get('node')\n        if not node_id:\n            msg = _(\n                \"Ironic node uuid not supplied to \"\n                \"driver for instance %s.\"\n            ) % instance.id\n            raise exception.NovaException(msg)\n        node = self._get_node(node_id)\n\n        # Its possible this node has just moved from deleting\n        # to cleaning. Placement will update the inventory\n        # as all reserved, but this instance might have got here\n        # before that happened, but after the previous allocation\n        # got deleted. We trigger a re-schedule to another node.\n        if (\n            self._node_resources_used(node) or\n            self._node_resources_unavailable(node)\n        ):\n            msg = \"Chosen ironic node %s is not available\" % node_id\n            LOG.info(msg, instance=instance)\n            raise exception.ComputeResourcesUnavailable(reason=msg)\n\n        self._set_instance_id(node, instance)"
+    },
+    "imports": {
+      "imports": [
+        "base64",
+        "gzip",
+        "shutil",
+        "tempfile",
+        "time",
+        "urllib:parse",
+        "openstack.baremetal.v1.node:PowerAction",
+        "openstack:exceptions",
+        "openstack:utils",
+        "oslo_log:log",
+        "oslo_serialization:jsonutils",
+        "oslo_service:loopingcall",
+        "oslo_utils:excutils",
+        "tooz:hashring",
+        "nova.api.metadata:base",
+        "nova:block_device",
+        "nova.compute:power_state",
+        "nova.compute:task_states",
+        "nova.compute:vm_states",
+        "nova.conf",
+        "nova.console:type",
+        "nova:context",
+        "nova:exception",
+        "nova.i18n:_",
+        "nova:objects",
+        "nova.objects:external_event",
+        "nova.objects:fields",
+        "nova:servicegroup",
+        "nova:utils",
+        "nova.virt:configdrive"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/nova/master/README.rst",
+      "content_excerpt": "==============\nOpenStack Nova\n==============\n\nOpenStack Nova provides a cloud computing fabric controller, supporting a wide\nvariety of compute technologies, including: libvirt (KVM, Xen, LXC and more),\nVMware and OpenStack Ironic.\n\nUse the following resources to learn more.\n\nAPI\n---\n\nTo learn how to use Nova's API, consult the documentation available online at:\n\n- `Compute API Guide <https://docs.openstack.org/api-guide/compute/>`__\n- `Compute API Reference <https://docs.openstack.org/api-ref/compute/>`__\n\nFor more information on OpenStack APIs, SDKs and CLIs in general, refer to:\n\n- `OpenStack for App Developers <https://www.openstack.org/appdev/>`__\n- `Development resources for OpenStack clouds\n  <https://developer.openstack.org/>`__\n\nOperators\n---------\n\nTo learn how to deploy and configure OpenStack Nova, consult the documentation\navailable online at:\n\n- `OpenStack Nova <https://docs.openstack.org/nova/>`__\n\nIn the unfortunate event that bugs are discovered, they should be reported to\nthe appropriate bug tracker. If you obtained the software from a 3rd party\noperating system vendor, it is often wise to use their own bug tracker for\nreporting problems. In all other cases use the master OpenStack bug tracker,\navailable at:\n\n- `Bug Tracker <https://bugs.launchpad.net/nova>`__\n\nDevelopers\n----------\n\nFor information on how to contribute to Nova, please see the contents of the\nCONTRIBUTING.rst.\n\nAny new code must follow the development guidelines detailed in the HACKING.rst\nfile, and pass all unit tests.\n\nTo understand better the processes that the team is using, please ref"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "prepare_for_spawn test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_vmops.py",
+          "path": "nova/tests/unit/virt/vmwareapi/test_vmops.py",
+          "sha": "0928ec0a5110bc789cb7693bc968bea66c55936e",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/virt/vmwareapi/test_vmops.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_driver.py",
+          "path": "nova/tests/unit/virt/ironic/test_driver.py",
+          "sha": "49b0a469642e4898292af6905747c4f6220fa0bc",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/virt/ironic/test_driver.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"prepare_for_spawn(\"",
+      "count": 5,
+      "items": [
+        {
+          "name": "driver.py",
+          "path": "nova/virt/driver.py",
+          "sha": "fc91a3626ef8257031061cf74efa02463fd8f4ca",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/virt/driver.py",
+          "score": 1.0
+        },
+        {
+          "name": "vmops.py",
+          "path": "nova/virt/vmwareapi/vmops.py",
+          "sha": "8660d7aae9f49dd3ed1504fb0f3e5e6d24a06e67",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/virt/vmwareapi/vmops.py",
+          "score": 1.0
+        },
+        {
+          "name": "driver.py",
+          "path": "nova/virt/vmwareapi/driver.py",
+          "sha": "7ed56250203908b6d42a2a7155d3ac493c3617c1",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/virt/vmwareapi/driver.py",
+          "score": 1.0
+        },
+        {
+          "name": "driver.py",
+          "path": "nova/virt/ironic/driver.py",
+          "sha": "292d9965b014ccc0c52644ce109e96193a09536b",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/virt/ironic/driver.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_driver.py",
+          "path": "nova/tests/unit/virt/ironic/test_driver.py",
+          "sha": "49b0a469642e4898292af6905747c4f6220fa0bc",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/virt/ironic/test_driver.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "nova/virt/ironic",
+      "count": 4,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "nova/virt/ironic/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "driver.py",
+          "path": "nova/virt/ironic/driver.py",
+          "type": "file"
+        },
+        {
+          "name": "ironic_states.py",
+          "path": "nova/virt/ironic/ironic_states.py",
+          "type": "file"
+        },
+        {
+          "name": "patcher.py",
+          "path": "nova/virt/ironic/patcher.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 3,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "nova/virt/ironic/__init__.py"
+        },
+        {
+          "name": "ironic_states.py",
+          "path": "nova/virt/ironic/ironic_states.py"
+        },
+        {
+          "name": "patcher.py",
+          "path": "nova/virt/ironic/patcher.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "nova/virt/ironic/driver.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "791310ae1e7f9e7c27c2bcdf9e3efb351f3a3d70",
+          "html_url": "https://github.com/openstack/nova/commit/791310ae1e7f9e7c27c2bcdf9e3efb351f3a3d70",
+          "message": "Add VNC console support for the Ironic driver\n\nIronic is adding support for VNC consoles tracked under the following\nspec[1]. This change provides support for the Nova Ironic driver to\naccess the consoles created by this feature effort.\n\nThis supersedes an existing Nova spec[2] to add VNC console su",
+          "author": "Steve Baker",
+          "date": "2025-02-23T21:43:40Z"
+        },
+        {
+          "sha": "21cebb77258dc2667e95fc019b11939ae54e33e8",
+          "html_url": "https://github.com/openstack/nova/commit/21cebb77258dc2667e95fc019b11939ae54e33e8",
+          "message": "[ironic] Use constants from Ironic, test w/ddt\n\nFollow-ups for the original fix to bug #2131960. Includes an update to\nmake tests match Nova style (ddt) and another to unify state constant\ncode between Ironic and Nova.\n\nThe new ironic_states.py was copied from ironic/common/states.py from\ncommit 262",
+          "author": "Jay Faulkner",
+          "date": "2025-12-02T21:33:41Z"
+        },
+        {
+          "sha": "56cb5f52fb833bd77bd0324ab24281edd59ab83e",
+          "html_url": "https://github.com/openstack/nova/commit/56cb5f52fb833bd77bd0324ab24281edd59ab83e",
+          "message": "[ironic] Ensure unprovision happens for new states\n\nStates were added to the Ironic API to enable the node servicing\nfeature, which can be performed on nodes provisioned with Nova\ninstances. Current nova, if asked to delete these instances, will only\nremove the instance metadata and not tear them do",
+          "author": "Jay Faulkner",
+          "date": "2025-11-20T23:14:36Z"
+        },
+        {
+          "sha": "adfd4868100c151abc611dc2c22c29eb14f778d7",
+          "html_url": "https://github.com/openstack/nova/commit/adfd4868100c151abc611dc2c22c29eb14f778d7",
+          "message": "Merge \"ironic: fix logging of validation errors\"",
+          "author": "Zuul",
+          "date": "2025-04-02T01:11:09Z"
+        },
+        {
+          "sha": "37888e875f0cef8350991b6a9cb81da9dacc1bac",
+          "html_url": "https://github.com/openstack/nova/commit/37888e875f0cef8350991b6a9cb81da9dacc1bac",
+          "message": "ironic: fix logging of validation errors\n\nWhen validation of the node fails, since switching to the SDK the\naddress of the ValidationResult object is displayed instead of the\nactual message. This has been broken since patch\nIbb5b168ee0944463b996e96f033bd3dfb498e304.\n\nCloses-Bug: 2100009\nChange-Id: I",
+          "author": "Doug Goldstein",
+          "date": "2025-02-17T23:19:16Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "prepare_for_spawn TODO dustinc Make consumers right",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "nova/virt/ironic/driver.py",
+      "satd_line": 392,
+      "last_commit": {
+        "sha": "791310ae1e7f9e7c27c2bcdf9e3efb351f3a3d70",
+        "html_url": "https://github.com/openstack/nova/commit/791310ae1e7f9e7c27c2bcdf9e3efb351f3a3d70",
+        "message": "Add VNC console support for the Ironic driver\n\nIronic is adding support for VNC consoles tracked under the following\nspec[1]. This change provides support for the Nova Ironic driver to\naccess the consoles created by this feature effort.\n\nThis supersedes an existing Nova spec[2] to add VNC console su",
+        "author": "Steve Baker",
+        "date": "2025-02-23T21:43:40Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 2,
+      "call_sites_count": 5,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "prepare_for_spawn",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

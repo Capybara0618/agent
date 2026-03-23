@@ -504,7 +504,8 @@ class OpenAIAnalyzer:
             "context_gaps (array of strings), repair_strategy (string), drop_reason (one of: intent_too_vague, architecture_level_change, insufficient_context, "
             "missing_validation_signal, high_behavioral_risk, too_many_call_sites, external_dependency_blocked, repo_history_conflict, or null), "
             "followup_context_requests (array of strings), intent_clarity (float 0-1), change_locality (float 0-1), semantic_risk (float 0-1), "
-            "context_sufficiency (float 0-1), verifiability (float 0-1), analyze_score (float 0-1). "
+            "primary_context_sufficiency (float 0-1), external_context_support (float 0-1), context_sufficiency (float 0-1), verifiability (float 0-1), analyze_score (float 0-1). "
+            "Judge whether the SATD is worth sending into an automatic fixer, not whether the final repair is guaranteed to exactly match human code. "
             "Keep evidence_summary concise and evidence-based. If repository evidence is stale or missing but the task still looks clear and local from SATD comment plus original code, do not drop solely for that reason.\n\n"
             f"Repository owner: {state['user']}\n"
             f"Repository name: {state['project']}\n"
@@ -546,9 +547,17 @@ class OpenAIAnalyzer:
         intent_clarity = self._clamp_float(payload.get("intent_clarity"), clarity_score)
         change_locality = self._clamp_float(payload.get("change_locality"), self._scope_to_locality(scope_radius))
         semantic_risk = self._clamp_float(payload.get("semantic_risk"), self._risk_to_numeric(risk_level))
+        primary_context_sufficiency = self._clamp_float(
+            payload.get("primary_context_sufficiency"),
+            context_score,
+        )
+        external_context_support = self._clamp_float(
+            payload.get("external_context_support"),
+            self._estimate_external_context_support(metadata),
+        )
         context_sufficiency = self._clamp_float(
             payload.get("context_sufficiency"),
-            context_score,
+            primary_context_sufficiency,
         )
         verifiability = self._clamp_float(
             payload.get("verifiability"),
@@ -560,7 +569,7 @@ class OpenAIAnalyzer:
                 intent_clarity,
                 change_locality,
                 semantic_risk,
-                context_sufficiency,
+                primary_context_sufficiency,
                 verifiability,
             ),
         )
@@ -572,7 +581,7 @@ class OpenAIAnalyzer:
             state,
             intent_clarity=intent_clarity,
             change_locality=change_locality,
-            context_sufficiency=context_sufficiency,
+            context_sufficiency=primary_context_sufficiency,
             analyze_score=analyze_score,
             scope_radius=scope_radius,
         )
@@ -590,21 +599,48 @@ class OpenAIAnalyzer:
             "too_many_call_sites",
             "repo_history_conflict",
         }
+        forced_non_drop = (
+            scope_radius in {"line", "function", "class", "file"}
+            and intent_clarity >= 0.55
+            and change_locality >= 0.60
+            and primary_context_sufficiency >= 0.55
+            and semantic_risk <= 0.65
+        )
+        strong_repairable = (
+            analyze_score >= 0.68
+            and intent_clarity >= 0.60
+            and change_locality >= 0.60
+            and semantic_risk <= 0.70
+        )
 
-        if decision == "needs_more_context" and primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.62:
+        if decision == "needs_more_context" and (
+            primary_clear
+            and local_enough
+            and intent_clarity >= 0.65
+            and change_locality >= 0.65
+            and primary_context_sufficiency >= 0.60
+            and semantic_risk <= 0.55
+            and analyze_score >= 0.70
+        ):
             decision = "repairable"
-            repairability_score = max(repairability_score, analyze_score, 0.64)
+            repairability_score = max(repairability_score, analyze_score, 0.70)
             confidence = max(confidence, 0.60)
             drop_reason = None
             followup_context_requests = []
 
         if decision == "drop" and weak_drop_reason:
-            if primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.66:
+            if (
+                scope_radius in {"line", "function", "class"}
+                and intent_clarity >= 0.72
+                and change_locality >= 0.70
+                and semantic_risk <= 0.50
+                and analyze_score >= 0.72
+            ):
                 decision = "repairable"
-                repairability_score = max(repairability_score, analyze_score, 0.66)
-                confidence = max(confidence, 0.60 if historical_snapshot_mismatch else 0.58)
+                repairability_score = max(repairability_score, analyze_score, 0.72)
+                confidence = max(confidence, 0.64 if historical_snapshot_mismatch else 0.62)
                 drop_reason = None
-            elif analyze_score >= 0.54 and not hard_drop_reason:
+            elif analyze_score >= 0.50 and not hard_drop_reason:
                 decision = "needs_more_context"
                 drop_reason = "insufficient_context"
 
@@ -612,15 +648,29 @@ class OpenAIAnalyzer:
             decision == "drop"
             and drop_reason == "architecture_level_change"
             and scope_radius in {"line", "function", "class"}
-            and analyze_score >= 0.58
+            and primary_context_sufficiency >= 0.55
+            and semantic_risk <= 0.65
         ):
-            decision = "repairable"
-            repairability_score = max(repairability_score, analyze_score, 0.62)
+            decision = "needs_more_context"
+            repairability_score = max(repairability_score, analyze_score, 0.58)
             confidence = max(confidence, 0.57)
-            drop_reason = None
 
-        if decision == "repairable" and primary_clear and local_enough and semantic_risk <= 0.72:
-            repairability_score = max(repairability_score, analyze_score, 0.64)
+        if decision == "drop" and forced_non_drop and not hard_drop_reason:
+            decision = "repairable" if strong_repairable else "needs_more_context"
+            repairability_score = max(repairability_score, analyze_score, 0.62 if decision == "repairable" else 0.56)
+            confidence = max(confidence, 0.58)
+            if decision == "repairable":
+                drop_reason = None
+
+        if strong_repairable:
+            decision = "repairable"
+            repairability_score = max(repairability_score, analyze_score, 0.68)
+            drop_reason = None
+        elif decision != "drop" and analyze_score >= 0.50:
+            decision = "needs_more_context"
+
+        if decision == "repairable" and primary_clear and local_enough and semantic_risk <= 0.70:
+            repairability_score = max(repairability_score, analyze_score, 0.68)
             confidence = max(confidence, 0.58)
             drop_reason = None
 
@@ -644,6 +694,8 @@ class OpenAIAnalyzer:
             change_locality=change_locality,
             semantic_risk=semantic_risk,
             context_sufficiency=context_sufficiency,
+            primary_context_sufficiency=primary_context_sufficiency,
+            external_context_support=external_context_support,
             verifiability=verifiability,
             analyze_score=analyze_score,
             confidence=confidence,
@@ -683,10 +735,10 @@ class OpenAIAnalyzer:
             and code_lines >= 1
             and has_local_structure
             and scope_local
-            and intent_clarity >= 0.48
-            and change_locality >= 0.50
-            and context_sufficiency >= 0.45
-            and analyze_score >= 0.54
+            and intent_clarity >= 0.55
+            and change_locality >= 0.55
+            and context_sufficiency >= 0.50
+            and analyze_score >= 0.60
         )
 
     def _scope_to_locality(self, scope_radius: str) -> float:
@@ -710,6 +762,24 @@ class OpenAIAnalyzer:
         if context_gaps:
             score -= min(0.20, 0.04 * len(context_gaps))
         return max(0.0, min(1.0, score))
+
+    def _estimate_external_context_support(self, metadata: dict[str, Any]) -> float:
+        evidence = 0.0
+        if metadata.get("target_file_ok"):
+            evidence += 0.22
+        if metadata.get("satd_window_found"):
+            evidence += 0.18
+        if metadata.get("enclosing_symbol_found"):
+            evidence += 0.15
+        if (metadata.get("related_tests_count") or 0) > 0:
+            evidence += 0.18
+        if (metadata.get("call_sites_count") or 0) > 0:
+            evidence += 0.12
+        if (metadata.get("commits_count") or 0) > 0:
+            evidence += 0.08
+        if (metadata.get("similar_history_count") or 0) > 0:
+            evidence += 0.07
+        return max(0.0, min(1.0, evidence))
 
     def _weighted_analyze_score(
         self,
@@ -863,9 +933,10 @@ class OpenAIReviewer:
         system_prompt = (
             "You are the reviewer agent in a SATD repair workflow. "
             "You are a moderately strict final gate. "
-            "Judge whether the repaired code is a focused, credible response to the SATD, with minimal unnecessary changes and acceptable semantic risk. "
+            "Judge whether the repaired code is a focused, minimal, and correct response to the SATD. "
             "Use the analyzer evidence and repair/review context, but do not reject solely because repository evidence is incomplete or stale. "
             "If historical snapshot mismatch is present, rely more on SATD comment and original code semantics. "
+            "Prioritize whether the repair actually solves the SATD's core problem over whether it merely looks like generally reasonable code. "
             "Return JSON only."
         )
         user_prompt = (
@@ -907,15 +978,28 @@ class OpenAIReviewer:
         minimality = self._clamp_float(payload.get("minimality"), 0.0)
         semantic_preservation = self._clamp_float(payload.get("semantic_preservation"), 0.0)
         internal_consistency = self._clamp_float(payload.get("internal_consistency"), 0.0)
-        review_score = self._clamp_float(
-            payload.get("review_score"),
-            self._weighted_review_score(problem_alignment, minimality, semantic_preservation, internal_consistency),
+        change_compactness = self._clamp_float(
+            payload.get("change_compactness"),
+            self._estimate_change_compactness(state["original_code"], repair.repaired_code),
         )
+        review_score = self._weighted_review_score(problem_alignment, minimality, semantic_preservation, internal_consistency)
         issues = [str(item).strip() for item in payload.get("issues", []) if str(item).strip()]
-        approved = bool(payload.get("approved"))
         reject_type = payload.get("reject_type")
         rationale = str(payload.get("rationale") or "")
         softened_gate_used = False
+        strong_reject_types = {
+            "unsafe_semantic_change",
+            "high_behavioral_risk",
+            "over_scoped_change",
+            "not_satd_aligned",
+        }
+
+        approved = (
+            review_score >= 0.75
+            and problem_alignment >= 0.75
+            and minimality >= 0.60
+            and semantic_preservation >= 0.60
+        )
 
         if problem_alignment < 0.58:
             approved = False
@@ -932,23 +1016,21 @@ class OpenAIReviewer:
             reject_type = reject_type or "unsafe_semantic_change"
             rationale = rationale + " | hard_gate=semantic_drift_risk"
 
+        if reject_type in strong_reject_types:
+            approved = False
+
         credible_local_fix = (
-            analysis.scope_radius in {"line", "function", "class", "file"}
-            and analysis.risk_level != "high"
-            and analysis.analyze_score >= 0.63
-            and repair.confidence >= 0.68
-            and review_score >= 0.72
-            and problem_alignment >= 0.72
-            and minimality >= 0.58
-            and semantic_preservation >= 0.58
+            analysis.scope_radius in {"line", "function"}
+            and analysis.risk_level == "low"
+            and analysis.analyze_score >= 0.70
+            and repair.confidence >= 0.75
+            and review_score >= 0.78
+            and problem_alignment >= 0.80
+            and minimality >= 0.72
+            and semantic_preservation >= 0.70
+            and change_compactness >= 0.65
             and len(issues) == 0
-            and reject_type not in {
-                "unsafe_semantic_change",
-                "high_behavioral_risk",
-                "architecture_level_change",
-                "not_satd_aligned",
-                "over_scoped_change",
-            }
+            and reject_type is None
         )
         if not approved and credible_local_fix:
             approved = True
@@ -970,6 +1052,7 @@ class OpenAIReviewer:
             minimality=minimality,
             semantic_preservation=semantic_preservation,
             internal_consistency=internal_consistency,
+            change_compactness=change_compactness,
             issues=issues,
             revision_advice=str(payload.get("revision_advice") or ""),
             reject_type=reject_type,
@@ -990,6 +1073,19 @@ class OpenAIReviewer:
             + 0.20 * semantic_preservation
             + 0.15 * internal_consistency
         )
+        return max(0.0, min(1.0, score))
+
+    def _estimate_change_compactness(self, original_code: str, repaired_code: str) -> float:
+        original_lines = [line.strip() for line in (original_code or "").splitlines() if line.strip()]
+        repaired_lines = [line.strip() for line in (repaired_code or "").splitlines() if line.strip()]
+        if not original_lines and not repaired_lines:
+            return 1.0
+        baseline = max(len(original_lines), 1)
+        delta = abs(len(repaired_lines) - len(original_lines))
+        overlap = len(set(original_lines) & set(repaired_lines))
+        overlap_ratio = overlap / max(len(set(original_lines)), 1)
+        size_penalty = min(1.0, delta / baseline)
+        score = 0.7 * overlap_ratio + 0.3 * (1.0 - size_penalty)
         return max(0.0, min(1.0, score))
 
     def _clamp_float(self, value: Any, default: float) -> float:

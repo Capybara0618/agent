@@ -1,0 +1,309 @@
+{
+  "task_id": "295",
+  "repo_owner": "algorand-devrel",
+  "repo_name": "beaker",
+  "file_path": "beaker/application.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T05:04:22+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__init__",
+    "satd_line": 116,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T05:04:32+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T05:04:46+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "beaker/application.py",
+    "original_code": "def __init__(self, version: int = MAX_TEAL_VERSION):\n    self.teal_version = version\n\n    self.attrs = {\n        m: (getattr(self, m), getattr_static(self, m))\n        for m in list(set(dir(self.__class__)) - set(dir(super())))\n        if not m.startswith(\"__\")\n    }\n\n    self.hints: dict[str, MethodHints] = {}\n    self.bare_handlers: dict[str, OnCompleteAction] = {}\n    self.methods: dict[str, tuple[ABIReturnSubroutine, MethodConfig]] = {}\n\n    acct_vals: dict[str, AccountStateValue | DynamicAccountStateValue] = {}\n    app_vals: dict[str, ApplicationStateValue | DynamicApplicationStateValue] = {}\n\n    for name, (bound_attr, static_attr) in self.attrs.items():\n\n        # Check for state vals\n        match bound_attr:\n            case AccountStateValue():\n                if bound_attr.key is None:\n                    bound_attr.key = Bytes(name)\n                acct_vals[name] = bound_attr\n            case DynamicAccountStateValue():\n                acct_vals[name] = bound_attr\n            case ApplicationStateValue():\n                if bound_attr.key is None:\n                    bound_attr.key = Bytes(name)\n                app_vals[name] = bound_attr\n            case DynamicApplicationStateValue():\n                app_vals[name] = bound_attr\n\n        if name in app_vals or name in acct_vals:\n            continue\n\n        # Check for handlers and internal methods\n        handler_config = get_handler_config(bound_attr)\n        match handler_config:\n            # Bare Handlers\n            case HandlerConfig(bare_method=BareCallActions()):\n                actions = {\n                    oc: cast(OnCompleteAction, action)\n                    for oc, action in handler_config.bare_method.__dict__.items()\n                    if action is not None\n                }\n\n                for oc, action in actions.items():\n                    if oc in self.bare_handlers:\n                        raise BareOverwriteError(oc)\n\n                    # Swap the implementation with the bound version\n                    if handler_config.referenced_self:\n                        action.action.subroutine.implementation = bound_attr\n\n                    self.bare_handlers[oc] = action\n\n            # ABI Methods\n            case HandlerConfig(method_spec=Method()):\n                # Create the ABIReturnSubroutine from the static attr\n                # but override the implementation with the bound version\n                abi_meth = ABIReturnSubroutine(static_attr)\n                if handler_config.referenced_self:\n                    abi_meth.subroutine.implementation = bound_attr\n                self.methods[name] = abi_meth\n\n                self.hints[name] = handler_config.hints()\n\n            # Internal subroutines\n            case HandlerConfig(subroutine=Subroutine()):\n                if handler_config.referenced_self:\n                    setattr(self, name, handler_config.subroutine(bound_attr))\n                else:\n                    setattr(\n                        self.__class__,\n                        name,\n                        handler_config.subroutine(static_attr),\n                    )\n\n    self.acct_state = AccountState(acct_vals)\n    self.app_state = ApplicationState(app_vals)\n\n    # Create router with name of class and bare handlers\n    self.router = Router(\n        name=self.__class__.__name__,\n        bare_calls=BareCallActions(**self.bare_handlers),\n        # description=self.__doc__ TODO: once the pr https://github.com/algorand/pyteal/pull/448 is merged, we can pass this\n    )\n\n    # Add method handlers\n    for method in self.methods.values():\n        self.router.add_method_handler(\n            method_call=method, method_config=handler_config.method_config\n        )\n\n    (\n        self.approval_program,\n        self.clear_program,\n        self.contract,\n    ) = self.router.compile_program(\n        version=self.teal_version,\n        assemble_constants=True,\n        optimize=OptimizeOptions(scratch_slots=True),\n    )",
+    "satd_comment": "# description=self.__doc__ TODO: once the pr https://github.com/algorand/pyteal/pull/448 is merged, we can pass this",
+    "target_file": {
+      "ok": true,
+      "path": "beaker/application.py",
+      "sha": "556010b9424815cdffb99993c07ae945afe031b9",
+      "download_url": "https://raw.githubusercontent.com/algorandfoundation/beaker/master/beaker/application.py",
+      "content_excerpt": "import dataclasses\nimport inspect\nimport warnings\nfrom collections.abc import Callable, Iterator, MutableMapping\nfrom contextlib import contextmanager\nfrom contextvars import ContextVar\nfrom typing import (\n    TYPE_CHECKING,\n    Concatenate,\n    Generic,\n    Literal,\n    ParamSpec,\n    TypeAlias,\n    TypeVar,\n    cast,\n    overload,\n)\n\nfrom algokit_utils import (\n    ApplicationSpecification,\n    CallConfig,\n    DefaultArgumentDict,\n    MethodHints,\n    OnCompleteActionName,\n)\nfrom algokit_utils import MethodConfigDict as AlgokitMethodConfigDict\nfrom pyteal import (\n    ABIReturnSubroutine,\n    Approve,\n    BareCallActions,\n    Bytes,\n    Expr,\n    Int,\n    MethodConfig,\n    OnCompleteAction,\n    Router,\n    SubroutineFnWrapper,\n    TealType,\n    Txn,\n)\nfrom pyteal import CallConfig as PyTealCallConfig\n\nfrom beaker.build_options import BuildOptions\nfrom beaker.decorators import AuthCallable\nfrom beaker.decorators import authorize as authorize_decorator\nfrom beaker.logic_signature import LogicSignature, LogicSignatureTemplate\nfrom beaker.precompile import (\n    PrecompileContextError,\n    PrecompiledApplication,\n    PrecompiledLogicSignature,\n    PrecompiledLogicSignatureTemplate,\n)\nfrom beaker.state._aggregate import GlobalStateAggregate, LocalStateAggregate\n\nif TYPE_CHECKING:\n    from algosdk.v2client.algod import AlgodClient\n\n__all__ = [\n    \"Application\",\n    \"this_app\",\n    \"precompiled\",\n    \"unconditional_create_approval\",\n    \"unconditional_opt_in_approval\",\n]\n\nMethodConfigDict: TypeAlias = dict[OnCompleteActionName, CallConfig | PyTealCallConfig]\n\nT = TypeVar(\"T\")\nP = ParamSpec(\"P\")\nTState = TypeVar(\"TState\", covariant=True)\n\nBareHandlerFunc = Callable[[], Expr]\nHandlerFunc = Callable[..., Expr]\n\n\n@dataclasses.dataclass\nclass ABIExternal:\n    actions: AlgokitMethodConfigDict\n    method: ABIReturnSubroutine\n    hints: MethodHints\n\n\nABIDecoratorFuncType = Callable[[HandlerFunc], ABIReturnSubroutine]\nBareDecoratorFuncType = Callable[[BareHandlerFunc], SubroutineFnWrapper]\n\nDecoratorFuncType: TypeAlias = ABIDecoratorFuncType | BareDecoratorFuncType\n\n\n@dataclasses.dataclass(frozen=True, kw_only=True)\nclass BuildContext:\n    app: \"Application\"\n    client: \"AlgodClient | None\"\n\n\n_ctx: ContextVar[BuildContext] = ContextVar(\"beaker.build_context\")\n\n\n@contextmanager\ndef _set_ctx(app: \"Application\", client: \"AlgodClient | None\") -> Iterator[None]:\n    token = _ctx.set(BuildContext(app=app, client=client))\n    try:\n        yield\n    finally:\n        _ctx.reset(token)\n\n\nclass Application(Generic[TState]):\n    \"\"\"A class representing an Application.\"\"\"\n\n    # TODO: more\n\n    @overload\n    def __init__(\n        self: \"Application[None]\",\n        name: str,\n        *,\n        descr: str | None = None,\n        build_options: BuildOptions | None = None,\n    ): ...\n\n    @overload\n    def __init__(\n        self: \"Application[TState]\",\n        name: str,\n        *,\n        state: TState,\n        descr: str | None = None,\n        build_options: BuildOptions | None = None,\n    ): ...\n\n    def __init__(\n        self,\n        name: str,\n        *,\n        state: TState = cast(TState, None),  # noqa: B008\n        descr: str | None = None,\n        build_options: BuildOptions | None = None,\n    ):\n        self._state: TState = state\n        self.name = name\n        self.descr = descr\n        self.build_options = build_options or BuildOptions()\n\n        self.bare_actions: dict[OnCompleteActionName, OnCompleteAction] = {}\n        self.abi_externals: dict[str, ABIExternal] = {}\n\n        self._clear_state_method: SubroutineFnWrapper | None = None\n        self._precompiled_lsigs: dict[LogicSignature, PrecompiledLogicSignature] = {}\n        self._precompiled_lsig_templates: dict[\n            LogicSignatureTemplate, PrecompiledLogicSignatureTemplate\n        ] = {}\n        self._precompiled_apps: dict[Application, PrecompiledApplication] = {}\n        self._local_state = LocalStateAggregate(self._state)\n        self._global_state = GlobalStateAggregate(self._state)\n\n    def __init_subclass__(cls) -> None:\n        warnings.warn(\n            \"Subclassing beaker.Application is deprecated, please see the migration guide at: \"\n            \"https://algorand-devrel.github.io/beaker/html/migration.html\",\n            DeprecationWarning,\n        )\n\n    @property\n    def state(self) -> TState:\n        return self._state\n\n    @overload\n    def precompiled(self, value: \"Application\", /) -> PrecompiledApplication: ...\n\n    @overload\n    def precompiled(self, value: LogicSignature, /) -> PrecompiledLogicSignature: ...\n\n    @overload\n    def precompiled(\n        self, value: LogicSignatureTemplate, /\n    ) -> PrecompiledLogicSignatureTemplate: ...\n\n    def precompiled(\n        self,\n        value: \"Application | LogicSignature | LogicSignatureTemplate\",\n        /,\n    ) -> (\n        PrecompiledApplication\n        | PrecompiledLogicSignature\n        | PrecompiledLogicSignatureTemplate\n    ):\n        \"\"\"Precompile an Application or LogicSignature for use in the logic of the application.\"\"\"\n\n        if value is self:\n            raise PrecompileContextError(\"Attempted to precompile current Application\")\n        try:\n            ctx = _ctx.get()\n        except LookupError as err:\n            raise PrecompileContextError(\n                \"precompiled must be called within a function used by an Application\"\n            ) from err\n        if ctx.app is not self:\n            raise PrecompileContextError(\n                f'Application.precompiled called for app \"{self.name}\" inside of a function of app \"{ctx.app.name}\"'\n            )\n        if ctx.client is None:\n            raise PrecompileContextError(\n                \"Precompilation requires use of a client when calling Application.build\"\n            )\n        client = ctx.client\n        match value:\n            case Application() as app:\n                return _lazy_setdefault(\n                    self._precompiled_apps,\n                    app,\n                    lambda: PrecompiledApplication(app, client),\n                )\n            case LogicSignature() as lsig:\n                return _lazy_setdefault(\n                    self._precompiled_lsigs,\n                    lsig,\n                    lambda: PrecompiledLogicSignature(lsig, client),\n                )\n            case LogicSignatureTemplate() as lsig_template:\n                return _lazy_setdefault(\n                    self._precompiled_lsig_templates,\n                    lsig_template,\n                    lambda: PrecompiledLogicSignatureTemplate(lsig_template, client),\n                )\n            case _:\n                raise TypeError(\n                    f\"Expected an Application, LogicSignature, or LogicSignatureTemplate, but got a {type(value)}\"\n                )\n\n    def _register_abi_external(\n        self,\n        method: ABIReturnSubroutine,\n        *,\n        actions: AlgokitMethodConfigDict,\n        hints: MethodHints,\n        override: bool | None,\n    ) -> None:\n        assert all(cc != CallConfig.NEVER for cc in actions.values())\n        method_sig = method.method_signature()\n        existing_method = self.abi_externals.get(method_sig)\n        if existing_method is None:\n            if override is True:\n                raise ValueError(\"override=True, but nothing to override\")\n        else:\n            if override is False:\n                raise ValueError(\n                    \"override=False, but method with matching signature already registered\"\n                )\n            # TODO: should we warn if call config differs?\n            self.deregister_abi_method(existing_method.method)\n        self.abi_externals[method_sig] = ABIExternal(\n            actions=actions,\n            method=method,\n            hints=hints,\n        )\n\n    def deregister_abi_method(\n        self,\n        method_signature_or_reference: str | ABIReturnSubroutine,\n        /,\n    ) -> None:\n        if isinstance(method_signature_or_reference, str):\n            sig = method_signature_or_reference\n        else:\n            sig = method_signature_or_reference.method_signature()\n        del self.abi_externals[sig]\n\n    def _register_bare_external(\n        self,\n        sub: SubroutineFnWrapper,\n        *,\n        actions: AlgokitMethodConfigDict,\n        override: bool | None,\n    ) -> None:\n        assert all(cc != CallConfig.NEVER for cc in actions.values())\n        for for_action, call_config in actions.items():\n            existing_action = self.bare_actions.get(for_action)\n            if existing_action is None:\n                if override is True:\n                    raise ValueError(\"override=True, but nothing to override\")\n            else:\n                if override is False:\n                    raise ValueError(\n                        f\"override=False, but bare external for {for_action} already exists\"\n                    )\n                assert isinstance(existing_action.action, SubroutineFnWrapper)\n                self.deregister_bare_method(existing_action.action)\n            self.bare_actions[for_action] = OnCompleteAction(\n                action=sub, call_config=PyTealCallConfig(call_config.value)\n            )\n\n    def deregister_bare_method(\n        self,\n        action_name_or_reference: (\n            OnCompleteActionName | Literal[\"clear_state\"] | SubroutineFnWrapper\n        ),\n        /,\n    ) -> None:\n        if isinstance(action_name_or_reference, SubroutineFnWrapper):\n            if action_name_or_reference is self._clear_state_method:\n                self._clear_state_method = None\n            else:\n                for k, v in self.bare_actions.items():\n                    if v.action is action_name_or_reference:\n                        del self.bare_actions[k]\n                        break\n                else:\n                    raise LookupError(\n                        f'Not a registered bare method: \"{action_name_or_reference.name()}\"'\n                    )\n        else:\n            if action_name_or_reference == \"clear_state\":\n                if self._clear_state_method is None:\n                    # not really any reason for this, other than to match behaviour\n                    # of other bare actions\n                    raise KeyError(\"No clear_state method defined\")\n                self._clear_state_method = None\n            else:\n                del self.bare_actions[action_name_or_reference]\n\n    # case 1: no-args\n    @overload\n    def external(\n        self,\n        fn: HandlerFunc,\n        /,\n    ) -> ABIReturnSubroutine: ...\n\n    # case 2: bare arg omitted\n    @overload\n    def external(\n        self,\n        /,\n        *,\n        method_config: MethodConfig | MethodConfigDict | None = None,\n        name: str | None = None,\n        authorize: AuthCallable | SubroutineFnWrapper | None = None,\n        read_only: bool = False,\n        override: bool | None = False,\n    ) -> ABIDecoratorFuncType: ...\n\n    # case 3: bare=False\n    @overload\n    def external(\n        self,\n        /,\n        *,\n        method_config: MethodConfig | MethodConfigDict | None = None,\n        name: str | None = None,\n        authorize: AuthCallable | SubroutineFnWrapper | None = None,\n        bare: Literal[False],\n        read_only: bool = False,\n        override: bool | None = False,\n    ) -> ABIDecoratorFuncType: ...\n\n    # case 4: bare=True\n    @overload\n    def external(\n        self,\n        /,\n        *,\n        method_config: MethodConfig | MethodConfigDict,\n        name: str | None = None,\n        authorize: AuthCallable | SubroutineFnWrapper | None = None,\n        bare: Literal[True],\n        override: bool | None = False,\n    ) -> BareDecoratorFuncType: ...\n\n    # case 5: bare is a variable\n    @overload\n    def external(\n        self,\n        /,\n        *,\n        method_config: MethodConfig | MethodConfigDict | None = None,\n        name: str | None = None,\n        authorize: AuthCallable | SubroutineFnWrapper | None = None,\n        bare: bool,\n        read_only: bool = False,\n        overrid",
+      "total_lines": 1380
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 116,
+      "start_line": 96,
+      "end_line": 136,
+      "matched_line": "        *,",
+      "excerpt": "96: \n97: \n98: @contextmanager\n99: def _set_ctx(app: \"Application\", client: \"AlgodClient | None\") -> Iterator[None]:\n100:     token = _ctx.set(BuildContext(app=app, client=client))\n101:     try:\n102:         yield\n103:     finally:\n104:         _ctx.reset(token)\n105: \n106: \n107: class Application(Generic[TState]):\n108:     \"\"\"A class representing an Application.\"\"\"\n109: \n110:     # TODO: more\n111: \n112:     @overload\n113:     def __init__(\n114:         self: \"Application[None]\",\n115:         name: str,\n116:         *,\n117:         descr: str | None = None,\n118:         build_options: BuildOptions | None = None,\n119:     ): ...\n120: \n121:     @overload\n122:     def __init__(\n123:         self: \"Application[TState]\",\n124:         name: str,\n125:         *,\n126:         state: TState,\n127:         descr: str | None = None,\n128:         build_options: BuildOptions | None = None,\n129:     ): ...\n130: \n131:     def __init__(\n132:         self,\n133:         name: str,\n134:         *,\n135:         state: TState = cast(TState, None),  # noqa: B008\n136:         descr: str | None = None,"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__init__",
+      "start_line": 113,
+      "end_line": 119,
+      "source": "    def __init__(\n        self: \"Application[None]\",\n        name: str,\n        *,\n        descr: str | None = None,\n        build_options: BuildOptions | None = None,\n    ): ..."
+    },
+    "imports": {
+      "imports": [
+        "dataclasses",
+        "inspect",
+        "warnings",
+        "collections.abc:Callable",
+        "collections.abc:Iterator",
+        "collections.abc:MutableMapping",
+        "contextlib:contextmanager",
+        "contextvars:ContextVar",
+        "typing:TYPE_CHECKING",
+        "typing:Concatenate",
+        "typing:Generic",
+        "typing:Literal",
+        "typing:ParamSpec",
+        "typing:TypeAlias",
+        "typing:TypeVar",
+        "typing:cast",
+        "typing:overload",
+        "algokit_utils:ApplicationSpecification",
+        "algokit_utils:CallConfig",
+        "algokit_utils:DefaultArgumentDict",
+        "algokit_utils:MethodHints",
+        "algokit_utils:OnCompleteActionName",
+        "algokit_utils:MethodConfigDict",
+        "pyteal:ABIReturnSubroutine",
+        "pyteal:Approve",
+        "pyteal:BareCallActions",
+        "pyteal:Bytes",
+        "pyteal:Expr",
+        "pyteal:Int",
+        "pyteal:MethodConfig"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/algorandfoundation/beaker/master/README.md",
+      "content_excerpt": "Beaker\n------\n<img align=\"left\" src=\"https://raw.githubusercontent.com/algorand-devrel/beaker/master/beaker.png\" margin=\"10px\" >\n\nBeaker is a smart contract development framework for [PyTeal](https://github.com/algorand/pyteal).\n\n&nbsp;\n\n&nbsp;\n\n&nbsp;\n\n## Hello, Beaker\n\n```py\nfrom pyteal import *\nfrom beaker import *\n\n\nhello_app = Application(\"HelloBeaker\")\n\n\n@hello_app.external\ndef hello(name: abi.String, *, output: abi.String) -> Expr:\n    # Set output to the result of `Hello, `+name\n    return output.set(Concat(Bytes(\"Hello, \"), name.get()))\n\n\n# Create an Application client\napp_client = client.ApplicationClient(\n    # Get sandbox algod client\n    client=sandbox.get_algod_client(),\n    # Pass instance of app to client\n    app=hello_app,\n    # Get acct from sandbox and pass the signer\n    signer=sandbox.get_accounts().pop().signer,\n)\n\n# Deploy the app on-chain\napp_id, app_addr, txid = app_client.create()\nprint(\n    f\"\"\"Deployed app in txid {txid}\n    App ID: {app_id}\n    Address: {app_addr}\n\"\"\"\n)\n\n# Call the `hello` method\nresult = app_client.call(hello, name=\"Beaker\")\nprint(result.return_value)  # \"Hello, Beaker\"\n\n```\n\n## Install\n\n    Beaker requires Python >= 3.10\n\nYou can install from pip:\n\n`pip install beaker-pyteal`\n\nOr from github directly (no promises on stability):\n\n`pip install git+https://github.com/algorand-devrel/beaker`\n\n# Dev Environment\n\nRequires a local network running to compile and test contracts.\n\nInstall [AlgoKit](https://github.com/algorandfoundation/algokit-cli#install)\n\nand start it\n\n```sh\n$ algokit localnet start\n$ algokit localnet status\n```\n\n## F"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "beaker",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "beaker/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "application.py",
+          "path": "beaker/application.py",
+          "type": "file"
+        },
+        {
+          "name": "build_options.py",
+          "path": "beaker/build_options.py",
+          "type": "file"
+        },
+        {
+          "name": "client",
+          "path": "beaker/client",
+          "type": "dir"
+        },
+        {
+          "name": "compilation.py",
+          "path": "beaker/compilation.py",
+          "type": "file"
+        },
+        {
+          "name": "consts.py",
+          "path": "beaker/consts.py",
+          "type": "file"
+        },
+        {
+          "name": "decorators.py",
+          "path": "beaker/decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "lib",
+          "path": "beaker/lib",
+          "type": "dir"
+        },
+        {
+          "name": "localnet",
+          "path": "beaker/localnet",
+          "type": "dir"
+        },
+        {
+          "name": "logic_signature.py",
+          "path": "beaker/logic_signature.py",
+          "type": "file"
+        },
+        {
+          "name": "precompile.py",
+          "path": "beaker/precompile.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "beaker/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "sandbox",
+          "path": "beaker/sandbox",
+          "type": "dir"
+        },
+        {
+          "name": "state",
+          "path": "beaker/state",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "beaker/__init__.py"
+        },
+        {
+          "name": "build_options.py",
+          "path": "beaker/build_options.py"
+        },
+        {
+          "name": "compilation.py",
+          "path": "beaker/compilation.py"
+        },
+        {
+          "name": "consts.py",
+          "path": "beaker/consts.py"
+        },
+        {
+          "name": "decorators.py",
+          "path": "beaker/decorators.py"
+        },
+        {
+          "name": "logic_signature.py",
+          "path": "beaker/logic_signature.py"
+        },
+        {
+          "name": "precompile.py",
+          "path": "beaker/precompile.py"
+        },
+        {
+          "name": "py.typed",
+          "path": "beaker/py.typed"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "beaker/application.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "df82d8ab4efe1b81ba0d890bb0ca759a7f001222",
+          "html_url": "https://github.com/algorandfoundation/beaker/commit/df82d8ab4efe1b81ba0d890bb0ca759a7f001222",
+          "message": "Increment PyTeal version and remove AlgoExplorer (#241)\n\n* use pyteal 0.25\r\n\r\n* remove algoexplorer apis\r\n\r\n* pyteal 0.26.1\r\n\r\n* passing tests\r\n\r\n* update black (pip-audit)\r\n\r\n* run black",
+          "author": "Joe Polny",
+          "date": "2024-09-24T21:04:11Z"
+        },
+        {
+          "sha": "56e81abd4651784cf8ba6f044a63d4ff5c83bcc9",
+          "html_url": "https://github.com/algorandfoundation/beaker/commit/56e81abd4651784cf8ba6f044a63d4ff5c83bcc9",
+          "message": "feature: add source mapping support (#226)",
+          "author": "Ben Guidarelli",
+          "date": "2023-04-26T13:50:18Z"
+        },
+        {
+          "sha": "2731447ad077187ff23f28338d61b6e8c4645a4e",
+          "html_url": "https://github.com/algorandfoundation/beaker/commit/2731447ad077187ff23f28338d61b6e8c4645a4e",
+          "message": "feat: add algokit-utils library and convert application client (#218)",
+          "author": "Daniel McGregor",
+          "date": "2023-03-28T12:41:56Z"
+        },
+        {
+          "sha": "0caf26a97a0608b5a1744d2a7cd92686e61169d3",
+          "html_url": "https://github.com/algorandfoundation/beaker/commit/0caf26a97a0608b5a1744d2a7cd92686e61169d3",
+          "message": "docs: make another pass on documentation to prepare for v1 (#220)",
+          "author": "Ben Guidarelli",
+          "date": "2023-03-27T17:29:27Z"
+        },
+        {
+          "sha": "f6f4807a44cd5b4a78977d3f20e5e1a277239daa",
+          "html_url": "https://github.com/algorandfoundation/beaker/commit/f6f4807a44cd5b4a78977d3f20e5e1a277239daa",
+          "message": "docs: refactor \"boxen\" example to be exemplary\n\nfix: reduces chances of unstable PyTeal output by wrapping Auth in a lambda",
+          "author": "Adam Chidlow",
+          "date": "2023-03-13T05:56:41Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "__init__ description self __doc__ TODO once",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "beaker/application.py",
+      "satd_line": 116,
+      "last_commit": {
+        "sha": "df82d8ab4efe1b81ba0d890bb0ca759a7f001222",
+        "html_url": "https://github.com/algorandfoundation/beaker/commit/df82d8ab4efe1b81ba0d890bb0ca759a7f001222",
+        "message": "Increment PyTeal version and remove AlgoExplorer (#241)\n\n* use pyteal 0.25\r\n\r\n* remove algoexplorer apis\r\n\r\n* pyteal 0.26.1\r\n\r\n* passing tests\r\n\r\n* update black (pip-audit)\r\n\r\n* run black",
+        "author": "Joe Polny",
+        "date": "2024-09-24T21:04:11Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

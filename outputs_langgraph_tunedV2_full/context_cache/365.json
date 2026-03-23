@@ -1,0 +1,385 @@
+{
+  "task_id": "365",
+  "repo_owner": "posthog",
+  "repo_name": "posthog",
+  "file_path": "posthog/models/activity_logging/activity_log.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-23T05:30:18+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 4,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-23T05:30:27+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-23T05:30:32+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "posthog/models/activity_logging/activity_log.py",
+    "original_code": "def changes_between(\n    model_type: Literal[\"FeatureFlag\", \"Person\", \"Insight\"],\n    previous: Optional[models.Model],\n    current: Optional[models.Model],\n) -> List[Change]:\n    \"\"\"\n    Identifies changes between two models by comparing fields\n    \"\"\"\n    changes: List[Change] = []\n\n    if previous is None and current is None:\n        # there are no changes between two things that don't exist\n        return changes\n\n    if previous is not None:\n        fields = current._meta.fields if current is not None else []\n\n        # TODO how to include tags in the fields assessed\n        filtered_fields = [f.name for f in fields if f.name not in field_exclusions[model_type]]\n        for field in filtered_fields:\n            left = getattr(previous, field, None)\n            right = getattr(current, field, None)\n\n            if left is None and right is not None:\n                changes.append(Change(type=model_type, field=field, action=\"created\", after=right,))\n            elif right is None and left is not None:\n                changes.append(Change(type=model_type, field=field, action=\"deleted\", before=left,))\n            elif left != right:\n                changes.append(Change(type=model_type, field=field, action=\"changed\", before=left, after=right,))\n\n    return changes",
+    "satd_comment": "# TODO how to include tags in the fields assessed",
+    "target_file": {
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "sha": "bafd7b24388c3d407e09421401e33b4677386fba",
+      "download_url": "https://raw.githubusercontent.com/PostHog/posthog/master/posthog/models/activity_logging/activity_log.py",
+      "content_excerpt": "import json\nimport dataclasses\nfrom typing import TYPE_CHECKING, Any, Literal, Optional, Required, TypedDict, Union\nfrom uuid import UUID\n\nfrom django.conf import settings\nfrom django.contrib.auth.models import AnonymousUser\nfrom django.contrib.postgres.indexes import GinIndex\nfrom django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist\nfrom django.core.paginator import Paginator\nfrom django.db import models, transaction\nfrom django.db.models import QuerySet\nfrom django.db.models.signals import post_save\nfrom django.dispatch.dispatcher import receiver\nfrom django.utils import timezone\n\nimport structlog\n\nfrom posthog.exceptions_capture import capture_exception\nfrom posthog.models.utils import ActivityDetailEncoder, UUIDTModel\n\nif TYPE_CHECKING:\n    from posthog.models.user import User\n\nlogger = structlog.get_logger(__name__)\n\nActivityScope = Literal[\n    \"Cohort\",\n    \"FeatureFlag\",\n    \"Person\",\n    \"Group\",\n    \"Insight\",\n    \"Plugin\",\n    \"PluginConfig\",\n    \"HogFunction\",\n    \"HogFlow\",\n    \"DataManagement\",\n    \"EventDefinition\",\n    \"PropertyDefinition\",\n    \"Notebook\",\n    \"Endpoint\",\n    \"EndpointVersion\",\n    \"Dashboard\",\n    \"Replay\",\n    \"Experiment\",\n    \"ExperimentHoldout\",\n    \"ExperimentSavedMetric\",\n    \"Survey\",\n    \"EarlyAccessFeature\",\n    \"SessionRecordingPlaylist\",\n    \"Comment\",\n    \"Team\",\n    \"Project\",\n    \"ErrorTrackingIssue\",\n    \"DataWarehouseSavedQuery\",\n    \"Organization\",\n    \"OrganizationDomain\",\n    \"OrganizationMembership\",\n    \"Role\",\n    \"UserGroup\",\n    \"BatchExport\",\n    \"BatchImport\",\n    \"Integration\",\n    \"Annotation\",\n    \"Tag\",\n    \"TaggedItem\",\n    \"Subscription\",\n    \"PersonalAPIKey\",\n    \"User\",\n    \"Action\",\n    \"AlertConfiguration\",\n    \"Threshold\",\n    \"AlertSubscription\",\n    \"ExternalDataSource\",\n    \"ExternalDataSchema\",\n    \"LLMTrace\",\n    \"WebAnalyticsFilterPreset\",\n    \"CustomerProfileConfig\",\n    \"Log\",\n    \"LogsAlertConfiguration\",\n    \"ProductTour\",\n    \"Ticket\",\n]\nChangeAction = Literal[\n    \"changed\", \"created\", \"deleted\", \"merged\", \"split\", \"exported\", \"revoked\", \"logged_in\", \"logged_out\", \"copied\"\n]\n\n\n@dataclasses.dataclass(frozen=True)\nclass Change:\n    type: ActivityScope | str\n    action: ChangeAction\n    field: Optional[str] = None\n    before: Optional[Any] = None\n    after: Optional[Any] = None\n\n\n@dataclasses.dataclass(frozen=True)\nclass Trigger:\n    job_type: str\n    job_id: str\n    payload: dict\n\n\n@dataclasses.dataclass(frozen=True)\nclass ActivityContextBase:\n    \"\"\"\n    Extend this class in specific implementations to add context-specific fields.\n    \"\"\"\n\n    pass\n\n\n@dataclasses.dataclass(frozen=True)\nclass Detail:\n    # The display name of the item in question\n    name: Optional[str] = None\n    # The short_id if it has one\n    short_id: Optional[str] = None\n    type: Optional[str] = None\n    changes: Optional[list[Change]] = None\n    trigger: Optional[Trigger] = None\n    context: Optional[ActivityContextBase] = None\n\n\nclass ActivityLog(UUIDTModel):\n    class Meta:\n        constraints = [\n            models.CheckConstraint(\n                name=\"must_have_team_or_organization_id\",\n                check=models.Q(team_id__isnull=False) | models.Q(organization_id__isnull=False),\n            ),\n        ]\n        indexes = [\n            models.Index(fields=[\"team_id\", \"scope\", \"item_id\"]),\n            models.Index(\n                fields=[\"organization_id\", \"scope\", \"-created_at\"],\n                name=\"idx_alog_org_scope_created_at\",\n                condition=models.Q(detail__isnull=False) & models.Q(detail__jsonb_typeof=\"object\"),\n            ),\n            models.Index(\n                fields=[\"organization_id\"],\n                name=\"idx_alog_org_detail_exists\",\n                condition=models.Q(detail__isnull=False) & models.Q(detail__jsonb_typeof=\"object\"),\n            ),\n            # Used for searching on the detail field, e.g. containing a specific value\n            GinIndex(\n                name=\"activitylog_detail_gin\",\n                fields=[\"detail\"],\n                opclasses=[\"jsonb_ops\"],\n            ),\n            # Used primarily for available_filters queries\n            GinIndex(\n                name=\"idx_alog_detail_gin_path_ops\",\n                fields=[\"detail\"],\n                opclasses=[\"jsonb_path_ops\"],\n                condition=models.Q(detail__isnull=False),\n            ),\n            # User-specific filtered queries\n            models.Index(\n                fields=[\"team_id\", \"activity\", \"scope\", \"user\"],\n                name=\"idx_alog_team_act_scope_usr\",\n                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),\n            ),\n            # Advanced activity logs: team-scoped queries with ordering\n            models.Index(\n                fields=[\"team_id\", \"scope\", \"-created_at\"],\n                name=\"idx_alog_team_scope_created\",\n                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),\n            ),\n            # Advanced activity logs: team queries with activity filter\n            models.Index(\n                fields=[\"team_id\", \"scope\", \"activity\", \"-created_at\"],\n                name=\"idx_alog_team_scp_act_crtd\",\n                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),\n            ),\n        ]\n\n    team_id = models.PositiveIntegerField(null=True)\n    organization_id = models.UUIDField(null=True)\n    user = models.ForeignKey(\"posthog.User\", null=True, on_delete=models.SET_NULL)\n    was_impersonated = models.BooleanField(null=True)\n    # If truthy, user can be unset and this indicates a 'system' user made activity asynchronously\n    is_system = models.BooleanField(null=True)\n\n    activity = models.fields.CharField(max_length=79, null=False)\n    # if scoped to a model this activity log holds the id of the model being logged\n    # if not scoped to a model this log might not hold an item_id\n    # this might be a numerical id, short id, or UUID, so each will be converted to string\n    # it will be used to lookup rows with exactly matching item_ids\n    # it probably only needs to be 36 characters in order to hold a GUID\n    # but 72 may be useful to avoid a migration in future\n    item_id = models.fields.CharField(max_length=72, null=True)\n    # e.g. FeatureFlags - this will often be the name of a model class\n    scope = models.fields.CharField(max_length=79, null=False)\n    detail = models.JSONField(encoder=ActivityDetailEncoder, null=True)\n    created_at = models.DateTimeField(default=timezone.now)\n\n\ncommon_field_exclusions = [\n    \"id\",\n    \"uuid\",\n    \"short_id\",\n    \"created_at\",\n    \"created_by\",\n    \"last_modified_at\",\n    \"last_modified_by\",\n    \"updated_at\",\n    \"updated_by\",\n    \"team\",\n    \"team_id\",\n]\n\n\nfield_with_masked_contents: dict[ActivityScope, list[str]] = {\n    \"HogFunction\": [\n        \"encrypted_inputs\",\n    ],\n    \"Integration\": [\n        \"config\",\n        \"sensitive_config\",\n    ],\n    \"BatchImport\": [\n        \"import_config\",\n    ],\n    \"Subscription\": [\n        \"target_value\",\n    ],\n    \"ExternalDataSource\": [\n        \"job_inputs\",\n    ],\n    \"OrganizationDomain\": [\n        \"scim_bearer_token\",\n        \"verification_challenge\",\n        \"saml_x509_cert\",\n    ],\n    \"User\": [\n        \"email\",\n        \"password\",\n        # No longer used but kept for backwards-compatibility with existing activity log entries\n        \"temporary_token\",\n        \"pending_email\",\n    ],\n}\n\nfield_name_overrides: dict[ActivityScope, dict[str, str]] = {\n    \"HogFunction\": {\n        \"execution_order\": \"priority\",\n    },\n    \"Organization\": {\n        \"name\": \"organization name\",\n        \"enforce_2fa\": \"two-factor authentication requirement\",\n        \"members_can_invite\": \"member invitation permissions\",\n        \"members_can_use_personal_api_keys\": \"personal API key permissions\",\n        \"allow_publicly_shared_resources\": \"public sharing permissions\",\n        \"is_member_join_email_enabled\": \"member join email notifications\",\n        \"session_cookie_age\": \"session cookie age\",\n        \"default_experiment_stats_method\": \"default experiment stats method\",\n    },\n    \"BatchExport\": {\n        \"paused\": \"enabled\",\n    },\n    \"ExternalDataSource\": {\n        \"job_inputs\": \"configuration\",\n    },\n    \"ExternalDataSchema\": {\n        \"should_sync\": \"enabled\",\n    },\n    \"OrganizationDomain\": {\n        \"jit_provisioning_enabled\": \"just-in-time provisioning\",\n        \"sso_enforcement\": \"SSO enforcement\",\n        \"saml_entity_id\": \"SAML entity ID\",\n        \"saml_acs_url\": \"SAML ACS URL\",\n        \"saml_x509_cert\": \"SAML X.509 certificate\",\n        \"scim_enabled\": \"SCIM provisioning\",\n        \"verified_at\": \"domain verification\",\n    },\n}\n\n# Fields that prevent activity signal triggering entirely when only these fields change\nsignal_exclusions: dict[ActivityScope, list[str]] = {\n    \"AlertConfiguration\": [\n        \"last_checked_at\",\n        \"next_check_at\",\n        \"is_calculating\",\n        \"last_notified_at\",\n        \"last_error_at\",\n    ],\n    \"Dashboard\": [\"last_accessed_at\"],\n    \"LogsAlertConfiguration\": [\n        \"next_check_at\",\n        \"last_notified_at\",\n        \"last_checked_at\",\n        \"consecutive_failures\",\n        \"state\",\n    ],\n    \"PersonalAPIKey\": [\n        \"last_used_at\",\n    ],\n    \"User\": [\n        \"last_login\",\n        \"date_joined\",\n        \"current_organization\",\n        \"current_team\",\n        \"current_organization_id\",\n        \"current_team_id\",\n    ],\n    \"OrganizationDomain\": [\n        \"last_verification_retry\",\n    ],\n}\n\n# Activity visibility restrictions - controls which users can see certain activity logs\n# Used to hide sensitive activities (e.g., impersonated logins, user account changes) from non-staff users\nactivity_visibility_restrictions: list[dict[str, Any]] = [\n    {\n        \"scope\": \"User\",\n        \"activities\": [\"logged_in\", \"logged_out\"],\n        \"exclude_when\": {\"was_impersonated\": True},\n        \"allow_staff\": True,\n    },\n    {\n        \"scope\": \"User\",\n        \"activities\": [\"created\", \"updated\"],\n        \"exclude_when\": {},\n        \"allow_staff\": True,\n    },\n    {\n        \"scope\": \"User\",\n        \"activities\": [\"scim_provisioned\", \"scim_replaced\", \"scim_updated\", \"scim_deprovisioned\"],\n        \"exclude_when\": {},\n        \"allow_staff\": True,\n    },\n    {\n        \"scope\": \"Role\",\n        \"activities\": [\"scim_provisioned\", \"scim_replaced\", \"scim_updated\", \"scim_deprovisioned\"],\n        \"exclude_when\": {},\n        \"allow_staff\": True,\n    },\n]\n\nfield_exclusions: dict[ActivityScope, list[str]] = {\n    \"OrganizationDomain\": [\n        \"organization\",\n        \"scim_provisioned_users\",\n    ],\n    \"Cohort\": [\n        \"version\",\n        \"pending_version\",\n        \"count\",\n        \"is_calculating\",\n        \"last_calculation\",\n        \"last_error_at\",\n        \"errors_calculating\",\n    ],\n    \"HogFunction\": [\n        \"bytecode\",\n        \"icon_url\",\n    ],\n    \"Notebook\": [\n        \"text_content\",\n    ],\n    \"FeatureFlag\": [\n        \"experiment\",\n        \"featureflagoverride\",\n        \"usage_dashboard\",\n        \"analytics_dashboards\",\n    ],\n    \"Experiment\": [\n        \"feature_flag\",\n        \"exposure_cohort\",\n        \"holdout\",\n        \"saved_metrics\",\n        \"experimenttosavedmetric_set\",\n    ],\n    \"ExperimentSavedMetric\": [\n        \"experiments\",\n        \"experimenttosavedmetric_set\",\n    ],\n    \"Person\": [\n        \"distinct_ids\",\n        \"name\",\n        \"is_identified\",\n        \"persondistinctid\",\n        \"cohort\",\n        \"cohortpeople\",\n        \"properties_last_updated_at\",\n        \"properties_last_operation\",\n        \"version\",\n        \"is_user\",\n    ],\n    \"Insight\": [\n        \"filters_hash\",\n        \"refreshing\",\n        \"dive_dashboard\",\n        \"type\",\n        \"funnel\",\n        \"layouts\",\n        \"color\",\n        \"order\",\n        \"result\",\n        \"dashboard\",\n        \"last_refresh\",\n        \"saved\",\n        \"is_sample\",\n        \"refresh_attempt\",\n        \"short_id\",\n        \"insightviewed\",\n        \"dashboardtile\",\n        \"caching_states\",\n    ",
+      "total_lines": 1053
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "dataclasses",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Literal",
+        "typing:Optional",
+        "typing:Required",
+        "typing:TypedDict",
+        "typing:Union",
+        "uuid:UUID",
+        "django.conf:settings",
+        "django.contrib.auth.models:AnonymousUser",
+        "django.contrib.postgres.indexes:GinIndex",
+        "django.core.exceptions:FieldDoesNotExist",
+        "django.core.exceptions:ObjectDoesNotExist",
+        "django.core.paginator:Paginator",
+        "django.db:models",
+        "django.db:transaction",
+        "django.db.models:QuerySet",
+        "django.db.models.signals:post_save",
+        "django.dispatch.dispatcher:receiver",
+        "django.utils:timezone",
+        "structlog",
+        "posthog.exceptions_capture:capture_exception",
+        "posthog.models.utils:ActivityDetailEncoder",
+        "posthog.models.utils:UUIDTModel",
+        "posthog.models.user:User",
+        "posthog.models.dashboard:Dashboard",
+        "posthog.models.dashboard_tile:DashboardTile",
+        "posthog.models.activity_logging.utils:activity_visibility_manager"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/PostHog/posthog/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <img alt=\"posthoglogo\" src=\"https://user-images.githubusercontent.com/65415371/205059737-c8a4f836-4889-4654-902e-f302b187b6a0.png\">\n</p>\n<p align=\"center\">\n  <a href='https://posthog.com/contributors'><img alt=\"GitHub contributors\" src=\"https://img.shields.io/github/contributors/posthog/posthog\"/></a>\n  <a href='http://makeapullrequest.com'><img alt='PRs Welcome' src='https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=shields'/></a>\n  <img alt=\"Docker Pulls\" src=\"https://img.shields.io/docker/pulls/posthog/posthog\"/>\n  <a href=\"https://github.com/PostHog/posthog/commits/master\"><img alt=\"GitHub commit activity\" src=\"https://img.shields.io/github/commit-activity/m/posthog/posthog\"/> </a>\n  <a href=\"https://github.com/PostHog/posthog/issues?q=is%3Aissue%20state%3Aclosed\"><img alt=\"GitHub closed issues\" src=\"https://img.shields.io/github/issues-closed/posthog/posthog\"/> </a>\n</p>\n\n<p align=\"center\">\n  <a href=\"https://posthog.com/docs\">Docs</a> - <a href=\"https://posthog.com/community\">Community</a> - <a href=\"https://posthog.com/roadmap\">Roadmap</a> - <a href=\"https://posthog.com/why\">Why PostHog?</a> - <a href=\"https://posthog.com/changelog\">Changelog</a> - <a href=\"https://github.com/PostHog/posthog/issues/new?assignees=&labels=bug&template=bug_report.yml\">Bug reports</a>\n</p>\n\n<p align=\"center\">\n  <a href=\"https://www.youtube.com/watch?v=2jQco8hEvTI\">\n    <img src=\"https://res.cloudinary.com/dmukukwp6/image/upload/demo_thumb_68d0d8d56d\" alt=\"PostHog Demonstration\">\n  </a>\n</p>\n\n## PostHog is an all-in-one, open source platform for building "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "changes_between test",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_activity_logging.py",
+          "path": "posthog/models/test/test_activity_logging.py",
+          "sha": "e7f3ed4c136635a08d4be7b9c3f002cdbc69a89d",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/models/test/test_activity_logging.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_insight_activity_logging.py",
+          "path": "posthog/test/activity_logging/test_insight_activity_logging.py",
+          "sha": "01701f60cc1024048e7caee35a97fc21d1002954",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/test/activity_logging/test_insight_activity_logging.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_person_activity_logging.py",
+          "path": "posthog/test/activity_logging/test_person_activity_logging.py",
+          "sha": "d1ff771c2a06dbdea985f4b1fb7adce1cf0be9e2",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/test/activity_logging/test_person_activity_logging.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_feature_flag_activity_logging.py",
+          "path": "posthog/test/activity_logging/test_feature_flag_activity_logging.py",
+          "sha": "592174dee87b1831205051393b55d3c0beb4b00c",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/test/activity_logging/test_feature_flag_activity_logging.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"changes_between(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "utils.py",
+          "path": "products/customer_analytics/backend/api/utils.py",
+          "sha": "d6ce94a85d231c9a726c7a0c5875cf4753584bd7",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/products/customer_analytics/backend/api/utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "alert.py",
+          "path": "posthog/api/alert.py",
+          "sha": "0adb2bcd658b39795b6b7081e14be74ea86e53db",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/api/alert.py",
+          "score": 1.0
+        },
+        {
+          "name": "ee_property_definition.py",
+          "path": "ee/api/ee_property_definition.py",
+          "sha": "9bd589a7eb537fc15e99d3925890196ce9fad304",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/ee/api/ee_property_definition.py",
+          "score": 1.0
+        },
+        {
+          "name": "project.py",
+          "path": "posthog/api/project.py",
+          "sha": "d5331ceb0ad0ef2d5bf1183b93a37393bbf99acd",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/api/project.py",
+          "score": 1.0
+        },
+        {
+          "name": "signal_handlers.py",
+          "path": "posthog/models/activity_logging/signal_handlers.py",
+          "sha": "e39312a8e8bdf9907018f94c143cf03bc2fd4cc1",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/models/activity_logging/signal_handlers.py",
+          "score": 1.0
+        },
+        {
+          "name": "plugin.py",
+          "path": "posthog/api/plugin.py",
+          "sha": "9cf717e891e0c9872dc8b579203b354391efaf13",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/api/plugin.py",
+          "score": 1.0
+        },
+        {
+          "name": "cohort.py",
+          "path": "posthog/api/cohort.py",
+          "sha": "73cecd6562d79202b76110b37ceb050afd7a384f",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/api/cohort.py",
+          "score": 1.0
+        },
+        {
+          "name": "survey.py",
+          "path": "posthog/api/survey.py",
+          "sha": "12cbe90d89677615f75c16d6fd80a04e8a10715a",
+          "html_url": "https://github.com/PostHog/posthog/blob/773ff732809fb75368dcd193ae8be4fe0b67321b/posthog/api/survey.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "posthog/models/activity_logging",
+      "count": 13,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "posthog/models/activity_logging/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "activity_log.py",
+          "path": "posthog/models/activity_logging/activity_log.py",
+          "type": "file"
+        },
+        {
+          "name": "activity_page.py",
+          "path": "posthog/models/activity_logging/activity_page.py",
+          "type": "file"
+        },
+        {
+          "name": "batch_export_utils.py",
+          "path": "posthog/models/activity_logging/batch_export_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "batch_import_utils.py",
+          "path": "posthog/models/activity_logging/batch_import_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "external_data_utils.py",
+          "path": "posthog/models/activity_logging/external_data_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "model_activity.py",
+          "path": "posthog/models/activity_logging/model_activity.py",
+          "type": "file"
+        },
+        {
+          "name": "notification_viewed.py",
+          "path": "posthog/models/activity_logging/notification_viewed.py",
+          "type": "file"
+        },
+        {
+          "name": "personal_api_key_utils.py",
+          "path": "posthog/models/activity_logging/personal_api_key_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "serializers.py",
+          "path": "posthog/models/activity_logging/serializers.py",
+          "type": "file"
+        },
+        {
+          "name": "signal_handlers.py",
+          "path": "posthog/models/activity_logging/signal_handlers.py",
+          "type": "file"
+        },
+        {
+          "name": "tag_utils.py",
+          "path": "posthog/models/activity_logging/tag_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "posthog/models/activity_logging/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "posthog/models/activity_logging/__init__.py"
+        },
+        {
+          "name": "activity_page.py",
+          "path": "posthog/models/activity_logging/activity_page.py"
+        },
+        {
+          "name": "batch_export_utils.py",
+          "path": "posthog/models/activity_logging/batch_export_utils.py"
+        },
+        {
+          "name": "batch_import_utils.py",
+          "path": "posthog/models/activity_logging/batch_import_utils.py"
+        },
+        {
+          "name": "external_data_utils.py",
+          "path": "posthog/models/activity_logging/external_data_utils.py"
+        },
+        {
+          "name": "model_activity.py",
+          "path": "posthog/models/activity_logging/model_activity.py"
+        },
+        {
+          "name": "notification_viewed.py",
+          "path": "posthog/models/activity_logging/notification_viewed.py"
+        },
+        {
+          "name": "personal_api_key_utils.py",
+          "path": "posthog/models/activity_logging/personal_api_key_utils.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "78e1c21b955ed67cd4d0009b957f043b86070643",
+          "html_url": "https://github.com/PostHog/posthog/commit/78e1c21b955ed67cd4d0009b957f043b86070643",
+          "message": "feat(logs-alerting): add alerting models, migration, and feature flag (#50364)\n\n## Problem\n\nAlerting is the top blocker for logs adoption. Customers can't switch from competing solutions without alerts - they need to know when errors spike without manually checking the logs viewer.\n\n## Changes\n\nSpik",
+          "author": "Jon McCallum",
+          "date": "2026-03-09T18:12:39Z"
+        },
+        {
+          "sha": "073976b0529b0e79a7a55eebe110c3638532f46d",
+          "html_url": "https://github.com/PostHog/posthog/commit/073976b0529b0e79a7a55eebe110c3638532f46d",
+          "message": "feat: ticket activity history (#49967)",
+          "author": "Alex V",
+          "date": "2026-03-05T12:28:06Z"
+        },
+        {
+          "sha": "901f6087e216ed1e4752276e5f3c7331fbb1715c",
+          "html_url": "https://github.com/PostHog/posthog/commit/901f6087e216ed1e4752276e5f3c7331fbb1715c",
+          "message": "fix(toolbar): simplify oauth flow (#49579)\n\n## Problem\n\nThe toolbar OAuth flow used a popup window (`window.open`) to authenticate users. This broke on customer sites with strict `Cross-Origin-Opener-Policy` headers, which sever `window.opener` and prevent the popup from delivering tokens back to th",
+          "author": "Fernando Gomes",
+          "date": "2026-03-03T16:16:25Z"
+        },
+        {
+          "sha": "57c2bf29be9714ba2518ff51bef25c4345082dcc",
+          "html_url": "https://github.com/PostHog/posthog/commit/57c2bf29be9714ba2518ff51bef25c4345082dcc",
+          "message": "feat: ensure SCIM can only act on org domain (#49160)",
+          "author": "Tom Piccirello",
+          "date": "2026-02-26T05:50:18Z"
+        },
+        {
+          "sha": "827bb9dae72da547f97f381ee2f7cae735b42d6e",
+          "html_url": "https://github.com/PostHog/posthog/commit/827bb9dae72da547f97f381ee2f7cae735b42d6e",
+          "message": "fix: improve activity logging for resource transfers (#48609)\n\nCo-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>",
+          "author": "Reece Jones",
+          "date": "2026-02-23T21:16:47Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "changes_between TODO include tags fields assessed",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "78e1c21b955ed67cd4d0009b957f043b86070643",
+        "html_url": "https://github.com/PostHog/posthog/commit/78e1c21b955ed67cd4d0009b957f043b86070643",
+        "message": "feat(logs-alerting): add alerting models, migration, and feature flag (#50364)\n\n## Problem\n\nAlerting is the top blocker for logs adoption. Customers can't switch from competing solutions without alerts - they need to know when errors spike without manually checking the logs viewer.\n\n## Changes\n\nSpik",
+        "author": "Jon McCallum",
+        "date": "2026-03-09T18:12:39Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 4,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

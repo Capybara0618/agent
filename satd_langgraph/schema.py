@@ -30,6 +30,8 @@ class AnalysisResult:
     change_locality: float
     semantic_risk: float
     context_sufficiency: float
+    primary_context_sufficiency: float
+    external_context_support: float
     verifiability: float
     analyze_score: float
     confidence: float
@@ -68,6 +70,7 @@ class ReviewResult:
     minimality: float
     semantic_preservation: float
     internal_consistency: float
+    change_compactness: float
     issues: list[str]
     revision_advice: str
     reject_type: str | None

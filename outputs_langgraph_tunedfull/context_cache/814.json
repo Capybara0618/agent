@@ -1,0 +1,420 @@
+{
+  "task_id": "814",
+  "repo_owner": "tensorflow",
+  "repo_name": "tensor2tensor",
+  "file_path": "tensor2tensor/models/research/glow_ops.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:25:27+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:25:37+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:25:47+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "tensor2tensor/models/research/glow_ops.py",
+    "original_code": "def invertible_1x1_conv(name, x, reverse=False):\n  \"\"\"1X1 convolution on x.\n\n  The 1X1 convolution is parametrized as P*L*(U + sign(s)*exp(log(s))) where\n  1. P is a permutation matrix.\n  2. L is a lower triangular matrix with diagonal entries unity.\n  3. U is a upper triangular matrix where the diagonal entries zero.\n  4. s is a vector.\n\n  sign(s) and P are fixed and the remaining are optimized. P, L, U and s are\n  initialized by the PLU decomposition of a random rotation matrix.\n\n  Args:\n    name: scope\n    x: Input Tensor.\n    reverse: whether the pass is from z -> x or x -> z.\n\n  Returns:\n    x_conv: x after a 1X1 convolution is applied on x.\n    objective: sum(log(s))\n  \"\"\"\n  _, height, width, channels = common_layers.shape_list(x)\n  w_shape = [channels, channels]\n\n  # Random rotation-matrix Q\n  random_matrix = np.random.rand(channels, channels)\n  np_w = scipy.linalg.qr(random_matrix)[0].astype(\"float32\")\n\n  # Initialize P,L,U and s from the LU decomposition of a random rotation matrix\n  np_p, np_l, np_u = scipy.linalg.lu(np_w)\n  np_s = np.diag(np_u)\n  np_sign_s = np.sign(np_s)\n  np_log_s = np.log(np.abs(np_s))\n  np_u = np.triu(np_u, k=1)\n\n  with tf.variable_scope(name, reuse=tf.AUTO_REUSE):\n    p = tf.get_variable(\"P\", initializer=np_p, trainable=False)\n    l = tf.get_variable(\"L\", initializer=np_l)\n    sign_s = tf.get_variable(\n        \"sign_S\", initializer=np_sign_s, trainable=False)\n    log_s = tf.get_variable(\"log_S\", initializer=np_log_s)\n    u = tf.get_variable(\"U\", initializer=np_u)\n\n    # W = P * L * (U + sign_s * exp(log_s))\n    l_mask = np.tril(np.ones([channels, channels], dtype=np.float32), -1)\n    l = l * l_mask + tf.eye(channels, channels)\n    u = u * np.transpose(l_mask) + tf.diag(sign_s * tf.exp(log_s))\n    w = tf.matmul(p, tf.matmul(l, u))\n\n    # If height or width cannot be statically determined then they end up as\n    # tf.int32 tensors, which cannot be directly multiplied with a floating\n    # point tensor without a cast.\n    objective = tf.reduce_sum(log_s) * tf.cast(height * width, log_s.dtype)\n    if not reverse:\n      w = tf.reshape(w, [1, 1] + w_shape)\n      x = tf.nn.conv2d(x, w, [1, 1, 1, 1], \"SAME\", data_format=\"NHWC\")\n    else:\n      # TODO(b/111271662): Remove when supported.\n      def tpu_inv(m):\n        \"\"\"tf.linalg.inv workaround until it is supported on TPU.\"\"\"\n        q, r = tf.linalg.qr(m)\n        return tf.linalg.triangular_solve(r, tf.transpose(q), lower=False)\n      w_inv = tf.reshape(tpu_inv(w), [1, 1]+w_shape)\n      x = tf.nn.conv2d(\n          x, w_inv, [1, 1, 1, 1], \"SAME\", data_format=\"NHWC\")\n      objective *= -1\n  return x, objective",
+    "satd_comment": "# TODO(b/111271662): Remove when supported.",
+    "target_file": {
+      "ok": true,
+      "path": "tensor2tensor/models/research/glow_ops.py",
+      "sha": "c5ee371cbe0e655f5f333481d93b2a5a7dae642e",
+      "download_url": "https://raw.githubusercontent.com/tensorflow/tensor2tensor/master/tensor2tensor/models/research/glow_ops.py",
+      "content_excerpt": "# coding=utf-8\n# Copyright 2023 The Tensor2Tensor Authors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Various reversible ops for the glow generative model.\"\"\"\n\nfrom __future__ import absolute_import\nfrom __future__ import division\nfrom __future__ import print_function\n\nimport functools\nimport numpy as np\nimport scipy\nfrom tensor2tensor.layers import common_layers\nfrom tensor2tensor.layers import common_video\nfrom tensor2tensor.utils import contrib\nimport tensorflow.compat.v1 as tf\nfrom tensorflow.compat.v1 import estimator as tf_estimator\nimport tensorflow_probability as tfp\n\narg_scope = contrib.framework().arg_scope\nadd_arg_scope = contrib.framework().add_arg_scope\n\n\ndef linear_interpolate(tensor1, tensor2, coeffs):\n  \"\"\"Linearly interpolate between two tensors at coeff.\n\n  Args:\n    tensor1: 4-D Tensor, shape=(NHWC)\n    tensor2: 4-D Tensor, shape=(NHWC)\n    coeffs: list of floats.\n  Returns:\n    interp_latents: 5-D Tensor, with interp_latents[i] representing\n                    interpolations at coeffs[i].\n                    shape=(len(coeffs), NHWC)\n  \"\"\"\n  interp_tensors = []\n  for coeff in coeffs:\n    interp_tensor = tensor1 + coeff * (tensor2 - tensor1)\n    interp_tensors.append(interp_tensor)\n  return tf.concat(interp_tensors, axis=0)\n\n\ndef linear_interpolate_rank(tensor1, tensor2, coeffs, rank=1):\n  \"\"\"Linearly interpolate channel at \"rank\" between two tensors.\n\n  The channels are ranked according to their L2 norm between tensor1[channel]\n  and tensor2[channel].\n\n  Args:\n    tensor1: 4-D Tensor, NHWC\n    tensor2: 4-D Tensor, NHWC\n    coeffs: list of floats.\n    rank: integer.\n  Returns:\n    interp_latents: list of interpolated 4-D Tensors, shape=(NHWC)\n  \"\"\"\n  # sum across space, max across channels.\n  _, _, _, num_channels = common_layers.shape_list(tensor1)\n  diff_sq_sum = tf.reduce_sum((tensor1 - tensor2)**2, axis=(0, 1, 2))\n  _, feature_ranks = tf.math.top_k(diff_sq_sum, k=rank)\n  feature_rank = feature_ranks[-1]\n  channel_inds = tf.range(num_channels, dtype=tf.int32)\n  channel_mask = tf.equal(channel_inds, feature_rank)\n  ones_t = tf.ones(num_channels, dtype=tf.float32)\n  zeros_t = tf.zeros(num_channels, dtype=tf.float32)\n\n  interp_tensors = []\n  for coeff in coeffs:\n    curr_coeff = tf.where(channel_mask, coeff * ones_t, zeros_t)\n    interp_tensor = tensor1 + curr_coeff * (tensor2 - tensor1)\n    interp_tensors.append(interp_tensor)\n  return tf.concat(interp_tensors, axis=0)\n\n\ndef postprocess(x, n_bits_x=8):\n  \"\"\"Converts x from [-0.5, 0.5], to [0, 255].\n\n  Args:\n    x: 3-D or 4-D Tensor normalized between [-0.5, 0.5]\n    n_bits_x: Number of bits representing each pixel of the output.\n              Defaults to 8, to default to 256 possible values.\n  Returns:\n    x: 3-D or 4-D Tensor representing images or videos.\n  \"\"\"\n  x = tf.where(tf.is_finite(x), x, tf.ones_like(x))\n  x = tf.clip_by_value(x, -0.5, 0.5)\n  x += 0.5\n  x = x * 2**n_bits_x\n  return tf.cast(tf.clip_by_value(x, 0, 255), dtype=tf.uint8)\n\n\nclass TemperedNormal(tfp.distributions.Normal):\n  \"\"\"Normal distribution with temperature T.\"\"\"\n\n  def __init__(self, loc, scale, temperature=1.0):\n    self.temperature = temperature\n    new_scale = scale * self.temperature\n    tfp.distributions.Normal.__init__(self, loc=loc, scale=new_scale)\n\n  def sample(self, sample_shape=(), seed=None, name=\"sample\"):\n    if self.temperature == 0.0:\n      if not sample_shape:\n        return self.loc\n      loc = tf.expand_dims(self.loc, axis=0)\n      return tf.tile(loc, (sample_shape[0], 1, 1))\n    return super(TemperedNormal, self).sample(\n        sample_shape=sample_shape, seed=seed, name=name)\n\n\ndef default_initializer(std=0.05):\n  return tf.random_normal_initializer(0., std)\n\n\ndef get_eps(dist, x):\n  \"\"\"Z = (X - mu) / sigma.\"\"\"\n  return (x - dist.loc) / dist.scale\n\n\ndef set_eps(dist, eps):\n  \"\"\"Z = eps * sigma + mu.\"\"\"\n  return eps * dist.scale + dist.loc\n\n\n@add_arg_scope\ndef assign(w, initial_value):\n  w = w.assign(initial_value)\n  with tf.control_dependencies([w]):\n    return w\n\n\ndef get_cond_latents_at_level(cond_latents, level, hparams):\n  \"\"\"Returns a single or list of conditional latents at level 'level'.\"\"\"\n  if cond_latents:\n    if hparams.latent_dist_encoder in [\"conv_net\", \"conv3d_net\"]:\n      return [cond_latent[level] for cond_latent in cond_latents]\n    elif hparams.latent_dist_encoder in [\"pointwise\", \"conv_lstm\"]:\n      return cond_latents[level]\n\n\ndef check_cond_latents(cond_latents, hparams):\n  \"\"\"Shape checking for cond_latents.\"\"\"\n  if cond_latents is None:\n    return\n  if not isinstance(cond_latents[0], list):\n    cond_latents = [cond_latents]\n  exp_num_latents = hparams.num_cond_latents\n  if hparams.latent_dist_encoder == \"conv_net\":\n    exp_num_latents += int(hparams.cond_first_frame)\n  if len(cond_latents) != exp_num_latents:\n    raise ValueError(\"Expected number of cond_latents: %d, got %d\" %\n                     (exp_num_latents, len(cond_latents)))\n  for cond_latent in cond_latents:\n    if len(cond_latent) != hparams.n_levels - 1:\n      raise ValueError(\"Expected level_latents to be %d, got %d\" %\n                       (hparams.n_levels - 1, len(cond_latent)))\n\n\n@add_arg_scope\ndef get_variable_ddi(name, shape, initial_value, dtype=tf.float32, init=False,\n                     trainable=True):\n  \"\"\"Wrapper for data-dependent initialization.\"\"\"\n  # If init is a tf bool: w is assigned dynamically at runtime.\n  # If init is a python bool: then w is determined during graph construction.\n  w = tf.get_variable(name, shape, dtype, None, trainable=trainable)\n  if isinstance(init, bool):\n    if init:\n      return assign(w, initial_value)\n    return w\n  else:\n    return tf.cond(init, lambda: assign(w, initial_value), lambda: w)\n\n\n@add_arg_scope\ndef get_dropout(x, rate=0.0, init=True):\n  \"\"\"Dropout x with dropout_rate = rate.\n\n  Apply zero dropout during init or prediction time.\n\n  Args:\n    x: 4-D Tensor, shape=(NHWC).\n    rate: Dropout rate.\n    init: Initialization.\n  Returns:\n    x: activations after dropout.\n  \"\"\"\n  if init or rate == 0:\n    return x\n  return tf.layers.dropout(x, rate=rate, training=True)\n\n\n@add_arg_scope\ndef actnorm_3d(name, x, logscale_factor=3.):\n  \"\"\"Applies actnorm to each time-step independently.\n\n  There are a total of 2*n_channels*n_steps parameters learnt.\n\n  Args:\n    name: variable scope.\n    x: 5-D Tensor, (NTHWC)\n    logscale_factor: Increases the learning rate of the scale by\n                     logscale_factor.\n  Returns:\n    x: 5-D Tensor, (NTHWC) with the per-timestep, per-channel normalization.\n  \"\"\"\n  with tf.variable_scope(name, reuse=tf.AUTO_REUSE):\n    x = tf.unstack(x, axis=1)\n    x_normed = []\n    for ind, x_step in enumerate(x):\n      x_step, _ = actnorm(\"actnorm_%d\" % ind, x_step,\n                          logscale_factor=logscale_factor)\n      x_normed.append(x_step)\n    return tf.stack(x_normed, axis=1), None\n\n\n@add_arg_scope\ndef actnorm(name, x, logscale_factor=3., reverse=False, init=False,\n            trainable=True):\n  \"\"\"x_{ij} = s x x_{ij} + b. Per-channel scaling and bias.\n\n  If init is set to True, the scaling and bias are initialized such\n  that the mean and variance of the output activations of the first minibatch\n  are zero and one respectively.\n\n  Args:\n    name: variable scope.\n    x: input\n    logscale_factor: Used in actnorm_scale. Optimizes f(ls*s') instead of f(s)\n                     where s' = s / ls. Helps in faster convergence.\n    reverse: forward or reverse operation.\n    init: Whether or not to do data-dependent initialization.\n    trainable:\n\n  Returns:\n    x: output after adding bias and scaling.\n    objective: log(sum(s))\n  \"\"\"\n  var_arg_scope = arg_scope([get_variable_ddi], trainable=trainable)\n  var_scope = tf.variable_scope(name, reuse=tf.AUTO_REUSE)\n\n  with var_scope, var_arg_scope:\n    if not reverse:\n      x = actnorm_center(name + \"_center\", x, reverse, init=init)\n      x, objective = actnorm_scale(\n          name + \"_scale\", x, logscale_factor=logscale_factor,\n          reverse=reverse, init=init)\n    else:\n      x, objective = actnorm_scale(\n          name + \"_scale\", x, logscale_factor=logscale_factor,\n          reverse=reverse, init=init)\n      x = actnorm_center(name + \"_center\", x, reverse, init=init)\n    return x, objective\n\n\n@add_arg_scope\ndef actnorm_center(name, x, reverse=False, init=False):\n  \"\"\"Add a bias to x.\n\n  Initialize such that the output of the first minibatch is zero centered\n  per channel.\n\n  Args:\n    name: scope\n    x: 2-D or 4-D Tensor.\n    reverse: Forward or backward operation.\n    init: data-dependent initialization.\n\n  Returns:\n    x_center: (x + b), if reverse is True and (x - b) otherwise.\n  \"\"\"\n  shape = common_layers.shape_list(x)\n  with tf.variable_scope(name, reuse=tf.AUTO_REUSE):\n    assert len(shape) == 2 or len(shape) == 4\n    if len(shape) == 2:\n      x_mean = tf.reduce_mean(x, [0], keepdims=True)\n      b = get_variable_ddi(\"b\", (1, shape[1]), initial_value=-x_mean,\n                           init=init)\n    elif len(shape) == 4:\n      x_mean = tf.reduce_mean(x, [0, 1, 2], keepdims=True)\n      b = get_variable_ddi(\n          \"b\", (1, 1, 1, shape[3]), initial_value=-x_mean, init=init)\n\n    if not reverse:\n      x += b\n    else:\n      x -= b\n    return x\n\n\n@add_arg_scope\ndef actnorm_scale(name, x, logscale_factor=3., reverse=False, init=False):\n  \"\"\"Per-channel scaling of x.\"\"\"\n  x_shape = common_layers.shape_list(x)\n  with tf.variable_scope(name, reuse=tf.AUTO_REUSE):\n\n    # Variance initialization logic.\n    assert len(x_shape) == 2 or len(x_shape) == 4\n    if len(x_shape) == 2:\n      x_var = tf.reduce_mean(x**2, [0], keepdims=True)\n      logdet_factor = 1\n      var_shape = (1, x_shape[1])\n    elif len(x_shape) == 4:\n      x_var = tf.reduce_mean(x**2, [0, 1, 2], keepdims=True)\n      logdet_factor = x_shape[1]*x_shape[2]\n      var_shape = (1, 1, 1, x_shape[3])\n\n    init_value = tf.log(1.0 / (tf.sqrt(x_var) + 1e-6)) / logscale_factor\n    logs = get_variable_ddi(\"logs\", var_shape, initial_value=init_value,\n                            init=init)\n    logs = logs * logscale_factor\n\n    # Function and reverse function.\n    if not reverse:\n      x = x * tf.exp(logs)\n    else:\n      x = x * tf.exp(-logs)\n\n    # Objective calculation, h * w * sum(log|s|)\n    dlogdet = tf.reduce_sum(logs) * logdet_factor\n    if reverse:\n      dlogdet *= -1\n    return x, dlogdet\n\n\n@add_arg_scope\ndef invertible_1x1_conv(name, x, reverse=False):\n  \"\"\"1X1 convolution on x.\n\n  The 1X1 convolution is parametrized as P*L*(U + sign(s)*exp(log(s))) where\n  1. P is a permutation matrix.\n  2. L is a lower triangular matrix with diagonal entries unity.\n  3. U is a upper triangular matrix where the diagonal entries zero.\n  4. s is a vector.\n\n  sign(s) and P are fixed and the remaining are optimized. P, L, U and s are\n  initialized by the PLU decomposition of a random rotation matrix.\n\n  Args:\n    name: scope\n    x: Input Tensor.\n    reverse: whether the pass is from z -> x or x -> z.\n\n  Returns:\n    x_conv: x after a 1X1 convolution is applied on x.\n    objective: sum(log(s))\n  \"\"\"\n  _, height, width, channels = common_layers.shape_list(x)\n  w_shape = [channels, channels]\n\n  # Random rotation-matrix Q\n  random_matrix = np.random.rand(channels, channels)\n  np_w = scipy.linalg.qr(random_matrix)[0].astype(\"float32\")\n\n  # Initialize P,L,U and s from the LU decomposition of a random rotation matrix\n  np_p, np_l, np_u = scipy.linalg.lu(np_w)\n  np_s = np.diag(np_u)\n  np_sign_s = np.sign(np_s)\n  np_log_s = np.log(np.abs(np_s))\n  np_u =",
+      "total_lines": 1389
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "__future__:division",
+        "__future__:print_function",
+        "functools",
+        "numpy",
+        "scipy",
+        "tensor2tensor.layers:common_layers",
+        "tensor2tensor.layers:common_video",
+        "tensor2tensor.utils:contrib",
+        "tensorflow.compat.v1",
+        "tensorflow.compat.v1:estimator",
+        "tensorflow_probability"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/tensorflow/tensor2tensor/master/README.md",
+      "content_excerpt": "# Tensor2Tensor\n\n[![PyPI\nversion](https://badge.fury.io/py/tensor2tensor.svg)](https://badge.fury.io/py/tensor2tensor)\n[![GitHub\nIssues](https://img.shields.io/github/issues/tensorflow/tensor2tensor.svg)](https://github.com/tensorflow/tensor2tensor/issues)\n[![Contributions\nwelcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)\n[![Gitter](https://img.shields.io/gitter/room/nwjs/nw.js.svg)](https://gitter.im/tensor2tensor/Lobby)\n[![License](https://img.shields.io/badge/License-Apache%202.0-brightgreen.svg)](https://opensource.org/licenses/Apache-2.0)\n[![Travis](https://img.shields.io/travis/tensorflow/tensor2tensor.svg)](https://travis-ci.org/tensorflow/tensor2tensor)\n[![Run on FH](https://static.floydhub.com/button/button-small.svg)](https://floydhub.com/run)\n\n[Tensor2Tensor](https://github.com/tensorflow/tensor2tensor), or\n[T2T](https://github.com/tensorflow/tensor2tensor) for short, is a library\nof deep learning models and datasets designed to make deep learning more\naccessible and [accelerate ML\nresearch](https://research.googleblog.com/2017/06/accelerating-deep-learning-research.html).\n\n\nT2T was developed by researchers and engineers in the\n[Google Brain team](https://research.google.com/teams/brain/) and a community\nof users. It is now deprecated &mdash; we keep it running and welcome\nbug-fixes, but encourage users to use the successor library [Trax](https://github.com/google/trax).\n\n### Quick Start\n\n[This iPython notebook](https://colab.research.google.com/github/tensorflow/tensor2tensor/blob/master/tensor2tensor/notebooks/hello_"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "invertible_1x1_conv test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"invertible_1x1_conv(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "tensor2tensor/models/research",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "tensor2tensor/models/research/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "adafactor_experiments.py",
+          "path": "tensor2tensor/models/research/adafactor_experiments.py",
+          "type": "file"
+        },
+        {
+          "name": "aligned.py",
+          "path": "tensor2tensor/models/research/aligned.py",
+          "type": "file"
+        },
+        {
+          "name": "attention_lm.py",
+          "path": "tensor2tensor/models/research/attention_lm.py",
+          "type": "file"
+        },
+        {
+          "name": "attention_lm_moe.py",
+          "path": "tensor2tensor/models/research/attention_lm_moe.py",
+          "type": "file"
+        },
+        {
+          "name": "autoencoders.py",
+          "path": "tensor2tensor/models/research/autoencoders.py",
+          "type": "file"
+        },
+        {
+          "name": "autoencoders_test.py",
+          "path": "tensor2tensor/models/research/autoencoders_test.py",
+          "type": "file"
+        },
+        {
+          "name": "cycle_gan.py",
+          "path": "tensor2tensor/models/research/cycle_gan.py",
+          "type": "file"
+        },
+        {
+          "name": "gene_expression.py",
+          "path": "tensor2tensor/models/research/gene_expression.py",
+          "type": "file"
+        },
+        {
+          "name": "gene_expression_test.py",
+          "path": "tensor2tensor/models/research/gene_expression_test.py",
+          "type": "file"
+        },
+        {
+          "name": "glow.py",
+          "path": "tensor2tensor/models/research/glow.py",
+          "type": "file"
+        },
+        {
+          "name": "glow_init_hook.py",
+          "path": "tensor2tensor/models/research/glow_init_hook.py",
+          "type": "file"
+        },
+        {
+          "name": "glow_ops.py",
+          "path": "tensor2tensor/models/research/glow_ops.py",
+          "type": "file"
+        },
+        {
+          "name": "glow_ops_test.py",
+          "path": "tensor2tensor/models/research/glow_ops_test.py",
+          "type": "file"
+        },
+        {
+          "name": "glow_test.py",
+          "path": "tensor2tensor/models/research/glow_test.py",
+          "type": "file"
+        },
+        {
+          "name": "lm_experiments.py",
+          "path": "tensor2tensor/models/research/lm_experiments.py",
+          "type": "file"
+        },
+        {
+          "name": "moe.py",
+          "path": "tensor2tensor/models/research/moe.py",
+          "type": "file"
+        },
+        {
+          "name": "moe_experiments.py",
+          "path": "tensor2tensor/models/research/moe_experiments.py",
+          "type": "file"
+        },
+        {
+          "name": "multiquery_paper.py",
+          "path": "tensor2tensor/models/research/multiquery_paper.py",
+          "type": "file"
+        },
+        {
+          "name": "neural_stack.py",
+          "path": "tensor2tensor/models/research/neural_stack.py",
+          "type": "file"
+        },
+        {
+          "name": "neural_stack_test.py",
+          "path": "tensor2tensor/models/research/neural_stack_test.py",
+          "type": "file"
+        },
+        {
+          "name": "residual_shuffle_exchange.py",
+          "path": "tensor2tensor/models/research/residual_shuffle_exchange.py",
+          "type": "file"
+        },
+        {
+          "name": "rl.py",
+          "path": "tensor2tensor/models/research/rl.py",
+          "type": "file"
+        },
+        {
+          "name": "shuffle_network.py",
+          "path": "tensor2tensor/models/research/shuffle_network.py",
+          "type": "file"
+        },
+        {
+          "name": "similarity_transformer.py",
+          "path": "tensor2tensor/models/research/similarity_transformer.py",
+          "type": "file"
+        },
+        {
+          "name": "super_lm.py",
+          "path": "tensor2tensor/models/research/super_lm.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_aux.py",
+          "path": "tensor2tensor/models/research/transformer_aux.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_aux_test.py",
+          "path": "tensor2tensor/models/research/transformer_aux_test.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_moe.py",
+          "path": "tensor2tensor/models/research/transformer_moe.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_nat.py",
+          "path": "tensor2tensor/models/research/transformer_nat.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_parallel.py",
+          "path": "tensor2tensor/models/research/transformer_parallel.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_revnet.py",
+          "path": "tensor2tensor/models/research/transformer_revnet.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_revnet_test.py",
+          "path": "tensor2tensor/models/research/transformer_revnet_test.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_seq2edits.py",
+          "path": "tensor2tensor/models/research/transformer_seq2edits.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_sketch.py",
+          "path": "tensor2tensor/models/research/transformer_sketch.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_symshard.py",
+          "path": "tensor2tensor/models/research/transformer_symshard.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_vae.py",
+          "path": "tensor2tensor/models/research/transformer_vae.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_vae_flow_prior.py",
+          "path": "tensor2tensor/models/research/transformer_vae_flow_prior.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_vae_flow_prior_ops.py",
+          "path": "tensor2tensor/models/research/transformer_vae_flow_prior_ops.py",
+          "type": "file"
+        },
+        {
+          "name": "transformer_vae_test.py",
+          "path": "tensor2tensor/models/research/transformer_vae_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "tensor2tensor/models/research/__init__.py"
+        },
+        {
+          "name": "adafactor_experiments.py",
+          "path": "tensor2tensor/models/research/adafactor_experiments.py"
+        },
+        {
+          "name": "aligned.py",
+          "path": "tensor2tensor/models/research/aligned.py"
+        },
+        {
+          "name": "attention_lm.py",
+          "path": "tensor2tensor/models/research/attention_lm.py"
+        },
+        {
+          "name": "attention_lm_moe.py",
+          "path": "tensor2tensor/models/research/attention_lm_moe.py"
+        },
+        {
+          "name": "autoencoders.py",
+          "path": "tensor2tensor/models/research/autoencoders.py"
+        },
+        {
+          "name": "autoencoders_test.py",
+          "path": "tensor2tensor/models/research/autoencoders_test.py"
+        },
+        {
+          "name": "cycle_gan.py",
+          "path": "tensor2tensor/models/research/cycle_gan.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "tensor2tensor/models/research/glow_ops.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "bafdc1b67730430d38d6ab802cbd51f9d053ba2e",
+          "html_url": "https://github.com/tensorflow/tensor2tensor/commit/bafdc1b67730430d38d6ab802cbd51f9d053ba2e",
+          "message": "Internal change\n\nPiperOrigin-RevId: 521121284",
+          "author": "T2T Team",
+          "date": "2023-04-01T10:18:41Z"
+        },
+        {
+          "sha": "c81d7700d7519fcf5bb87081ae117e351687ab37",
+          "html_url": "https://github.com/tensorflow/tensor2tensor/commit/c81d7700d7519fcf5bb87081ae117e351687ab37",
+          "message": "Explicitly import estimator from tensorflow as a separate import instead of\naccessing it via tf.estimator and depend on the tensorflow estimator target.\n\nPiperOrigin-RevId: 436558317",
+          "author": "Fabien Hertschuh",
+          "date": "2022-03-22T20:38:29Z"
+        },
+        {
+          "sha": "ef1fccebe8d2c0cf482f41f9d940e2938c816c78",
+          "html_url": "https://github.com/tensorflow/tensor2tensor/commit/ef1fccebe8d2c0cf482f41f9d940e2938c816c78",
+          "message": "Update out-of-vocabulary error message to include the OOV token.\n\nThis facilitates debugging.\n\nPiperOrigin-RevId: 430848881",
+          "author": "Dan Zheng",
+          "date": "2022-02-25T03:30:23Z"
+        },
+        {
+          "sha": "9902e885fff48d610034b52153f7769081fcf2e0",
+          "html_url": "https://github.com/tensorflow/tensor2tensor/commit/9902e885fff48d610034b52153f7769081fcf2e0",
+          "message": "Internal change\n\nPiperOrigin-RevId: 356771804",
+          "author": "Tiago Quelhas",
+          "date": "2021-02-10T18:44:04Z"
+        },
+        {
+          "sha": "11f9a63b4297b4de70d8bcdee2f7ed8e332de097",
+          "html_url": "https://github.com/tensorflow/tensor2tensor/commit/11f9a63b4297b4de70d8bcdee2f7ed8e332de097",
+          "message": "Explicitly replace \"import tensorflow\" with \"tensorflow.compat.v1\" for TF2.x migration\n\nPiperOrigin-RevId: 294590634",
+          "author": "Rohan Jain",
+          "date": "2020-02-12T05:51:14Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "invertible_1x1_conv TODO 111271662 Remove when supported",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "tensor2tensor/models/research/glow_ops.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "bafdc1b67730430d38d6ab802cbd51f9d053ba2e",
+        "html_url": "https://github.com/tensorflow/tensor2tensor/commit/bafdc1b67730430d38d6ab802cbd51f9d053ba2e",
+        "message": "Internal change\n\nPiperOrigin-RevId: 521121284",
+        "author": "T2T Team",
+        "date": "2023-04-01T10:18:41Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment with bug ID",
+        "local workaround code block identified",
+        "function and variable context sufficient",
+        "no external dependency blocking removal",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

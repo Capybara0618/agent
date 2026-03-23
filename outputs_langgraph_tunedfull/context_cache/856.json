@@ -1,0 +1,438 @@
+{
+  "task_id": "856",
+  "repo_owner": "ovirt",
+  "repo_name": "vdsm",
+  "file_path": "lib/vdsm/storage/lvm.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:35:22+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:35:31+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:35:35+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lib/vdsm/storage/lvm.py",
+    "original_code": "def _addExtraCfg(self, cmd, devices=tuple(), use_lvmpolld=True):\n    newcmd = [constants.EXT_LVM, cmd[0]]\n\n    if devices:\n        dev_filter = _buildFilter(devices)\n    else:\n        dev_filter = self._getCachedFilter()\n\n    # TODO: remove locking type configuration\n    # once we require only lvm-2.03\n    conf = _buildConfig(\n        dev_filter=dev_filter,\n        locking_type=\"4\" if self._read_only else \"1\",\n        use_lvmpolld=\"1\" if use_lvmpolld else \"0\")\n    newcmd += [\"--config\", conf]\n\n    if len(cmd) > 1:\n        newcmd += cmd[1:]\n\n    return newcmd",
+    "satd_comment": "# TODO: remove locking type configuration\n# once we require only lvm-2.03",
+    "target_file": {
+      "ok": true,
+      "path": "lib/vdsm/storage/lvm.py",
+      "sha": "53e1000222efc6911c25f62fb12529efc55c31ac",
+      "download_url": "https://raw.githubusercontent.com/oVirt/vdsm/master/lib/vdsm/storage/lvm.py",
+      "content_excerpt": "# SPDX-FileCopyrightText: Red Hat, Inc.\n# SPDX-License-Identifier: GPL-2.0-or-later\n\n\"\"\"\nGeneric LVM interface wrapper\n\nIncapsulates the actual LVM mechanics.\n\"\"\"\nfrom __future__ import absolute_import\n\nimport os\nimport re\nimport pwd\nimport glob\nimport grp\nimport logging\nfrom collections import namedtuple\nimport pprint as pp\nimport subprocess\nimport threading\n\nfrom itertools import chain\n\nfrom vdsm import constants\nfrom vdsm import osinfo\nfrom vdsm import utils\nfrom vdsm.common import commands\nfrom vdsm.common import errors\nfrom vdsm.common import logutils\nfrom vdsm.common.units import MiB\n\nfrom vdsm.storage import devicemapper\nfrom vdsm.storage import constants as sc\nfrom vdsm.storage import exception as se\nfrom vdsm.storage import lsof\nfrom vdsm.storage import misc\nfrom vdsm.storage import multipath\n\nfrom vdsm.config import config\n\nlog = logging.getLogger(\"storage.lvm\")\n\nPV_FIELDS = (\"uuid,name,size,vg_name,vg_uuid,pe_start,pe_count,\"\n             \"pe_alloc_count,mda_count,dev_size,mda_used_count\")\nPV_FIELDS_LEN = len(PV_FIELDS.split(\",\"))\n\nVG_FIELDS = (\"uuid,name,attr,size,free,extent_size,extent_count,free_count,\"\n             \"tags,vg_mda_size,vg_mda_free,lv_count,pv_count,pv_name\")\nVG_FIELDS_LEN = len(VG_FIELDS.split(\",\"))\n\nLV_FIELDS = \"uuid,name,vg_name,attr,size,seg_start_pe,devices,tags\"\nLV_FIELDS_LEN = len(LV_FIELDS.split(\",\"))\n\nVG_ATTR_BITS = (\"permission\", \"resizeable\", \"exported\",\n                \"partial\", \"allocation\", \"clustered\")\nVG_ATTR = namedtuple(\"VG_ATTR\", VG_ATTR_BITS)\n\nLV_ATTR_BITS = (\"voltype\", \"permission\", \"allocations\", \"fixedminor\", \"state\",\n                \"devopen\", \"target\", \"zero\")\nLV_ATTR = namedtuple(\"LV_ATTR\", LV_ATTR_BITS)\n\n# Returned by vgs and pvs for missing pv or unknown vg name.\nUNKNOWN = \"[unknown]\"\n\n\nclass InvalidOutputLine(errors.Base):\n    msg = \"Invalid {self.command} command ouptut line: {self.line!r}\"\n\n    def __init__(self, command, line):\n        self.command = command\n        self.line = line\n\n\nclass PV(namedtuple(\"_PV\", PV_FIELDS + \",guid\")):\n    __slots__ = ()\n\n    @classmethod\n    def fromlvm(cls, *args):\n        \"\"\"\n        Create PV from lvm pvs command output.\n        \"\"\"\n        guid = os.path.basename(args[1])\n        args += (guid,)\n        return cls(*args)\n\n    def is_stale(self):\n        return False\n\n    def is_metadata_pv(self):\n        \"\"\"\n        This method returns boolean indicating whether this pv is used for\n        storing the vg metadata. When we create a vg we create on all the pvs 2\n        metadata areas but enable them only on one of the pvs, for that pv the\n        mda_used_count should be therefore 2 - see createVG().\n        \"\"\"\n        return self.mda_used_count == '2'\n\n\nclass VG(namedtuple(\"_VG\", VG_FIELDS + \",writeable,partial\")):\n    __slots__ = ()\n\n    @classmethod\n    def fromlvm(cls, *args):\n        \"\"\"\n        Create VG from lvm vgs command output.\n        \"\"\"\n        args = list(args)\n        # Convert tag string into tuple.\n        tags = _tags2Tuple(args[VG._fields.index(\"tags\")])\n        args[VG._fields.index(\"tags\")] = tags\n        # Convert attr string into named tuple fields.\n        # tuple(\"wz--n-\") = ('w', 'z', '-', '-', 'n', '-')\n        sAttr = args[VG._fields.index(\"attr\")]\n        attr_values = tuple(sAttr[:len(VG_ATTR._fields)])\n        attrs = VG_ATTR(*attr_values)\n        args[VG._fields.index(\"attr\")] = attrs\n        # Convert pv_names list to tuple.\n        args[VG._fields.index(\"pv_name\")] = \\\n            tuple(args[VG._fields.index(\"pv_name\")])\n        # Add properties. Should be ordered as VG_PROPERTIES.\n        args.append(attrs.permission == \"w\")  # Writable\n        args.append(VG_OK if attrs.partial == \"-\" else VG_PARTIAL)  # Partial\n        return cls(*args)\n\n    def is_stale(self):\n        return False\n\n\nclass LV(namedtuple(\"_LV\", LV_FIELDS + \",writeable,opened,active\")):\n    __slots__ = ()\n\n    @classmethod\n    def fromlvm(cls, *args):\n        \"\"\"\n        Create LV from lvm pvs command output.\n        \"\"\"\n        args = list(args)\n        # Convert tag string into tuple.\n        tags = _tags2Tuple(args[cls._fields.index(\"tags\")])\n        args[LV._fields.index(\"tags\")] = tags\n        # Convert attr string into named tuple fields.\n        sAttr = args[cls._fields.index(\"attr\")]\n        attr_values = tuple(sAttr[:len(LV_ATTR._fields)])\n        attrs = LV_ATTR(*attr_values)\n        args[cls._fields.index(\"attr\")] = attrs\n        # Add properties. Should be ordered as VG_PROPERTIES.\n        args.append(attrs.permission == \"w\")  # writable\n        args.append(attrs.devopen == \"o\")     # opened\n        args.append(attrs.state == \"a\")       # active\n        return cls(*args)\n\n    def is_stale(self):\n        return False\n\n\nclass Stale(namedtuple(\"_Stale\", \"name\")):\n    __slots__ = ()\n\n    def is_stale(self):\n        return True\n\n\nclass Unreadable(namedtuple(\"_Unreadable\", \"name\")):\n    __slots__ = ()\n\n    def is_stale(self):\n        return True\n\n    def __getattr__(self, attrName):\n        log.warning(\"%s can't be reloaded, please check your storage \"\n                    \"connections.\", self.name)\n        raise AttributeError(\"Failed reload: %s\" % self.name)\n\n\n# VG states\nVG_OK = \"OK\"\nVG_PARTIAL = \"PARTIAL\"\n\nSEPARATOR = \"|\"\nLVM_NOBACKUP = (\"--autobackup\", \"n\")\nLVM_FLAGS = (\"--noheadings\", \"--units\", \"b\", \"--nosuffix\", \"--separator\",\n             SEPARATOR, \"--ignoreskippedcluster\")\n\nPV_PREFIX = \"/dev/mapper\"\n# Assuming there are no spaces in the PV name\nre_pvName = re.compile(PV_PREFIX + r'[^\\s\\\"]+', re.MULTILINE)\n\nPVS_CMD = (\"pvs\",) + LVM_FLAGS + (\"-o\", PV_FIELDS)\nVGS_CMD = (\"vgs\",) + LVM_FLAGS + (\"-o\", VG_FIELDS)\nLVS_CMD = (\"lvs\",) + LVM_FLAGS + (\"-o\", LV_FIELDS)\n\n# FIXME we must use different METADATA_USER ownership for qemu-unreadable\n# metadata volumes\nUSER_GROUP = constants.DISKIMAGE_USER + \":\" + constants.DISKIMAGE_GROUP\n\n# Runtime configuration notes\n# ===========================\n#\n# This configuration is used for all commands using --config option. This\n# overrides various options built into lvm comamnds, or defined in\n# /etc/lvm/lvm.conf or /etc/lvm/lvmlocl.conf.\n#\n# hints=\"none\"\n# ------------\n# prevent from lvm to remember which devices are PVs so that lvm can avoid\n# scanning other devices that are not PVs, since we create and remove PVs from\n# other hosts, then the hints might be wrong.  Finally because oVirt host is\n# like to use strict lvm filter, the hints are not needed.  Disable hints for\n# lvm commands run by vdsm, even if hints are enabled on the host.\n#\n# obtain_device_list_from_udev=0\n# ------------------------------\n# Avoid random faiures in lvcreate an lvchange seen during stress tests\n# (using tests/storage/stress/reload.py). This was disabled in RHEL 6, and\n# enabled back in RHEL 7, and seems to be broken again in RHEL 8.\n\nLVMCONF_TEMPLATE = \"\"\"\ndevices {\n preferred_names=[\"^/dev/mapper/\"]\n ignore_suspended_devices=1\n write_cache_state=0\n disable_after_error_count=3\n %(filter)s\n hints=\"none\"\n obtain_device_list_from_udev=0\n}\nglobal {\n prioritise_write_locks=1\n wait_for_locks=1\n use_lvmpolld=%(use_lvmpolld)s\n}\nbackup {\n retain_min=50\n retain_days=0\n}\n\"\"\"\n\nUSER_DEV_LIST = [d for d in config.get(\"irs\", \"lvm_dev_whitelist\").split(\",\")\n                 if d is not None]\n\nUSE_DEVICES = config.get(\"lvm\", \"config_method\").lower() == \"devices\"\n\n\ndef _get_lvm_version():\n    packages = osinfo.package_versions()\n    lvm_version = tuple(\n        int(v)\n        for v in packages['lvm2']['version'].split('.')\n    )\n    return lvm_version\n\n\ndef _prepare_device_set(devs):\n    devices = set(d.strip() for d in chain(devs, USER_DEV_LIST))\n    devices.discard('')\n    if devices:\n        devices = sorted(d.replace(r'\\x', r'\\\\x') for d in devices)\n    return devices\n\n\ndef _buildFilter(devices):\n    if devices:\n        # Accept specified devices, reject everything else.\n        # [\"a|^/dev/1$|^/dev/2$|\", \"r|.*|\"]\n        pattern = \"|\".join(\"^{}$\".format(d) for d in devices)\n        accept = '\"a|{}|\", '.format(pattern)\n    else:\n        # Reject all devices.\n        # [\"r|.*|\"]\n        accept = ''\n    return '[{}\"r|.*|\"]'.format(accept)\n\n\ndef _buildConfig(dev_filter=\"\", use_lvmpolld=\"1\"):\n    if dev_filter:\n        dev_filter = f\"filter={dev_filter}\"\n\n    conf = LVMCONF_TEMPLATE % {\n        \"filter\": dev_filter,\n        \"use_lvmpolld\": use_lvmpolld,\n    }\n    return conf.replace(\"\\n\", \" \").strip()\n\n\n#\n# Make sure that \"args\" is suitable for consumption in interfaces\n# that expect an iterabale argument. As we pass as an argument on of\n# None, list or string, we check only None and string.\n# Once we enforce iterables in all functions, this function should be removed.\n#\ndef normalize_args(args=None):\n    if args is None:\n        args = []\n    elif isinstance(args, str):\n        args = [args]\n\n    return args\n\n\ndef _tags2Tuple(sTags):\n    \"\"\"\n    Tags comma separated string as a list.\n\n    Return an empty tuple for sTags == \"\"\n    \"\"\"\n    return tuple(sTags.split(\",\")) if sTags else tuple()\n\n\nclass LVMRunner(object):\n    \"\"\"\n    Does actual execution of the LVM command and handle output, e.g. decode\n    output or log warnings.\n    \"\"\"\n\n    # Warnings written to LVM stderr that should not be logged as warnings.\n    SUPPRESS_WARNINGS = re.compile(\n        \"|\".join([\n            \"WARNING: This metadata update is NOT backed up\",\n            (r\"WARNING: ignoring metadata seqno \\d+ on /dev/mapper/\\w+ for \"\n             r\"seqno \\d+ on /dev/mapper/\\w+ for VG \\w+\"),\n            r\"WARNING: Inconsistent metadata found for VG \\w+\",\n            (\"WARNING: Activation disabled. No device-mapper interaction \"\n             \"will be attempted\"),\n        ]),\n        re.IGNORECASE)\n\n    def run(self, cmd):\n        \"\"\"\n        Run LVM command, logging warnings for successful commands.\n\n        An example case is when LVM decide to fix VG metadata when running a\n        command that should not change the metadata on non-SPM host. In this\n        case LVM will log this warning:\n\n            WARNING: Inconsistent metadata found for VG xxx-yyy-zzz - updating\n            to use version 42\n\n        We log warnings only for successful commands since callers are already\n        handling failures.\n        \"\"\"\n\n        rc, out, err = self._run_command(cmd)\n\n        out = out.decode(\"utf-8\").splitlines()\n        err = err.decode(\"utf-8\").splitlines()\n\n        err = [s for s in err if not self.SUPPRESS_WARNINGS.search(s)]\n\n        if rc == 0 and err:\n            log.warning(\"Command %s succeeded with warnings: %s\", cmd, err)\n\n        if rc != 0:\n            raise se.LVMCommandError(cmd, rc, out, err)\n\n        return out\n\n    def _run_command(self, cmd):\n        p = commands.start(\n            cmd,\n            sudo=True,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE\n        )\n        out, err = commands.communicate(p)\n        return p.returncode, out, err\n\n\nclass LVMCache(object):\n    \"\"\"\n    Keep all the LVM information.\n    \"\"\"\n\n    # Maximum number of concurent commands. This is important both for\n    # limiting the I/O caused by lvm comamdns during refreshes, and for\n    # having exponential back-off for read-only commands.\n    MAX_COMMANDS = 10\n\n    def __init__(self, cmd_runner=LVMRunner(), cache_lvs=False):\n        \"\"\"\n        Arguemnts:\n            cmd_runner (LVMRunner): used to run LVM command\n            cache_lvs (bool): use LVs cache when looking up LVs. False by\n                defualt since it works only on the SPM.\n        \"\"\"\n        self._runner = cmd_runner\n        self._cache_lvs = cache_lvs\n        self._devices = None\n        self._devices_stale = True\n        self._devices_lock = threading.Lock()\n        self._lock = threading.Lock()\n        self._cmd_sem = threading.BoundedSemaphore(self.MAX_COMMANDS)\n        self._stalepv = True\n        self._stalevg = True\n        self._freshlv = set()\n        self._pvs = {}\n        self._vgs = {}\n        self._lvs = {}\n        self._stats = CacheStats()\n\n    @property\n    def stats(self):\n        return self._stats",
+      "total_lines": 2013
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "os",
+        "re",
+        "pwd",
+        "glob",
+        "grp",
+        "logging",
+        "collections:namedtuple",
+        "pprint",
+        "subprocess",
+        "threading",
+        "itertools:chain",
+        "vdsm:constants",
+        "vdsm:osinfo",
+        "vdsm:utils",
+        "vdsm.common:commands",
+        "vdsm.common:errors",
+        "vdsm.common:logutils",
+        "vdsm.common.units:MiB",
+        "vdsm.storage:devicemapper",
+        "vdsm.storage:constants",
+        "vdsm.storage:exception",
+        "vdsm.storage:lsof",
+        "vdsm.storage:misc",
+        "vdsm.storage:multipath",
+        "vdsm.config:config"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/oVirt/vdsm/master/README.md",
+      "content_excerpt": "<!--\nSPDX-FileCopyrightText: Red Hat, Inc.\nSPDX-License-Identifier: GPL-2.0-or-later\n-->\n\n# Virtual Desktop Server Manager\n\n[![CI Status](https://github.com/oVirt/vdsm/actions/workflows/ci.yml/badge.svg)](https://github.com/oVirt/vdsm/actions)\n[![Copr build status](https://copr.fedorainfracloud.org/coprs/ovirt/ovirt-master-snapshot/package/vdsm/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/ovirt/ovirt-master-snapshot/package/vdsm/)\n\nWelcome to the Vdsm source repository.\n\nThe Vdsm service exposes an API for managing virtualization\nhosts running the KVM hypervisor technology. Vdsm manages and monitors\nthe host's storage, memory and networks as well as virtual machine\ncreation, other host administration tasks, statistics gathering, and\nlog collection.\n\n## How to contribute\n\n### Contibuting\n\nTo contribute please read the [development](./doc/development.md)\ndocumentation.\n\n### Submitting patches\n\nPlease use GitHub pull requests.\n\n### Found a bug or documentation issue?\n\nTo submit a bug or suggest an enhancement for Vdsm please use\nGitHub [issues](https://github.com/oVirt/vdsm/issues).\n\nIf you find a documentation issue on the oVirt website please navigate\nand click \"Report an issue on GitHub\" in the page footer.\n\n### Code review history\n\nVdsm moved to GitHub on Jan 9, 2022. To look up code reviews before this\ndate, please check the [Gerrit vdsm project](https://gerrit.ovirt.org/q/project:vdsm+is:merged).\n\n## Manual installation\n\nAdd ovirt repositories to your repositories list.\n\nFor CentOS Stream 9 use:\n\n    sudo dnf copr enable -y ovirt/ovirt-master-sna"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_addExtraCfg test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_addExtraCfg(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "lvm.py",
+          "path": "lib/vdsm/storage/lvm.py",
+          "sha": "53e1000222efc6911c25f62fb12529efc55c31ac",
+          "html_url": "https://github.com/oVirt/vdsm/blob/fa1a6c1a81841cc597012bb2ff0a35f8dc544d16/lib/vdsm/storage/lvm.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lib/vdsm/storage",
+      "count": 40,
+      "entries": [
+        {
+          "name": "Makefile.am",
+          "path": "lib/vdsm/storage/Makefile.am",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "lib/vdsm/storage/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "asyncevent.py",
+          "path": "lib/vdsm/storage/asyncevent.py",
+          "type": "file"
+        },
+        {
+          "name": "asyncutils.py",
+          "path": "lib/vdsm/storage/asyncutils.py",
+          "type": "file"
+        },
+        {
+          "name": "backends.py",
+          "path": "lib/vdsm/storage/backends.py",
+          "type": "file"
+        },
+        {
+          "name": "bitmaps.py",
+          "path": "lib/vdsm/storage/bitmaps.py",
+          "type": "file"
+        },
+        {
+          "name": "blkdiscard.py",
+          "path": "lib/vdsm/storage/blkdiscard.py",
+          "type": "file"
+        },
+        {
+          "name": "blockSD.py",
+          "path": "lib/vdsm/storage/blockSD.py",
+          "type": "file"
+        },
+        {
+          "name": "blockVolume.py",
+          "path": "lib/vdsm/storage/blockVolume.py",
+          "type": "file"
+        },
+        {
+          "name": "blockdev.py",
+          "path": "lib/vdsm/storage/blockdev.py",
+          "type": "file"
+        },
+        {
+          "name": "check.py",
+          "path": "lib/vdsm/storage/check.py",
+          "type": "file"
+        },
+        {
+          "name": "clusterlock.py",
+          "path": "lib/vdsm/storage/clusterlock.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "lib/vdsm/storage/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "curl-img-wrap",
+          "path": "lib/vdsm/storage/curl-img-wrap",
+          "type": "file"
+        },
+        {
+          "name": "curlImgWrap.py",
+          "path": "lib/vdsm/storage/curlImgWrap.py",
+          "type": "file"
+        },
+        {
+          "name": "devicemapper.py",
+          "path": "lib/vdsm/storage/devicemapper.py",
+          "type": "file"
+        },
+        {
+          "name": "directio.py",
+          "path": "lib/vdsm/storage/directio.py",
+          "type": "file"
+        },
+        {
+          "name": "dispatcher.py",
+          "path": "lib/vdsm/storage/dispatcher.py",
+          "type": "file"
+        },
+        {
+          "name": "dmsetup.py",
+          "path": "lib/vdsm/storage/dmsetup.py",
+          "type": "file"
+        },
+        {
+          "name": "exception.py",
+          "path": "lib/vdsm/storage/exception.py",
+          "type": "file"
+        },
+        {
+          "name": "fallocate.py",
+          "path": "lib/vdsm/storage/fallocate.py",
+          "type": "file"
+        },
+        {
+          "name": "fc-scan",
+          "path": "lib/vdsm/storage/fc-scan",
+          "type": "file"
+        },
+        {
+          "name": "fileSD.py",
+          "path": "lib/vdsm/storage/fileSD.py",
+          "type": "file"
+        },
+        {
+          "name": "fileUtils.py",
+          "path": "lib/vdsm/storage/fileUtils.py",
+          "type": "file"
+        },
+        {
+          "name": "fileVolume.py",
+          "path": "lib/vdsm/storage/fileVolume.py",
+          "type": "file"
+        },
+        {
+          "name": "formatconverter.py",
+          "path": "lib/vdsm/storage/formatconverter.py",
+          "type": "file"
+        },
+        {
+          "name": "fsutils.py",
+          "path": "lib/vdsm/storage/fsutils.py",
+          "type": "file"
+        },
+        {
+          "name": "fuser.py",
+          "path": "lib/vdsm/storage/fuser.py",
+          "type": "file"
+        },
+        {
+          "name": "glance.py",
+          "path": "lib/vdsm/storage/glance.py",
+          "type": "file"
+        },
+        {
+          "name": "glusterSD.py",
+          "path": "lib/vdsm/storage/glusterSD.py",
+          "type": "file"
+        },
+        {
+          "name": "glusterVolume.py",
+          "path": "lib/vdsm/storage/glusterVolume.py",
+          "type": "file"
+        },
+        {
+          "name": "guarded.py",
+          "path": "lib/vdsm/storage/guarded.py",
+          "type": "file"
+        },
+        {
+          "name": "hba.py",
+          "path": "lib/vdsm/storage/hba.py",
+          "type": "file"
+        },
+        {
+          "name": "hsm.py",
+          "path": "lib/vdsm/storage/hsm.py",
+          "type": "file"
+        },
+        {
+          "name": "image.py",
+          "path": "lib/vdsm/storage/image.py",
+          "type": "file"
+        },
+        {
+          "name": "imageSharing.py",
+          "path": "lib/vdsm/storage/imageSharing.py",
+          "type": "file"
+        },
+        {
+          "name": "imagetickets.py",
+          "path": "lib/vdsm/storage/imagetickets.py",
+          "type": "file"
+        },
+        {
+          "name": "iscsi.py",
+          "path": "lib/vdsm/storage/iscsi.py",
+          "type": "file"
+        },
+        {
+          "name": "iscsiadm.py",
+          "path": "lib/vdsm/storage/iscsiadm.py",
+          "type": "file"
+        },
+        {
+          "name": "localFsSD.py",
+          "path": "lib/vdsm/storage/localFsSD.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "Makefile.am",
+          "path": "lib/vdsm/storage/Makefile.am"
+        },
+        {
+          "name": "__init__.py",
+          "path": "lib/vdsm/storage/__init__.py"
+        },
+        {
+          "name": "asyncevent.py",
+          "path": "lib/vdsm/storage/asyncevent.py"
+        },
+        {
+          "name": "asyncutils.py",
+          "path": "lib/vdsm/storage/asyncutils.py"
+        },
+        {
+          "name": "backends.py",
+          "path": "lib/vdsm/storage/backends.py"
+        },
+        {
+          "name": "bitmaps.py",
+          "path": "lib/vdsm/storage/bitmaps.py"
+        },
+        {
+          "name": "blkdiscard.py",
+          "path": "lib/vdsm/storage/blkdiscard.py"
+        },
+        {
+          "name": "blockSD.py",
+          "path": "lib/vdsm/storage/blockSD.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lib/vdsm/storage/lvm.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "1b1a21054b42335c9b6cbca7e9d3f34022f8c737",
+          "html_url": "https://github.com/oVirt/vdsm/commit/1b1a21054b42335c9b6cbca7e9d3f34022f8c737",
+          "message": "storage: add --fs ignore to lvreduce on lvm > 2.03.17\n\nSince LVM v2.03.17 (https://github.com/lvmteam/lvm2/commit/f6f2737015746b1b6c7fbd0d297a4596c584749b), reducing a logical volume (LV) requires the LV to be active due to the default 'checksize' option, which requires an active LV. This results in",
+          "author": "Brooklyn Dewolf",
+          "date": "2024-05-23T07:56:11Z"
+        },
+        {
+          "sha": "fc61b50283a90ac94722426907ea2792df240b9b",
+          "html_url": "https://github.com/oVirt/vdsm/commit/fc61b50283a90ac94722426907ea2792df240b9b",
+          "message": "reuse: addheader GPL storage/*.py\n\nAdd GPL copyright header to storage python files.\n\nSigned-off-by: Albert Esteve <aesteve@redhat.com>",
+          "author": "Albert Esteve",
+          "date": "2022-09-06T14:27:14Z"
+        },
+        {
+          "sha": "ecfb3f83aca093f919042fc8d46db789fcba9875",
+          "html_url": "https://github.com/oVirt/vdsm/commit/ecfb3f83aca093f919042fc8d46db789fcba9875",
+          "message": "compat: remove subprocess32 import\n\nIn the compat module subprocess32 was imported\nfor back compatibility with python2. Since\nit is not required anymore, we can just drop it.\n\nSigned-off-by: Albert Esteve <aesteve@redhat.com>",
+          "author": "Albert Esteve",
+          "date": "2022-09-08T08:47:32Z"
+        },
+        {
+          "sha": "9bf9a30230ae318a7798a25b5ab362ce33a006a7",
+          "html_url": "https://github.com/oVirt/vdsm/commit/9bf9a30230ae318a7798a25b5ab362ce33a006a7",
+          "message": "lvm: disable vg autoactivation in createVG\n\nDisable setautoactivation attribute of a VG in\nits creation in order to avoid unwanted VG activation.\n\nAdd a test to verify that LVs in a VG cannot be\nautoactivated after creation.\n\nFixes #229\nSigned-off-by: Albert Esteve <aesteve@redhat.com>",
+          "author": "Albert Esteve",
+          "date": "2022-06-06T07:48:44Z"
+        },
+        {
+          "sha": "d43d31f5a1f165bcff68ac9b4d38645c2761015f",
+          "html_url": "https://github.com/oVirt/vdsm/commit/d43d31f5a1f165bcff68ac9b4d38645c2761015f",
+          "message": "lvm: remove outdated warning\n\nThis log is left over from times we retried the lvm command\nbefore failing. Now we run once with specific lvm devices, and again\nwith all devices, so this log is not very helpful and can be removed.\n\nBug-Url: https://bugzilla.redhat.com/2048545\nSigned-off-by: Albert Est",
+          "author": "Albert Esteve",
+          "date": "2022-05-02T14:27:03Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_addExtraCfg TODO remove locking type configuration",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lib/vdsm/storage/lvm.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "1b1a21054b42335c9b6cbca7e9d3f34022f8c737",
+        "html_url": "https://github.com/oVirt/vdsm/commit/1b1a21054b42335c9b6cbca7e9d3f34022f8c737",
+        "message": "storage: add --fs ignore to lvreduce on lvm > 2.03.17\n\nSince LVM v2.03.17 (https://github.com/lvmteam/lvm2/commit/f6f2737015746b1b6c7fbd0d297a4596c584749b), reducing a logical volume (LV) requires the LV to be active due to the default 'checksize' option, which requires an active LV. This results in",
+        "author": "Brooklyn Dewolf",
+        "date": "2024-05-23T07:56:11Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

@@ -1,0 +1,335 @@
+{
+  "task_id": "156",
+  "repo_owner": "ooici",
+  "repo_name": "pyon",
+  "file_path": "pyon/ion/event.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T15:57:18+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 119,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T15:57:30+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T15:57:36+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "pyon/ion/event.py",
+    "original_code": "def publish_event_object(self, event_object):\n    \"\"\"\n    Publishes an event of given type for the given origin. Event_type defaults to an\n    event_type set when initializing the EventPublisher. Other kwargs fill out the fields\n    of the event. This operation will fail with an exception.\n    @param event_object     the event object to be published\n    @retval event_object    the event object which was published\n    \"\"\"\n    assert event_object\n\n    topic = self._topic(event_object)\n    to_name = (self._send_name.exchange, topic)\n    log.trace(\"Publishing event message to %s\", to_name)\n\n    current_time = int(get_ion_ts())\n\n    #Ensure valid created timestamp if supplied\n    if event_object.ts_created:\n\n        if not is_valid_ts(event_object.ts_created):\n            raise BadRequest(\"The ts_created value is not a valid timestamp: '%s'\" % (event_object.ts_created))\n\n        #Reject events that are older than specified time\n        if int(event_object.ts_created) > ( current_time + VALID_EVENT_TIME_PERIOD ):\n            raise BadRequest(\"This ts_created value is too far in the future:'%s'\" % (event_object.ts_created))\n\n        #Reject events that are older than specified time\n        if int(event_object.ts_created) < (current_time - VALID_EVENT_TIME_PERIOD) :\n            raise BadRequest(\"This ts_created value is too old:'%s'\" % (event_object.ts_created))\n\n    else:\n        event_object.ts_created = str(current_time)\n\n    #Validate this object\n    #TODO - enable this once the resource agent issue sending a dict is figured out\n    #event_object._validate()\n\n    #Ensure the event object has a unique id\n    if '_id' in event_object:\n        raise BadRequest(\"The event object cannot contain a _id field '%s'\" % (event_object))\n\n    #Generate a unique ID for this event\n    event_object._id = create_unique_event_id()\n\n    try:\n        self.publish(event_object, to_name=to_name)\n    except Exception as ex:\n        log.exception(\"Failed to publish event (%s): '%s'\" % (ex.message, event_object))\n        raise\n\n    return event_object",
+    "satd_comment": "#TODO - enable this once the resource agent issue sending a dict is figured out\n#event_object._validate()",
+    "target_file": {
+      "ok": true,
+      "path": "pyon/ion/event.py",
+      "sha": "c75ae05e4e4be232a0db64a0804bd15883b839c1",
+      "download_url": "https://raw.githubusercontent.com/ooici/pyon/master/pyon/ion/event.py",
+      "content_excerpt": "#!/usr/bin/env python\n\n\"\"\"Events framework with publisher, subscriber and repository.\"\"\"\n\n__author__ = 'Dave Foster <dfoster@asascience.com>, Michael Meisinger'\n\nimport functools\nimport sys\nimport traceback\nfrom gevent import event as gevent_event\n\nfrom pyon.core import bootstrap\nfrom pyon.core.exception import BadRequest, IonException, StreamException\nfrom pyon.datastore.datastore import DataStore\nfrom pyon.datastore.datastore_query import QUERY_EXP_KEY, DatastoreQueryBuilder, DQ\nfrom pyon.ion.identifier import create_unique_event_id, create_simple_unique_id\nfrom pyon.net.endpoint import Publisher, Subscriber\nfrom pyon.util.async import spawn\nfrom pyon.util.containers import get_ion_ts_millis, is_valid_ts\nfrom pyon.util.log import log\n\nfrom interface.objects import Event\n\n\n# @TODO: configurable\nEVENTS_XP = \"pyon.events\"\nEVENTS_XP_TYPE = \"topic\"\n\n#The event will be ignored if older than this time period\nVALID_EVENT_TIME_PERIOD = 365 * 24 * 60 * 60 * 1000   # one year\n\ndef get_events_exchange_point():\n    return \"%s.%s\" % (bootstrap.get_sys_name(), EVENTS_XP)\n\n\nclass EventError(IonException):\n    status_code = 500\n\n\nclass EventPublisher(Publisher):\n\n    def __init__(self, event_type=None, xp=None, process=None, **kwargs):\n        \"\"\"\n        Constructs a publisher of events for a specific type.\n\n        @param  event_type  The name of the event type object\n        @param  xp          Exchange (AMQP) name, can be none, will use events default.\n        \"\"\"\n\n        self.event_type = event_type\n        self.process = process\n\n        if bootstrap.container_instance and getattr(bootstrap.container_instance, 'event_repository', None):\n            self.event_repo = bootstrap.container_instance.event_repository\n        else:\n            self.event_repo = None\n\n        # generate an exchange name to publish events to\n        xp = xp or get_events_exchange_point()\n        name = (xp, None)\n\n        Publisher.__init__(self, to_name=name, **kwargs)\n\n    def _topic(self, event_object):\n        \"\"\"\n        Builds the topic that this event should be published to.\n        \"\"\"\n        assert event_object\n        base_types = event_object.base_types or []\n        base_str = \".\".join(reversed(base_types))\n        sub_type = event_object.sub_type or \"_\"\n        origin_type = event_object.origin_type or \"_\"\n        routing_key = \"%s.%s.%s.%s.%s\" % (base_str, event_object._get_type(), sub_type, origin_type, event_object.origin)\n        return routing_key\n\n\n    def publish_event_object(self, event_object):\n        \"\"\"\n        Publishes an event of given type for the given origin. Event_type defaults to an\n        event_type set when initializing the EventPublisher. Other kwargs fill out the fields\n        of the event. This operation will fail with an exception.\n        @param event_object     the event object to be published\n        @retval event_object    the event object which was published\n        \"\"\"\n        if not event_object:\n            raise BadRequest(\"Must provide event_object\")\n\n        event_object.base_types = event_object._get_extends()\n\n        topic = self._topic(event_object)  # Routing key generated using type_, base_types, origin, origin_type, sub_type\n        to_name = (self._send_name.exchange, topic)\n\n        current_time = get_ion_ts_millis()\n\n        # Ensure valid created timestamp if supplied\n        if event_object.ts_created:\n\n            if not is_valid_ts(event_object.ts_created):\n                raise BadRequest(\"The ts_created value is not a valid timestamp: '%s'\" % (event_object.ts_created))\n\n            # Reject events that are older than specified time\n            if int(event_object.ts_created) > ( current_time + VALID_EVENT_TIME_PERIOD ):\n                raise BadRequest(\"This ts_created value is too far in the future:'%s'\" % (event_object.ts_created))\n\n            # Reject events that are older than specified time\n            if int(event_object.ts_created) < (current_time - VALID_EVENT_TIME_PERIOD) :\n                raise BadRequest(\"This ts_created value is too old:'%s'\" % (event_object.ts_created))\n\n        else:\n            event_object.ts_created = str(current_time)\n\n        # Set the actor id based on\n        if not event_object.actor_id:\n            event_object.actor_id = self._get_actor_id()\n\n        #Validate this object - ideally the validator should pass on problems, but for now just log\n        #any errors and keep going, since seeing invalid situations are better than skipping validation.\n        try:\n            event_object._validate()\n        except Exception, e:\n            log.exception(e)\n\n\n        #Ensure the event object has a unique id\n        if '_id' in event_object:\n            raise BadRequest(\"The event object cannot contain a _id field '%s'\" % (event_object))\n\n        #Generate a unique ID for this event\n        event_object._id = create_unique_event_id()\n\n        try:\n            self.publish(event_object, to_name=to_name)\n        except Exception as ex:\n            log.exception(\"Failed to publish event (%s): '%s'\" % (ex.message, event_object))\n            raise\n\n        return event_object\n\n\n    def publish_event(self, origin=None, event_type=None, **kwargs):\n        \"\"\"\n        Publishes an event of given type for the given origin. Event_type defaults to an\n        event_type set when initializing the EventPublisher. Other kwargs fill out the fields\n        of the event. This operation will fail with an exception.\n        @param origin     the origin field value\n        @param event_type the event type (defaults to the EventPublisher's event_type if set)\n        @param kwargs     additional event fields\n        @retval event_object    the event object which was published\n        \"\"\"\n\n        event_type = event_type or self.event_type\n        if not event_type:\n            raise BadRequest(\"No event_type provided\")\n\n        event_object = bootstrap.IonObject(event_type, origin=origin, **kwargs)\n        ret_val = self.publish_event_object(event_object)\n        return ret_val\n\n    def _get_actor_id(self):\n        \"\"\"Returns the current ion-actor-id from incoming process headers\"\"\"\n        actor_id = \"\"\n        try:\n            if self.process:\n                ctx = self.process.get_context()\n                actor_id = ctx.get('ion-actor-id', None) or \"\"\n        except Exception as ex:\n            pass\n\n        return actor_id\n\n\nclass BaseEventSubscriberMixin(object):\n    \"\"\"\n    A mixin class for Event subscribers to facilitate inheritance.\n\n    EventSubscribers must come in both standard and process level versions, which\n    rely on common base code. It is difficult to multiple inherit due to both of\n    them sharing a base class, so this mixin is preferred.\n    \"\"\"\n\n    @staticmethod\n    def _topic(event_type, origin, sub_type=None, origin_type=None):\n        \"\"\"\n        Builds the topic that this event should be published to.\n        If either side of the event_id.origin pair are missing, will subscribe to anything.\n        \"\"\"\n        if event_type == \"Event\":\n            event_type = \"Event.#\"\n        elif event_type:\n            event_type = \"#.%s.#\" % event_type\n        else:\n            event_type = \"#\"\n\n        sub_type = sub_type or \"*.#\"\n        origin_type = origin_type or \"*\"\n        origin      = origin or \"*\"\n\n        return \"%s.%s.%s.%s\" % (event_type, sub_type, origin_type, origin)\n\n    def __init__(self, xp_name=None, event_type=None, origin=None, queue_name=None,\n                 sub_type=None, origin_type=None, pattern=None):\n        self.event_type = event_type\n        self.sub_type = sub_type\n        self.origin_type = origin_type\n        self.origin = origin\n\n        xp_name = xp_name or get_events_exchange_point()\n        if pattern:\n            binding = pattern\n        else:\n            binding = self._topic(event_type, origin, sub_type, origin_type)\n        self.binding = binding\n\n        # TODO: Provide a case where we can have multiple bindings (e.g. different event_types)\n\n        # prefix the queue_name, if specified, with the sysname\n        if queue_name is not None:\n            if not queue_name.startswith(bootstrap.get_sys_name()):\n                queue_name = \"%s.%s\" % (bootstrap.get_sys_name(), queue_name)\n        else:\n            queue_name = create_simple_unique_id()\n            if hasattr(self, \"_process\") and self._process:\n                queue_name = \"%s_%s\" % (self._process._proc_name, queue_name)\n            queue_name = \"%s.%s\" % (bootstrap.get_sys_name(), queue_name)\n\n        # set this name to be picked up by inherited folks\n        self._ev_recv_name = (xp_name, queue_name)\n\n\nclass EventSubscriber(Subscriber, BaseEventSubscriberMixin):\n\n    ALL_EVENTS = \"#\"\n\n    def __init__(self, xp_name=None, event_type=None, origin=None, queue_name=None, callback=None,\n                 sub_type=None, origin_type=None, pattern=None, auto_delete=None, *args, **kwargs):\n        \"\"\"\n        Initializer.\n\n        If the queue_name is specified here, the sysname is prefixed automatically to it. This is because\n        named queues are not namespaces to their exchanges, so two different systems on the same broker\n        can cross-pollute messages if a named queue is used.\n\n        Note: an EventSubscriber needs to be closed to free broker resources\n        \"\"\"\n        self._cbthread = None\n        self._auto_delete = auto_delete\n\n        BaseEventSubscriberMixin.__init__(self, xp_name=xp_name, event_type=event_type, origin=origin,\n                                          queue_name=queue_name, sub_type=sub_type, origin_type=origin_type, pattern=pattern)\n\n        log.debug(\"EventPublisher events pattern %s\", self.binding)\n\n        Subscriber.__init__(self, from_name=self._ev_recv_name, binding=self.binding, callback=callback, **kwargs)\n\n    def start(self):\n        \"\"\"\n        Pass in a subscriber here, this will make it listen in a background greenlet.\n        \"\"\"\n        assert not self._cbthread, \"start called twice on EventSubscriber\"\n        gl = spawn(self.listen)\n        gl._glname = \"EventSubscriber\"\n        self._cbthread = gl\n        if not self._ready_event.wait(timeout=5):\n            log.warning('EventSubscriber start timed out.')\n        log.debug(\"EventSubscriber started. Event pattern=%s\", self.binding)\n        return gl\n\n    def stop(self):\n        self.close()\n        self._cbthread.join(timeout=5)\n        self._cbthread.kill()\n        self._cbthread = None\n        log.debug(\"EventSubscriber stopped. Event pattern=%s\", self.binding)\n\n    def __str__(self):\n        return \"EventSubscriber at %s:\\n\\trecv_name: %s\\n\\tcb: %s\" % (hex(id(self)), str(self._recv_name), str(self._callback))\n\n    def _create_channel(self, **kwargs):\n        \"\"\"\n        Override to set the channel's queue_auto_delete property.\n        \"\"\"\n        ch = Subscriber._create_channel(self, **kwargs)\n        if self._auto_delete is not None:\n            ch.queue_auto_delete = self._auto_delete\n\n        return ch\n\nclass EventRepository(object):\n    \"\"\"\n    Class that uses a data store to provide a persistent repository for ION events.\n    \"\"\"\n\n    def __init__(self, datastore_manager=None, container=None):\n        self.container = container or bootstrap.container_instance\n\n        # Get an instance of datastore configured as directory.\n        # May be persistent or mock, forced clean, with indexes\n        datastore_manager = datastore_manager or self.container.datastore_manager\n        self.event_store = datastore_manager.get_datastore(\"events\", DataStore.DS_PROFILE.EVENTS)\n\n    def start(self):\n        pass\n\n    def stop(self):\n        self.close()\n\n    def close(self):\n        \"\"\"\n        Pass-through method to close the underlying datastore.\n        \"\"\"\n        self.event_store.close()\n\n    def put_event(self, event):\n        log.trace(\"Store event persistently %s\", event)\n        if not isinstance(event, Event):\n            raise BadRequest(\"event must be type Event, not %s\" % type(event))\n        event_id ",
+      "total_lines": 457
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 119,
+      "start_line": 99,
+      "end_line": 139,
+      "matched_line": "            event_object._validate()",
+      "excerpt": "99:                 raise BadRequest(\"The ts_created value is not a valid timestamp: '%s'\" % (event_object.ts_created))\n100: \n101:             # Reject events that are older than specified time\n102:             if int(event_object.ts_created) > ( current_time + VALID_EVENT_TIME_PERIOD ):\n103:                 raise BadRequest(\"This ts_created value is too far in the future:'%s'\" % (event_object.ts_created))\n104: \n105:             # Reject events that are older than specified time\n106:             if int(event_object.ts_created) < (current_time - VALID_EVENT_TIME_PERIOD) :\n107:                 raise BadRequest(\"This ts_created value is too old:'%s'\" % (event_object.ts_created))\n108: \n109:         else:\n110:             event_object.ts_created = str(current_time)\n111: \n112:         # Set the actor id based on\n113:         if not event_object.actor_id:\n114:             event_object.actor_id = self._get_actor_id()\n115: \n116:         #Validate this object - ideally the validator should pass on problems, but for now just log\n117:         #any errors and keep going, since seeing invalid situations are better than skipping validation.\n118:         try:\n119:             event_object._validate()\n120:         except Exception, e:\n121:             log.exception(e)\n122: \n123: \n124:         #Ensure the event object has a unique id\n125:         if '_id' in event_object:\n126:             raise BadRequest(\"The event object cannot contain a _id field '%s'\" % (event_object))\n127: \n128:         #Generate a unique ID for this event\n129:         event_object._id = create_unique_event_id()\n130: \n131:         try:\n132:             self.publish(event_object, to_name=to_name)\n133:         except Exception as ex:\n134:             log.exception(\"Failed to publish event (%s): '%s'\" % (ex.message, event_object))\n135:             raise\n136: \n137:         return event_object\n138: \n139: "
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "syntax_error: invalid syntax (<unknown>, line 18)"
+    },
+    "imports": {
+      "imports": [],
+      "error": "syntax_error: invalid syntax (<unknown>, line 18)"
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README",
+      "download_url": "https://raw.githubusercontent.com/ooici/pyon/master/README",
+      "content_excerpt": "===========================================================\nOcean Observatories Initiative Cyberinfrastructure (OOI CI)\nIntegrated Observatory Network (ION) - OOINet\n\npyon - Python Capability Container and Core Modules\nhttps://confluence.oceanobservatories.org/x/ehdTAQ\n\n(C) The Regents of the University of California, 2010-2014\nOpen source under BSD license. See LICENSE.txt for details.\n===========================================================\n\n\nINSTALL\n=======\n\nInstall the following if not yet present:\n\n* OS Packages and package management:\nFor Mac, use homebrew\n    > /usr/bin/ruby <(curl -fsSkL raw.github.com/mxcl/homebrew/go)\n- python 2.7.x\n    > brew install python --framework --universal\n    Note: see 'brew doctor' for any path issues\n- git 1.7.7 or higher: Use brew or download the Mac or Linux installer and run it\n    > brew install git\n\n- Install core packages with Homebrew\n\n    > brew install libevent libyaml zeromq rabbitmq hdf5 pkg-config netcdf udunits\n\n    Linux: Note that many installs have much older versions installed by default.\n    (If you have trouble with brew 'MD5 mismatch' errors, try running 'brew update'\n    and try the install again)\n    For any kind of installation trouble run 'brew doctor' and fix any issues.\n\n- Install Postgres with Homebrew\n\n    > brew install postgres postgis\n\n    If you have trouble with the installation, please see:\n    https://confluence.oceanobservatories.org/display/CIDev/Postgres+Datastore\n    https://confluence.oceanobservatories.org/display/CIDev/M112+Geospatial+Search\n\n    As user postgres:\n    > createuser -s ion\n\n* "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "publish_event_object test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_event.py",
+          "path": "pyon/ion/test/test_event.py",
+          "sha": "572a2153c7e010d3f3b1d099c9d865cf78730a06",
+          "html_url": "https://github.com/ooici/pyon/blob/122c629290d27f32f2f41dafd5c12469295e8acf/pyon/ion/test/test_event.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"publish_event_object(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "event.py",
+          "path": "pyon/ion/event.py",
+          "sha": "c75ae05e4e4be232a0db64a0804bd15883b839c1",
+          "html_url": "https://github.com/ooici/pyon/blob/122c629290d27f32f2f41dafd5c12469295e8acf/pyon/ion/event.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_event.py",
+          "path": "pyon/ion/test/test_event.py",
+          "sha": "572a2153c7e010d3f3b1d099c9d865cf78730a06",
+          "html_url": "https://github.com/ooici/pyon/blob/122c629290d27f32f2f41dafd5c12469295e8acf/pyon/ion/test/test_event.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "pyon/ion",
+      "count": 21,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "pyon/ion/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "conversation.py",
+          "path": "pyon/ion/conversation.py",
+          "type": "file"
+        },
+        {
+          "name": "conversation_log.py",
+          "path": "pyon/ion/conversation_log.py",
+          "type": "file"
+        },
+        {
+          "name": "coverage.py",
+          "path": "pyon/ion/coverage.py",
+          "type": "file"
+        },
+        {
+          "name": "directory.py",
+          "path": "pyon/ion/directory.py",
+          "type": "file"
+        },
+        {
+          "name": "directory_standalone.py",
+          "path": "pyon/ion/directory_standalone.py",
+          "type": "file"
+        },
+        {
+          "name": "endpoint.py",
+          "path": "pyon/ion/endpoint.py",
+          "type": "file"
+        },
+        {
+          "name": "event.py",
+          "path": "pyon/ion/event.py",
+          "type": "file"
+        },
+        {
+          "name": "exchange.py",
+          "path": "pyon/ion/exchange.py",
+          "type": "file"
+        },
+        {
+          "name": "identifier.py",
+          "path": "pyon/ion/identifier.py",
+          "type": "file"
+        },
+        {
+          "name": "objstore.py",
+          "path": "pyon/ion/objstore.py",
+          "type": "file"
+        },
+        {
+          "name": "process.py",
+          "path": "pyon/ion/process.py",
+          "type": "file"
+        },
+        {
+          "name": "resource.py",
+          "path": "pyon/ion/resource.py",
+          "type": "file"
+        },
+        {
+          "name": "resregistry.py",
+          "path": "pyon/ion/resregistry.py",
+          "type": "file"
+        },
+        {
+          "name": "resregistry_standalone.py",
+          "path": "pyon/ion/resregistry_standalone.py",
+          "type": "file"
+        },
+        {
+          "name": "service.py",
+          "path": "pyon/ion/service.py",
+          "type": "file"
+        },
+        {
+          "name": "state.py",
+          "path": "pyon/ion/state.py",
+          "type": "file"
+        },
+        {
+          "name": "stream.py",
+          "path": "pyon/ion/stream.py",
+          "type": "file"
+        },
+        {
+          "name": "streamdef.py",
+          "path": "pyon/ion/streamdef.py",
+          "type": "file"
+        },
+        {
+          "name": "streamproc.py",
+          "path": "pyon/ion/streamproc.py",
+          "type": "file"
+        },
+        {
+          "name": "test",
+          "path": "pyon/ion/test",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "pyon/ion/__init__.py"
+        },
+        {
+          "name": "conversation.py",
+          "path": "pyon/ion/conversation.py"
+        },
+        {
+          "name": "conversation_log.py",
+          "path": "pyon/ion/conversation_log.py"
+        },
+        {
+          "name": "coverage.py",
+          "path": "pyon/ion/coverage.py"
+        },
+        {
+          "name": "directory.py",
+          "path": "pyon/ion/directory.py"
+        },
+        {
+          "name": "directory_standalone.py",
+          "path": "pyon/ion/directory_standalone.py"
+        },
+        {
+          "name": "endpoint.py",
+          "path": "pyon/ion/endpoint.py"
+        },
+        {
+          "name": "exchange.py",
+          "path": "pyon/ion/exchange.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "pyon/ion/event.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "e5eefa84961ad2c9df2b91adc4c9355635b89b06",
+          "html_url": "https://github.com/ooici/pyon/commit/e5eefa84961ad2c9df2b91adc4c9355635b89b06",
+          "message": "Remove references to Apache license from source code headers",
+          "author": "Michael Meisinger",
+          "date": "2014-06-16T18:44:52Z"
+        },
+        {
+          "sha": "b22baf525b6f69acd5b48bb75a3a51311d2198ab",
+          "html_url": "https://github.com/ooici/pyon/commit/b22baf525b6f69acd5b48bb75a3a51311d2198ab",
+          "message": "CIDEVSTC-306: Enhance event queries",
+          "author": "Michael Meisinger",
+          "date": "2014-05-20T23:57:50Z"
+        },
+        {
+          "sha": "c019bf34f65d15f855e2255317b3a27f356433bd",
+          "html_url": "https://github.com/ooici/pyon/commit/c019bf34f65d15f855e2255317b3a27f356433bd",
+          "message": "Event and policy mechanisms polished",
+          "author": "Michael Meisinger",
+          "date": "2014-02-28T21:23:36Z"
+        },
+        {
+          "sha": "303b56cc3ee0fba7603ed415de04d0f1e1628ad0",
+          "html_url": "https://github.com/ooici/pyon/commit/303b56cc3ee0fba7603ed415de04d0f1e1628ad0",
+          "message": "Add ordering to datastore query",
+          "author": "Michael Meisinger",
+          "date": "2014-02-26T16:44:52Z"
+        },
+        {
+          "sha": "2d2b420b45a45df080e3b4c312609fe5807b52ca",
+          "html_url": "https://github.com/ooici/pyon/commit/2d2b420b45a45df080e3b4c312609fe5807b52ca",
+          "message": "Fix event repository find_events with id_only",
+          "author": "Michael Meisinger",
+          "date": "2014-02-18T23:54:53Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "publish_event_object TODO enable this once resource",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "pyon/ion/event.py",
+      "satd_line": 119,
+      "last_commit": {
+        "sha": "e5eefa84961ad2c9df2b91adc4c9355635b89b06",
+        "html_url": "https://github.com/ooici/pyon/commit/e5eefa84961ad2c9df2b91adc4c9355635b89b06",
+        "message": "Remove references to Apache license from source code headers",
+        "author": "Michael Meisinger",
+        "date": "2014-06-16T18:44:52Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

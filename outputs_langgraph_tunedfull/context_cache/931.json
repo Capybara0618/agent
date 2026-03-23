@@ -1,0 +1,438 @@
+{
+  "task_id": "931",
+  "repo_owner": "openstack",
+  "repo_name": "nova",
+  "file_path": "nova/objects/instance.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T20:08:31+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T20:08:41+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T20:08:44+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "nova/objects/instance.py",
+    "original_code": "def _load_pci_requests(self, db_requests=None):\n    # FIXME: also do this if none!\n    if db_requests is not None:\n        self.pci_requests = objects.InstancePCIRequests.obj_from_db(\n            self._context, self.uuid, db_requests)\n    else:\n        self.pci_requests = \\\n            objects.InstancePCIRequests.get_by_instance_uuid(\n                self._context, self.uuid)",
+    "satd_comment": "# FIXME: also do this if none!",
+    "target_file": {
+      "ok": true,
+      "path": "nova/objects/instance.py",
+      "sha": "dc3aa76a592b8a6ba1fe229176bb907c3f87b171",
+      "download_url": "https://raw.githubusercontent.com/openstack/nova/master/nova/objects/instance.py",
+      "content_excerpt": "#    Copyright 2013 IBM Corp.\n#\n#    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n#    not use this file except in compliance with the License. You may obtain\n#    a copy of the License at\n#\n#         http://www.apache.org/licenses/LICENSE-2.0\n#\n#    Unless required by applicable law or agreed to in writing, software\n#    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n#    License for the specific language governing permissions and limitations\n#    under the License.\n\nimport contextlib\n\nfrom oslo_config import cfg\nfrom oslo_db import exception as db_exc\nfrom oslo_log import log as logging\nfrom oslo_serialization import jsonutils\nfrom oslo_utils import timeutils\nfrom oslo_utils import versionutils\nimport sqlalchemy as sa\nfrom sqlalchemy import sql\nfrom sqlalchemy.sql import func\n\nfrom nova import availability_zones as avail_zone\nfrom nova.compute import task_states\nfrom nova.compute import vm_states\nfrom nova import context as nova_context\nfrom nova.db.main import api as db\nfrom nova.db.main import models\nfrom nova import exception\nfrom nova.i18n import _\nfrom nova.network import model as network_model\nfrom nova import notifications\nfrom nova import objects\nfrom nova.objects import base\nfrom nova.objects import fields\nfrom nova import utils\n\n\nCONF = cfg.CONF\nLOG = logging.getLogger(__name__)\n\n\n# List of fields that can be joined in DB layer.\n_INSTANCE_OPTIONAL_JOINED_FIELDS = ['metadata', 'system_metadata',\n                                    'info_cache', 'security_groups',\n                                    'pci_devices', 'tags', 'services',\n                                    'fault']\n# These are fields that are optional but don't translate to db columns\n_INSTANCE_OPTIONAL_NON_COLUMN_FIELDS = ['flavor', 'old_flavor',\n                                        'new_flavor', 'ec2_ids']\n# These are fields that are optional and in instance_extra\n_INSTANCE_EXTRA_FIELDS = ['numa_topology', 'pci_requests',\n                          'flavor', 'vcpu_model', 'migration_context',\n                          'keypairs', 'device_metadata', 'trusted_certs',\n                          'resources']\n# These are fields that applied/drooped by migration_context\n_MIGRATION_CONTEXT_ATTRS = ['numa_topology', 'pci_requests',\n                            'pci_devices', 'resources']\n\n# These are fields that can be specified as expected_attrs\nINSTANCE_OPTIONAL_ATTRS = (_INSTANCE_OPTIONAL_JOINED_FIELDS +\n                           _INSTANCE_OPTIONAL_NON_COLUMN_FIELDS +\n                           _INSTANCE_EXTRA_FIELDS)\n\n__all__ = [\n    'Instance',\n    'InstanceList',\n    'populate_instance_compute_id',\n    'populate_missing_availability_zones',\n]\n\n# These are fields that most query calls load by default\nINSTANCE_DEFAULT_FIELDS = ['metadata', 'system_metadata',\n                           'info_cache', 'security_groups']\n\n# Maximum count of tags to one instance\nMAX_TAG_COUNT = 50\n\n\ndef _expected_cols(expected_attrs):\n    \"\"\"Return expected_attrs that are columns needing joining.\n\n    NB: This function may modify expected_attrs if one\n    requested attribute requires another.\n    \"\"\"\n    if not expected_attrs:\n        return expected_attrs\n\n    simple_cols = [attr for attr in expected_attrs\n                   if attr in _INSTANCE_OPTIONAL_JOINED_FIELDS]\n\n    complex_cols = ['extra.%s' % field\n                    for field in _INSTANCE_EXTRA_FIELDS\n                    if field in expected_attrs]\n    if complex_cols:\n        simple_cols.append('extra')\n    simple_cols = [x for x in simple_cols if x not in _INSTANCE_EXTRA_FIELDS]\n    expected_cols = simple_cols + complex_cols\n    # NOTE(pumaranikar): expected_cols list can contain duplicates since\n    # caller appends column attributes to expected_attr without checking if\n    # it is already present in the list or not. Hence, we remove duplicates\n    # here, if any. The resultant list is sorted based on list index to\n    # maintain the insertion order.\n    return sorted(list(set(expected_cols)), key=expected_cols.index)\n\n\n_NO_DATA_SENTINEL = object()\n\n\n# TODO(berrange): Remove NovaObjectDictCompat\n@base.NovaObjectRegistry.register\nclass Instance(base.NovaPersistentObject, base.NovaObject,\n               base.NovaObjectDictCompat):\n    # Version 2.0: Initial version\n    # Version 2.1: Added services\n    # Version 2.2: Added keypairs\n    # Version 2.3: Added device_metadata\n    # Version 2.4: Added trusted_certs\n    # Version 2.5: Added hard_delete kwarg in destroy\n    # Version 2.6: Added hidden\n    # Version 2.7: Added resources\n    # Version 2.8: Added compute_id\n    VERSION = '2.8'\n\n    fields = {\n        'id': fields.IntegerField(),\n\n        'user_id': fields.StringField(nullable=True),\n        'project_id': fields.StringField(nullable=True),\n\n        'image_ref': fields.StringField(nullable=True),\n        'kernel_id': fields.StringField(nullable=True),\n        'ramdisk_id': fields.StringField(nullable=True),\n        'hostname': fields.StringField(nullable=True),\n\n        'launch_index': fields.IntegerField(nullable=True),\n        'key_name': fields.StringField(nullable=True),\n        'key_data': fields.StringField(nullable=True),\n\n        'power_state': fields.IntegerField(nullable=True),\n        'vm_state': fields.StringField(nullable=True),\n        'task_state': fields.StringField(nullable=True),\n\n        'services': fields.ObjectField('ServiceList'),\n\n        'memory_mb': fields.IntegerField(nullable=True),\n        'vcpus': fields.IntegerField(nullable=True),\n        'root_gb': fields.IntegerField(nullable=True),\n        'ephemeral_gb': fields.IntegerField(nullable=True),\n        'ephemeral_key_uuid': fields.UUIDField(nullable=True),\n\n        'host': fields.StringField(nullable=True),\n        'node': fields.StringField(nullable=True),\n        'compute_id': fields.IntegerField(nullable=True),\n\n        # TODO(stephenfin): Remove this in version 3.0 of the object as it has\n        # been replaced by 'flavor'\n        'instance_type_id': fields.IntegerField(nullable=True),\n\n        'user_data': fields.StringField(nullable=True),\n\n        'reservation_id': fields.StringField(nullable=True),\n\n        'launched_at': fields.DateTimeField(nullable=True),\n        'terminated_at': fields.DateTimeField(nullable=True),\n\n        'availability_zone': fields.StringField(nullable=True),\n\n        'display_name': fields.StringField(nullable=True),\n        'display_description': fields.StringField(nullable=True),\n\n        'launched_on': fields.StringField(nullable=True),\n\n        'locked': fields.BooleanField(default=False),\n        'locked_by': fields.StringField(nullable=True),\n\n        'os_type': fields.StringField(nullable=True),\n        'architecture': fields.StringField(nullable=True),\n        'vm_mode': fields.StringField(nullable=True),\n        'uuid': fields.UUIDField(),\n\n        'root_device_name': fields.StringField(nullable=True),\n        'default_ephemeral_device': fields.StringField(nullable=True),\n        'default_swap_device': fields.StringField(nullable=True),\n        'config_drive': fields.StringField(nullable=True),\n\n        'access_ip_v4': fields.IPV4AddressField(nullable=True),\n        'access_ip_v6': fields.IPV6AddressField(nullable=True),\n\n        'auto_disk_config': fields.BooleanField(default=False),\n        'progress': fields.IntegerField(nullable=True),\n\n        'shutdown_terminate': fields.BooleanField(default=False),\n        'disable_terminate': fields.BooleanField(default=False),\n\n        # TODO(stephenfin): Remove this in version 3.0 of the object as it's\n        # related to cells v1\n        'cell_name': fields.StringField(nullable=True),\n\n        'metadata': fields.DictOfStringsField(),\n        'system_metadata': fields.DictOfNullableStringsField(),\n\n        'info_cache': fields.ObjectField('InstanceInfoCache',\n                                         nullable=True),\n\n        # TODO(stephenfin): Remove this in version 3.0 of the object as it's\n        # related to nova-network\n        'security_groups': fields.ObjectField('SecurityGroupList'),\n\n        'fault': fields.ObjectField('InstanceFault', nullable=True),\n\n        'cleaned': fields.BooleanField(default=False),\n\n        'pci_devices': fields.ObjectField('PciDeviceList', nullable=True),\n        'numa_topology': fields.ObjectField('InstanceNUMATopology',\n                                            nullable=True),\n        'pci_requests': fields.ObjectField('InstancePCIRequests',\n                                           nullable=True),\n        'device_metadata': fields.ObjectField('InstanceDeviceMetadata',\n                                              nullable=True),\n        'tags': fields.ObjectField('TagList'),\n        'flavor': fields.ObjectField('Flavor'),\n        'old_flavor': fields.ObjectField('Flavor', nullable=True),\n        'new_flavor': fields.ObjectField('Flavor', nullable=True),\n        'vcpu_model': fields.ObjectField('VirtCPUModel', nullable=True),\n        'ec2_ids': fields.ObjectField('EC2Ids'),\n        'migration_context': fields.ObjectField('MigrationContext',\n                                                nullable=True),\n        'keypairs': fields.ObjectField('KeyPairList'),\n        'trusted_certs': fields.ObjectField('TrustedCerts', nullable=True),\n        'hidden': fields.BooleanField(default=False),\n        'resources': fields.ObjectField('ResourceList', nullable=True),\n        }\n\n    obj_extra_fields = ['name']\n\n    def obj_make_compatible(self, primitive, target_version):\n        super(Instance, self).obj_make_compatible(primitive, target_version)\n        target_version = versionutils.convert_version_to_tuple(target_version)\n        if target_version < (2, 8) and 'compute_id' in primitive:\n            del primitive['compute_id']\n        if target_version < (2, 7) and 'resources' in primitive:\n            del primitive['resources']\n        if target_version < (2, 6) and 'hidden' in primitive:\n            del primitive['hidden']\n        if target_version < (2, 4) and 'trusted_certs' in primitive:\n            del primitive['trusted_certs']\n        if target_version < (2, 3) and 'device_metadata' in primitive:\n            del primitive['device_metadata']\n        if target_version < (2, 2) and 'keypairs' in primitive:\n            del primitive['keypairs']\n        if target_version < (2, 1) and 'services' in primitive:\n            del primitive['services']\n\n    def __init__(self, *args, **kwargs):\n        super(Instance, self).__init__(*args, **kwargs)\n        self._reset_metadata_tracking()\n\n    @property\n    def image_meta(self):\n        return objects.ImageMeta.from_instance(self)\n\n    def _reset_metadata_tracking(self, fields=None):\n        if fields is None or 'system_metadata' in fields:\n            self._orig_system_metadata = (dict(self.system_metadata) if\n                                          'system_metadata' in self else {})\n        if fields is None or 'metadata' in fields:\n            self._orig_metadata = (dict(self.metadata) if\n                                   'metadata' in self else {})\n\n    def obj_clone(self):\n        \"\"\"Create a copy of this instance object.\"\"\"\n        nobj = super(Instance, self).obj_clone()\n        # Since the base object only does a deep copy of the defined fields,\n        # need to make sure to also copy the additional tracking metadata\n        # attributes so they don't show as changed and cause the metadata\n        # to always be updated even when stale information.\n        if hasattr(self, '_orig_metadata'):\n            nobj._orig_metadata = dict(self._orig_metadata)\n        if hasattr(self, '_orig_system_metadata'):\n            nobj._orig_system_metadata = dict(self._orig_system_metadata)\n        return nobj\n\n    def obj_reset_changes(self, fields=None, recursive=False):\n        super(Instance, self).obj_reset_changes(fields,\n                                                recursive=rec",
+      "total_lines": 1720
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "contextlib",
+        "oslo_config:cfg",
+        "oslo_db:exception",
+        "oslo_log:log",
+        "oslo_serialization:jsonutils",
+        "oslo_utils:timeutils",
+        "oslo_utils:versionutils",
+        "sqlalchemy",
+        "sqlalchemy:sql",
+        "sqlalchemy.sql:func",
+        "nova:availability_zones",
+        "nova.compute:task_states",
+        "nova.compute:vm_states",
+        "nova:context",
+        "nova.db.main:api",
+        "nova.db.main:models",
+        "nova:exception",
+        "nova.i18n:_",
+        "nova.network:model",
+        "nova:notifications",
+        "nova:objects",
+        "nova.objects:base",
+        "nova.objects:fields",
+        "nova:utils"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/nova/master/README.rst",
+      "content_excerpt": "==============\nOpenStack Nova\n==============\n\nOpenStack Nova provides a cloud computing fabric controller, supporting a wide\nvariety of compute technologies, including: libvirt (KVM, Xen, LXC and more),\nVMware and OpenStack Ironic.\n\nUse the following resources to learn more.\n\nAPI\n---\n\nTo learn how to use Nova's API, consult the documentation available online at:\n\n- `Compute API Guide <https://docs.openstack.org/api-guide/compute/>`__\n- `Compute API Reference <https://docs.openstack.org/api-ref/compute/>`__\n\nFor more information on OpenStack APIs, SDKs and CLIs in general, refer to:\n\n- `OpenStack for App Developers <https://www.openstack.org/appdev/>`__\n- `Development resources for OpenStack clouds\n  <https://developer.openstack.org/>`__\n\nOperators\n---------\n\nTo learn how to deploy and configure OpenStack Nova, consult the documentation\navailable online at:\n\n- `OpenStack Nova <https://docs.openstack.org/nova/>`__\n\nIn the unfortunate event that bugs are discovered, they should be reported to\nthe appropriate bug tracker. If you obtained the software from a 3rd party\noperating system vendor, it is often wise to use their own bug tracker for\nreporting problems. In all other cases use the master OpenStack bug tracker,\navailable at:\n\n- `Bug Tracker <https://bugs.launchpad.net/nova>`__\n\nDevelopers\n----------\n\nFor information on how to contribute to Nova, please see the contents of the\nCONTRIBUTING.rst.\n\nAny new code must follow the development guidelines detailed in the HACKING.rst\nfile, and pass all unit tests.\n\nTo understand better the processes that the team is using, please ref"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_load_pci_requests test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_load_pci_requests(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "instance.py",
+          "path": "nova/objects/instance.py",
+          "sha": "dc3aa76a592b8a6ba1fe229176bb907c3f87b171",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/objects/instance.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "nova/objects",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "nova/objects/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aggregate.py",
+          "path": "nova/objects/aggregate.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "nova/objects/base.py",
+          "type": "file"
+        },
+        {
+          "name": "block_device.py",
+          "path": "nova/objects/block_device.py",
+          "type": "file"
+        },
+        {
+          "name": "build_request.py",
+          "path": "nova/objects/build_request.py",
+          "type": "file"
+        },
+        {
+          "name": "cell_mapping.py",
+          "path": "nova/objects/cell_mapping.py",
+          "type": "file"
+        },
+        {
+          "name": "compute_node.py",
+          "path": "nova/objects/compute_node.py",
+          "type": "file"
+        },
+        {
+          "name": "console_auth_token.py",
+          "path": "nova/objects/console_auth_token.py",
+          "type": "file"
+        },
+        {
+          "name": "diagnostics.py",
+          "path": "nova/objects/diagnostics.py",
+          "type": "file"
+        },
+        {
+          "name": "ec2.py",
+          "path": "nova/objects/ec2.py",
+          "type": "file"
+        },
+        {
+          "name": "external_event.py",
+          "path": "nova/objects/external_event.py",
+          "type": "file"
+        },
+        {
+          "name": "fields.py",
+          "path": "nova/objects/fields.py",
+          "type": "file"
+        },
+        {
+          "name": "flavor.py",
+          "path": "nova/objects/flavor.py",
+          "type": "file"
+        },
+        {
+          "name": "host_mapping.py",
+          "path": "nova/objects/host_mapping.py",
+          "type": "file"
+        },
+        {
+          "name": "hv_spec.py",
+          "path": "nova/objects/hv_spec.py",
+          "type": "file"
+        },
+        {
+          "name": "image_meta.py",
+          "path": "nova/objects/image_meta.py",
+          "type": "file"
+        },
+        {
+          "name": "instance.py",
+          "path": "nova/objects/instance.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_action.py",
+          "path": "nova/objects/instance_action.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_fault.py",
+          "path": "nova/objects/instance_fault.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_group.py",
+          "path": "nova/objects/instance_group.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_info_cache.py",
+          "path": "nova/objects/instance_info_cache.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_mapping.py",
+          "path": "nova/objects/instance_mapping.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_numa.py",
+          "path": "nova/objects/instance_numa.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_pci_requests.py",
+          "path": "nova/objects/instance_pci_requests.py",
+          "type": "file"
+        },
+        {
+          "name": "keypair.py",
+          "path": "nova/objects/keypair.py",
+          "type": "file"
+        },
+        {
+          "name": "migrate_data.py",
+          "path": "nova/objects/migrate_data.py",
+          "type": "file"
+        },
+        {
+          "name": "migration.py",
+          "path": "nova/objects/migration.py",
+          "type": "file"
+        },
+        {
+          "name": "migration_context.py",
+          "path": "nova/objects/migration_context.py",
+          "type": "file"
+        },
+        {
+          "name": "monitor_metric.py",
+          "path": "nova/objects/monitor_metric.py",
+          "type": "file"
+        },
+        {
+          "name": "network_metadata.py",
+          "path": "nova/objects/network_metadata.py",
+          "type": "file"
+        },
+        {
+          "name": "network_request.py",
+          "path": "nova/objects/network_request.py",
+          "type": "file"
+        },
+        {
+          "name": "numa.py",
+          "path": "nova/objects/numa.py",
+          "type": "file"
+        },
+        {
+          "name": "pci_device.py",
+          "path": "nova/objects/pci_device.py",
+          "type": "file"
+        },
+        {
+          "name": "pci_device_pool.py",
+          "path": "nova/objects/pci_device_pool.py",
+          "type": "file"
+        },
+        {
+          "name": "quotas.py",
+          "path": "nova/objects/quotas.py",
+          "type": "file"
+        },
+        {
+          "name": "request_spec.py",
+          "path": "nova/objects/request_spec.py",
+          "type": "file"
+        },
+        {
+          "name": "resource.py",
+          "path": "nova/objects/resource.py",
+          "type": "file"
+        },
+        {
+          "name": "security_group.py",
+          "path": "nova/objects/security_group.py",
+          "type": "file"
+        },
+        {
+          "name": "selection.py",
+          "path": "nova/objects/selection.py",
+          "type": "file"
+        },
+        {
+          "name": "service.py",
+          "path": "nova/objects/service.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "nova/objects/__init__.py"
+        },
+        {
+          "name": "aggregate.py",
+          "path": "nova/objects/aggregate.py"
+        },
+        {
+          "name": "base.py",
+          "path": "nova/objects/base.py"
+        },
+        {
+          "name": "block_device.py",
+          "path": "nova/objects/block_device.py"
+        },
+        {
+          "name": "build_request.py",
+          "path": "nova/objects/build_request.py"
+        },
+        {
+          "name": "cell_mapping.py",
+          "path": "nova/objects/cell_mapping.py"
+        },
+        {
+          "name": "compute_node.py",
+          "path": "nova/objects/compute_node.py"
+        },
+        {
+          "name": "console_auth_token.py",
+          "path": "nova/objects/console_auth_token.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "nova/objects/instance.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "8fe5d3ce752fa1590eeae0d78c368e5781452cb9",
+          "html_url": "https://github.com/openstack/nova/commit/8fe5d3ce752fa1590eeae0d78c368e5781452cb9",
+          "message": "Merge \"Faults from cell DB missing in GET /servers/detail\"",
+          "author": "Zuul",
+          "date": "2026-01-23T05:00:40Z"
+        },
+        {
+          "sha": "e785ab52dc77bae29e70be1b928483228af34ce9",
+          "html_url": "https://github.com/openstack/nova/commit/e785ab52dc77bae29e70be1b928483228af34ce9",
+          "message": "typing: Replace objects from typing with literals\n\nWe also replace the use of typing.Union and add missing parameters and\nreturns types for Callable types.\n\nChange-Id: I75ed4d1cc4d84515910a5bd315f8626135258148\nSigned-off-by: Stephen Finucane <stephenfin@redhat.com>",
+          "author": "Stephen Finucane",
+          "date": "2025-06-04T10:41:40Z"
+        },
+        {
+          "sha": "c870873f7fbf0dec03a520f60423491cf9ecf64f",
+          "html_url": "https://github.com/openstack/nova/commit/c870873f7fbf0dec03a520f60423491cf9ecf64f",
+          "message": "typing: \"Import\" objects\n\nmypy doesn't know that we dynamically register these: give it a helping\nhand.\n\nChange-Id: I73321f67766b67e00038fd8de744f95128c3e6cb\nSigned-off-by: Stephen Finucane <stephenfin@redhat.com>",
+          "author": "Stephen Finucane",
+          "date": "2025-02-27T18:05:10Z"
+        },
+        {
+          "sha": "fb661ec597e326b70829246cfdd4309dc7273bfa",
+          "html_url": "https://github.com/openstack/nova/commit/fb661ec597e326b70829246cfdd4309dc7273bfa",
+          "message": "Faults from cell DB missing in GET /servers/detail\n\nField  is empty in the response of API GET /servers/detail if the\ninstance (hence instace_faults DB entry) is in nova cell DB.\nUnlike that, for API /servers/:id fault is retrieved correctly no matter\nin which nova cell the instance belongs.\n\nCloses",
+          "author": "Ivaylo Mitev",
+          "date": "2019-12-16T10:32:12Z"
+        },
+        {
+          "sha": "98885344bd93531d569ded3f4492f473b09d0614",
+          "html_url": "https://github.com/openstack/nova/commit/98885344bd93531d569ded3f4492f473b09d0614",
+          "message": "Fix fill_metadata usage for the ImagePropertiesWeigher\n\nWhen using the weigher, we need to target the right cell context for the\nexisting instances in the host.\nfill_metadata was also having an issue as we need to pass the dict value\nfrom the updated dict by keying the instance uuid, not the whole d",
+          "author": "Sylvain Bauza",
+          "date": "2025-09-30T14:08:57Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_load_pci_requests FIXME also this none",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "nova/objects/instance.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "8fe5d3ce752fa1590eeae0d78c368e5781452cb9",
+        "html_url": "https://github.com/openstack/nova/commit/8fe5d3ce752fa1590eeae0d78c368e5781452cb9",
+        "message": "Merge \"Faults from cell DB missing in GET /servers/detail\"",
+        "author": "Zuul",
+        "date": "2026-01-23T05:00:40Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "presence of conditional logic on db_requests",
+        "clear FIXME comment indicating missing case",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

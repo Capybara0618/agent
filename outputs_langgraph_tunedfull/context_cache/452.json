@@ -1,0 +1,273 @@
+{
+  "task_id": "452",
+  "repo_owner": "flexget",
+  "repo_name": "flexget",
+  "file_path": "flexget/components/backlog/backlog.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:42:52+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:43:02+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:43:04+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "flexget/components/backlog/backlog.py",
+    "original_code": "def on_task_metainfo(self, task, config):\n    # Take a snapshot of any new entries' states before metainfo event in case we have to store them to backlog\n    # This is really a hack to avoid unnecessary lazy lookups causing db locks. Ideally, saving a snapshot\n    # should not cause lazy lookups, but we currently have no other way of saving a lazy field than performing its\n    # action.\n    # https://github.com/Flexget/Flexget/issues/1000\n    for entry in task.entries:\n        snapshot = entry.snapshots.get('after_input')\n        if snapshot:\n            continue\n        entry.take_snapshot('after_input')",
+    "satd_comment": "# This is really a hack to avoid unnecessary lazy lookups causing db locks. Ideally, saving a snapshot\n# should not cause lazy lookups, but we currently have no other way of saving a lazy field than performing its\n# action.\n# https://github.com/Flexget/Flexget/issues/1000",
+    "target_file": {
+      "ok": true,
+      "path": "flexget/components/backlog/backlog.py",
+      "sha": "7c8d996ea7e515282bcfeec6014eb4822f321a70",
+      "download_url": "https://raw.githubusercontent.com/Flexget/Flexget/develop/flexget/components/backlog/backlog.py",
+      "content_excerpt": "from datetime import datetime\n\nfrom loguru import logger\n\nfrom flexget import plugin\nfrom flexget.components.backlog.db import BacklogEntry, clear_entries, get_entries\nfrom flexget.event import event\nfrom flexget.manager import Session\nfrom flexget.utils.database import with_session\nfrom flexget.utils.serialization import serialize\nfrom flexget.utils.tools import parse_timedelta\n\nlogger = logger.bind(name='backlog')\n\n\nclass InputBacklog:\n    \"\"\"Keeps task history for given amount of time.\n\n    Example::\n\n      backlog: 4 days\n\n    Rarely useful for end users, mainly used by other plugins.\n    \"\"\"\n\n    schema = {'type': 'string', 'format': 'interval'}\n\n    @plugin.priority(plugin.PRIORITY_LAST)\n    def on_task_input(self, task, config):\n        # Get a list of entries to inject\n        injections = self.get_injections(task)\n        if config:\n            # If backlog is manually enabled for this task, learn the entries.\n            self.learn_backlog(task, config)\n        # Return the entries from backlog that are not already in the task\n        return injections\n\n    @plugin.priority(plugin.PRIORITY_FIRST)\n    def on_task_metainfo(self, task, config):\n        # Take a snapshot of any new entries' states before metainfo event in case we have to store them to backlog\n        for entry in task.entries:\n            entry['_backlog_snapshot'] = serialize(entry)\n\n    def on_task_abort(self, task, config):\n        \"\"\"Remember all entries until next execution when task gets aborted.\"\"\"\n        if task.entries:\n            logger.debug('Remembering all entries to backlog because of task abort.')\n            self.learn_backlog(task)\n\n    @with_session\n    def add_backlog(self, task, entry, amount='', session=None):\n        \"\"\"Add single entry to task backlog.\n\n        If :amount: is not specified, entry will only be injected on next execution.\n        \"\"\"\n        snapshot = entry.get('_backlog_snapshot')\n        if not snapshot:\n            if task.current_phase != 'input':\n                # Not having a snapshot is normal during input phase, don't display a warning\n                logger.warning(\n                    'No input snapshot available for `{}`, using current state', entry['title']\n                )\n            snapshot = serialize(entry)\n        expire_time = datetime.now() + parse_timedelta(amount)\n        backlog_entry = (\n            session\n            .query(BacklogEntry)\n            .filter(BacklogEntry.title == entry['title'])\n            .filter(BacklogEntry.task == task.name)\n            .first()\n        )\n        if backlog_entry:\n            # If there is already a backlog entry for this, update the expiry time if necessary.\n            if backlog_entry.expire < expire_time:\n                logger.debug('Updating expiry time for {}', entry['title'])\n                backlog_entry.expire = expire_time\n        else:\n            logger.debug('Saving {}', entry['title'])\n            backlog_entry = BacklogEntry()\n            backlog_entry.title = entry['title']\n            backlog_entry.entry = snapshot\n            backlog_entry.task = task.name\n            backlog_entry.expire = expire_time\n            session.add(backlog_entry)\n\n    def learn_backlog(self, task, amount=''):\n        \"\"\"Learn current entries into backlog. All task inputs must have been executed.\"\"\"\n        with Session() as session:\n            for entry in task.entries:\n                self.add_backlog(task, entry, amount, session=session)\n\n    @with_session\n    def get_injections(self, task, session=None):\n        \"\"\"Insert missing entries from backlog.\"\"\"\n        entries = []\n        for backlog_entry in get_entries(task=task.name, session=session):\n            entry = backlog_entry.entry\n\n            # this is already in the task\n            if task.find_entry(title=entry['title'], url=entry['url']):\n                continue\n            logger.debug('Restoring {}', entry['title'])\n            entries.append(entry)\n        if entries:\n            logger.verbose('Added {} entries from backlog', len(entries))\n\n        # purge expired\n        purged = clear_entries(task=task.name, all=False, session=session)\n        logger.debug('{} entries purged from backlog', purged)\n\n        return entries\n\n\n@event('plugin.register')\ndef register_plugin():\n    plugin.register(InputBacklog, 'backlog', builtin=True, api_ver=2)\n",
+      "total_lines": 116
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "datetime:datetime",
+        "loguru:logger",
+        "flexget:plugin",
+        "flexget.components.backlog.db:BacklogEntry",
+        "flexget.components.backlog.db:clear_entries",
+        "flexget.components.backlog.db:get_entries",
+        "flexget.event:event",
+        "flexget.manager:Session",
+        "flexget.utils.database:with_session",
+        "flexget.utils.serialization:serialize",
+        "flexget.utils.tools:parse_timedelta"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/Flexget/Flexget/develop/README.rst",
+      "content_excerpt": ".. image:: https://github.com/flexget/flexget/raw/develop/docs/_static/logo.png\n   :align: center\n   :target: https://flexget.com\n   :height: 50\n\n|\n\n.. image:: https://img.shields.io/pypi/v/flexget?logo=pypi&labelColor=F3F3F3\n   :target: https://pypi.org/project/flexget/\n\n.. image:: https://img.shields.io/docker/v/flexget/flexget/latest?logo=docker&label=docker&labelColor=F3F3F3\n   :target: https://hub.docker.com/r/flexget/flexget\n\n.. image:: https://img.shields.io/pypi/pyversions/flexget?logo=python&labelColor=F3F3F3\n   :target: https://pypi.org/project/flexget/\n\n.. image:: https://img.shields.io/codecov/c/github/flexget/flexget?logo=codecov&labelColor=F3F3F3\n   :target: https://codecov.io/gh/Flexget/Flexget\n\n..\n   Commenting these out for now, as they seem to be broken.\n   .. image:: https://api.codacy.com/project/badge/Grade/86bb847efe984c12948bdeccabcbccad\n      :target: https://www.codacy.com/app/Flexget/Flexget?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=Flexget/Flexget&amp;utm_campaign=Badge_Grade\n\n.. image:: https://img.shields.io/github/actions/workflow/status/flexget/flexget/test.yml?logo=github&logoColor=222222&label=tests&labelColor=F3F3F3\n   :target: https://github.com/Flexget/Flexget/actions/workflows/test.yml?query=branch%3Adevelop\n\n.. image:: https://img.shields.io/readthedocs/flexget?logo=readthedocs&labelColor=F3F3F3\n   :target: https://flexget.readthedocs.io/en/latest/\n\n.. image:: https://img.shields.io/discord/536690097056120833?logo=discord&label=discord&labelColor=F3F3F3\n   :target: https://discord.gg/W6CQrJx\n\n`FlexGet`_ is a multipur"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "on_task_metainfo test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"on_task_metainfo(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "task.py",
+          "path": "flexget/plugins/metainfo/task.py",
+          "sha": "bfaf1a03faa0ff318d2d34236de23b4b83f7df5d",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/plugins/metainfo/task.py",
+          "score": 1.0
+        },
+        {
+          "name": "all_series.py",
+          "path": "flexget/components/series/all_series.py",
+          "sha": "a9701757a0b9c757ef9b9c96c532747ebf2736d7",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/components/series/all_series.py",
+          "score": 1.0
+        },
+        {
+          "name": "emby_lookup.py",
+          "path": "flexget/components/emby/emby_lookup.py",
+          "sha": "b628f50bf6a80138e884bcf8ebe2c3fb06dcb7d6",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/components/emby/emby_lookup.py",
+          "score": 1.0
+        },
+        {
+          "name": "tmdb_lookup.py",
+          "path": "flexget/components/tmdb/tmdb_lookup.py",
+          "sha": "3b9a789b8f7d89b790da1da7a1154f673ba74a7b",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/components/tmdb/tmdb_lookup.py",
+          "score": 1.0
+        },
+        {
+          "name": "backlog.py",
+          "path": "flexget/components/backlog/backlog.py",
+          "sha": "7c8d996ea7e515282bcfeec6014eb4822f321a70",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/components/backlog/backlog.py",
+          "score": 1.0
+        },
+        {
+          "name": "trakt_lookup.py",
+          "path": "flexget/components/trakt/trakt_lookup.py",
+          "sha": "e84cfe733424c00913830502dda62ada82877d0e",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/components/trakt/trakt_lookup.py",
+          "score": 1.0
+        },
+        {
+          "name": "tvmaze_lookup.py",
+          "path": "flexget/components/tvmaze/tvmaze_lookup.py",
+          "sha": "3bbeb0c1f144604e40fb9936ec2823841f2afa33",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/components/tvmaze/tvmaze_lookup.py",
+          "score": 1.0
+        },
+        {
+          "name": "path_by_space.py",
+          "path": "flexget/plugins/modify/path_by_space.py",
+          "sha": "54193866093681d88d888a56957b2d2e8f6ec0af",
+          "html_url": "https://github.com/Flexget/Flexget/blob/05853922ad8651b4032080390d19634fcd274691/flexget/plugins/modify/path_by_space.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "flexget/components/backlog",
+      "count": 4,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "flexget/components/backlog/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "backlog.py",
+          "path": "flexget/components/backlog/backlog.py",
+          "type": "file"
+        },
+        {
+          "name": "cli.py",
+          "path": "flexget/components/backlog/cli.py",
+          "type": "file"
+        },
+        {
+          "name": "db.py",
+          "path": "flexget/components/backlog/db.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 3,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "flexget/components/backlog/__init__.py"
+        },
+        {
+          "name": "cli.py",
+          "path": "flexget/components/backlog/cli.py"
+        },
+        {
+          "name": "db.py",
+          "path": "flexget/components/backlog/db.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "flexget/components/backlog/backlog.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "e14ae4ef2b9c357fb2b9b9bfeac97fabdbbe0e9c",
+          "html_url": "https://github.com/Flexget/Flexget/commit/e14ae4ef2b9c357fb2b9b9bfeac97fabdbbe0e9c",
+          "message": "[pre-commit.ci] auto fixes from pre-commit.com hooks\n\nfor more information, see https://pre-commit.ci",
+          "author": "pre-commit-ci[bot]",
+          "date": "2025-12-21T17:46:57Z"
+        },
+        {
+          "sha": "eee3c3a9cad386cc717703eba52cd5f2f9ca019a",
+          "html_url": "https://github.com/Flexget/Flexget/commit/eee3c3a9cad386cc717703eba52cd5f2f9ca019a",
+          "message": "fix",
+          "author": "vivodi",
+          "date": "2025-02-20T20:19:42Z"
+        },
+        {
+          "sha": "3f0b6dbedc4d1a066047183762df3f11995c2899",
+          "html_url": "https://github.com/Flexget/Flexget/commit/3f0b6dbedc4d1a066047183762df3f11995c2899",
+          "message": "fix",
+          "author": "vivodi",
+          "date": "2025-02-14T14:22:24Z"
+        },
+        {
+          "sha": "581ef42660f6c18e09a631143201e27940b80bef",
+          "html_url": "https://github.com/Flexget/Flexget/commit/581ef42660f6c18e09a631143201e27940b80bef",
+          "message": "Fix backlog use of updated serialization system.",
+          "author": "Chase Sterling",
+          "date": "2020-01-21T14:28:24Z"
+        },
+        {
+          "sha": "7bb9527a966c2901c9a0e1463ed27ccbe69ea1dc",
+          "html_url": "https://github.com/Flexget/Flexget/commit/7bb9527a966c2901c9a0e1463ed27ccbe69ea1dc",
+          "message": "Refactor serialization system",
+          "author": "Chase Sterling",
+          "date": "2020-01-21T02:37:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "on_task_metainfo This really hack avoid unnecessary",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "flexget/components/backlog/backlog.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "e14ae4ef2b9c357fb2b9b9bfeac97fabdbbe0e9c",
+        "html_url": "https://github.com/Flexget/Flexget/commit/e14ae4ef2b9c357fb2b9b9bfeac97fabdbbe0e9c",
+        "message": "[pre-commit.ci] auto fixes from pre-commit.com hooks\n\nfor more information, see https://pre-commit.ci",
+        "author": "pre-commit-ci[bot]",
+        "date": "2025-12-21T17:46:57Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

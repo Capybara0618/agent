@@ -1,0 +1,449 @@
+{
+  "task_id": "804",
+  "repo_owner": "kde",
+  "repo_name": "kajongg",
+  "file_path": "src/server.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:21:43+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:21:51+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:21:55+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/server.py",
+    "original_code": "def claimMahJongg(self, player, concealedMelds, withDiscard):\n    # TODO: check content of concealedMelds: does the player actually have those tiles and is it really mah jongg?\n    ignoreDiscard = withDiscard\n    for part in concealedMelds.split():\n        meld = Meld(part)\n        for pair in meld.pairs:\n            if pair == ignoreDiscard:\n                ignoreDiscard = None\n            else:\n                if not pair in player.concealedTiles:\n                    print 'concealedMelds:', concealedMelds\n                    print 'meld:', meld\n                    print 'tile:', pair\n                    msg = 'claimMahJongg: Player does not really have tile %s' % pair\n                    self.sendAbortMessage(msg)\n                player.concealedTiles.remove(pair)\n        player.concealedMelds.append(meld)\n    if player.concealedTiles:\n        msg='claimMahJongg: Player did not pass all concealed tiles to server'\n        self.sendAbortMessage(msg)\n    self.game.winner = player\n    self.tellAll(player, 'declaredMahJongg', source=concealedMelds, lastTile=player.lastTile, withDiscard=withDiscard)\n    self.endHand()",
+    "satd_comment": "# TODO: check content of concealedMelds: does the player actually have those tiles and is it really mah jongg?",
+    "target_file": {
+      "ok": true,
+      "path": "src/server.py",
+      "sha": "c5b4569c4ab586be834a354048a6388c4faa777a",
+      "download_url": "https://raw.githubusercontent.com/KDE/kajongg/master/src/server.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n\n\"\"\"\nCopyright (C) 2009-2016 Wolfgang Rohdewald <wolfgang@rohdewald.de>\n\nSPDX-License-Identifier: GPL-2.0-only\n\n\nThe DBPasswordChecker is based on an example from the book\nTwisted Network Programming Essentials by Abe Fettig, 2006\nO'Reilly Media, Inc., ISBN 0-596-10032-9\n\"\"\"\n\n# pylint: disable=wrong-import-order, wrong-import-position\n\nimport sys\nimport os\nimport logging\nimport datetime\nimport argparse\nfrom typing import TYPE_CHECKING, Tuple, Any, Optional, Sequence, List, Mapping, Dict, Union, cast, Type\n\nfrom zope.interface import implementer\n\n\ndef cleanExit(*unusedArgs: Any) ->None:\n    \"\"\"we want to cleanly close sqlite3 files\"\"\"\n    if Debug.quit:\n        logDebug('cleanExit')\n    if Options.socket and sys.platform != 'win32':\n        try:\n            os.remove(Options.socket)\n        except FileNotFoundError:\n            pass\n    try:\n        if Internal.db:\n            Internal.db.close()\n                              # setting to None does not call close(), do we\n                              # need close?\n        logging.shutdown()\n        os._exit(0)\n    except NameError:\n        logging.shutdown()\n    try:\n        reactor.stop()  # type:ignore[misc]\n    except NameError:\n        sys.exit(0)\n    except ReactorNotRunning:\n        pass\n\nfrom common import handleSignals\nhandleSignals(cleanExit)\n\nfrom common import Options, Internal, Debug\nInternal.isServer = True\nInternal.logPrefix = 'S'\n\nfrom twisted.spread import pb\nfrom twisted.internet.interfaces import IReactorCore\nfrom twisted.internet import error\nfrom twisted.internet.defer import maybeDeferred, fail, succeed, Deferred\nfrom twisted.cred import checkers, portal, credentials, error as credError\nfrom twisted.internet import reactor as reactor_module\nfrom twisted.internet.error import ReactorNotRunning\nif TYPE_CHECKING:\n    from twisted.python.failure import Failure\n\nreactor = cast(IReactorCore, reactor_module)\nreactor.addSystemEventTrigger('before', 'shutdown', cleanExit)  # type:ignore[arg-type]\nInternal.reactor = reactor  # type:ignore[assignment]\n\nfrom player import Players\nfrom query import Query, initDb\nfrom log import logDebug, logWarning, logError, logInfo, logException, SERVERMARK, logFailure\nfrom mi18n import i18n, i18nE\nfrom util import elapsedSince\nfrom message import Message, ChatMessage\nfrom deferredutil import DeferredBlock\nfrom rule import Ruleset\nfrom servercommon import srvError, srvMessage\nfrom user import User\nfrom servertable import ServerTable, ServerGame\n\n\n@implementer(checkers.ICredentialsChecker)\nclass DBPasswordChecker:\n\n    \"\"\"checks against our sqlite3 databases\"\"\"\n    credentialInterfaces = (credentials.IUsernamePassword,\n                            credentials.IUsernameHashedPassword)\n\n    def requestAvatarId(self, cred: pb._PortalAuthChallenger) ->Deferred:\n        \"\"\"get user id from database\"\"\"\n        cred.username = cred.username.decode('utf-8')\n        args = cred.username.split(SERVERMARK)\n        if len(args) > 1:\n            if args[0] == 'adduser':\n                cred.username = args[1]\n                password = args[2]\n                query = Query(\n                    'insert or ignore into player(name,password) values(?,?)',\n                    (cred.username,\n                     password))\n            elif args[1] == 'deluser':\n                pass\n        query = Query(\n            'select id, password from player where name=?', (cred.username,))\n        if not query.records:\n            template = 'Wrong username: %1'\n            if Debug.connections:\n                logDebug(i18n(template, cred.username))\n            return fail(credError.UnauthorizedLogin(srvMessage(template, cred.username)))\n        userid, password = query.records[0]\n        defer1 = maybeDeferred(cred.checkPassword, password.encode('utf-8'))\n        defer1.addCallback(DBPasswordChecker._checkedPassword, userid).addErrback(logFailure)\n        return defer1\n\n    @staticmethod\n    def _checkedPassword(matched: bool, userid:str) ->Union[str, Deferred]:\n        \"\"\"after the password has been checked. TODO: is the result type correct?\"\"\"\n        if not matched:\n            return fail(credError.UnauthorizedLogin(srvMessage(i18nE('Wrong password'))))\n        return userid\n\n\nclass MJServer:\n\n    \"\"\"the real mah jongg server\"\"\"\n\n    def __init__(self) ->None:\n        self.tables:Dict[int, ServerTable] = {}\n        self.srvUsers:List[User] = []\n        Players.load()\n        self.lastPing = datetime.datetime.now()\n        self.checkPings()\n\n    def chat(self, chatString:str) ->None:\n        \"\"\"a client sent us a chat message\"\"\"\n        # FIXME: why does this work?\n        chatLine = ChatMessage(chatString)  # type:ignore[arg-type]\n\n\n        self.tables[chatLine.tableid].sendChatMessage(chatLine)\n\n    def login(self, user: User) ->None:\n        \"\"\"accept a new user\"\"\"\n        if user not in self.srvUsers:\n            self.srvUsers.append(user)\n            self.loadSuspendedTables(user)\n\n    def callRemote(self, user:User, *args: Any, **kwargs:Mapping[Any, Any]) ->Deferred:\n        \"\"\"if we still have a connection, call remote, otherwise clean up\"\"\"\n        if user.mind:\n            try:\n                args2, kwargs2 = Message.jellyAll(args, kwargs)\n                return user.mind.callRemote(*args2, **kwargs2).addErrback(MJServer.ignoreLostConnection)\n            except (pb.DeadReferenceError, pb.PBConnectionLost):\n                user.mind = None\n                self.logout(user)\n        return succeed([])\n\n    @staticmethod\n    def __stopAfterLastDisconnect() ->None:\n        \"\"\"as the name says\"\"\"\n        if Options.socket and not Options.continueServer:\n            try:\n                reactor.stop()  # type:ignore[misc]\n                if Debug.connections:\n                    logDebug(f'local server terminates from {Options.socket}. Reason: last client disconnected')\n            except ReactorNotRunning:\n                pass\n\n    def checkPings(self) ->None:\n        \"\"\"are all clients still alive? If not log them out\"\"\"\n        since = elapsedSince(self.lastPing)\n        if self.srvUsers and since > 30:\n            if Debug.quit:\n                logDebug(f'no ping since {elapsedSince(self.lastPing)} seconds but we still have users:{self.srvUsers}')\n        if not self.srvUsers and since > 30:\n            # no user at all since 30 seconds, but we did already have a user\n            self.__stopAfterLastDisconnect()\n        for user in self.srvUsers:\n            if elapsedSince(user.lastPing) > 60:\n                logInfo(\n                    f'No messages from {user.name} since 60 seconds, clearing connection now')\n                user.mind = None\n                self.logout(user)\n        reactor.callLater(10, self.checkPings)\n\n    @staticmethod\n    def ignoreLostConnection(failure: 'Failure') ->None:\n        \"\"\"if the client went away correctly, do not dump error messages on stdout.\"\"\"\n        msg = failure.getErrorMessage()\n        if 'twisted.internet.error.ConnectionDone' not in msg:\n            logError(msg)\n        failure.trap(pb.PBConnectionLost)\n\n    def sendTables(self, user:User, tables:Optional[List[ServerTable]]=None) ->Deferred:\n        \"\"\"send tables to user. If tables is None, he gets all new tables and those\n        suspended tables he was sitting on\"\"\"\n        if tables is None:\n            tables = [\n                x for x in self.tables.values()\n                if not x.running and (not x.suspendedAt or x.hasName(user.name))]\n        if tables:\n            data = [x.asSimpleList() for x in tables]\n            if Debug.table:\n                logDebug(\n                    f'sending {len(tables)} tables to {user.name}: {data}')\n            return self.callRemote(user, 'newTables', data)\n        return succeed([])\n\n    def _lookupTable(self, tableid: int) ->ServerTable:\n        \"\"\"return table by id or raise exception\"\"\"\n        if tableid not in self.tables:\n            srvError(\n                pb.Error,\n                i18nE('table with id <numid>%1</numid> not found'),\n                tableid)\n        return self.tables[tableid]\n\n    def generateTableId(self) ->int:\n        \"\"\"generates a new table id: the first free one\"\"\"\n        usedIds = set(self.tables or [0])\n        availableIds = set(x for x in range(1, 2 + max(usedIds)))\n        return min(availableIds - usedIds)\n\n    def newTable(self, user:User, ruleset:str, playOpen:bool,\n                 autoPlay:bool, wantedGame:str, tableId:Optional[int]=None) ->Optional[Deferred]:\n        \"\"\"user creates new table and joins it\"\"\"\n        def gotRuleset(ruleset:str) ->None:\n            \"\"\"now we have the full ruleset definition from the client\"\"\"\n            Ruleset.cached(\n                ruleset).save()  # make it known to the cache and save in db\n        if tableId in self.tables:\n            assert tableId is not None  # for mypy\n            return fail(srvError(pb.Error,\n                                 f'You want a new table with id={int(tableId)} '\n                                 f'but that id is already used for table {self.tables[tableId]}'))\n        if Ruleset.hashIsKnown(ruleset):\n            return self.__newTable(None, user, ruleset, playOpen, autoPlay, wantedGame, tableId)\n        _ = self.callRemote(user, 'needRuleset', ruleset)\n        if _:\n            return _.addCallback(\n                gotRuleset).addErrback(logException).addCallback(\n                    self.__newTable, user, ruleset, playOpen, autoPlay, wantedGame, tableId).addErrback(logException)\n        return None\n\n    def __newTable(self, unused:None, user:User, ruleset:str,\n                   playOpen:bool, autoPlay:bool, wantedGame:str, tableId:Optional[int]=None) ->Deferred:\n        \"\"\"now we know the ruleset\"\"\"\n        def sent(unused: Any) ->int:\n            \"\"\"new table sent to user who created it\"\"\"\n            return table.tableid\n        table = ServerTable(\n            self,\n            owner=user,\n            ruleset=ruleset,\n            suspendedAt=None,\n            playOpen=playOpen,\n            autoPlay=autoPlay,\n            wantedGame=wantedGame,\n            tableId=tableId)\n        result = None\n        for srvUser in self.srvUsers:\n            deferred = self.sendTables(srvUser, [table])\n            if user == srvUser:\n                result = deferred\n                deferred.addCallback(sent).addErrback(logFailure)\n        assert result\n        return result\n\n    def needRulesets(self, rulesetHashes: List[str]) -> List[List[List[Union[int, str, float]]]]:\n        \"\"\"the client wants those full rulesets\"\"\"\n        result = []\n        for table in self.tables.values():\n            if table.ruleset.hash in rulesetHashes:\n                result.append(table.ruleset.toList())\n        return result\n\n    def joinTable(self, user: User, tableid: int) ->bool:\n        \"\"\"user joins table\"\"\"\n        table = self._lookupTable(tableid)\n        table.addUser(user)\n        block = DeferredBlock(table, where='joinTable')\n        block.tell(\n            None,\n            self.srvUsers,\n            Message.TableChanged,\n            source=table.asSimpleList())\n        if len(table.users) == table.maxSeats():\n            if Debug.table:\n                logDebug(f'Table {table}: All seats taken, starting')\n\n            def startTable(unused: Any) -> None:\n                \"\"\"now all players know about our join\"\"\"\n                assert table.owner\n                table.readyForGameStart(table.owner)\n            block.callback(startTable)\n        else:\n            block.callback(False)\n        return True\n\n    def tablesWith(self, user: User) ->List[int]:\n        \"\"\"table ids with user, except table 'without'\"\"\"\n        return [x.tableid for x in self.tables.values() if user in x.users]\n\n    def leaveTable(self, user: User, tableid: int, message: str, *args: str) ->bool:\n        \"\"\"user leaves table. If no human user is left on a new table, remove it\"\"\"\n        if tableid in self.tables:\n            table = self.tables[tableid]\n",
+      "total_lines": 505
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "sys",
+        "os",
+        "logging",
+        "datetime",
+        "argparse",
+        "typing:TYPE_CHECKING",
+        "typing:Tuple",
+        "typing:Any",
+        "typing:Optional",
+        "typing:Sequence",
+        "typing:List",
+        "typing:Mapping",
+        "typing:Dict",
+        "typing:Union",
+        "typing:cast",
+        "typing:Type",
+        "zope.interface:implementer",
+        "common:handleSignals",
+        "common:Options",
+        "common:Internal",
+        "common:Debug",
+        "twisted.spread:pb",
+        "twisted.internet.interfaces:IReactorCore",
+        "twisted.internet:error",
+        "twisted.internet.defer:maybeDeferred",
+        "twisted.internet.defer:fail",
+        "twisted.internet.defer:succeed",
+        "twisted.internet.defer:Deferred",
+        "twisted.cred:checkers",
+        "twisted.cred:portal"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README",
+      "download_url": "https://raw.githubusercontent.com/KDE/kajongg/master/README",
+      "content_excerpt": "Kajongg - the classical Mah Jongg for four players. If you are looking for the Mah Jongg solitaire please use the application KMahjongg.\n\n[b][u]Installing Kajongg on Windows[/b][/u]\n\nDownload the installer from the link below.\n\nKajongg needs the Microsoft Visual C++ Redistributable Package.\nI believe I am not allowed to include a copy in the installer.\nChances are good that you already have this installed. Otherwise\nyou should see a corresponding error message. You can get that\npackage from Microsoft here: [url]http://www.microsoft.com/en-us/download/details.aspx?id=29[/url]\n\nSupport for Windows is very new, there might be a few things missing. Still to be done:\n\n- toolbar, statusbar, keyboard shortcuts everywhere\n\n- application language selection. For now, the language of the installed Windows\n  is used. If Kajongg is not translated into that language, it is english. If you really\n  need to, you can edit a configuration file and select any of the available languages.\n\n\n[b][u]Installing Kajongg on Linux[/b][/u]\n\nKajongg is part of the KDE games, your Linux distribution should bring it to you.\n\n\n[b][u]More[/b][/u]\n\nKajongg is covered by the GNU GPL2 license - see COPYING.\n\nKajongg can be used in two different ways: Scoring a manual\ngame where you play as always and use Kajongg for the computation\nof scores and for bookkeeping. Or you can use Kajongg to play\nagainst any combination of other human players or computer players.\n\nKajongg currently comes with two rulesets for classical chinese, one\nfor rules in Germany and one for rules in England.\nYou can change many things in th"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "claimMahJongg test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"claimMahJongg(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "message.py",
+          "path": "src/message.py",
+          "sha": "1ab237aa50013b25b3618e7245a561632e2d2133",
+          "html_url": "https://github.com/KDE/kajongg/blob/ea496858f012ebfa9a1a838bcdb65c1d2bb5f42c/src/message.py",
+          "score": 1.0
+        },
+        {
+          "name": "servertable.py",
+          "path": "src/servertable.py",
+          "sha": "6eb30d0f978991eb62802116e4332df9f13a577b",
+          "html_url": "https://github.com/KDE/kajongg/blob/ea496858f012ebfa9a1a838bcdb65c1d2bb5f42c/src/servertable.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src",
+      "count": 40,
+      "entries": [
+        {
+          "name": ".gitignore",
+          "path": "src/.gitignore",
+          "type": "file"
+        },
+        {
+          "name": "altint.py",
+          "path": "src/altint.py",
+          "type": "file"
+        },
+        {
+          "name": "animation.py",
+          "path": "src/animation.py",
+          "type": "file"
+        },
+        {
+          "name": "appversion.py.in",
+          "path": "src/appversion.py.in",
+          "type": "file"
+        },
+        {
+          "name": "background.py",
+          "path": "src/background.py",
+          "type": "file"
+        },
+        {
+          "name": "backgroundselector.py",
+          "path": "src/backgroundselector.py",
+          "type": "file"
+        },
+        {
+          "name": "board.py",
+          "path": "src/board.py",
+          "type": "file"
+        },
+        {
+          "name": "chat.py",
+          "path": "src/chat.py",
+          "type": "file"
+        },
+        {
+          "name": "check_unused",
+          "path": "src/check_unused",
+          "type": "file"
+        },
+        {
+          "name": "client.py",
+          "path": "src/client.py",
+          "type": "file"
+        },
+        {
+          "name": "common.py",
+          "path": "src/common.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "src/config.py",
+          "type": "file"
+        },
+        {
+          "name": "configdialog.py",
+          "path": "src/configdialog.py",
+          "type": "file"
+        },
+        {
+          "name": "deferredutil.py",
+          "path": "src/deferredutil.py",
+          "type": "file"
+        },
+        {
+          "name": "dialogs.py",
+          "path": "src/dialogs.py",
+          "type": "file"
+        },
+        {
+          "name": "differ.py",
+          "path": "src/differ.py",
+          "type": "file"
+        },
+        {
+          "name": "game.py",
+          "path": "src/game.py",
+          "type": "file"
+        },
+        {
+          "name": "games.py",
+          "path": "src/games.py",
+          "type": "file"
+        },
+        {
+          "name": "genericdelegates.py",
+          "path": "src/genericdelegates.py",
+          "type": "file"
+        },
+        {
+          "name": "guiutil.py",
+          "path": "src/guiutil.py",
+          "type": "file"
+        },
+        {
+          "name": "hand.py",
+          "path": "src/hand.py",
+          "type": "file"
+        },
+        {
+          "name": "handboard.py",
+          "path": "src/handboard.py",
+          "type": "file"
+        },
+        {
+          "name": "humanclient.py",
+          "path": "src/humanclient.py",
+          "type": "file"
+        },
+        {
+          "name": "intelligence.py",
+          "path": "src/intelligence.py",
+          "type": "file"
+        },
+        {
+          "name": "kajcsv.py",
+          "path": "src/kajcsv.py",
+          "type": "file"
+        },
+        {
+          "name": "kajongg.py",
+          "path": "src/kajongg.py",
+          "type": "file"
+        },
+        {
+          "name": "kajonggserver.py",
+          "path": "src/kajonggserver.py",
+          "type": "file"
+        },
+        {
+          "name": "kajonggtest",
+          "path": "src/kajonggtest",
+          "type": "file"
+        },
+        {
+          "name": "kajonggtest.py",
+          "path": "src/kajonggtest.py",
+          "type": "file"
+        },
+        {
+          "name": "kajonggui.rc",
+          "path": "src/kajonggui.rc",
+          "type": "file"
+        },
+        {
+          "name": "kde.py",
+          "path": "src/kde.py",
+          "type": "file"
+        },
+        {
+          "name": "kdepaths.py.in",
+          "path": "src/kdepaths.py.in",
+          "type": "file"
+        },
+        {
+          "name": "kdestub.py",
+          "path": "src/kdestub.py",
+          "type": "file"
+        },
+        {
+          "name": "log.py",
+          "path": "src/log.py",
+          "type": "file"
+        },
+        {
+          "name": "login.py",
+          "path": "src/login.py",
+          "type": "file"
+        },
+        {
+          "name": "mainwindow.py",
+          "path": "src/mainwindow.py",
+          "type": "file"
+        },
+        {
+          "name": "message.py",
+          "path": "src/message.py",
+          "type": "file"
+        },
+        {
+          "name": "mi18n.py",
+          "path": "src/mi18n.py",
+          "type": "file"
+        },
+        {
+          "name": "mjresource.py",
+          "path": "src/mjresource.py",
+          "type": "file"
+        },
+        {
+          "name": "modeltest.py",
+          "path": "src/modeltest.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": ".gitignore",
+          "path": "src/.gitignore"
+        },
+        {
+          "name": "altint.py",
+          "path": "src/altint.py"
+        },
+        {
+          "name": "animation.py",
+          "path": "src/animation.py"
+        },
+        {
+          "name": "appversion.py.in",
+          "path": "src/appversion.py.in"
+        },
+        {
+          "name": "background.py",
+          "path": "src/background.py"
+        },
+        {
+          "name": "backgroundselector.py",
+          "path": "src/backgroundselector.py"
+        },
+        {
+          "name": "board.py",
+          "path": "src/board.py"
+        },
+        {
+          "name": "chat.py",
+          "path": "src/chat.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/server.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "fca0526348a3e50034fde1b58dc9ca9aa2b87f7d",
+          "html_url": "https://github.com/KDE/kajongg/commit/fca0526348a3e50034fde1b58dc9ca9aa2b87f7d",
+          "message": "fix possible race\n\njust in case TWO kajonggserver instances listened on the same port",
+          "author": "Wolfgang Rohdewald",
+          "date": "2024-12-31T03:31:06Z"
+        },
+        {
+          "sha": "31493a0ba1e49736e693f191f99e479a34534eee",
+          "html_url": "https://github.com/KDE/kajongg/commit/31493a0ba1e49736e693f191f99e479a34534eee",
+          "message": "new: logFailure() for twisted Deferred errbacks",
+          "author": "Wolfgang Rohdewald",
+          "date": "2025-01-27T21:14:47Z"
+        },
+        {
+          "sha": "e5730d376a754ef4a22d42797984a3637ea12a5e",
+          "html_url": "https://github.com/KDE/kajongg/commit/e5730d376a754ef4a22d42797984a3637ea12a5e",
+          "message": "SPDX License GPL-2.0 is deprecated, use GPL-2.0-only",
+          "author": "Wolfgang Rohdewald",
+          "date": "2025-01-25T17:58:19Z"
+        },
+        {
+          "sha": "a00815e6f8640fbe18ef059c6c4ffabfac66d28b",
+          "html_url": "https://github.com/KDE/kajongg/commit/a00815e6f8640fbe18ef059c6c4ffabfac66d28b",
+          "message": "annotations: realm/dbpasswordchecker",
+          "author": "Wolfgang Rohdewald",
+          "date": "2025-01-28T15:18:25Z"
+        },
+        {
+          "sha": "0b9d23ecaa0a74c702c270aef8c76bcb45186189",
+          "html_url": "https://github.com/KDE/kajongg/commit/0b9d23ecaa0a74c702c270aef8c76bcb45186189",
+          "message": "pylint is now 3.3.3 on Debian 13",
+          "author": "Wolfgang Rohdewald",
+          "date": "2025-01-26T18:26:00Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "claimMahJongg TODO check content concealedMelds does",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/server.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "fca0526348a3e50034fde1b58dc9ca9aa2b87f7d",
+        "html_url": "https://github.com/KDE/kajongg/commit/fca0526348a3e50034fde1b58dc9ca9aa2b87f7d",
+        "message": "fix possible race\n\njust in case TWO kajonggserver instances listened on the same port",
+        "author": "Wolfgang Rohdewald",
+        "date": "2024-12-31T03:31:06Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

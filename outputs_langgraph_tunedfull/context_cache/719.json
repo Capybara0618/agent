@@ -1,0 +1,440 @@
+{
+  "task_id": "719",
+  "repo_owner": "getsentry",
+  "repo_name": "sentry",
+  "file_path": "src/sentry/snuba/subscriptions.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:59:26+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:59:34+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:59:39+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/sentry/snuba/subscriptions.py",
+    "original_code": "def update_snuba_subscription(\n    subscription, query, aggregation, time_window, resolution, environments\n):\n    \"\"\"\n    Updates a subscription to a snuba query.\n\n    :param query: An event search query that we can parse and convert into a\n    set of Snuba conditions\n    :param aggregation: An aggregation to calculate over the time window\n    :param time_window: The time window to aggregate over\n    :param resolution: How often to receive updates/bucket size\n    :param environments: List of environments to filter by\n    :return: The QuerySubscription representing the subscription\n    \"\"\"\n    # TODO: Move this call to snuba into a task. This lets us successfully update a\n    # subscription in postgres and rollback as needed without having to create/delete\n    # from snuba\n    dataset = QueryDatasets(subscription.dataset)\n    _delete_from_snuba(dataset, subscription.subscription_id)\n    subscription_id = _create_in_snuba(\n        subscription.project, dataset, query, aggregation, time_window, resolution, environments\n    )\n    subscription.update(\n        subscription_id=subscription_id,\n        query=query,\n        aggregation=aggregation.value,\n        time_window=int(time_window.total_seconds()),\n        resolution=int(resolution.total_seconds()),\n    )\n    QuerySubscriptionEnvironment.objects.filter(query_subscription=subscription).exclude(\n        environment__in=environments\n    ).delete()\n    for e in environments:\n        QuerySubscriptionEnvironment.objects.get_or_create(\n            query_subscription=subscription, environment=e\n        )\n\n    return subscription",
+    "satd_comment": "# TODO: Move this call to snuba into a task. This lets us successfully update a\n# subscription in postgres and rollback as needed without having to create/delete\n# from snuba",
+    "target_file": {
+      "ok": true,
+      "path": "src/sentry/snuba/subscriptions.py",
+      "sha": "e357c5d12d19079af9fc46548d0349408559ce25",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/master/src/sentry/snuba/subscriptions.py",
+      "content_excerpt": "import logging\nfrom collections.abc import Collection, Iterable, Sequence\nfrom datetime import timedelta\n\nfrom django.db import router, transaction\n\nfrom sentry.models.environment import Environment\nfrom sentry.models.project import Project\nfrom sentry.snuba.dataset import Dataset\nfrom sentry.snuba.models import (\n    ExtrapolationMode,\n    QuerySubscription,\n    SnubaQuery,\n    SnubaQueryEventType,\n)\nfrom sentry.snuba.tasks import (\n    create_subscription_in_snuba,\n    delete_subscription_from_snuba,\n    update_subscription_in_snuba,\n)\n\nlogger = logging.getLogger(__name__)\n\n\ndef create_snuba_query(\n    query_type: SnubaQuery.Type,\n    dataset: Dataset,\n    query: str,\n    aggregate: str,\n    time_window: timedelta,\n    resolution: timedelta,\n    environment: Environment | None,\n    event_types: Collection[SnubaQueryEventType.EventType] = (),\n    group_by: Sequence[str] | None = None,\n    extrapolation_mode: ExtrapolationMode | None = None,\n) -> SnubaQuery:\n    \"\"\"\n    Constructs a SnubaQuery which is the postgres representation of a query in snuba\n\n    :param query_type: The SnubaQuery.Type of this query\n    :param dataset: The snuba dataset to query and aggregate over\n    :param query: An event search query that we can parse and convert into a\n    set of Snuba conditions\n    :param aggregate: An aggregate to calculate over the time window\n    :param time_window: The time window to aggregate over\n    :param resolution: How often to receive updates/bucket size\n    :param environment: An optional environment to filter by\n    :param event_types: A (currently) optional list of event_types that apply to this\n    query. If not passed, we'll infer a default value based on the dataset.\n    :return: A list of QuerySubscriptions\n    \"\"\"\n    snuba_query = SnubaQuery.objects.create(\n        type=query_type.value,\n        dataset=dataset.value,\n        query=query,\n        aggregate=aggregate,\n        time_window=int(time_window.total_seconds()),\n        resolution=int(resolution.total_seconds()),\n        environment=environment,\n        group_by=group_by,\n        extrapolation_mode=(\n            extrapolation_mode.value\n            if extrapolation_mode is not None\n            else ExtrapolationMode.UNKNOWN.value\n        ),\n    )\n    if not event_types:\n        if dataset == Dataset.Events:\n            event_types = [SnubaQueryEventType.EventType.ERROR]\n        elif dataset == Dataset.Transactions:\n            event_types = [SnubaQueryEventType.EventType.TRANSACTION]\n\n    if event_types:\n        sq_event_types = [\n            SnubaQueryEventType(snuba_query=snuba_query, type=event_type.value)\n            for event_type in set(event_types)\n        ]\n        SnubaQueryEventType.objects.bulk_create(sq_event_types)\n    return snuba_query\n\n\ndef update_snuba_query(\n    snuba_query: SnubaQuery,\n    query_type: SnubaQuery.Type,\n    dataset: Dataset,\n    query: str,\n    aggregate: str,\n    time_window: timedelta,\n    resolution: timedelta,\n    environment: Environment | None,\n    event_types: Collection[SnubaQueryEventType.EventType] | None,\n    extrapolation_mode: ExtrapolationMode | None = None,\n) -> None:\n    \"\"\"\n    Updates a SnubaQuery. Triggers updates to any related QuerySubscriptions.\n\n    :param snuba_query: The `SnubaQuery` to update.\n    :param query_type: The SnubaQuery.Type of this query\n    :param dataset: The snuba dataset to query and aggregate over\n    :param query: An event search query that we can parse and convert into a\n    set of Snuba conditions\n    :param aggregate: An aggregate to calculate over the time window\n    :param time_window: The time window to aggregate over\n    :param resolution: How often to receive updates/bucket size\n    :param environment: An optional environment to filter by\n    :param event_types: A (currently) optional list of event_types that apply to this\n    query. If not passed, we'll use the existing event types on the query.\n    :return: A list of QuerySubscriptions\n\n    TODO: Ensure update handles activated alert rule updates\n    eg. insert start_time into query, insert release version into query, etc.\n    \"\"\"\n    current_event_types = set(snuba_query.event_types)\n    if not event_types:\n        event_types = current_event_types\n\n    new_event_types = set(event_types) - current_event_types\n    removed_event_types = current_event_types - set(event_types)\n    old_query_type = SnubaQuery.Type(snuba_query.type)\n    old_dataset = Dataset(snuba_query.dataset)\n    old_query = snuba_query.query\n    old_aggregate = snuba_query.aggregate\n    with transaction.atomic(router.db_for_write(SnubaQuery)):\n        query_subscriptions = list(snuba_query.subscriptions.all())\n        snuba_query.update(\n            type=query_type.value,\n            dataset=dataset.value,\n            query=query,\n            aggregate=aggregate,\n            time_window=int(time_window.total_seconds()),\n            resolution=int(resolution.total_seconds()),\n            environment=environment,\n            extrapolation_mode=(\n                extrapolation_mode.value\n                if extrapolation_mode is not None\n                else snuba_query.extrapolation_mode\n            ),\n        )\n        if new_event_types:\n            SnubaQueryEventType.objects.bulk_create(\n                [\n                    SnubaQueryEventType(snuba_query=snuba_query, type=event_type.value)\n                    for event_type in set(new_event_types)\n                ]\n            )\n        if removed_event_types:\n            SnubaQueryEventType.objects.filter(\n                snuba_query=snuba_query, type__in=[et.value for et in removed_event_types]\n            ).delete()\n\n        bulk_update_snuba_subscriptions(\n            query_subscriptions, old_query_type, old_dataset, old_aggregate, old_query\n        )\n\n\ndef bulk_create_snuba_subscriptions(\n    projects: Iterable[Project],\n    subscription_type: str,\n    snuba_query: SnubaQuery,\n    query_extra: str | None = None,\n) -> list[QuerySubscription]:\n    \"\"\"\n    Creates a subscription to a snuba query for each project.\n\n    :param projects: The projects we're applying the query to\n    :param subscription_type: Text identifier for the subscription type this is. Used\n    to identify the registered callback associated with this subscription.\n    :param snuba_query: A `SnubaQuery` instance to subscribe the projects to.\n    :return: A list of QuerySubscriptions\n    \"\"\"\n    subscriptions = []\n    # TODO: Batch this up properly once we care about multi-project rules.\n    for project in projects:\n        subscriptions.append(\n            create_snuba_subscription(project, subscription_type, snuba_query, query_extra)\n        )\n    return subscriptions\n\n\ndef create_snuba_subscription(\n    project: Project,\n    subscription_type: str,\n    snuba_query: SnubaQuery,\n    query_extra: str | None = None,\n) -> QuerySubscription:\n    \"\"\"\n    Creates a subscription to a snuba query.\n\n    :param project: The project we're applying the query to\n    :param subscription_type: Text identifier for the subscription type this is. Used\n    to identify the registered callback associated with this subscription.\n    :param snuba_query: A `SnubaQuery` instance to subscribe the project to.\n    :return: The QuerySubscription representing the subscription\n    \"\"\"\n    subscription = QuerySubscription.objects.create(\n        status=QuerySubscription.Status.CREATING.value,\n        project=project,\n        snuba_query=snuba_query,\n        type=subscription_type,\n        query_extra=query_extra,\n    )\n\n    transaction.on_commit(\n        lambda: create_subscription_in_snuba.delay(query_subscription_id=subscription.id),\n        using=router.db_for_write(QuerySubscription),\n    )\n\n    return subscription\n\n\ndef bulk_update_snuba_subscriptions(\n    subscriptions: list[QuerySubscription],\n    old_query_type: SnubaQuery.Type,\n    old_dataset: Dataset,\n    old_aggregate: str,\n    old_query: str,\n) -> list[QuerySubscription]:\n    \"\"\"\n    Updates a list of query subscriptions.\n\n    :param subscriptions: The subscriptions we're updating\n    :param snuba_query: A `SnubaQuery` instance to subscribe the project to.\n    :return: A list of QuerySubscriptions\n    \"\"\"\n    updated_subscriptions = []\n    # TODO: Batch this up properly once we care about multi-project rules.\n    for subscription in subscriptions:\n        updated_subscriptions.append(\n            update_snuba_subscription(\n                subscription, old_query_type, old_dataset, old_aggregate, old_query\n            )\n        )\n    return subscriptions\n\n\ndef update_snuba_subscription(\n    subscription: QuerySubscription,\n    old_query_type: SnubaQuery.Type,\n    old_dataset: Dataset,\n    old_aggregate: str,\n    old_query: str,\n) -> QuerySubscription:\n    \"\"\"\n    Updates a subscription to a snuba query.\n\n    :param query: An event search query that we can parse and convert into a\n    set of Snuba conditions\n    :param old_dataset: The `QueryDataset` that this subscription was associated with\n    before the update.\n    :return: The QuerySubscription representing the subscription\n    \"\"\"\n    with transaction.atomic(router.db_for_write(QuerySubscription)):\n        subscription.update(status=QuerySubscription.Status.UPDATING.value)\n\n        transaction.on_commit(\n            lambda: update_subscription_in_snuba.delay(\n                query_subscription_id=subscription.id,\n                old_query_type=old_query_type.value,\n                old_dataset=old_dataset.value,\n                old_aggregate=old_aggregate,\n                old_query=old_query,\n            ),\n            using=router.db_for_write(QuerySubscription),\n        )\n\n    return subscription\n\n\ndef bulk_delete_snuba_subscriptions(subscriptions: Iterable[QuerySubscription]) -> None:\n    \"\"\"\n    Deletes a list of snuba query subscriptions.\n    :param subscriptions: The subscriptions to delete\n    :return:\n    \"\"\"\n    for subscription in subscriptions:\n        # TODO: Batch this up properly once we care about multi-project rules.\n        delete_snuba_subscription(subscription)\n\n\ndef delete_snuba_subscription(subscription: QuerySubscription) -> None:\n    \"\"\"\n    Deletes a subscription to a snuba query.\n    :param subscription: The subscription to delete\n    :return:\n    \"\"\"\n    subscription.update(status=QuerySubscription.Status.DELETING.value)\n\n    transaction.on_commit(\n        lambda: delete_subscription_from_snuba.delay(query_subscription_id=subscription.id),\n        using=router.db_for_write(QuerySubscription),\n    )\n\n\ndef bulk_disable_snuba_subscriptions(subscriptions: Iterable[QuerySubscription]) -> None:\n    \"\"\"\n    Disables a list of snuba query subscriptions.\n    :param subscriptions: The subscriptions to disable\n    :return:\n    \"\"\"\n    for subscription in subscriptions:\n        # TODO: Batch this up properly once we care about multi-project rules.\n        disable_snuba_subscription(subscription)\n\n\ndef disable_snuba_subscription(subscription: QuerySubscription) -> None:\n    \"\"\"\n    Disables a subscription to a snuba query.\n    :param subscription: The subscription to disable\n    :return:\n    \"\"\"\n    subscription.update(status=QuerySubscription.Status.DISABLED.value)\n\n    transaction.on_commit(\n        lambda: delete_subscription_from_snuba.delay(query_subscription_id=subscription.id),\n        using=router.db_for_write(QuerySubscription),\n    )\n\n\ndef bulk_enable_snuba_subscriptions(subscriptions: Iterable[QuerySubscription]) -> None:\n    \"\"\"\n    enables a list of snuba query subscriptions.\n    :param subscriptions: The subscriptions to enable\n    :return:\n    \"\"\"\n    for subscription in subscriptions:\n        # TODO: Batch this up properly once we care about multi-project rules.\n        enable_snuba_subscription(subscription)\n\n\ndef enable_snuba_subscription(subscription: QuerySubscription) -> None:\n    \"\"\"\n    enables a subscription to a snuba query.\n    :param subscription: The subscription to enable\n    :return:\n    \"\"\"\n    subscription.update(status=QuerySubscription.Status",
+      "total_lines": 341
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "logging",
+        "collections.abc:Collection",
+        "collections.abc:Iterable",
+        "collections.abc:Sequence",
+        "datetime:timedelta",
+        "django.db:router",
+        "django.db:transaction",
+        "sentry.models.environment:Environment",
+        "sentry.models.project:Project",
+        "sentry.snuba.dataset:Dataset",
+        "sentry.snuba.models:ExtrapolationMode",
+        "sentry.snuba.models:QuerySubscription",
+        "sentry.snuba.models:SnubaQuery",
+        "sentry.snuba.models:SnubaQueryEventType",
+        "sentry.snuba.tasks:create_subscription_in_snuba",
+        "sentry.snuba.tasks:delete_subscription_from_snuba",
+        "sentry.snuba.tasks:update_subscription_in_snuba"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <p align=\"center\">\n    <a href=\"https://sentry.io/?utm_source=github&utm_medium=logo\" target=\"_blank\">\n      <img src=\"https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png\" alt=\"Sentry\" width=\"280\" height=\"84\" />\n    </a>\n  </p>\n  <p align=\"center\">\n    Users and logs provide clues. Sentry provides answers.\n  </p>\n</p>\n\n# What's Sentry?\n\nSentry is the debugging platform that helps every developer detect, trace, and fix issues. Code breaks, fix it faster.\n\n<p align=\"center\">\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/issue-details.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/seer.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/traces.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/trace-explorer.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/replays.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/logs.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/uptime.png\" width=\"270\" />\n</p>\n\n## Official Sentry SDKs\n\n- [JavaScript](https://github.com/getsentry/sentry-javascript)\n- [Electron]("
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "update_snuba_subscription test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_subscriptions.py",
+          "path": "tests/sentry/snuba/test_subscriptions.py",
+          "sha": "8f5dd22f715829ae1c47a9cdf829c0b8b22d7129",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/snuba/test_subscriptions.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_alerts_translation.py",
+          "path": "tests/sentry/explore/translation/test_alerts_translation.py",
+          "sha": "3e914334970fd4bb80eb9da810ddb5e271a95650",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/explore/translation/test_alerts_translation.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"update_snuba_subscription(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "subscriptions.py",
+          "path": "src/sentry/snuba/subscriptions.py",
+          "sha": "e357c5d12d19079af9fc46548d0349408559ce25",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/snuba/subscriptions.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_subscriptions.py",
+          "path": "tests/sentry/snuba/test_subscriptions.py",
+          "sha": "8f5dd22f715829ae1c47a9cdf829c0b8b22d7129",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/snuba/test_subscriptions.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/sentry/snuba",
+      "count": 38,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/sentry/snuba/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "dataset.py",
+          "path": "src/sentry/snuba/dataset.py",
+          "type": "file"
+        },
+        {
+          "name": "discover.py",
+          "path": "src/sentry/snuba/discover.py",
+          "type": "file"
+        },
+        {
+          "name": "entity_subscription.py",
+          "path": "src/sentry/snuba/entity_subscription.py",
+          "type": "file"
+        },
+        {
+          "name": "errors.py",
+          "path": "src/sentry/snuba/errors.py",
+          "type": "file"
+        },
+        {
+          "name": "events.py",
+          "path": "src/sentry/snuba/events.py",
+          "type": "file"
+        },
+        {
+          "name": "functions.py",
+          "path": "src/sentry/snuba/functions.py",
+          "type": "file"
+        },
+        {
+          "name": "issue_platform.py",
+          "path": "src/sentry/snuba/issue_platform.py",
+          "type": "file"
+        },
+        {
+          "name": "metrics",
+          "path": "src/sentry/snuba/metrics",
+          "type": "dir"
+        },
+        {
+          "name": "metrics_enhanced_performance.py",
+          "path": "src/sentry/snuba/metrics_enhanced_performance.py",
+          "type": "file"
+        },
+        {
+          "name": "metrics_layer",
+          "path": "src/sentry/snuba/metrics_layer",
+          "type": "dir"
+        },
+        {
+          "name": "metrics_performance.py",
+          "path": "src/sentry/snuba/metrics_performance.py",
+          "type": "file"
+        },
+        {
+          "name": "models.py",
+          "path": "src/sentry/snuba/models.py",
+          "type": "file"
+        },
+        {
+          "name": "occurrences_rpc.py",
+          "path": "src/sentry/snuba/occurrences_rpc.py",
+          "type": "file"
+        },
+        {
+          "name": "ourlogs.py",
+          "path": "src/sentry/snuba/ourlogs.py",
+          "type": "file"
+        },
+        {
+          "name": "outcomes.py",
+          "path": "src/sentry/snuba/outcomes.py",
+          "type": "file"
+        },
+        {
+          "name": "preprod_size.py",
+          "path": "src/sentry/snuba/preprod_size.py",
+          "type": "file"
+        },
+        {
+          "name": "processing_errors_rpc.py",
+          "path": "src/sentry/snuba/processing_errors_rpc.py",
+          "type": "file"
+        },
+        {
+          "name": "profile_functions.py",
+          "path": "src/sentry/snuba/profile_functions.py",
+          "type": "file"
+        },
+        {
+          "name": "profiles.py",
+          "path": "src/sentry/snuba/profiles.py",
+          "type": "file"
+        },
+        {
+          "name": "query_sources.py",
+          "path": "src/sentry/snuba/query_sources.py",
+          "type": "file"
+        },
+        {
+          "name": "query_subscriptions",
+          "path": "src/sentry/snuba/query_subscriptions",
+          "type": "dir"
+        },
+        {
+          "name": "referrer.py",
+          "path": "src/sentry/snuba/referrer.py",
+          "type": "file"
+        },
+        {
+          "name": "rpc_dataset_common.py",
+          "path": "src/sentry/snuba/rpc_dataset_common.py",
+          "type": "file"
+        },
+        {
+          "name": "sessions.py",
+          "path": "src/sentry/snuba/sessions.py",
+          "type": "file"
+        },
+        {
+          "name": "sessions_v2.py",
+          "path": "src/sentry/snuba/sessions_v2.py",
+          "type": "file"
+        },
+        {
+          "name": "snuba_query_validator.py",
+          "path": "src/sentry/snuba/snuba_query_validator.py",
+          "type": "file"
+        },
+        {
+          "name": "spans_indexed.py",
+          "path": "src/sentry/snuba/spans_indexed.py",
+          "type": "file"
+        },
+        {
+          "name": "spans_metrics.py",
+          "path": "src/sentry/snuba/spans_metrics.py",
+          "type": "file"
+        },
+        {
+          "name": "spans_rpc.py",
+          "path": "src/sentry/snuba/spans_rpc.py",
+          "type": "file"
+        },
+        {
+          "name": "subscriptions.py",
+          "path": "src/sentry/snuba/subscriptions.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks.py",
+          "path": "src/sentry/snuba/tasks.py",
+          "type": "file"
+        },
+        {
+          "name": "trace.py",
+          "path": "src/sentry/snuba/trace.py",
+          "type": "file"
+        },
+        {
+          "name": "trace_metrics.py",
+          "path": "src/sentry/snuba/trace_metrics.py",
+          "type": "file"
+        },
+        {
+          "name": "transactions.py",
+          "path": "src/sentry/snuba/transactions.py",
+          "type": "file"
+        },
+        {
+          "name": "types.py",
+          "path": "src/sentry/snuba/types.py",
+          "type": "file"
+        },
+        {
+          "name": "uptime_results.py",
+          "path": "src/sentry/snuba/uptime_results.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "src/sentry/snuba/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/sentry/snuba/__init__.py"
+        },
+        {
+          "name": "dataset.py",
+          "path": "src/sentry/snuba/dataset.py"
+        },
+        {
+          "name": "discover.py",
+          "path": "src/sentry/snuba/discover.py"
+        },
+        {
+          "name": "entity_subscription.py",
+          "path": "src/sentry/snuba/entity_subscription.py"
+        },
+        {
+          "name": "errors.py",
+          "path": "src/sentry/snuba/errors.py"
+        },
+        {
+          "name": "events.py",
+          "path": "src/sentry/snuba/events.py"
+        },
+        {
+          "name": "functions.py",
+          "path": "src/sentry/snuba/functions.py"
+        },
+        {
+          "name": "issue_platform.py",
+          "path": "src/sentry/snuba/issue_platform.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/sentry/snuba/subscriptions.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b8dbb5959e351aaa5bbba314f1d351374c56dbea",
+          "html_url": "https://github.com/getsentry/sentry/commit/b8dbb5959e351aaa5bbba314f1d351374c56dbea",
+          "message": "types(snuba): Improve Snuba type coverage (#109374)\n\nMove more of Snuba code (specifically, the subset that interacts with\ncode owned by alerts-notifications) to the strong set.",
+          "author": "Kyle Consalus",
+          "date": "2026-02-25T22:38:33Z"
+        },
+        {
+          "sha": "e7be12cb78f4e160e2e7ddab219023b08a319b0a",
+          "html_url": "https://github.com/getsentry/sentry/commit/e7be12cb78f4e160e2e7ddab219023b08a319b0a",
+          "message": "fix(aci): accept str instead of int for extrapolation mode in validator (#104015)\n\nSlack thread for context:\nhttps://sentry.slack.com/archives/C07H2DHMSS0/p1764091469147239\n\nExtrapolation mode would not be accepted as a string in the validator\n(which is what it gets passed to the backend as) so it w",
+          "author": "Nikki Kapadia",
+          "date": "2025-11-27T14:47:20Z"
+        },
+        {
+          "sha": "191c6c0d13abcf75ae5dd54a206e80b0c1de65f7",
+          "html_url": "https://github.com/getsentry/sentry/commit/191c6c0d13abcf75ae5dd54a206e80b0c1de65f7",
+          "message": "chore(spans-migration): add post and put validation for EAP extrapolation mode (#102970)\n\nWe've added a new extrapolation mode field in metrics alerts for EAP. We\nwant to make sure the `server_weighted` value is not put in by the user.\nThey also shouldn't be able to set this extrapolation mode if th",
+          "author": "Nikki Kapadia",
+          "date": "2025-11-12T14:57:54Z"
+        },
+        {
+          "sha": "1f1e5b658ccce192ce87ea330a9dc17551135713",
+          "html_url": "https://github.com/getsentry/sentry/commit/1f1e5b658ccce192ce87ea330a9dc17551135713",
+          "message": "fix(aci): More specific logging on inconsistency-triggered subscription deletion (#101030)\n\nThis sort of inconsistency is rare and consequential; we want to know\nexactly how often it happens,\nand have a clear error message for each case.",
+          "author": "Kyle Consalus",
+          "date": "2025-10-06T22:19:23Z"
+        },
+        {
+          "sha": "a10104f8811870fed6f8d948007f4933c486752d",
+          "html_url": "https://github.com/getsentry/sentry/commit/a10104f8811870fed6f8d948007f4933c486752d",
+          "message": "feat(snuba): Add group_by field validation to SnubaQueryValidator (#96888)\n\n- Add group_by field to SnubaQueryValidator with validation\n- field can only be set if the feature flag mentioned in the PR is\nturned on,\n- defaults to `None`\n- Prevent empty lists (allow_empty=False)\n- Validate list length ",
+          "author": "Josh Ferge",
+          "date": "2025-08-01T12:26:38Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "update_snuba_subscription TODO Move this call snuba",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/sentry/snuba/subscriptions.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "b8dbb5959e351aaa5bbba314f1d351374c56dbea",
+        "html_url": "https://github.com/getsentry/sentry/commit/b8dbb5959e351aaa5bbba314f1d351374c56dbea",
+        "message": "types(snuba): Improve Snuba type coverage (#109374)\n\nMove more of Snuba code (specifically, the subset that interacts with\ncode owned by alerts-notifications) to the strong set.",
+        "author": "Kyle Consalus",
+        "date": "2026-02-25T22:38:33Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

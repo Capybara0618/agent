@@ -1,0 +1,294 @@
+{
+  "task_id": "738",
+  "repo_owner": "agronholm",
+  "repo_name": "apscheduler",
+  "file_path": "src/apscheduler/datastores/sqlalchemy.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:04:05+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 6,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:04:13+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:04:18+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/apscheduler/datastores/sqlalchemy.py",
+    "original_code": "async def remove_schedules(self, ids: Iterable[str]) -> None:\n    async for attempt in self._retry():\n        with attempt:\n            async with self._begin_transaction() as conn:\n                delete: Delete | ReturningDelete[\n                    Any\n                ] = self._t_schedules.delete().where(\n                    self._t_schedules.c.id.in_(ids)\n                )\n                if self._supports_update_returning:\n                    delete_returning = delete.returning(self._t_schedules.c.id)\n                    removed_ids: Iterable[str] = [\n                        row[0]\n                        for row in await self._execute(conn, delete_returning)\n                    ]\n                else:\n                    # TODO: actually check which rows were deleted?\n                    await self._execute(conn, delete)\n                    removed_ids = ids\n\n    for schedule_id in removed_ids:\n        await self._event_broker.publish(ScheduleRemoved(schedule_id=schedule_id))",
+    "satd_comment": "# TODO: actually check which rows were deleted?",
+    "target_file": {
+      "ok": true,
+      "path": "src/apscheduler/datastores/sqlalchemy.py",
+      "sha": "83f14856c5db4415312e75e12c411505962b8593",
+      "download_url": "https://raw.githubusercontent.com/agronholm/apscheduler/master/src/apscheduler/datastores/sqlalchemy.py",
+      "content_excerpt": "from __future__ import annotations\n\nfrom collections import defaultdict\nfrom collections.abc import AsyncGenerator, Iterable, Mapping, Sequence\nfrom contextlib import AsyncExitStack, asynccontextmanager\nfrom datetime import datetime, timedelta, timezone\nfrom functools import partial\nfrom logging import Logger\nfrom typing import Any, cast\nfrom uuid import UUID\n\nimport anyio\nimport attrs\nimport tenacity\nfrom anyio import CancelScope, to_thread\nfrom attr.validators import instance_of\nfrom sqlalchemy import (\n    JSON,\n    BigInteger,\n    Boolean,\n    Column,\n    DateTime,\n    Enum,\n    Integer,\n    Interval,\n    LargeBinary,\n    MetaData,\n    SmallInteger,\n    Table,\n    TypeDecorator,\n    Unicode,\n    Uuid,\n    and_,\n    bindparam,\n    create_engine,\n    false,\n    or_,\n    select,\n)\nfrom sqlalchemy.engine import URL, Dialect, Result\nfrom sqlalchemy.exc import (\n    CompileError,\n    IntegrityError,\n    InterfaceError,\n    InvalidRequestError,\n    ProgrammingError,\n)\nfrom sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine\nfrom sqlalchemy.future import Connection, Engine\nfrom sqlalchemy.schema import CreateSchema\nfrom sqlalchemy.sql import Executable\nfrom sqlalchemy.sql.ddl import DropTable\nfrom sqlalchemy.sql.elements import BindParameter, literal\nfrom sqlalchemy.sql.type_api import TypeEngine\n\nfrom .._enums import CoalescePolicy, ConflictPolicy, JobOutcome\nfrom .._events import (\n    DataStoreEvent,\n    Event,\n    JobAcquired,\n    JobAdded,\n    JobDeserializationFailed,\n    JobReleased,\n    ScheduleAdded,\n    ScheduleDeserializationFailed,\n    ScheduleRemoved,\n    ScheduleUpdated,\n    TaskAdded,\n    TaskRemoved,\n    TaskUpdated,\n)\nfrom .._exceptions import (\n    ConflictingIdError,\n    DeserializationError,\n    SerializationError,\n    TaskLookupError,\n)\nfrom .._structures import Job, JobResult, Schedule, ScheduleResult, Task\nfrom .._utils import create_repr, current_async_library\nfrom ..abc import EventBroker\nfrom .base import BaseExternalDataStore\n\n\nclass EmulatedTimestampTZ(TypeDecorator[datetime]):\n    impl = Unicode(32)\n    cache_ok = True\n\n    def process_bind_param(\n        self, value: datetime | None, dialect: Dialect\n    ) -> str | None:\n        return value.isoformat() if value is not None else None\n\n    def process_result_value(\n        self, value: str | None, dialect: Dialect\n    ) -> datetime | None:\n        return datetime.fromisoformat(value) if value is not None else None\n\n\nclass EmulatedInterval(TypeDecorator[timedelta]):\n    impl = BigInteger()\n    cache_ok = True\n\n    def process_bind_param(\n        self, value: timedelta | None, dialect: Dialect\n    ) -> float | None:\n        return value.total_seconds() * 1000000 if value is not None else None\n\n    def process_result_value(\n        self, value: int | None, dialect: Dialect\n    ) -> timedelta | None:\n        return timedelta(seconds=value / 1000000) if value is not None else None\n\n\ndef marshal_timestamp(timestamp: datetime | None, key: str) -> Mapping[str, Any]:\n    if timestamp is None:\n        return {key: None, key + \"_utcoffset\": None}\n\n    return {\n        key: int(timestamp.timestamp() * 1000_000),\n        key + \"_utcoffset\": cast(timedelta, timestamp.utcoffset()).total_seconds()\n        // 60,\n    }\n\n\n@attrs.define(eq=False, frozen=True)\nclass _JobDiscard:\n    job_id: UUID\n    outcome: JobOutcome\n    task_id: str\n    schedule_id: str | None\n    scheduled_fire_time: datetime | None\n    result_expires_at: datetime\n    exception: Exception | None = None\n\n\n@attrs.define(eq=False, repr=False)\nclass SQLAlchemyDataStore(BaseExternalDataStore):\n    \"\"\"\n    Uses a relational database to store data.\n\n    When started, this data store creates the appropriate tables on the given database\n    if they're not already present.\n\n    Operations are retried (in accordance to ``retry_settings``) when an operation\n    raises either :exc:`OSError` or :exc:`sqlalchemy.exc.InterfaceError`.\n\n    This store has been tested to work with:\n\n     * PostgreSQL (asyncpg and psycopg drivers)\n     * MySQL (asyncmy driver)\n     * aiosqlite (not recommended right now, as issues like\n       `#1032 <https://github.com/agronholm/apscheduler/issues/1032>`_ exist)\n\n    :param engine_or_url: a SQLAlchemy URL or engine (preferably asynchronous, but can\n        be synchronous)\n    :param schema: a database schema name to use, if not the default\n\n    .. note:: The data store will not manage the life cycle of any engine instance\n        passed to it, so you need to close the engine afterwards when you're done with\n        it.\n\n    .. warning:: Do not use SQLite when sharing the data store with multiple schedulers,\n        as there is an unresolved issue with that\n        (`#959 <https://github.com/agronholm/apscheduler/issues/959>`_).\n    \"\"\"\n\n    engine_or_url: str | URL | Engine | AsyncEngine = attrs.field(\n        validator=instance_of((str, URL, Engine, AsyncEngine))\n    )\n    schema: str | None = attrs.field(kw_only=True, default=None)\n\n    _engine: Engine | AsyncEngine = attrs.field(init=False)\n    _close_on_exit: bool = attrs.field(init=False, default=False)\n    _supports_update_returning: bool = attrs.field(init=False, default=False)\n    _supports_tzaware_timestamps: bool = attrs.field(init=False, default=False)\n    _supports_native_interval: bool = attrs.field(init=False, default=False)\n    _metadata: MetaData = attrs.field(init=False)\n    _t_metadata: Table = attrs.field(init=False)\n    _t_tasks: Table = attrs.field(init=False)\n    _t_schedules: Table = attrs.field(init=False)\n    _t_jobs: Table = attrs.field(init=False)\n    _t_job_results: Table = attrs.field(init=False)\n\n    def __attrs_post_init__(self) -> None:\n        if isinstance(self.engine_or_url, (str, URL)):\n            try:\n                self._engine = create_async_engine(self.engine_or_url)\n            except InvalidRequestError:\n                self._engine = create_engine(self.engine_or_url)\n\n            self._close_on_exit = True\n        else:\n            self._engine = self.engine_or_url\n\n        # Generate the table definitions\n        prefix = f\"{self.schema}.\" if self.schema else \"\"\n        self._supports_tzaware_timestamps = self._engine.dialect.name in (\n            \"postgresql\",\n            \"oracle\",\n        )\n        self._supports_native_interval = self._engine.dialect.name == \"postgresql\"\n        self._metadata = self.get_table_definitions()\n        self._t_metadata = self._metadata.tables[prefix + \"metadata\"]\n        self._t_tasks = self._metadata.tables[prefix + \"tasks\"]\n        self._t_schedules = self._metadata.tables[prefix + \"schedules\"]\n        self._t_jobs = self._metadata.tables[prefix + \"jobs\"]\n        self._t_job_results = self._metadata.tables[prefix + \"job_results\"]\n\n    def __repr__(self) -> str:\n        return create_repr(self, url=repr(self._engine.url), schema=self.schema)\n\n    def _retry(self) -> tenacity.AsyncRetrying:\n        def after_attempt(retry_state: tenacity.RetryCallState) -> None:\n            self._logger.warning(\n                \"Temporary data store error (attempt %d): %s\",\n                retry_state.attempt_number,\n                retry_state.outcome.exception(),\n            )\n\n        # OSError is raised by asyncpg if it can't connect\n        return tenacity.AsyncRetrying(\n            stop=self.retry_settings.stop,\n            wait=self.retry_settings.wait,\n            retry=tenacity.retry_if_exception_type((InterfaceError, OSError)),\n            after=after_attempt,\n            sleep=anyio.sleep,\n            reraise=True,\n        )\n\n    @asynccontextmanager\n    async def _begin_transaction(\n        self,\n    ) -> AsyncGenerator[Connection | AsyncConnection, None]:\n        # A shielded cancel scope is injected to the exit stack to allow finalization\n        # to occur even when the surrounding cancel scope is cancelled\n        async with AsyncExitStack() as exit_stack:\n            if isinstance(self._engine, AsyncEngine):\n                async_cm = self._engine.begin()\n                conn = await async_cm.__aenter__()\n                exit_stack.enter_context(CancelScope(shield=True))\n                exit_stack.push_async_exit(async_cm.__aexit__)\n            else:\n                cm = self._engine.begin()\n                conn = await to_thread.run_sync(cm.__enter__)\n                exit_stack.enter_context(CancelScope(shield=True))\n                exit_stack.push_async_exit(partial(to_thread.run_sync, cm.__exit__))\n\n            yield conn\n\n    async def _create_metadata(self, conn: Connection | AsyncConnection) -> None:\n        if isinstance(conn, AsyncConnection):\n            await conn.run_sync(self._metadata.create_all)\n        else:\n            await to_thread.run_sync(self._metadata.create_all, conn)\n\n    async def _execute(\n        self,\n        conn: Connection | AsyncConnection,\n        statement: Executable,\n        parameters: Sequence | Mapping | None = None,\n    ):\n        if isinstance(conn, AsyncConnection):\n            return await conn.execute(statement, parameters)\n        else:\n            return await to_thread.run_sync(conn.execute, statement, parameters)\n\n    @property\n    def _temporary_failure_exceptions(self) -> tuple[type[Exception], ...]:\n        # SQlite does not use the network, so it doesn't have \"temporary\" failures\n        if self._engine.dialect.name == \"sqlite\":\n            return ()\n\n        return InterfaceError, OSError\n\n    def _convert_incoming_fire_times(self, data: dict[str, Any]) -> dict[str, Any]:\n        for field in (\"last_fire_time\", \"next_fire_time\"):\n            if not self._supports_tzaware_timestamps:\n                utcoffset_minutes = data.pop(f\"{field}_utcoffset\", None)\n                if utcoffset_minutes is not None:\n                    tz = timezone(timedelta(minutes=utcoffset_minutes))\n                    timestamp = data[field] / 1000_000\n                    data[field] = datetime.fromtimestamp(timestamp, tz=tz)\n\n        return data\n\n    def _convert_outgoing_fire_times(self, data: dict[str, Any]) -> dict[str, Any]:\n        for field in (\"last_fire_time\", \"next_fire_time\"):\n            if not self._supports_tzaware_timestamps:\n                field_value = data[field]\n                if field_value is not None:\n                    data[field] = int(field_value.timestamp() * 1000_000)\n                    data[f\"{field}_utcoffset\"] = (\n                        field_value.utcoffset().total_seconds() // 60\n                    )\n                else:\n                    data[f\"{field}_utcoffset\"] = None\n\n        return data\n\n    def get_table_definitions(self) -> MetaData:\n        if self._supports_tzaware_timestamps:\n            timestamp_type: TypeEngine[datetime] = DateTime(timezone=True)\n            last_fire_time_tzoffset_columns: tuple[Column, ...] = (\n                Column(\"last_fire_time\", timestamp_type),\n            )\n            next_fire_time_tzoffset_columns: tuple[Column, ...] = (\n                Column(\"next_fire_time\", timestamp_type, index=True),\n            )\n        else:\n            timestamp_type = EmulatedTimestampTZ()\n            last_fire_time_tzoffset_columns = (\n                Column(\"last_fire_time\", BigInteger),\n                Column(\"last_fire_time_utcoffset\", SmallInteger),\n            )\n            next_fire_time_tzoffset_columns = (\n                Column(\"next_fire_time\", BigInteger, index=True),\n                Column(\"next_fire_time_utcoffset\", SmallInteger),\n            )\n\n        if self._supports_native_interval:\n            interval_type: TypeDecorator[timedelta] = Interval(second_precision=6)\n        else:\n            interval_type = EmulatedInterval()\n\n        if self._engine.dialect.name == \"postgresql\":\n            from sqlalchemy.dialects.postgresql import JSONB\n\n            json_type = JSONB\n        else:\n            json_type = JSON\n\n        metadata = MetaData(schema=self.schema)\n        Table(\"metadata\", metadata, Column(\"schema_version\", Integer, nullable=False))\n        Table(\n         ",
+      "total_lines": 1240
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "collections:defaultdict",
+        "collections.abc:AsyncGenerator",
+        "collections.abc:Iterable",
+        "collections.abc:Mapping",
+        "collections.abc:Sequence",
+        "contextlib:AsyncExitStack",
+        "contextlib:asynccontextmanager",
+        "datetime:datetime",
+        "datetime:timedelta",
+        "datetime:timezone",
+        "functools:partial",
+        "logging:Logger",
+        "typing:Any",
+        "typing:cast",
+        "uuid:UUID",
+        "anyio",
+        "attrs",
+        "tenacity",
+        "anyio:CancelScope",
+        "anyio:to_thread",
+        "attr.validators:instance_of",
+        "sqlalchemy:JSON",
+        "sqlalchemy:BigInteger",
+        "sqlalchemy:Boolean",
+        "sqlalchemy:Column",
+        "sqlalchemy:DateTime",
+        "sqlalchemy:Enum",
+        "sqlalchemy:Integer",
+        "sqlalchemy:Interval"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/agronholm/apscheduler/master/README.rst",
+      "content_excerpt": ".. image:: https://github.com/agronholm/apscheduler/actions/workflows/test.yml/badge.svg\n  :target: https://github.com/agronholm/apscheduler/actions/workflows/test.yml\n  :alt: Build Status\n.. image:: https://coveralls.io/repos/github/agronholm/apscheduler/badge.svg?branch=master\n  :target: https://coveralls.io/github/agronholm/apscheduler?branch=master\n  :alt: Code Coverage\n.. image:: https://readthedocs.org/projects/apscheduler/badge/?version=latest\n  :target: https://apscheduler.readthedocs.io/en/master/?badge=latest\n  :alt: Documentation\n\n.. warning:: The v4.0 series is provided as a **pre-release** and may change in a\n   backwards incompatible fashion without any migration pathway, so do NOT use this\n   release in production!\n\nAdvanced Python Scheduler (APScheduler) is a task scheduler and task queue system for\nPython. It can be used solely as a job queuing system if you have no need for task\nscheduling. It scales both up and down, and is suitable for both trivial, single-process\nuse cases as well as large deployments spanning multiple nodes. Multiple schedulers and\nworkers can be deployed to use a shared data store to provide both a degree of high\navailability and horizontal scaling.\n\nAPScheduler comes in both synchronous and asynchronous flavors, making it a good fit for\nboth traditional, thread-based applications, and asynchronous (asyncio or Trio_)\napplications. Documentation and examples are provided for integrating with either WSGI_\nor ASGI_ compatible web applications.\n\nSupport is provided for persistent storage of schedules and jobs. This means that they\ncan be "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "remove_schedules test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_datastores.py",
+          "path": "tests/test_datastores.py",
+          "sha": "b064e949fa58a74c4736b04ffec6f469e98ee02e",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/tests/test_datastores.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"remove_schedules(\"",
+      "count": 6,
+      "items": [
+        {
+          "name": "memory.py",
+          "path": "src/apscheduler/datastores/memory.py",
+          "sha": "1c3ecccee81d5ed967eb9d81b8380fcdd450c1cf",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/src/apscheduler/datastores/memory.py",
+          "score": 1.0
+        },
+        {
+          "name": "async_.py",
+          "path": "src/apscheduler/_schedulers/async_.py",
+          "sha": "fb5cb5460db3965cea07c0ceb2f3cd308f1e281b",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/src/apscheduler/_schedulers/async_.py",
+          "score": 1.0
+        },
+        {
+          "name": "abc.py",
+          "path": "src/apscheduler/abc.py",
+          "sha": "34e70a0787892a44ee3d168691df0b8788e4f891",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/src/apscheduler/abc.py",
+          "score": 1.0
+        },
+        {
+          "name": "mongodb.py",
+          "path": "src/apscheduler/datastores/mongodb.py",
+          "sha": "ea5ee18b9327a275bd50dba23235309bdb37675a",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/src/apscheduler/datastores/mongodb.py",
+          "score": 1.0
+        },
+        {
+          "name": "sqlalchemy.py",
+          "path": "src/apscheduler/datastores/sqlalchemy.py",
+          "sha": "83f14856c5db4415312e75e12c411505962b8593",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/src/apscheduler/datastores/sqlalchemy.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_datastores.py",
+          "path": "tests/test_datastores.py",
+          "sha": "b064e949fa58a74c4736b04ffec6f469e98ee02e",
+          "html_url": "https://github.com/agronholm/apscheduler/blob/ff65a444f83083ceef865f4eb97fccd2186fef01/tests/test_datastores.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/apscheduler/datastores",
+      "count": 5,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/apscheduler/datastores/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "src/apscheduler/datastores/base.py",
+          "type": "file"
+        },
+        {
+          "name": "memory.py",
+          "path": "src/apscheduler/datastores/memory.py",
+          "type": "file"
+        },
+        {
+          "name": "mongodb.py",
+          "path": "src/apscheduler/datastores/mongodb.py",
+          "type": "file"
+        },
+        {
+          "name": "sqlalchemy.py",
+          "path": "src/apscheduler/datastores/sqlalchemy.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 4,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/apscheduler/datastores/__init__.py"
+        },
+        {
+          "name": "base.py",
+          "path": "src/apscheduler/datastores/base.py"
+        },
+        {
+          "name": "memory.py",
+          "path": "src/apscheduler/datastores/memory.py"
+        },
+        {
+          "name": "mongodb.py",
+          "path": "src/apscheduler/datastores/mongodb.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/apscheduler/datastores/sqlalchemy.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ab90d713e8ae72c986d4ebdf16ce36a80a1c612c",
+          "html_url": "https://github.com/agronholm/apscheduler/commit/ab90d713e8ae72c986d4ebdf16ce36a80a1c612c",
+          "message": "Removed unconditional import of sniffio\n\nSniffio is no longer an implicit dependency, as of AnyIO 4.12.0.\n\nFixes #1093.",
+          "author": "Alex Grönholm",
+          "date": "2025-12-01T22:14:57Z"
+        },
+        {
+          "sha": "1b184f55b13f20caddecf18101b322f0ec5c815c",
+          "html_url": "https://github.com/agronholm/apscheduler/commit/1b184f55b13f20caddecf18101b322f0ec5c815c",
+          "message": "Applied more Ruff rules and the fixes that they required",
+          "author": "Alex Grönholm",
+          "date": "2025-11-30T00:05:47Z"
+        },
+        {
+          "sha": "4600fd457051f8e128d7a2797d1d3d248abd8270",
+          "html_url": "https://github.com/agronholm/apscheduler/commit/4600fd457051f8e128d7a2797d1d3d248abd8270",
+          "message": "Fixed Sphinx warnings",
+          "author": "Alex Grönholm",
+          "date": "2025-04-27T08:28:49Z"
+        },
+        {
+          "sha": "97365fd8e31b38d8b2c6bc70b53c9734263464ce",
+          "html_url": "https://github.com/agronholm/apscheduler/commit/97365fd8e31b38d8b2c6bc70b53c9734263464ce",
+          "message": "Added warning about #959",
+          "author": "Alex Grönholm",
+          "date": "2025-04-23T20:31:49Z"
+        },
+        {
+          "sha": "e4b1db1dcb8d9e88d10f4688f0c6f72e844f8bf7",
+          "html_url": "https://github.com/agronholm/apscheduler/commit/e4b1db1dcb8d9e88d10f4688f0c6f72e844f8bf7",
+          "message": "Added the DataStore.reap_abandoned_jobs() method",
+          "author": "Alex Grönholm",
+          "date": "2025-04-23T18:10:25Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "remove_schedules TODO actually check which rows",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/apscheduler/datastores/sqlalchemy.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "ab90d713e8ae72c986d4ebdf16ce36a80a1c612c",
+        "html_url": "https://github.com/agronholm/apscheduler/commit/ab90d713e8ae72c986d4ebdf16ce36a80a1c612c",
+        "message": "Removed unconditional import of sniffio\n\nSniffio is no longer an implicit dependency, as of AnyIO 4.12.0.\n\nFixes #1093.",
+        "author": "Alex Grönholm",
+        "date": "2025-12-01T22:14:57Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 6,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

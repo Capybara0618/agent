@@ -1,0 +1,314 @@
+{
+  "task_id": "468",
+  "repo_owner": "mozilla",
+  "repo_name": "dxr",
+  "file_path": "dxr/build.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:46:21+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:46:30+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:46:41+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "dxr/build.py",
+    "original_code": "def run_html_workers(tree, conn):\n    \"\"\" Build HTML for a tree \"\"\"\n    print \"Building HTML for the '%s' tree\" % tree.name\n\n    # Let's find the number of rows, this is the maximum rowid, assume we didn't\n    # delete files, this assumption should hold, but even if we delete files, it's\n    # fairly like that this partition the work reasonably evenly.\n    sql = \"SELECT files.ID FROM files ORDER BY files.ID DESC LIMIT 1\"\n    row = conn.execute(sql).fetchone()\n    file_count = row[0]\n\n    # Make some slices\n    slices = []\n    # Don't make slices bigger than 500\n    step = max(min(500, int(file_count) / int(tree.config.nb_jobs)), 1)\n    start = None  # None, is not --start argument\n    for end in xrange(step, file_count, step):\n        slices.append((start, end))\n        start = end + 1\n    slices.append((start, None))  # None, means omit --end argument\n\n    # Map from pid to workers\n    workers = {}\n    next_id = 1   # unique ids for workers, to associate log files\n\n    # While there's slices and workers, we can manage them\n    while slices or workers:\n        # Create workers while we have slots available\n        while len(workers) < int(tree.config.nb_jobs) and slices:\n            # Get slice of work\n            start, end = slices.pop()\n            # Setup arguments\n            args = ['--file', tree.config.configfile, '--tree', tree.name]\n            if start is not None:\n                args += ['--start', str(start)]\n            if end is not None:\n                args += ['--end', str(end)]\n            # Open log file\n            log = dxr.utils.open_log(tree, \"dxr-worker-%s.log\" % next_id)\n            # Create a worker\n            print \" - Starting worker %i\" % next_id\n\n            # TODO: Switch to multiprocessing.\n            cmd = [sys.executable, os.path.join(dirname(__file__), 'dxr-worker.py')] + args\n\n            # Write command to log\n            log.write(\" \".join(cmd) + \"\\n\")\n            log.flush()\n            worker = subprocess.Popen(\n                cmd,\n                stdout = log,\n                stderr = log\n            )\n            # Add worker\n            workers[worker.pid] = (worker, log, datetime.now(), next_id)\n            next_id += 1\n\n        # Wait for a subprocess to terminate\n        pid, exit = os.waitpid(0, 0)\n        # Find worker that terminated\n        worker, log, started, wid = workers[pid]\n        print \" - Worker %i finished in %s\" % (wid, datetime.now() - started)\n        # Remove from workers\n        del workers[pid]\n        # Close log file\n        log.close()\n        # Crash and error if we have problems\n        if exit != 0:\n            print >> sys.stderr, \"dxr-worker.py subprocess failed!\"\n            print >> sys.stderr, \"    | Log from %s:\" % log.name\n            # Print log for easy debugging\n            with open(log.name, 'r') as log:\n                for line in log:\n                    print >> sys.stderr, \"    | \" + line.strip('\\n')\n            # Kill co-workers\n            for worker, log, started, wid in workers.values():\n                worker.kill()\n                log.close()\n            # Exit, we're done here\n            sys.exit(1)",
+    "satd_comment": "# TODO: Switch to multiprocessing.",
+    "target_file": {
+      "ok": true,
+      "path": "dxr/build.py",
+      "sha": "8374435d7f7d55ada7609f170c8b476e7c304f01",
+      "download_url": "https://raw.githubusercontent.com/mozilla/dxr/master/dxr/build.py",
+      "content_excerpt": "from datetime import datetime\nfrom errno import ENOENT\nfrom fnmatch import fnmatchcase\nfrom itertools import chain, izip, repeat\nimport os\nfrom os import stat, makedirs\nfrom os.path import islink, relpath, join, split\nfrom shutil import rmtree\nimport subprocess\nimport sys\nfrom sys import exc_info\nfrom traceback import format_exc\nfrom uuid import uuid1\n\nfrom binaryornot.helpers import is_binary_string\nfrom concurrent.futures import as_completed, ProcessPoolExecutor\nfrom click import progressbar\nfrom flask import current_app\nfrom funcy import ichunks, first\nfrom pyelasticsearch import (ElasticSearch, IndexAlreadyExistsError,\n                             bulk_chunks, Timeout, ConnectionError)\n\nfrom dxr.app import make_app, dictify_links\nfrom dxr.config import FORMAT\nfrom dxr.es import UNINDEXED_STRING, UNANALYZED_STRING, TREE, create_index_and_wait\nfrom dxr.exceptions import BuildError\nfrom dxr.filters import LINE, FILE\nfrom dxr.lines import es_lines, finished_tags\nfrom dxr.mime import decode_data\nfrom dxr.utils import (open_log, deep_update, append_update,\n                       append_update_by_line, append_by_line, bucket,\n                       split_content_lines, unicode_for_display)\nfrom dxr.vcs import VcsCache\n\n\ndef full_traceback(callable, *args, **kwargs):\n    \"\"\"Work around the wretched exception reporting of concurrent.futures.\n\n    Futures generally gives no access to the traceback of the task; you get\n    only a traceback into the guts of futures, plus the description line of\n    the task's traceback. We jam the full traceback of any exception that\n    occurs into the message of the exception: disgusting but informative.\n\n    \"\"\"\n    try:\n        return callable(*args, **kwargs)\n    except Exception:\n        raise Exception(format_exc())\n\n\ndef index_and_deploy_tree(tree, verbose=False):\n    \"\"\"Index a tree, and make it accessible.\n\n    :arg tree: The TreeConfig of the tree to build\n\n    \"\"\"\n    config = tree.config\n    es = ElasticSearch(config.es_hosts,\n                       timeout=config.es_indexing_timeout,\n                       max_retries=config.es_indexing_retries)\n    index_name = index_tree(tree, es, verbose=verbose)\n    if 'index' not in tree.config.skip_stages:\n        deploy_tree(tree, es, index_name)\n\n\ndef deploy_tree(tree, es, index_name):\n    \"\"\"Point the ES aliases and catalog records to a newly built tree, and\n    delete any obsoleted index.\n\n    \"\"\"\n    config = tree.config\n\n    # Make new index live:\n    alias = config.es_alias.format(format=FORMAT,\n                                   tree=tree.name,\n                                   config_path_hash=config.path_hash())\n    swap_alias(alias, index_name, es)\n\n    # Create catalog index if it doesn't exist.\n    try:\n        create_index_and_wait(\n            es,\n            config.es_catalog_index,\n            settings={\n                'settings': {\n                    'index': {\n                        # Fewer should be faster:\n                        'number_of_shards': 1,\n                        # This should be cranked up until it's on all nodes,\n                        # so it's always a fast read:\n                        'number_of_replicas': config.es_catalog_replicas\n                    },\n                },\n                'mappings': {\n                    TREE: {\n                        '_all': {\n                            'enabled': False\n                        },\n                        'properties': {\n                            'name': UNANALYZED_STRING,\n                            'format': UNANALYZED_STRING,\n                            # In case es_alias changes in the conf file:\n                            'es_alias': UNINDEXED_STRING,\n                            # Needed so new trees or edited descriptions can show\n                            # up without a WSGI restart:\n                            'description': UNINDEXED_STRING,\n                            # [\"clang\", \"pygmentize\"]:\n                            'enabled_plugins': UNINDEXED_STRING,\n                            'generated_date': UNINDEXED_STRING\n                            # We may someday also need to serialize some plugin\n                            # configuration here.\n                        }\n                    }\n                }\n            })\n    except IndexAlreadyExistsError:\n        pass\n\n    # Insert or update the doc representing this tree. There'll be a little\n    # race between this and the alias swap. We'll live.\n    es.index(config.es_catalog_index,\n             doc_type=TREE,\n             doc=dict(name=tree.name,\n                      format=FORMAT,\n                      es_alias=alias,\n                      description=tree.description,\n                      enabled_plugins=[p.name for p in tree.enabled_plugins],\n                      generated_date=config.generated_date),\n             id='%s/%s' % (FORMAT, tree.name))\n\n\ndef swap_alias(alias, index, es):\n    \"\"\"Point an ES alias to a new index, and delete the old index.\n\n    :arg index: The new index name\n\n    \"\"\"\n    # Get the index the alias currently points to.\n    old_index = first(es.aliases(alias))\n\n    # Make the alias point to the new index.\n    removal = ([{'remove': {'index': old_index, 'alias': alias}}] if\n               old_index else [])\n    es.update_aliases(removal + [{'add': {'index': index, 'alias': alias}}])  # atomic\n\n    # Delete the old index.\n    if old_index:\n        es.delete_index(old_index)\n\n\ndef index_tree(tree, es, verbose=False):\n    \"\"\"Index a single tree into ES and the filesystem, and return the\n    name of the new ES index.\n\n    \"\"\"\n    def new_pool():\n        return ProcessPoolExecutor(max_workers=tree.workers)\n\n    def farm_out(method_name):\n        \"\"\"Farm out a call to all tree indexers across a process pool.\n\n        Return the tree indexers, including anything mutations the method call\n        might have made.\n\n        Show progress while doing it.\n\n        \"\"\"\n        if not tree.workers:\n            return [save_scribbles(ti, method_name) for ti in tree_indexers]\n        else:\n            futures = [pool.submit(full_traceback, save_scribbles, ti, method_name)\n                       for ti in tree_indexers]\n            return [future.result() for future in\n                    show_progress(futures, 'Running %s' % method_name)]\n\n    def delete_index_quietly(es, index):\n        \"\"\"Delete an index, and ignore any error.\n\n        This cannot be done inline in the except clause below, because, even\n        if we catch this exception, it spoils the exception info in that\n        scope, making the bare ``raise`` raise the not-found error rather than\n        whatever went wrong earlier.\n\n        \"\"\"\n        try:\n            es.delete_index(index)\n        except Exception:\n            pass\n\n    print \"Starting tree '%s'.\" % tree.name\n\n    # Note starting time\n    start_time = datetime.now()\n\n    config = tree.config\n    skip_indexing = 'index' in config.skip_stages\n    skip_build = 'build' in config.skip_stages\n    skip_cleanup = skip_indexing or skip_build or 'clean' in config.skip_stages\n\n    # Create and/or clear out folders:\n    ensure_folder(tree.object_folder, tree.source_folder != tree.object_folder and not skip_cleanup)\n    ensure_folder(tree.temp_folder, not skip_cleanup)\n    ensure_folder(tree.log_folder, not skip_cleanup)\n    ensure_folder(join(tree.temp_folder, 'plugins'), not skip_cleanup)\n    for plugin in tree.enabled_plugins:\n        ensure_folder(join(tree.temp_folder, 'plugins', plugin.name),\n                      not skip_cleanup)\n\n    vcs_cache = VcsCache(tree)\n    tree_indexers = [p.tree_to_index(p.name, tree, vcs_cache) for p in\n                     tree.enabled_plugins if p.tree_to_index]\n    try:\n        if not skip_indexing:\n            # Substitute the format, tree name, and uuid into the index identifier.\n            index = tree.es_index.format(format=FORMAT,\n                                         tree=tree.name,\n                                         unique=uuid1(),\n                                         config_path_hash=config.path_hash())\n            create_index_and_wait(\n                es,\n                index,\n                settings={\n                    'settings': {\n                        'index': {\n                            'number_of_shards': tree.es_shards,  # Fewer should be faster, assuming enough RAM.\n                            'number_of_replicas': 0  # for speed\n                        },\n                        # Default analyzers and mappings are in the core plugin.\n                        'analysis': reduce(\n                                deep_update,\n                                (p.analyzers for p in tree.enabled_plugins),\n                                {}),\n\n                        # DXR indices are immutable once built. Turn the\n                        # refresh interval down to keep the segment count low\n                        # while indexing. It will make for less merging later.\n                        # We could also simply call \"optimize\" after we're\n                        # done indexing, but it is unthrottled; we'd have to\n                        # use shard allocation to do the indexing on one box\n                        # and then move it elsewhere for actual use.\n                        'refresh_interval':\n                            '%is' % config.es_refresh_interval\n                    },\n                    'mappings': reduce(deep_update,\n                                       (p.mappings for p in\n                                            tree.enabled_plugins),\n                                       {})\n                })\n        else:\n            index = None\n            print \"Skipping indexing (due to 'index' in 'skip_stages')\"\n\n        # Run pre-build hooks:\n        with new_pool() as pool:\n            tree_indexers = farm_out('pre_build')\n            # Tear down pool to let the build process use more RAM.\n\n        if not skip_build:\n            # Set up env vars, and build:\n            build_tree(tree, tree_indexers, verbose)\n        else:\n            print \"Skipping rebuild (due to 'build' in 'skip_stages')\"\n\n        # Post-build, and index files:\n        if not skip_indexing:\n            with new_pool() as pool:\n                tree_indexers = farm_out('post_build')\n                index_files(tree, tree_indexers, index, pool, es)\n\n            # refresh() times out in prod. Wait until it doesn't. That\n            # probably means things are ready to rock again.\n            with aligned_progressbar(repeat(None), label='Refreshing index') as bar:\n                for _ in bar:\n                    try:\n                        es.refresh(index=index)\n                    except (ConnectionError, Timeout) as exc:\n                        pass\n                    else:\n                        break\n\n            es.update_settings(\n                index,\n                {\n                    'settings': {\n                        'index': {\n                            'number_of_replicas': 1  # fairly arbitrary\n                        }\n                    }\n                })\n    except Exception as exc:\n        # If anything went wrong, delete the index, because we're not\n        # going to have a way of returning its name if we raise an\n        # exception.\n        if not skip_indexing:\n            delete_index_quietly(es, index)\n        raise\n\n    print \"Finished '%s' in %s.\" % (tree.name, datetime.now() - start_time)\n    if not skip_cleanup:\n        # By default, we remove the temp files, because they're huge.\n        rmtree(tree.temp_folder)\n    return index\n\n\ndef aligned_progressbar(*args, **kwargs):\n    \"\"\"Fall through to click's progress bar, but line up all the bars so they\n    aren't askew.\"\"\"\n    return progressbar(\n        *args, bar_template='%(label)-18s [%(bar)s] %(info)s', **kwargs)\n\n\ndef show_progress(futures, message):\n    \"\"\"Show progress and yield results as futures complete.\"\"\"\n    with aligned_progres",
+      "total_lines": 686
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [],
+      "error": "syntax_error: Missing parentheses in call to 'print'. Did you mean print(...)? (<unknown>, line 190)"
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/mozilla/dxr/master/README.rst",
+      "content_excerpt": "===\nDXR\n===\n\nDXR is a code search and navigation tool aimed at making sense of large\nprojects like Firefox. It supports full-text and regex searches as well as\nstructural queries like \"Find all the callers of this function.\" Behind the\nscenes, it uses trigram indices, elasticsearch, and static analysis data\ncollected by instrumented compilers to make searches faster and more accurate\nthan is possible with simple tools like grep. DXR also exposes a plugin API\nthrough which understanding of more languages can be added.\n\n.. image:: docs/source/screenshot.png\n\n* Example: http://dxr.mozilla.org/\n* Documentation: https://dxr.readthedocs.org/\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "run_html_workers test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"run_html_workers(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "dxr",
+      "count": 22,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "dxr/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "app.py",
+          "path": "dxr/app.py",
+          "type": "file"
+        },
+        {
+          "name": "build.py",
+          "path": "dxr/build.py",
+          "type": "file"
+        },
+        {
+          "name": "cli",
+          "path": "dxr/cli",
+          "type": "dir"
+        },
+        {
+          "name": "config.py",
+          "path": "dxr/config.py",
+          "type": "file"
+        },
+        {
+          "name": "es.py",
+          "path": "dxr/es.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "dxr/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "filters.py",
+          "path": "dxr/filters.py",
+          "type": "file"
+        },
+        {
+          "name": "format",
+          "path": "dxr/format",
+          "type": "file"
+        },
+        {
+          "name": "hgext",
+          "path": "dxr/hgext",
+          "type": "dir"
+        },
+        {
+          "name": "indexers.py",
+          "path": "dxr/indexers.py",
+          "type": "file"
+        },
+        {
+          "name": "lines.py",
+          "path": "dxr/lines.py",
+          "type": "file"
+        },
+        {
+          "name": "mime.py",
+          "path": "dxr/mime.py",
+          "type": "file"
+        },
+        {
+          "name": "plugins",
+          "path": "dxr/plugins",
+          "type": "dir"
+        },
+        {
+          "name": "query.py",
+          "path": "dxr/query.py",
+          "type": "file"
+        },
+        {
+          "name": "static_unhashed",
+          "path": "dxr/static_unhashed",
+          "type": "dir"
+        },
+        {
+          "name": "templates",
+          "path": "dxr/templates",
+          "type": "dir"
+        },
+        {
+          "name": "testing.py",
+          "path": "dxr/testing.py",
+          "type": "file"
+        },
+        {
+          "name": "trigrammer.py",
+          "path": "dxr/trigrammer.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "dxr/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "vcs.py",
+          "path": "dxr/vcs.py",
+          "type": "file"
+        },
+        {
+          "name": "wsgi.py",
+          "path": "dxr/wsgi.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "dxr/__init__.py"
+        },
+        {
+          "name": "app.py",
+          "path": "dxr/app.py"
+        },
+        {
+          "name": "config.py",
+          "path": "dxr/config.py"
+        },
+        {
+          "name": "es.py",
+          "path": "dxr/es.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "dxr/exceptions.py"
+        },
+        {
+          "name": "filters.py",
+          "path": "dxr/filters.py"
+        },
+        {
+          "name": "format",
+          "path": "dxr/format"
+        },
+        {
+          "name": "indexers.py",
+          "path": "dxr/indexers.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "dxr/build.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "93ac8d09a356a9151b5b6f2bf420f0aedf46365d",
+          "html_url": "https://github.com/mozilla/dxr/commit/93ac8d09a356a9151b5b6f2bf420f0aedf46365d",
+          "message": "Use a unique name for the ES index for every test.\nWhen a test has finished delete only the index created by that test and\nnot all test indices.",
+          "author": "James Abbatiello",
+          "date": "2018-02-11T22:07:08Z"
+        },
+        {
+          "sha": "8a9e9c3cf9b7bdfbdf72c77732b7a0362dc069a7",
+          "html_url": "https://github.com/mozilla/dxr/commit/8a9e9c3cf9b7bdfbdf72c77732b7a0362dc069a7",
+          "message": "Don't clean the object folder if the user has explicitly requested no cleaning.",
+          "author": "James Abbatiello",
+          "date": "2018-02-09T05:51:36Z"
+        },
+        {
+          "sha": "c8924053c7ced8118a2f29c3dcd970f69a9a5f9e",
+          "html_url": "https://github.com/mozilla/dxr/commit/c8924053c7ced8118a2f29c3dcd970f69a9a5f9e",
+          "message": "Change directions. Embrace paths as bags of bytes. Fixes bug 1290945.\n\nThis is how Linux handles them, so we may encounted undecodeable names as we traverse the FS. Convert to unicode only at the last minute, for ES and for display on the web. This may cause dirs and files that are named the same ex",
+          "author": "Erik Rose",
+          "date": "2016-08-01T21:23:20Z"
+        },
+        {
+          "sha": "dd918bee56dd39a1cb8d220466da226ea569dc49",
+          "html_url": "https://github.com/mozilla/dxr/commit/dd918bee56dd39a1cb8d220466da226ea569dc49",
+          "message": "Allow per-tree specification of worker count. Fixes bug 1288242. (#604)\n\nThis way, we can keep RAM use low for hungry plugins but still aggressively parallelize other trees.",
+          "author": "Erik Rose",
+          "date": "2016-07-27T17:01:33Z"
+        },
+        {
+          "sha": "23d90131e70c36231fd32bb58c62e30dc3da9b94",
+          "html_url": "https://github.com/mozilla/dxr/commit/23d90131e70c36231fd32bb58c62e30dc3da9b94",
+          "message": "Unignored docstring wording",
+          "author": "Peter Elmers",
+          "date": "2016-07-11T22:40:15Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "run_html_workers TODO Switch multiprocessing",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "dxr/build.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "93ac8d09a356a9151b5b6f2bf420f0aedf46365d",
+        "html_url": "https://github.com/mozilla/dxr/commit/93ac8d09a356a9151b5b6f2bf420f0aedf46365d",
+        "message": "Use a unique name for the ES index for every test.\nWhen a test has finished delete only the index created by that test and\nnot all test indices.",
+        "author": "James Abbatiello",
+        "date": "2018-02-11T22:07:08Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

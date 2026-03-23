@@ -1,0 +1,407 @@
+{
+  "task_id": "483",
+  "repo_owner": "deshaw",
+  "repo_name": "pyflyby",
+  "file_path": "lib/python/pyflyby/_modules.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:51:17+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_remove_import_cache_dir",
+    "satd_line": 74,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:51:27+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:51:33+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lib/python/pyflyby/_modules.py",
+    "original_code": "def exports(self):\n    \"\"\"\n    Get symbols exported by this module.\n\n    Note that this requires involves actually importing this module, which\n    may have side effects.  (TODO: rewrite to avoid this?)\n\n    :rtype:\n      `ImportSet` or ``None``\n    :return:\n      Exports, or ``None`` if nothing exported.\n    \"\"\"\n    from pyflyby._importclns import ImportStatement, ImportSet\n    module = self.module\n    try:\n        members = module.__all__\n    except AttributeError:\n        members = dir(module)\n        # Filter by non-private.\n        members = [n for n in members if not n.startswith(\"_\")]\n        # Filter by definition in the module.\n        def from_this_module(name):\n            # TODO: could do this more robustly by parsing the AST and\n            # looking for STOREs (definitions/assignments/etc).\n            x = getattr(module, name)\n            m = getattr(x, \"__module__\", None)\n            if not m:\n                return False\n            return DottedIdentifier(m).startswith(self.name)\n        members = [n for n in members if from_this_module(n)]\n    else:\n        if not all(type(s) == str for s in members):\n            raise Exception(\n                \"Module %r contains non-string entries in __all__\"\n                % (str(self.name),))\n    # Filter out artificially added \"deep\" members.\n    members = [(n, None) for n in members if \".\" not in n]\n    if not members:\n        return None\n    return ImportSet(\n        [ ImportStatement.from_parts(str(self.name), members) ])",
+    "satd_comment": "# TODO: could do this more robustly by parsing the AST and\n# looking for STOREs (definitions/assignments/etc).",
+    "target_file": {
+      "ok": true,
+      "path": "lib/python/pyflyby/_modules.py",
+      "sha": "2e97e6a800783f7014e4e0ed8805012e1c870a6b",
+      "download_url": "https://raw.githubusercontent.com/deshaw/pyflyby/master/lib/python/pyflyby/_modules.py",
+      "content_excerpt": "# pyflyby/_modules.py.\n# Copyright (C) 2011, 2012, 2013, 2014, 2015 Karl Chen.\n# License: MIT http://opensource.org/licenses/MIT\n\nfrom __future__ import annotations\n\nimport ast\nfrom   functools                import cached_property, total_ordering\nimport hashlib\nimport importlib\nimport itertools\nimport json\nimport os\nimport pathlib\nimport pkgutil\nimport platformdirs\nimport textwrap\n\nfrom   pyflyby._fast_iter_modules \\\n                                import _iter_file_finder_modules\nfrom   pyflyby._file            import FileText, Filename\nfrom   pyflyby._idents          import DottedIdentifier, is_identifier\nfrom   pyflyby._log             import logger\nfrom   pyflyby._util            import (ExcludeImplicitCwdFromPathCtx, cmp,\n                                        memoize, prefixes)\n\nimport re\nimport shutil\nimport sys\nimport types\nfrom   typing                   import Any, Dict, Generator, Union\n\nclass ErrorDuringImportError(ImportError):\n    \"\"\"\n    Exception raised by import_module if the module exists but an exception\n    occurred while attempting to import it.  That nested exception could be\n    ImportError, e.g. if a module tries to import another module that doesn't\n    exist.\n    \"\"\"\n\ndef rebuild_import_cache():\n    \"\"\"Force the import cache to be rebuilt.\n\n    The cache is deleted before calling _fast_iter_modules, which repopulates the cache.\n    \"\"\"\n    for path in pathlib.Path(\n        platformdirs.user_cache_dir(appname='pyflyby', appauthor=False)\n    ).iterdir():\n        _remove_import_cache_dir(path)\n    _fast_iter_modules()\n\n\ndef _remove_import_cache_dir(path: pathlib.Path):\n    \"\"\"Remove an import cache directory.\n\n    Import cache directories exist in <user cache dir>/pyflyby/, and they should\n    contain just a single file which itself contains a JSON blob of cached import names.\n    We therefore only delete the requested path if it is a directory.\n\n    Parameters\n    ----------\n    path : pathlib.Path\n        Import cache directory path to remove\n    \"\"\"\n    if path.is_dir():\n        # Only directories are valid import cache entries\n        try:\n            shutil.rmtree(str(path))\n        except Exception as e:\n            logger.error(\n                f\"Failed to remove cache directory at {path} - please \"\n                \"consider removing this directory manually. Error:\\n\"\n                f\"{textwrap.indent(str(e), prefix='  ')}\"\n            )\n\n\n@memoize\ndef import_module(module_name):\n    module_name = str(module_name)\n    logger.debug(\"Importing %r\", module_name)\n    try:\n        result = __import__(module_name, fromlist=['dummy'])\n        if result.__name__ != module_name:\n            logger.debug(\"Note: import_module(%r).__name__ == %r\",\n                         module_name, result.__name__)\n        return result\n    except ImportError as e:\n        # We got an ImportError.  Figure out whether this is due to the module\n        # not existing, or whether the module exists but caused an ImportError\n        # (perhaps due to trying to import another problematic module).\n        # Do this by looking at the exception traceback.  If the previous\n        # frame in the traceback is this function (because locals match), then\n        # it should be the internal import machinery reporting that the module\n        # doesn't exist.  Re-raise the exception as-is.\n        # If some sys.meta_path or other import hook isn't compatible with\n        # such a check, here are some things we could do:\n        #   - Use pkgutil.find_loader() after the fact to check if the module\n        #     is supposed to exist.  Note that we shouldn't rely solely on\n        #     this before attempting to import, because find_loader() doesn't\n        #     work with meta_path.\n        #   - Write a memoized global function that compares in the current\n        #     environment the difference between attempting to import a\n        #     non-existent module vs a problematic module, and returns a\n        #     function that uses the working discriminators.\n        real_importerror1 = type(e) is ImportError\n        real_importerror2 = (sys.exc_info()[2].tb_frame.f_locals is locals())\n        m = re.match(\"^No module named (.*)$\", str(e))\n        real_importerror3 = (m and m.group(1) == module_name\n                             or module_name.endswith(\".\"+m.group(1)))\n        logger.debug(\"import_module(%r): real ImportError: %s %s %s\",\n                     module_name,\n                     real_importerror1, real_importerror2, real_importerror3)\n        if real_importerror1 and real_importerror2 and real_importerror3:\n            raise\n        raise ErrorDuringImportError(\n            \"Error while attempting to import %s: %s: %s\"\n            % (module_name, type(e).__name__, e)) from e\n    except Exception as e:\n        raise ErrorDuringImportError(\n            \"Error while attempting to import %s: %s: %s\"\n            % (module_name, type(e).__name__, e)) from e\n\n\ndef _my_iter_modules(path, prefix=''):\n    # Modified version of pkgutil.ImpImporter.iter_modules(), patched to\n    # handle inaccessible subdirectories.\n    if path is None:\n        return\n    try:\n        filenames = os.listdir(path)\n    except OSError:\n        return # silently ignore inaccessible paths\n    filenames.sort()  # handle packages before same-named modules\n    yielded = {}\n    import inspect\n    for fn in filenames:\n        modname = inspect.getmodulename(fn)\n        if modname=='__init__' or modname in yielded:\n            continue\n        subpath = os.path.join(path, fn)\n        ispkg = False\n        try:\n            if not modname and os.path.isdir(path) and '.' not in fn:\n                modname = fn\n                for fn in os.listdir(subpath):\n                    subname = inspect.getmodulename(fn)\n                    if subname=='__init__':\n                        ispkg = True\n                        break\n                else:\n                    continue    # not a package\n        except OSError:\n            continue # silently ignore inaccessible subdirectories\n        if modname and '.' not in modname:\n            yielded[modname] = 1\n            yield prefix + modname, ispkg\n\n\ndef pyc_to_py(filename):\n    if filename.endswith(\".pyc\") or filename.endswith(\".pyo\"):\n        filename = filename[:-1]\n    return filename\n\n\n@total_ordering\nclass ModuleHandle(object):\n    \"\"\"\n    A handle to a module.\n    \"\"\"\n\n    name: DottedIdentifier\n\n    def __new__(cls, arg):\n        if isinstance(arg, cls):\n            return arg\n        if isinstance(arg, Filename):\n            return cls._from_filename(arg)\n        if isinstance(arg, (str, DottedIdentifier)):\n            return cls._from_modulename(arg)\n        if isinstance(arg, types.ModuleType):\n            return cls._from_module(arg)\n        raise TypeError(\"ModuleHandle: unexpected %s\" % (type(arg).__name__,))\n\n    _cls_cache:Dict[Any, Any] = {}\n\n    @classmethod\n    def _from_modulename(cls, modulename):\n        modulename = DottedIdentifier(modulename)\n        try:\n            return cls._cls_cache[modulename]\n        except KeyError:\n            pass\n        self = object.__new__(cls)\n        self.name = modulename\n        cls._cls_cache[modulename] = self\n        return self\n\n    @classmethod\n    def _from_module(cls, module):\n        if not isinstance(module, types.ModuleType):\n            raise TypeError\n        self = cls._from_modulename(module.__name__)\n        assert self.module is module\n        return self\n\n    @classmethod\n    def _from_filename(cls, filename):\n        filename = Filename(filename)\n        raise NotImplementedError(\n            \"TODO: look at sys.path to guess module name\")\n\n    @cached_property\n    def parent(self):\n        if not self.name.parent:\n            return None\n        return ModuleHandle(self.name.parent)\n\n    @cached_property\n    def ancestors(self):\n        return tuple(ModuleHandle(m) for m in self.name.prefixes)\n\n    @cached_property\n    def module(self):\n        \"\"\"\n        Return the module instance.\n\n        :rtype:\n          ``types.ModuleType``\n        :raise ErrorDuringImportError:\n          The module should exist but an error occurred while attempting to\n          import it.\n        :raise ImportError:\n          The module doesn't exist.\n        \"\"\"\n        # First check if prefix component is importable.\n        if self.parent:\n            self.parent.module\n        # Import.\n        return import_module(self.name)\n\n    @cached_property\n    def exists(self):\n        \"\"\"\n        Return whether the module exists, according to pkgutil.\n        Note that this doesn't work for things that are only known by using\n        sys.meta_path.\n        \"\"\"\n        name = str(self.name)\n        if name in sys.modules:\n            return True\n        if self.parent and not self.parent.exists:\n            return False\n\n        import importlib.util\n        find = importlib.util.find_spec\n\n        try:\n            pkg = find(name)\n        except Exception:\n            # Catch all exceptions, not just ImportError.  If the __init__.py\n            # for the parent package of the module raises an exception, it'll\n            # propagate to here.\n            pkg = None\n        return pkg is not None\n\n    @cached_property\n    def filename(self):\n        \"\"\"\n        Return the filename, if appropriate.\n\n        The module itself will not be imported, but if the module is not a\n        top-level module/package, accessing this attribute may cause the\n        parent package to be imported.\n\n        :rtype:\n          `Filename`\n        \"\"\"\n        if sys.version_info > (3, 12):\n            from importlib.util import find_spec\n            try:\n                mod = find_spec(str(self.name))\n                if mod is None or mod.origin is None:\n                    return None\n                else:\n                    assert isinstance(mod.origin, str)\n                    return Filename(mod.origin)\n            except ModuleNotFoundError:\n                return None\n            assert False\n\n        # Use the loader mechanism to find the filename.  We do so instead of\n        # using self.module.__file__, because the latter forces importing a\n        # module, which may be undesirable.\n\n        import pkgutil\n        try:\n             #TODO: deprecated and will be removed in 3.14\n            loader = pkgutil.get_loader(str(self.name))\n        except ImportError:\n            return None\n        if not loader:\n            return None\n        # Get the filename using loader.get_filename().  Note that this does\n        # more than just loader.filename: for example, it adds /__init__.py\n        # for packages.\n        if not hasattr(loader, 'get_filename'):\n            return None\n        filename = loader.get_filename()\n        if not filename:\n            return None\n        return Filename(pyc_to_py(filename))\n\n    @cached_property\n    def text(self):\n        return FileText(self.filename)\n\n    @cached_property\n    def block(self):\n        from pyflyby._parse import PythonBlock\n        return PythonBlock(self.text)\n\n    @staticmethod\n    @memoize\n    def list() -> list[str]:\n        \"\"\"Enumerate all top-level packages/modules.\n\n        The current working directory is excluded for autoimporting; if we autoimported\n        random python scripts in the current directory, we could accidentally execute\n        code with side effects.\n\n        Also exclude any module names that are not legal python module names (e.g.\n        \"try.py\" or \"123.py\").\n\n        :return: A list of all importable module names\n        \"\"\"\n        with ExcludeImplicitCwdFromPathCtx():\n            return [mod.name for mod in _fast_iter_modules() if is_identifier(mod.name)]\n\n    @cached_property\n    def submodules(self):\n        \"\"\"\n        Enumerate the importable submodules of this module.\n\n          >>> ModuleHandle(\"email\").submodules      # doctest:+ELLIPSIS\n          (..., ModuleHandle('email.encoders'), ..., ModuleHandle('email.mime'), ...)\n\n        :rtype:\n ",
+      "total_lines": 643
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 74,
+      "start_line": 54,
+      "end_line": 94,
+      "matched_line": "            )",
+      "excerpt": "54:     \"\"\"Remove an import cache directory.\n55: \n56:     Import cache directories exist in <user cache dir>/pyflyby/, and they should\n57:     contain just a single file which itself contains a JSON blob of cached import names.\n58:     We therefore only delete the requested path if it is a directory.\n59: \n60:     Parameters\n61:     ----------\n62:     path : pathlib.Path\n63:         Import cache directory path to remove\n64:     \"\"\"\n65:     if path.is_dir():\n66:         # Only directories are valid import cache entries\n67:         try:\n68:             shutil.rmtree(str(path))\n69:         except Exception as e:\n70:             logger.error(\n71:                 f\"Failed to remove cache directory at {path} - please \"\n72:                 \"consider removing this directory manually. Error:\\n\"\n73:                 f\"{textwrap.indent(str(e), prefix='  ')}\"\n74:             )\n75: \n76: \n77: @memoize\n78: def import_module(module_name):\n79:     module_name = str(module_name)\n80:     logger.debug(\"Importing %r\", module_name)\n81:     try:\n82:         result = __import__(module_name, fromlist=['dummy'])\n83:         if result.__name__ != module_name:\n84:             logger.debug(\"Note: import_module(%r).__name__ == %r\",\n85:                          module_name, result.__name__)\n86:         return result\n87:     except ImportError as e:\n88:         # We got an ImportError.  Figure out whether this is due to the module\n89:         # not existing, or whether the module exists but caused an ImportError\n90:         # (perhaps due to trying to import another problematic module).\n91:         # Do this by looking at the exception traceback.  If the previous\n92:         # frame in the traceback is this function (because locals match), then\n93:         # it should be the internal import machinery reporting that the module\n94:         # doesn't exist.  Re-raise the exception as-is."
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_remove_import_cache_dir",
+      "start_line": 53,
+      "end_line": 74,
+      "source": "def _remove_import_cache_dir(path: pathlib.Path):\n    \"\"\"Remove an import cache directory.\n\n    Import cache directories exist in <user cache dir>/pyflyby/, and they should\n    contain just a single file which itself contains a JSON blob of cached import names.\n    We therefore only delete the requested path if it is a directory.\n\n    Parameters\n    ----------\n    path : pathlib.Path\n        Import cache directory path to remove\n    \"\"\"\n    if path.is_dir():\n        # Only directories are valid import cache entries\n        try:\n            shutil.rmtree(str(path))\n        except Exception as e:\n            logger.error(\n                f\"Failed to remove cache directory at {path} - please \"\n                \"consider removing this directory manually. Error:\\n\"\n                f\"{textwrap.indent(str(e), prefix='  ')}\"\n            )"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "ast",
+        "functools:cached_property",
+        "functools:total_ordering",
+        "hashlib",
+        "importlib",
+        "itertools",
+        "json",
+        "os",
+        "pathlib",
+        "pkgutil",
+        "platformdirs",
+        "textwrap",
+        "pyflyby._fast_iter_modules:_iter_file_finder_modules",
+        "pyflyby._file:FileText",
+        "pyflyby._file:Filename",
+        "pyflyby._idents:DottedIdentifier",
+        "pyflyby._idents:is_identifier",
+        "pyflyby._log:logger",
+        "pyflyby._util:ExcludeImplicitCwdFromPathCtx",
+        "pyflyby._util:cmp",
+        "pyflyby._util:memoize",
+        "pyflyby._util:prefixes",
+        "re",
+        "shutil",
+        "sys",
+        "types",
+        "typing:Any",
+        "typing:Dict",
+        "typing:Generator"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/deshaw/pyflyby/master/README.rst",
+      "content_excerpt": "#########\n Pyflyby\n#########\n\n.. image:: https://badge.fury.io/py/pyflyby.svg\n   :target: https://pypi.org/project/pyflyby/\n\n.. image:: https://travis-ci.org/deshaw/pyflyby.png?branch=master\n   :target: https://travis-ci.org/deshaw/pyflyby\n\nPyflyby is a set of Python programming productivity tools for Python.\n\nFor command-line interaction:\n  * ``py``: command-line multitool\n\nFor IPython interaction:\n  * ``autoimporter``: automatically imports symbols when needed.\n\nFor editing python source code:\n  * ``tidy-imports``: adds missing 'import's, removes unused 'import's,\n    and also reformats import blocks.\n  * ``find-import``: prints to stdout how to import a particular symbol.\n  * ``reformat-imports``: reformats ``import`` blocks\n  * ``collect-imports``: prints out all the imports in a given set of files.\n  * ``collect-exports``: prints out definitions in a given set of modules,\n    in the form of import statements.\n  * ``transform-imports``: renames imported modules/functions.\n\n`Learn more about Pyflyby <https://www.deshaw.com/library/desco-quansight-improving-jupyter-efficiency>`_ in this blog post.\n\nInstallation\n============\n\n.. code:: bash\n\n    $ pip install pyflyby\n\nThis creates an alias for your `ipython` named `py` which runs the `pyflyby` plug internally.\n `pyflyby` has a dependency on `ipython`, if it isn't already installed do install it with:\n\n.. code:: bash\n\n    $ pip install ipython\n\n\nQuick start: Autoimporter + IPython\n===================================\n\n.. code:: bash\n\n   $ py\n   In [1]: re.search(\"[a-z]+\", \"....hello...\").group(0)\n   [PYFLYBY] import re\n   Ou"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_remove_import_cache_dir test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_remove_import_cache_dir(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "_modules.py",
+          "path": "lib/python/pyflyby/_modules.py",
+          "sha": "2e97e6a800783f7014e4e0ed8805012e1c870a6b",
+          "html_url": "https://github.com/deshaw/pyflyby/blob/09f94bce93c716336ad0b13eea48e611669a0e2f/lib/python/pyflyby/_modules.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lib/python/pyflyby",
+      "count": 32,
+      "entries": [
+        {
+          "name": ".gitignore",
+          "path": "lib/python/pyflyby/.gitignore",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "lib/python/pyflyby/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "lib/python/pyflyby/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "_autoimp.py",
+          "path": "lib/python/pyflyby/_autoimp.py",
+          "type": "file"
+        },
+        {
+          "name": "_cmdline.py",
+          "path": "lib/python/pyflyby/_cmdline.py",
+          "type": "file"
+        },
+        {
+          "name": "_comms.py",
+          "path": "lib/python/pyflyby/_comms.py",
+          "type": "file"
+        },
+        {
+          "name": "_dbg.py",
+          "path": "lib/python/pyflyby/_dbg.py",
+          "type": "file"
+        },
+        {
+          "name": "_dynimp.py",
+          "path": "lib/python/pyflyby/_dynimp.py",
+          "type": "file"
+        },
+        {
+          "name": "_fast_iter_modules.pyi",
+          "path": "lib/python/pyflyby/_fast_iter_modules.pyi",
+          "type": "file"
+        },
+        {
+          "name": "_file.py",
+          "path": "lib/python/pyflyby/_file.py",
+          "type": "file"
+        },
+        {
+          "name": "_flags.py",
+          "path": "lib/python/pyflyby/_flags.py",
+          "type": "file"
+        },
+        {
+          "name": "_format.py",
+          "path": "lib/python/pyflyby/_format.py",
+          "type": "file"
+        },
+        {
+          "name": "_idents.py",
+          "path": "lib/python/pyflyby/_idents.py",
+          "type": "file"
+        },
+        {
+          "name": "_import_sorting.py",
+          "path": "lib/python/pyflyby/_import_sorting.py",
+          "type": "file"
+        },
+        {
+          "name": "_importclns.py",
+          "path": "lib/python/pyflyby/_importclns.py",
+          "type": "file"
+        },
+        {
+          "name": "_importdb.py",
+          "path": "lib/python/pyflyby/_importdb.py",
+          "type": "file"
+        },
+        {
+          "name": "_imports2s.py",
+          "path": "lib/python/pyflyby/_imports2s.py",
+          "type": "file"
+        },
+        {
+          "name": "_importstmt.py",
+          "path": "lib/python/pyflyby/_importstmt.py",
+          "type": "file"
+        },
+        {
+          "name": "_interactive.py",
+          "path": "lib/python/pyflyby/_interactive.py",
+          "type": "file"
+        },
+        {
+          "name": "_livepatch.py",
+          "path": "lib/python/pyflyby/_livepatch.py",
+          "type": "file"
+        },
+        {
+          "name": "_log.py",
+          "path": "lib/python/pyflyby/_log.py",
+          "type": "file"
+        },
+        {
+          "name": "_modules.py",
+          "path": "lib/python/pyflyby/_modules.py",
+          "type": "file"
+        },
+        {
+          "name": "_parse.py",
+          "path": "lib/python/pyflyby/_parse.py",
+          "type": "file"
+        },
+        {
+          "name": "_py.py",
+          "path": "lib/python/pyflyby/_py.py",
+          "type": "file"
+        },
+        {
+          "name": "_saveframe.py",
+          "path": "lib/python/pyflyby/_saveframe.py",
+          "type": "file"
+        },
+        {
+          "name": "_saveframe_reader.py",
+          "path": "lib/python/pyflyby/_saveframe_reader.py",
+          "type": "file"
+        },
+        {
+          "name": "_util.py",
+          "path": "lib/python/pyflyby/_util.py",
+          "type": "file"
+        },
+        {
+          "name": "_version.py",
+          "path": "lib/python/pyflyby/_version.py",
+          "type": "file"
+        },
+        {
+          "name": "autoimport.py",
+          "path": "lib/python/pyflyby/autoimport.py",
+          "type": "file"
+        },
+        {
+          "name": "check_parse.py",
+          "path": "lib/python/pyflyby/check_parse.py",
+          "type": "file"
+        },
+        {
+          "name": "importdb.py",
+          "path": "lib/python/pyflyby/importdb.py",
+          "type": "file"
+        },
+        {
+          "name": "meson.build",
+          "path": "lib/python/pyflyby/meson.build",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": ".gitignore",
+          "path": "lib/python/pyflyby/.gitignore"
+        },
+        {
+          "name": "__init__.py",
+          "path": "lib/python/pyflyby/__init__.py"
+        },
+        {
+          "name": "__main__.py",
+          "path": "lib/python/pyflyby/__main__.py"
+        },
+        {
+          "name": "_autoimp.py",
+          "path": "lib/python/pyflyby/_autoimp.py"
+        },
+        {
+          "name": "_cmdline.py",
+          "path": "lib/python/pyflyby/_cmdline.py"
+        },
+        {
+          "name": "_comms.py",
+          "path": "lib/python/pyflyby/_comms.py"
+        },
+        {
+          "name": "_dbg.py",
+          "path": "lib/python/pyflyby/_dbg.py"
+        },
+        {
+          "name": "_dynimp.py",
+          "path": "lib/python/pyflyby/_dynimp.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lib/python/pyflyby/_modules.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "0b91680a3ca6645c7950f34eeffe8e679733f27e",
+          "html_url": "https://github.com/deshaw/pyflyby/commit/0b91680a3ca6645c7950f34eeffe8e679733f27e",
+          "message": "Remove single usage of __text__, replace by instance check. (#475)\n\nRemove single usage of __text__, replace by instance check.",
+          "author": "M Bussonnier",
+          "date": "2026-02-21T14:56:03Z"
+        },
+        {
+          "sha": "14b1b12b959fd1c59acad89e5c94934083b5af19",
+          "html_url": "https://github.com/deshaw/pyflyby/commit/14b1b12b959fd1c59acad89e5c94934083b5af19",
+          "message": "Drop six requirement (#443)\n\nPyflyby have been py3only for wuite some time.\n\nI did not remove the six import isn etc/pyflyby/std.py database",
+          "author": "M Bussonnier",
+          "date": "2025-11-20T08:19:20Z"
+        },
+        {
+          "sha": "d299533052bfb6817cb4cc4912247b2868d8b02e",
+          "html_url": "https://github.com/deshaw/pyflyby/commit/d299533052bfb6817cb4cc4912247b2868d8b02e",
+          "message": "Fast module iter: use try/execept (#424)\n\nThis uses a try/except approach instead of a permission checking\nto catch various problems that could arise preventing reading\ndirs. It also adds a test.\n\nI'm not sure how to properly test in a reliable\nway when the process group is not the owner, at least o",
+          "author": "M Bussonnier",
+          "date": "2025-10-20T09:47:24Z"
+        },
+        {
+          "sha": "206f54b7b012ac412abe20aae0829ef2f4cb74a5",
+          "html_url": "https://github.com/deshaw/pyflyby/commit/206f54b7b012ac412abe20aae0829ef2f4cb74a5",
+          "message": "Disable rebuild cache messages by default (#423)\n\n* Disable rebuild cache messages by default\n\n* setenv to 0\n\n* fix import",
+          "author": "M Bussonnier",
+          "date": "2025-10-13T11:47:53Z"
+        },
+        {
+          "sha": "94c77b71ae773c7e5fb5d5e253e07689bdfe5cd1",
+          "html_url": "https://github.com/deshaw/pyflyby/commit/94c77b71ae773c7e5fb5d5e253e07689bdfe5cd1",
+          "message": "Replace deprecated `appdirs` dependency with `platformdirs` (#408)",
+          "author": "Peyton Murray",
+          "date": "2025-09-09T11:28:12Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_remove_import_cache_dir TODO could this more robustly",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lib/python/pyflyby/_modules.py",
+      "satd_line": 74,
+      "last_commit": {
+        "sha": "0b91680a3ca6645c7950f34eeffe8e679733f27e",
+        "html_url": "https://github.com/deshaw/pyflyby/commit/0b91680a3ca6645c7950f34eeffe8e679733f27e",
+        "message": "Remove single usage of __text__, replace by instance check. (#475)\n\nRemove single usage of __text__, replace by instance check.",
+        "author": "M Bussonnier",
+        "date": "2026-02-21T14:56:03Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_remove_import_cache_dir",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

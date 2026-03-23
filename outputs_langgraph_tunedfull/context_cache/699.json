@@ -1,0 +1,377 @@
+{
+  "task_id": "699",
+  "repo_owner": "nocproject",
+  "repo_name": "noc",
+  "file_path": "core/service/rpc.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:54:39+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:54:47+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:54:54+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "core/service/rpc.py",
+    "original_code": "def _call(self, method, *args, **kwargs):\n    tid = self._tid.next()\n    msg = {\n        \"method\": method,\n        \"params\": list(args)\n    }\n    is_notify = \"_notify\" in kwargs\n    if not is_notify:\n        msg[\"id\"] = tid\n    msg = json.dumps(msg)\n    for timeout in self._service.iter_rpc_retry_timeout():\n        services = self._service.resolve_service(self._service_name)\n        if not services:\n            raise RPCError(\"Service not found\")\n        for svc in services:\n            client = tornado.httpclient.AsyncHTTPClient()\n            try:\n                response = yield client.fetch(\n                    \"http://%s/api/%s/\" % (svc, self._api),\n                    method=\"POST\",\n                    body=msg\n                )\n            except tornado.httpclient.HTTPError, why:\n                if why.code != 499:\n                    raise RPCError(\"RPC Call Failed: %s\", why)\n                else:\n                    self._service.logger.info(\n                        \"Service is not available at %s. Retrying\",\n                        svc\n                    )\n                    continue\n            except Exception, why:\n                # @todo: Grab connection refused\n                # wait for timeout\n                raise RPCError(\"RPC Call Failed: %s\" % why)\n            if not is_notify:\n                result = json.loads(response.body)\n                if result.get(\"error\"):\n                    raise RPCError(\"RPC Call Failed: %s\" % result[\"error\"])\n                else:\n                    raise tornado.gen.Return(result[\"result\"])\n        self._service.logger.info(\n            \"All services are not available. Waiting %s seconds\"\n        )\n        yield tornado.gen.sleep(timeout)",
+    "satd_comment": "# @todo: Grab connection refused\n# wait for timeout",
+    "target_file": {
+      "ok": true,
+      "path": "core/service/rpc.py",
+      "sha": "2a64a1f03a48cc6208e59ddcbd27e7f4105a5cc4",
+      "download_url": "https://raw.githubusercontent.com/nocproject/noc/master/core/service/rpc.py",
+      "content_excerpt": "# ----------------------------------------------------------------------\n# RPC Wrapper\n# ----------------------------------------------------------------------\n# Copyright (C) 2007-2020 The NOC Project\n# See LICENSE for details\n# ----------------------------------------------------------------------\n\n# Python modules\nimport itertools\nimport logging\nimport random\nfrom time import perf_counter\nfrom typing import Optional\nimport asyncio\nimport threading\n\n# Third-party modules\nimport orjson\n\n# NOC modules\nfrom noc.core.log import PrefixLoggerAdapter\nfrom noc.core.http.async_client import HttpClient\nfrom noc.core.perf import metrics\nfrom noc.config import config\nfrom noc.core.span import Span, get_current_span\nfrom noc.core.ioloop.util import run_sync\nfrom .error import RPCError, RPCNoService, RPCHTTPError, RPCException, RPCRemoteError\nfrom noc.core.comp import DEFAULT_ENCODING\n\nlogger = logging.getLogger(__name__)\n\n# Connection time\nCONNECT_TIMEOUT = config.rpc.async_connect_timeout\n# Total request time\nREQUEST_TIMEOUT = config.rpc.async_request_timeout\n\n# WARNING: later ujson versions are not thread-safe when dealing with floating numbers # deserealization,\n# so we need the time to prove orjson is thread-safe and\n# to remove the lock\n# @todo: Check and remove the lock\n_orjson_crash_lock = threading.Lock()\n\n\nclass RPCProxy(object):\n    \"\"\"\n    API Proxy\n    \"\"\"\n\n    RPCError = RPCError\n\n    def __init__(self, service, service_name, sync=False, hints=None):\n        self._logger = PrefixLoggerAdapter(logger, service_name)\n        self._service = service\n        self._service_name = service_name\n        self._api = service_name.split(\"-\")[0]\n        self._tid = itertools.count()\n        self._transactions = {}\n        self._hints = hints\n        self._sync = sync\n        self._client = HttpClient(\n            max_redirects=None,\n            headers={\n                \"X-NOC-Calling-Service\": self._service.name.encode(DEFAULT_ENCODING),\n                \"Content-Type\": b\"application/json\",\n            },\n            connect_timeout=CONNECT_TIMEOUT,\n            timeout=REQUEST_TIMEOUT,\n        )\n\n    def __getattr__(self, item):\n        async def _call(method, *args, **kwargs):\n            async def make_call(url, body, limit=3) -> Optional[bytes]:\n                req_headers = {}\n                sample = 1 if span_ctx and span_id else 0\n                with Span(\n                    server=self._service_name,\n                    service=method,\n                    sample=sample,\n                    context=span_ctx,\n                    parent=span_id,\n                ) as span:\n                    if sample:\n                        req_headers[\"X-NOC-Span-Ctx\"] = str(span.span_context).encode(\n                            DEFAULT_ENCODING\n                        )\n                        req_headers[\"X-NOC-Span\"] = str(span.span_id).encode(DEFAULT_ENCODING)\n                    code, headers, data = await self._client.post(url, body, headers=req_headers)\n                    # Process response\n                    if code == 200:\n                        return data\n                    if code == 307:\n                        # Process redirect\n                        if not limit:\n                            raise RPCException(\"Redirects limit exceeded\")\n                        url = headers.get(\"location\")\n                        self._logger.debug(\"Redirecting to %s\", url)\n                        return await make_call(url.decode(DEFAULT_ENCODING), data, limit - 1)\n                    if code in (598, 599):\n                        span.set_error(code)\n                        self._logger.debug(\"Timed out\")\n                        return None\n                    span.set_error(code)\n                    raise RPCHTTPError(f\"HTTP Error {code}: {body}\")\n\n            t0 = perf_counter()\n            self._logger.debug(\n                \"[%sCALL>] %s.%s(%s, %s)\",\n                \"SYNC \" if self._sync else \"\",\n                self._service_name,\n                method,\n                args,\n                kwargs,\n            )\n            metrics[\"rpc_call\", (\"called_service\", self._service_name), (\"method\", method)] += 1\n            tid = next(self._tid)\n            msg = {\"method\": method, \"params\": list(args)}\n            is_notify = \"_notify\" in kwargs\n            if not is_notify:\n                msg[\"id\"] = tid\n            body = orjson.dumps(msg)\n            # Get services\n            response = None\n            for t in self._service.iter_rpc_retry_timeout():\n                # Resolve service against service catalog\n                if self._hints:\n                    svc = random.choice(self._hints)\n                else:\n                    svc = await self._service.dcs.resolve(self._service_name)\n                response = await make_call(f\"http://{svc}/api/{self._api}/\", body)\n                if response:\n                    break\n                await asyncio.sleep(t)\n            t = perf_counter() - t0\n            self._logger.debug(\"[CALL<] %s.%s (%.2fms)\", self._service_name, method, t * 1000)\n            if response:\n                if not is_notify:\n                    try:\n                        with _orjson_crash_lock:\n                            result = orjson.loads(response)\n                    except ValueError as e:\n                        raise RPCHTTPError(\"Cannot decode json: %s\" % e)\n                    if result.get(\"error\"):\n                        self._logger.error(\"RPC call failed: %s\", result[\"error\"])\n                        raise RPCRemoteError(\n                            f\"RPC call failed: {result['error']['message']}\",\n                            remote_code=result[\"error\"].get(\"code\", None),\n                        )\n                    return result[\"result\"]\n                # Notifications return None\n                return None\n            raise RPCNoService(f\"No active service {self._service_name} found\")\n\n        async def async_wrapper(*args, **kwargs):\n            return await _call(item, *args, **kwargs)\n\n        def sync_wrapper(*args, **kwargs):\n            async def wrapper():\n                return await _call(item, *args, **kwargs)\n\n            return run_sync(wrapper)\n\n        if item.startswith(\"_\"):\n            return self.__dict__[item]\n        span_ctx, span_id = get_current_span()\n        if self._sync:\n            return sync_wrapper\n        return async_wrapper\n",
+      "total_lines": 167
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "itertools",
+        "logging",
+        "random",
+        "time:perf_counter",
+        "typing:Optional",
+        "asyncio",
+        "threading",
+        "orjson",
+        "noc.core.log:PrefixLoggerAdapter",
+        "noc.core.http.async_client:HttpClient",
+        "noc.core.perf:metrics",
+        "noc.config:config",
+        "noc.core.span:Span",
+        "noc.core.span:get_current_span",
+        "noc.core.ioloop.util:run_sync",
+        "error:RPCError",
+        "error:RPCNoService",
+        "error:RPCHTTPError",
+        "error:RPCException",
+        "error:RPCRemoteError",
+        "noc.core.comp:DEFAULT_ENCODING"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/nocproject/noc/master/README.md",
+      "content_excerpt": "[![codecov](https://codecov.io/gh/gufolabs/noc/graph/badge.svg?token=s2OGCsO5ZW)](https://codecov.io/gh/gufolabs/noc)\n![Sponsors](https://img.shields.io/github/sponsors/gufolabs)\n\n# NOC Project\n![logo_180px](https://cdn.getnoc.com/logo/logo_180px.png)\n\n[![Documentation](https://img.shields.io/badge/documentation-yes-brightgreen.svg)](https://docs.getnoc.com)\n[![License: BSD 3-Clause License](https://img.shields.io/badge/License-BSD-brightgreen.svg)](https://choosealicense.com/licenses/bsd-3-clause/)\n\n\n> NOC project is an Operation Support System (OSS) for telecom companies, service providers, and enterprise Network Operation Centers (NOC)\n\n### [Homepage](https://getnoc.com/)\n\n### Features:\n+ Fault Management\n  + Root Cause Analysis, topology correlation, escalation. Active probing and passive alarm condition detection in syslog and SNMP traps.\n+ Performance Management\n  + Flexible metrics collection via SNMP and CLI. Long-term metrics storage. Automatic configuration of dashboards. Complex threshold control with window functions.\n+ Inventory\n  + Centralized database of physical and logical resources. Tracks physical assets like chassis and modules. Tracks logical resources (IP, VLAN, Phone Numbers) usage as well. IP address planning via IPAM.\n+ Discovery\n  + Sophisticated multi-protocol network topology discovery. Configuration and resource usage discovery.\n+ Vendor-agnostic\n  + Breaking the vendor locks with 80+ of supported vendors. Adding new vendors and platforms on daily routine basis.\n+ LargeScale\n  + Starting from simple single-node installation and up to clusters co"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_call test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_handler.py",
+          "path": "tests/test_handler.py",
+          "sha": "b751176b0c1b1f5f68249e57860fb08deed6fcc6",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/tests/test_handler.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_discovery.py",
+          "path": "tests/test_discovery.py",
+          "sha": "7403b761e8bb7a16c3d05de11faaff17b0d692bf",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/tests/test_discovery.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_call(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "rpc.py",
+          "path": "core/service/rpc.py",
+          "sha": "2a64a1f03a48cc6208e59ddcbd27e7f4105a5cc4",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/core/service/rpc.py",
+          "score": 1.0
+        },
+        {
+          "name": "fix-pip",
+          "path": "scripts/deploy/fix-pip",
+          "sha": "0afc0177bda18385fb82230f9948e38105f6b501",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/scripts/deploy/fix-pip",
+          "score": 1.0
+        },
+        {
+          "name": "translation.py",
+          "path": "commands/translation.py",
+          "sha": "bef8d9096a1e3eb11f4ce771a0741e8cc9579ace",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/commands/translation.py",
+          "score": 1.0
+        },
+        {
+          "name": "0076_migrate_repo.py",
+          "path": "sa/migrations/0076_migrate_repo.py",
+          "sha": "3c86fa787c5270aa28a351feec7c834d5cd798c9",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/sa/migrations/0076_migrate_repo.py",
+          "score": 1.0
+        },
+        {
+          "name": "compile-handlebars.py",
+          "path": "scripts/build/compile-handlebars.py",
+          "sha": "bb3c85fe688269197f8fdd4d70e6571b11e07bf5",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/scripts/build/compile-handlebars.py",
+          "score": 1.0
+        },
+        {
+          "name": "l3-topology.py",
+          "path": "commands/l3-topology.py",
+          "sha": "eecb64d33e7dbfd08ac248d60ac739a3989d9ca9",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/commands/l3-topology.py",
+          "score": 1.0
+        },
+        {
+          "name": "mib.py",
+          "path": "services/mib/paths/mib.py",
+          "sha": "77c990b3139215ec8dc1c9bd05585fb1caba8d37",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/services/mib/paths/mib.py",
+          "score": 1.0
+        },
+        {
+          "name": "import-rancid.py",
+          "path": "commands/import-rancid.py",
+          "sha": "24aeac566f62999d4bde47519f15ab6e14ed92c8",
+          "html_url": "https://github.com/nocproject/noc/blob/9c98211a599ec5952c3dc5c1344b376bee09e3b9/commands/import-rancid.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "core/service",
+      "count": 16,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "core/service/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "core/service/base.py",
+          "type": "file"
+        },
+        {
+          "name": "client.py",
+          "path": "core/service/client.py",
+          "type": "file"
+        },
+        {
+          "name": "deps",
+          "path": "core/service/deps",
+          "type": "dir"
+        },
+        {
+          "name": "error.py",
+          "path": "core/service/error.py",
+          "type": "file"
+        },
+        {
+          "name": "fastapi.py",
+          "path": "core/service/fastapi.py",
+          "type": "file"
+        },
+        {
+          "name": "jsonrpcapi.py",
+          "path": "core/service/jsonrpcapi.py",
+          "type": "file"
+        },
+        {
+          "name": "loader.py",
+          "path": "core/service/loader.py",
+          "type": "file"
+        },
+        {
+          "name": "middleware",
+          "path": "core/service/middleware",
+          "type": "dir"
+        },
+        {
+          "name": "models",
+          "path": "core/service/models",
+          "type": "dir"
+        },
+        {
+          "name": "nodatachecker.py",
+          "path": "core/service/nodatachecker.py",
+          "type": "file"
+        },
+        {
+          "name": "paths",
+          "path": "core/service/paths",
+          "type": "dir"
+        },
+        {
+          "name": "pub.py",
+          "path": "core/service/pub.py",
+          "type": "file"
+        },
+        {
+          "name": "rpc.py",
+          "path": "core/service/rpc.py",
+          "type": "file"
+        },
+        {
+          "name": "stormprotection.py",
+          "path": "core/service/stormprotection.py",
+          "type": "file"
+        },
+        {
+          "name": "stub.py",
+          "path": "core/service/stub.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "core/service/__init__.py"
+        },
+        {
+          "name": "base.py",
+          "path": "core/service/base.py"
+        },
+        {
+          "name": "client.py",
+          "path": "core/service/client.py"
+        },
+        {
+          "name": "error.py",
+          "path": "core/service/error.py"
+        },
+        {
+          "name": "fastapi.py",
+          "path": "core/service/fastapi.py"
+        },
+        {
+          "name": "jsonrpcapi.py",
+          "path": "core/service/jsonrpcapi.py"
+        },
+        {
+          "name": "loader.py",
+          "path": "core/service/loader.py"
+        },
+        {
+          "name": "nodatachecker.py",
+          "path": "core/service/nodatachecker.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "core/service/rpc.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "8225ae7810948c7bba66987ecac025c840e02015",
+          "html_url": "https://github.com/nocproject/noc/commit/8225ae7810948c7bba66987ecac025c840e02015",
+          "message": "Ruff 0.13.3",
+          "author": "Dmitry Volodin",
+          "date": "2025-10-04T16:22:41Z"
+        },
+        {
+          "sha": "90feaa199a07d574e4b628b0021ef65d0163aef4",
+          "html_url": "https://github.com/nocproject/noc/commit/90feaa199a07d574e4b628b0021ef65d0163aef4",
+          "message": "ruff: Enable RET501,502,504-508",
+          "author": "Dmitry Volodin",
+          "date": "2025-09-26T15:15:23Z"
+        },
+        {
+          "sha": "e2558e968bb561135ad70c0bf6b9ccf1fe83e32f",
+          "html_url": "https://github.com/nocproject/noc/commit/e2558e968bb561135ad70c0bf6b9ccf1fe83e32f",
+          "message": "Disable HTTP Redirect on RPC Client.",
+          "author": "Andrey Vertiprakhov",
+          "date": "2024-04-03T13:03:10Z"
+        },
+        {
+          "sha": "138773fe4a72753b97d5433f8ef6d79716e84b15",
+          "html_url": "https://github.com/nocproject/noc/commit/138773fe4a72753b97d5433f8ef6d79716e84b15",
+          "message": "Add Gufo HTTP client for replace NOC HTTP Client.",
+          "author": "Andrey Vertiprahov",
+          "date": "2024-03-31T09:50:55Z"
+        },
+        {
+          "sha": "d02aade2fe5beb2d1616a09940d0f575ded02d99",
+          "html_url": "https://github.com/nocproject/noc/commit/d02aade2fe5beb2d1616a09940d0f575ded02d99",
+          "message": "noc/noc#1930 Migrate Activator to FastAPI.",
+          "author": "Andrey Vertiprahov",
+          "date": "2022-10-07T11:06:06Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_call todo Grab connection refused wait",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "core/service/rpc.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "8225ae7810948c7bba66987ecac025c840e02015",
+        "html_url": "https://github.com/nocproject/noc/commit/8225ae7810948c7bba66987ecac025c840e02015",
+        "message": "Ruff 0.13.3",
+        "author": "Dmitry Volodin",
+        "date": "2025-10-04T16:22:41Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

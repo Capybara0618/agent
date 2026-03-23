@@ -754,6 +754,12 @@ class LangGraphSATDWorkflow:
             decision="drop",
             repairable=False,
             repairability_score=0.0,
+            intent_clarity=0.0,
+            change_locality=0.0,
+            semantic_risk=1.0,
+            context_sufficiency=0.0,
+            verifiability=0.0,
+            analyze_score=0.0,
             confidence=0.0,
             satd_type="content_filtered",
             reason="Analyzer prompt was blocked by provider content filtering.",
@@ -786,10 +792,15 @@ class LangGraphSATDWorkflow:
             round_id=state["round_id"],
             approved=False,
             review_score=0.0,
+            problem_alignment=0.0,
+            minimality=0.0,
+            semantic_preservation=0.0,
+            internal_consistency=0.0,
             issues=["Reviewer prompt was blocked by provider content filtering."],
             revision_advice="Stop automatic approval for this SATD because reviewer prompting was content-filtered.",
             reject_type="content_filter",
             rationale="Reviewer prompt was blocked by provider content filtering.",
+            softened_gate_used=False,
         )
 
     def _log(self, message: str) -> None:

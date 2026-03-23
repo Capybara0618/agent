@@ -1,0 +1,469 @@
+{
+  "task_id": "941",
+  "repo_owner": "stamusnetworks",
+  "repo_name": "scirius",
+  "file_path": "rules/views.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T20:11:19+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "ruleset",
+    "satd_line": 1379,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 6,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T20:11:29+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T20:11:37+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "rules/views.py",
+    "original_code": "def threshold_rule(request, rule_id):\n    rule_object = get_object_or_404(Rule, sid=rule_id)\n\n    if not request.user.is_staff:\n        context = { 'object': rule, 'error': 'Unsufficient permissions' }\n        return scirius_render(request, 'rules/rule.html', context)\n\n    if request.method == 'POST': # If the form has been submitted...\n        if request.POST.has_key('threshold_type'):\n            if request.POST['threshold_type'] == 'threshold':\n                form = AddRuleThresholdForm(request.POST)\n            else:\n                form = AddRuleSuppressForm(request.POST)\n        else:\n            context = {'rule': rule_object, 'form': form, 'error': 'Invalid form, threshold type is missing'}\n            if request.POST['threshold_type'] == 'suppress':\n                context['type'] = 'suppress'\n            else:\n                context['type'] = 'threshold'\n            return scirius_render(request, 'rules/add_threshold.html', context)\n        if form.is_valid():\n            threshold = form.save(commit=False)\n            threshold.rule = rule_object\n            threshold.save()\n            return redirect(rule_object)\n        else:\n            context = {'rule': rule_object, 'form': form, 'error': 'Could not create threshold'}\n            if request.POST['threshold_type'] == 'suppress':\n                context['type'] = 'suppress'\n            else:\n                context['type'] = 'threshold'\n            return scirius_render(request, 'rules/add_threshold.html', context)\n    # FIXME Display list of matching threshold if exists\n    data = { 'gid': 1, 'count': 1, 'seconds': 60, 'type': 'limit', 'rule': rule_object, 'ruleset': 1 }\n    if request.GET.__contains__('action'):\n        data['threshold_type'] = request.GET.get('action', 'suppress')\n    if request.GET.__contains__('net'):\n        data['net'] = request.GET.get('net', None)\n    if request.GET.__contains__('dir'):\n        direction = request.GET.get('dir', 'both')\n        if direction == 'src':\n            direction = 'by_src'\n        elif direction == 'dest':\n            direction = 'by_dst'\n        data['track_by'] = direction\n\n    container = None\n    pth = Threshold(rule = rule_object, track_by = data['track_by'], threshold_type = data['threshold_type'])\n    if data.has_key('net'):\n        pth.net = data['net']\n    thresholds = Threshold.objects.filter(rule = rule_object)\n    for threshold in thresholds:\n        if threshold.contain(pth):\n            container = threshold\n            break\n    if thresholds:\n        thresholds = ThresholdTable(thresholds)\n        tables.RequestConfig(request).configure(thresholds)\n\n    context = {'rule': rule_object, 'thresholds': thresholds, 'container': container }\n    if data['threshold_type'] == 'suppress':\n        context['form'] = AddRuleSuppressForm(data)\n        context['type'] = 'suppress'\n    else:\n        context['form'] = AddRuleThresholdForm(data)\n        context['type'] = 'threshold'\n    return scirius_render(request, 'rules/add_threshold.html', context)",
+    "satd_comment": "# FIXME Display list of matching threshold if exists",
+    "target_file": {
+      "ok": true,
+      "path": "rules/views.py",
+      "sha": "a7e2abfab8e9575eb103c1e81f4c351719a4b3d6",
+      "download_url": "https://raw.githubusercontent.com/StamusNetworks/scirius/master/rules/views.py",
+      "content_excerpt": "\"\"\"\nCopyright(C) 2014-2016, Stamus Networks\nWritten by Eric Leblond <eleblond@stamus-networks.com>\n\nThis file is part of Scirius.\n\nScirius is free software: you can redistribute it and/or modify\nit under the terms of the GNU General Public License as published by\nthe Free Software Foundation, either version 3 of the License, or\n(at your option) any later version.\n\nScirius is distributed in the hope that it will be useful,\nbut WITHOUT ANY WARRANTY; without even the implied warranty of\nMERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\nGNU General Public License for more details.\n\nYou should have received a copy of the GNU General Public License\nalong with Scirius.  If not, see <http://www.gnu.org/licenses/>.\n\"\"\"\n\nimport re\nimport os\nimport yaml\nimport json\nimport tarfile\nfrom datetime import date\n\nfrom dateutil.relativedelta import relativedelta\nfrom django.shortcuts import get_object_or_404, redirect\nfrom django.utils import timezone\nfrom django.http import HttpResponse, HttpResponseServerError, JsonResponse\nfrom django.db import IntegrityError\nfrom django.db.models.functions import Greatest\nfrom django.conf import settings\nfrom django.core.exceptions import ValidationError, PermissionDenied\nfrom django.contrib import messages\nfrom django.contrib.auth.decorators import permission_required\nfrom elasticsearch.exceptions import ConnectionError as ESConnectionError\nimport django_tables2 as tables\n\nfrom scirius.utils import (\n    get_middleware_module, scirius_render,\n    scirius_listing, RequestsWrapper,\n    convert_to_local, is_ajax\n)\n\nfrom rules.es_data import ESData\nfrom rules.models import RuleAtVersion, Ruleset, Source, SourceUpdate, Category, Rule, SuppressedRuleAtVersion, dependencies_check, get_system_settings\nfrom rules.models import Threshold, Transformation, RulesetTransformation, UserAction\nfrom rules.tables import UpdateRuleTable, DeletedRuleTable, ThresholdTable, SourceUpdateTable\n\nfrom rules.es_graphs import ESError, ESRulesStats, ESFieldStatsAsTable, ESSidByHosts, ESIndices, ESDeleteAlertsBySid\nfrom rules.es_graphs import get_es_major_version\n\nfrom suricata.tasks import tasks_permission_required, check_task_perms\n\nfrom .tables import RuleTable, CategoryTable, RulesetTable, CategoryRulesetTable, RuleHostTable, ESIndexessTable\nfrom .tables import RuleThresholdTable, RuleSuppressTable, RulesetThresholdTable, RulesetSuppressTable\nfrom .tables import EditCategoryTable, EditRuleTable, EditSourceTable\nfrom .forms import RuleCommentForm, RuleTransformForm, CategoryTransformForm, RulesetSuppressForm, CommentForm\nfrom .forms import AddRuleThresholdForm, AddRuleSuppressForm, AddSourceForm, AddPublicSourceForm, SourceForm\nfrom .forms import (\n    RulesetForm, RulesetEditForm, RulesetCopyForm,\n    SystemSettingsForm, KibanaDataForm, EditThresholdForm,\n    PoliciesForm\n)\nfrom .suripyg import SuriHTMLFormat\n\nMIDDLEWARE = __import__(settings.RULESET_MIDDLEWARE)\n\n\n# Create your views here.\ndef index(request):\n    ruleset_list = Ruleset.objects.all().order_by('-created_date')[:5]\n    source_list = Source.objects.all().order_by('-created_date')[:5]\n    context = {'ruleset_list': ruleset_list,\n               'source_list': source_list}\n    try:\n        context['probes'] = ['\"' + x + '\"' for x in MIDDLEWARE.models.get_probe_hostnames()]\n    except:\n        pass\n    return scirius_render(request, 'rules/index.html', context)\n\n\n@permission_required('rules.ruleset_policy_view', raise_exception=True)\ndef search(request):\n    context = {}\n    length = 0\n    rules_width = 4\n    search = None\n    if request.method == 'POST':\n        if 'search' in request.POST:\n            search = request.POST['search']\n            request.GET = request.GET.copy()\n            request.GET.update({'search': search})\n    elif request.method == 'GET':\n        if 'search' in request.GET:\n            search = request.GET['search']\n    if search:\n        rules = Rule.objects.filter(ruleatversion__content__icontains=search).distinct()\n        if rules.count() > 0:\n            length += rules.count()\n            rules = RuleTable(rules)\n            tables.RequestConfig(request).configure(rules)\n        else:\n            rules = None\n        categories_ = Category.objects.filter(name__icontains=search)\n        if categories_.count() > 0:\n            length += categories_.count()\n            categories_ = CategoryTable(categories_)\n            tables.RequestConfig(request).configure(categories_)\n        else:\n            rules_width += 4\n            categories_ = None\n        rulesets = Ruleset.objects.filter(name__icontains=search)\n        if rulesets.count() > 0:\n            length += rulesets.count()\n            rulesets = RulesetTable(rulesets)\n            tables.RequestConfig(request).configure(rulesets)\n        else:\n            rules_width += 4\n            rulesets = None\n    else:\n        rules = None\n        categories_ = None\n        rulesets = None\n\n    context = {\n        'rules': rules,\n        'rules_width': rules_width,\n        'categories': categories_,\n        'rulesets': rulesets,\n        'motif': search,\n        'length': length\n    }\n    return scirius_render(request, 'rules/search.html', context)\n\n\n@permission_required('rules.source_view', raise_exception=True)\ndef sources(request):\n    return scirius_render(\n        request,\n        'rules/sources.html',\n        {'sources': Source.get_sources()}\n    )\n\n\n@permission_required('rules.ruleset_policy_view', raise_exception=True)\ndef source(request, source_id, error=None, update=False, activate=False, rulesets=None):\n    source = get_object_or_404(Source, pk=source_id)\n\n    context = {\n        'source': source,\n        'update': update,\n        'activate': activate,\n        'rulesets': rulesets,\n        'rules_count': source.category_set.values('rule').count()\n    }\n\n    cats = CategoryTable(Category.objects.filter(source=source).order_by('name'))\n    tables.RequestConfig(request).configure(cats)\n    context.update({'categories': cats})\n\n    if error:\n        context['error'] = error\n\n    if hasattr(MIDDLEWARE.common, 'update_source'):\n        context['middleware_has_update'] = True\n\n    return scirius_render(request, 'rules/source.html', context)\n\n\n@permission_required('rules.ruleset_policy_view', raise_exception=True)\ndef categories(request):\n    assocfn = {\n        'Category': {\n            'table': CategoryTable,\n            'manage_links': {},\n            'action_links': {}\n        }\n    }\n\n    return scirius_listing(request, Category, assocfn)\n\n\n@permission_required('rules.ruleset_policy_view', raise_exception=True)\ndef category(request, cat_id):\n    cat = get_object_or_404(Category, pk=cat_id)\n    rules = Rule.objects.filter(category=cat)\n\n    context = {\n        'object_path': [cat.source],\n        'category': cat,\n        'rules': [],\n    }\n\n    for version in MIDDLEWARE.common.rules_version():\n        real_version = Rule.get_last_real_version(version, **{'category__pk': cat.pk})\n\n        rulesets_status = []\n        rule_struct = {\n            'version': version,\n            'active': None,\n            'commented': None,\n            'rulesets': [],\n            'version_exists': True\n        }\n\n        context['rules'].append(rule_struct)\n\n        # active rules (at version=real_version)\n        rules_table = RuleTable(rules.filter(\n            ruleatversion__state=True,\n            ruleatversion__version=real_version).order_by('sid')\n        )\n        tables.RequestConfig(request).configure(rules_table)\n        rule_struct['active'] = rules_table\n\n        # Commented rules (at version)\n        commented_rules_table = RuleTable(rules.filter(\n            ruleatversion__state=False,\n            ruleatversion__version=real_version).order_by('sid')\n        )\n        tables.RequestConfig(request).configure(commented_rules_table)\n        rule_struct['commented_rules'] = commented_rules_table\n\n        for ruleset in Ruleset.objects.all():\n            status = 'Inactive'\n            if cat in ruleset.categories.all():\n                status = 'Active'\n\n            transformations = {}\n            for key in (Transformation.ACTION, Transformation.LATERAL, Transformation.TARGET):\n                trans = cat.get_transformation(ruleset, key, override=True)\n                if trans:\n                    transformations[key] = \"%s: %s\" % (key.value.capitalize(), trans.value.capitalize())\n\n            rulesets_status.append({\n                'name': ruleset.name,\n                'pk': ruleset.pk,\n                'status': status,\n                'action': transformations[Transformation.ACTION] if Transformation.ACTION in transformations else '',\n                'lateral': transformations[Transformation.LATERAL] if Transformation.LATERAL in transformations else '',\n                'target': transformations[Transformation.TARGET] if Transformation.TARGET in transformations else '',\n            })\n\n        rulesets_status = CategoryRulesetTable(rulesets_status)\n        tables.RequestConfig(request).configure(rulesets_status)\n        rule_struct['rulesets'] = rulesets_status\n\n    return scirius_render(request, 'rules/category.html', context)\n\n\nclass Reference:\n    def __init__(self, key, value):\n        self.value = value\n        self.key = key\n        self.url = None\n\n\ndef elasticsearch(request):\n    RULE_FIELDS_MAPPING = {\n        'rule_src': 'src_ip',\n        'rule_dest': 'dest_ip',\n        'rule_source': 'alert.source.ip',\n        'rule_target': 'alert.target.ip',\n        'rule_probe': settings.ELASTICSEARCH_HOSTNAME,\n        'field_stats': None\n    }\n    context = get_middleware_module('common').sn_loggers()\n\n    def check_perms(query):\n        PERM_CONF_VIEW = ('indices', 'rule_probe', 'field_stats', None)\n        PERM_EVENT_VIEW = ('rule_src', 'rule_dest', 'rule_source', 'rule_target')\n        PERM_CONF_AND_EVENT_VIEW = ('rules', 'rule')\n\n        if query in PERM_EVENT_VIEW:\n            if not request.user.has_perm('rules.events_view'):\n                raise PermissionDenied()\n\n        if query in PERM_CONF_VIEW:\n            if not request.user.has_perm('rules.configuration_view'):\n                raise PermissionDenied()\n\n        if query in PERM_CONF_AND_EVENT_VIEW:\n            if not request.user.has_perm('rules.configuration_view') and not request.user.has_perm('rules.events_view'):\n                raise PermissionDenied()\n\n    if request.GET.__contains__('query'):\n        query = request.GET.get('query')\n        check_perms(query)\n        try:\n            if query == 'rules':\n                rules = ESRulesStats(request).get()\n                if rules is None:\n                    return JsonResponse(rules)\n                context['table'] = rules\n                return scirius_render(request, 'rules/table.html', context)\n            elif query == 'rule':\n                sid = request.GET.get('sid', None)\n                hosts = ESSidByHosts(request).get(sid)\n                context['table'] = hosts\n                return scirius_render(request, 'rules/table.html', context)\n            elif query in list(RULE_FIELDS_MAPPING.keys()):\n                ajax = request.GET.get('json', None)\n                if ajax:\n                    raise ESError('Use REST API instead.')\n\n                if query == 'field_stats':\n                    filter_ip = request.GET.get('field', 'src_ip')\n                else:\n                    filter_ip = RULE_FIELDS_MAPPING[query]\n\n                sid = request.GET.get('sid', None)\n                count = request.GET.get('page_size', 10)\n\n                hosts = ESFieldStatsAsTable(request).get(\n                    sid,\n                    filter_ip + '.' + settings.ELASTICSEARCH_KEYWORD,\n                    RuleHostTable,\n                    count=count\n                )\n                context['table'] = hosts\n                return scirius_render(request, 'rules/table.html', context)\n            elif query == 'indices':\n                if is_ajax(request):\n                    indices = ESIndexessTable(ESIndi",
+      "total_lines": 2268
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 1379,
+      "start_line": 1359,
+      "end_line": 1399,
+      "matched_line": "        # Threshold",
+      "excerpt": "1359:         ruleset.number_of_rules()\n1360:     context = {'rulesets': rulesets}\n1361:     return scirius_render(request, 'rules/rulesets.html', context)\n1362: \n1363: \n1364: @permission_required('rules.ruleset_policy_view', raise_exception=True)\n1365: def ruleset(request, ruleset_id, mode='struct', error=None):\n1366:     ruleset = get_object_or_404(Ruleset, pk=ruleset_id)\n1367:     context = {}\n1368: \n1369:     if mode == 'struct':\n1370:         categories_list = {}\n1371:         sources = ruleset.sources.order_by('name')\n1372:         for source in sources:\n1373:             cats = CategoryTable(ruleset.categories.filter(source=source).order_by('name'))\n1374:             tables.RequestConfig(request, paginate={\"per_page\": 15}).configure(cats)\n1375:             categories_list[source.name] = cats\n1376: \n1377:         context = {'ruleset': ruleset, 'categories_list': categories_list, 'sources': sources, 'mode': mode}\n1378: \n1379:         # Threshold\n1380:         thresholds = Threshold.objects.filter(ruleset=ruleset, threshold_type='threshold')\n1381:         if thresholds:\n1382:             thresholds = RulesetThresholdTable(thresholds)\n1383:             tables.RequestConfig(request).configure(thresholds)\n1384:             context['thresholds'] = thresholds\n1385: \n1386:         suppress = Threshold.objects.filter(ruleset=ruleset, threshold_type='suppress')\n1387:         if suppress:\n1388:             suppress = RulesetSuppressTable(suppress)\n1389:             tables.RequestConfig(request).configure(suppress)\n1390:             context['suppress'] = suppress\n1391: \n1392:         # Error\n1393:         if error:\n1394:             context['error'] = error\n1395: \n1396:         A_REJECT = Transformation.A_REJECT\n1397:         A_DROP = Transformation.A_DROP\n1398:         A_FILESTORE = Transformation.A_FILESTORE\n1399: "
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "ruleset",
+      "start_line": 1365,
+      "end_line": 1444,
+      "source": "def ruleset(request, ruleset_id, mode='struct', error=None):\n    ruleset = get_object_or_404(Ruleset, pk=ruleset_id)\n    context = {}\n\n    if mode == 'struct':\n        categories_list = {}\n        sources = ruleset.sources.order_by('name')\n        for source in sources:\n            cats = CategoryTable(ruleset.categories.filter(source=source).order_by('name'))\n            tables.RequestConfig(request, paginate={\"per_page\": 15}).configure(cats)\n            categories_list[source.name] = cats\n\n        context = {'ruleset': ruleset, 'categories_list': categories_list, 'sources': sources, 'mode': mode}\n\n        # Threshold\n        thresholds = Threshold.objects.filter(ruleset=ruleset, threshold_type='threshold')\n        if thresholds:\n            thresholds = RulesetThresholdTable(thresholds)\n            tables.RequestConfig(request).configure(thresholds)\n            context['thresholds'] = thresholds\n\n        suppress = Threshold.objects.filter(ruleset=ruleset, threshold_type='suppress')\n        if suppress:\n            suppress = RulesetSuppressTable(suppress)\n            tables.RequestConfig(request).configure(suppress)\n            context['suppress'] = suppress\n\n        # Error\n        if error:\n            context['error'] = error\n\n        A_REJECT = Transformation.A_REJECT\n        A_DROP = Transformation.A_DROP\n        A_FILESTORE = Transformation.A_FILESTORE\n\n        for trans in (A_REJECT, A_DROP, A_FILESTORE):\n            # Rules transformation\n            trans_rules = ruleset.rules_transformation.filter(ruletransformation__value=trans.value).all()\n            if trans_rules.count():\n                trans_rules_t = RuleTable(trans_rules.order_by('sid'))\n                tables.RequestConfig(request).configure(trans_rules_t)\n\n                ctx_lb = '%s_rules' % trans.value\n                context[ctx_lb] = trans_rules_t\n\n            # Categories Transformation\n            trans_categories = ruleset.categories_transformation.filter(\n                categorytransformation__value=trans.value\n            ).all()\n\n            if trans_categories.count():\n                trans_categories_t = CategoryTable(trans_categories.order_by('name'))\n                tables.RequestConfig(request).configure(trans_categories_t)\n                context['%s_categories' % trans.value] = trans_categories_t\n\n        suppr_rules_pk = SuppressedRuleAtVersion.objects.filter(\n            ruleset=ruleset\n        ).values_list('rule_at_version__rule__pk', flat=True).distinct()\n\n        suppr_rules = Rule.objects.filter(pk__in=suppr_rules_pk)\n        suppr_rules_t = RuleTable(suppr_rules.order_by('sid'))\n        tables.RequestConfig(request).configure(suppr_rules_t)\n        context['disabled_rules'] = suppr_rules_t\n\n    elif mode == 'display':\n        vers_ravs = get_middleware_module('common').rules_at_version_from_ruleset(ruleset)\n\n        all_rules = {}\n        for version, ravs in vers_ravs.items():\n            rules = Rule.objects.filter(ruleatversion__pk__in=ravs.values_list('pk', flat=True))\n            rules_table = RuleTable(rules)\n            tables.RequestConfig(request).configure(rules_table)\n            all_rules[version] = rules_table\n        context = {'ruleset': ruleset, 'all_rules': all_rules, 'mode': mode}\n        if error:\n            context['error'] = error\n\n    rule_versions = MIDDLEWARE.common.rules_version()\n    context['single_rule_version'] = True if len(rule_versions) == 1 else False\n    return scirius_render(request, 'rules/ruleset.html', context)"
+    },
+    "imports": {
+      "imports": [
+        "re",
+        "os",
+        "yaml",
+        "json",
+        "tarfile",
+        "datetime:date",
+        "dateutil.relativedelta:relativedelta",
+        "django.shortcuts:get_object_or_404",
+        "django.shortcuts:redirect",
+        "django.utils:timezone",
+        "django.http:HttpResponse",
+        "django.http:HttpResponseServerError",
+        "django.http:JsonResponse",
+        "django.db:IntegrityError",
+        "django.db.models.functions:Greatest",
+        "django.conf:settings",
+        "django.core.exceptions:ValidationError",
+        "django.core.exceptions:PermissionDenied",
+        "django.contrib:messages",
+        "django.contrib.auth.decorators:permission_required",
+        "elasticsearch.exceptions:ConnectionError",
+        "django_tables2",
+        "scirius.utils:get_middleware_module",
+        "scirius.utils:scirius_render",
+        "scirius.utils:scirius_listing",
+        "scirius.utils:RequestsWrapper",
+        "scirius.utils:convert_to_local",
+        "scirius.utils:is_ajax",
+        "rules.es_data:ESData",
+        "rules.models:RuleAtVersion"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/StamusNetworks/scirius/master/README.rst",
+      "content_excerpt": "=======\nScirius\n=======\n\nIntroduction\n============\n\nScirius Community Edition is a web interface dedicated to Suricata ruleset management.\nIt handles the rules file and update associated files.\n\n.. image:: https://github.com/StamusNetworks/scirius/raw/master/doc/images/suricata-index.png\n    :alt: Suricata page\n    :align: center\n\nScirius CE is developed by `Stamus Networks <https://www.stamus-networks.com/>`_ and is available under the\nGNU GPLv3 license.\n\nFeatures\n========\n\nScirius can build Suricata ruleset composed of different sources. Sources or feeds can be picked from public sources\npublished by `OISF <https://oisf.net/>`_ or can be custom.\n\n.. image:: https://github.com/StamusNetworks/scirius/raw/master/doc/images/public-sources.png\n    :alt: public sources from OISF\n    :align: center\n\nScirius will take care of refreshing the sources and composing the ruleset by applying your transformation\non it.\n\n.. image:: https://github.com/StamusNetworks/scirius/raw/master/doc/images/ruleset.png\n    :alt: Ruleset with 5 sources\n    :align: center\n\nTransformations like disabling a rule or applying a threshold (to lower the noise only) can be made\nfor each rule or at the category level.\n\n.. image:: https://github.com/StamusNetworks/scirius/raw/master/doc/images/rule-page.png\n    :alt: Rule page\n    :align: center\n\nScirius also presents statistics on rules activity to give information and facilitate the tuning.\n\nGet Help\n========\n\nDocumentation\n-------------\n\n`Scirius Documentation <https://scirius.readthedocs.io/en/latest/>`_ is on readthedocs.\n\nSupport\n-------\n\nYou can join IRC"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "ruleset test",
+      "count": 6,
+      "items": [
+        {
+          "name": "20_ruleset.robot",
+          "path": "tests/robotframework/10_rules/20_ruleset.robot",
+          "sha": "f28431323628167dcdba93b5bb7998e2ea55f340",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/tests/robotframework/10_rules/20_ruleset.robot",
+          "score": 1.0
+        },
+        {
+          "name": "0008_auto__add_field_ruleset_need_test__add_field_ruleset_validity.py",
+          "path": "rules/south_migrations/0008_auto__add_field_ruleset_need_test__add_field_ruleset_validity.py",
+          "sha": "b63998e134640705e2b38b64d2d64a8b286dcc53",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/south_migrations/0008_auto__add_field_ruleset_need_test__add_field_ruleset_validity.py",
+          "score": 1.0
+        },
+        {
+          "name": "tests.py",
+          "path": "rules/tests.py",
+          "sha": "5d7d6016f383285f2d6aace2e6587fa48da4ed86",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/tests.py",
+          "score": 1.0
+        },
+        {
+          "name": "config.txt",
+          "path": "tests/robotframework/config.txt",
+          "sha": "cee19d2edbb2ebe22a7559a304d0428065854d8d",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/tests/robotframework/config.txt",
+          "score": 1.0
+        },
+        {
+          "name": "clean.robot",
+          "path": "tests/robotframework/tools/clean.robot",
+          "sha": "d841d82636d7215dca76f25f0b25585dbfd3c6ed",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/tests/robotframework/tools/clean.robot",
+          "score": 1.0
+        },
+        {
+          "name": "common.robot",
+          "path": "tests/robotframework/10_rules/common.robot",
+          "sha": "e4d117249459fc206386d668c35c9c7683f8ca34",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/tests/robotframework/10_rules/common.robot",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"ruleset(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "views.py",
+          "path": "rules/views.py",
+          "sha": "a7e2abfab8e9575eb103c1e81f4c351719a4b3d6",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/views.py",
+          "score": 1.0
+        },
+        {
+          "name": "ruleset.html",
+          "path": "rules/templates/rules/ruleset.html",
+          "sha": "a50f01e2f71f8c335b870a27f279038a5120850a",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/templates/rules/ruleset.html",
+          "score": 1.0
+        },
+        {
+          "name": "saga.js",
+          "path": "ui/app/containers/App/saga.js",
+          "sha": "5e2b336c2291d95116b3d5eabf88b088efed5a9a",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/ui/app/containers/App/saga.js",
+          "score": 1.0
+        },
+        {
+          "name": "forms.py",
+          "path": "rules/forms.py",
+          "sha": "9edbbcf7397faadf38244e6c6203ac9d11caf881",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/forms.py",
+          "score": 1.0
+        },
+        {
+          "name": "common.py",
+          "path": "suricata/common.py",
+          "sha": "9acec7b2309808fde18cf84ac75360f217897d94",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/suricata/common.py",
+          "score": 1.0
+        },
+        {
+          "name": "delete.html",
+          "path": "rules/templates/rules/delete.html",
+          "sha": "a7fd8b00f97a98e4df48c490bdc46282a5f080a6",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/templates/rules/delete.html",
+          "score": 1.0
+        },
+        {
+          "name": "index.js",
+          "path": "ui/app/components/UpdatePushRuleset/index.js",
+          "sha": "67351611d309b2b2745b4354fe9131b1b951a591",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/ui/app/components/UpdatePushRuleset/index.js",
+          "score": 1.0
+        },
+        {
+          "name": "disable_rule.html",
+          "path": "rules/templates/rules/disable_rule.html",
+          "sha": "245fe11dec01668ae75e14fba25252b16ca06154",
+          "html_url": "https://github.com/StamusNetworks/scirius/blob/3bb49d383f4801b79e6356f9de9f25806afe0311/rules/templates/rules/disable_rule.html",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "rules",
+      "count": 25,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "rules/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "backup.py",
+          "path": "rules/backup.py",
+          "type": "file"
+        },
+        {
+          "name": "es_analytics.py",
+          "path": "rules/es_analytics.py",
+          "type": "file"
+        },
+        {
+          "name": "es_data.py",
+          "path": "rules/es_data.py",
+          "type": "file"
+        },
+        {
+          "name": "es_graphs.py",
+          "path": "rules/es_graphs.py",
+          "type": "file"
+        },
+        {
+          "name": "es_query.py",
+          "path": "rules/es_query.py",
+          "type": "file"
+        },
+        {
+          "name": "filter_sets.py",
+          "path": "rules/filter_sets.py",
+          "type": "file"
+        },
+        {
+          "name": "forms.py",
+          "path": "rules/forms.py",
+          "type": "file"
+        },
+        {
+          "name": "hunt_webpack.py",
+          "path": "rules/hunt_webpack.py",
+          "type": "file"
+        },
+        {
+          "name": "management",
+          "path": "rules/management",
+          "type": "dir"
+        },
+        {
+          "name": "migrations",
+          "path": "rules/migrations",
+          "type": "dir"
+        },
+        {
+          "name": "models.py",
+          "path": "rules/models.py",
+          "type": "file"
+        },
+        {
+          "name": "rest_api.py",
+          "path": "rules/rest_api.py",
+          "type": "file"
+        },
+        {
+          "name": "rest_permissions.py",
+          "path": "rules/rest_permissions.py",
+          "type": "file"
+        },
+        {
+          "name": "rest_processing.py",
+          "path": "rules/rest_processing.py",
+          "type": "file"
+        },
+        {
+          "name": "south_migrations",
+          "path": "rules/south_migrations",
+          "type": "dir"
+        },
+        {
+          "name": "static",
+          "path": "rules/static",
+          "type": "dir"
+        },
+        {
+          "name": "suripyg.py",
+          "path": "rules/suripyg.py",
+          "type": "file"
+        },
+        {
+          "name": "tables.py",
+          "path": "rules/tables.py",
+          "type": "file"
+        },
+        {
+          "name": "templates",
+          "path": "rules/templates",
+          "type": "dir"
+        },
+        {
+          "name": "tests.py",
+          "path": "rules/tests.py",
+          "type": "file"
+        },
+        {
+          "name": "tests_rules.py",
+          "path": "rules/tests_rules.py",
+          "type": "file"
+        },
+        {
+          "name": "urls.py",
+          "path": "rules/urls.py",
+          "type": "file"
+        },
+        {
+          "name": "validators.py",
+          "path": "rules/validators.py",
+          "type": "file"
+        },
+        {
+          "name": "views.py",
+          "path": "rules/views.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "rules/__init__.py"
+        },
+        {
+          "name": "backup.py",
+          "path": "rules/backup.py"
+        },
+        {
+          "name": "es_analytics.py",
+          "path": "rules/es_analytics.py"
+        },
+        {
+          "name": "es_data.py",
+          "path": "rules/es_data.py"
+        },
+        {
+          "name": "es_graphs.py",
+          "path": "rules/es_graphs.py"
+        },
+        {
+          "name": "es_query.py",
+          "path": "rules/es_query.py"
+        },
+        {
+          "name": "filter_sets.py",
+          "path": "rules/filter_sets.py"
+        },
+        {
+          "name": "forms.py",
+          "path": "rules/forms.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "rules/views.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "2abbb581053a6fb57d371cee11e3d4ec4284bfa8",
+          "html_url": "https://github.com/StamusNetworks/scirius/commit/2abbb581053a6fb57d371cee11e3d4ec4284bfa8",
+          "message": "rules: fix is_ajax because it has been removed in django 4.2",
+          "author": "Nicolas Frisoni",
+          "date": "2024-11-18T15:18:36Z"
+        },
+        {
+          "sha": "5072403856ebfa1b1c8aa5cb85a5bcf3f60a1a8c",
+          "html_url": "https://github.com/StamusNetworks/scirius/commit/5072403856ebfa1b1c8aa5cb85a5bcf3f60a1a8c",
+          "message": "rules: upgrade to django 4.2",
+          "author": "Sébastien Lundi",
+          "date": "2024-10-02T14:11:50Z"
+        },
+        {
+          "sha": "8c4e4d27b3ec8c904d045c44a9a7d2e765642ad7",
+          "html_url": "https://github.com/StamusNetworks/scirius/commit/8c4e4d27b3ec8c904d045c44a9a7d2e765642ad7",
+          "message": "rules: fix linter error",
+          "author": "Nicolas Frisoni",
+          "date": "2024-11-18T11:04:03Z"
+        },
+        {
+          "sha": "83eec179c8cba7a728ac4ad0d1a2b213f831d76c",
+          "html_url": "https://github.com/StamusNetworks/scirius/commit/83eec179c8cba7a728ac4ad0d1a2b213f831d76c",
+          "message": "rules: celery tasks impl + add some tasks",
+          "author": "Nicolas Frisoni",
+          "date": "2024-10-29T09:04:18Z"
+        },
+        {
+          "sha": "718ace5921a224a81163e70131c063ca445d31b9",
+          "html_url": "https://github.com/StamusNetworks/scirius/commit/718ace5921a224a81163e70131c063ca445d31b9",
+          "message": "rules: add middleware to know if curator is available",
+          "author": "Nicolas Frisoni",
+          "date": "2024-07-29T14:23:09Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "ruleset FIXME Display list matching threshold",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "rules/views.py",
+      "satd_line": 1379,
+      "last_commit": {
+        "sha": "2abbb581053a6fb57d371cee11e3d4ec4284bfa8",
+        "html_url": "https://github.com/StamusNetworks/scirius/commit/2abbb581053a6fb57d371cee11e3d4ec4284bfa8",
+        "message": "rules: fix is_ajax because it has been removed in django 4.2",
+        "author": "Nicolas Frisoni",
+        "date": "2024-11-18T15:18:36Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "existing threshold query and filtering",
+        "form handling for threshold types",
+        "rendering context with thresholds and forms",
+        "use of django_tables2 for table display"
+      ],
+      "related_tests_count": 6,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "ruleset",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

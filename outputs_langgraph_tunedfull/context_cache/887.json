@@ -1,0 +1,441 @@
+{
+  "task_id": "887",
+  "repo_owner": "google",
+  "repo_name": "grr",
+  "file_path": "grr/server/grr_response_server/flows/general/filesystem.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:56:31+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:56:40+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:56:46+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "grr/server/grr_response_server/flows/general/filesystem.py",
+    "original_code": "def ProcessDirectory(self, responses):\n  \"\"\"Recursively list the directory, and add to the timeline.\"\"\"\n  if responses.success:\n    response = responses.First()\n\n    if response is None:\n      return\n\n    directory_pathspec = response.pathspec.Dirname()\n\n    urn = directory_pathspec.AFF4Path(self.client_urn)\n\n    self.StoreDirectory(responses)\n\n    # If the urn is too deep we quit to prevent recursion errors.\n    if self.state.first_directory is None:\n      self.state.first_directory = urn\n\n    else:\n      relative_name = urn.RelativeName(self.state.first_directory) or \"\"\n      # TODO: The split call from should be removed from\n      # the exit condition. Also one extra iteration is done with this\n      # exit condition.\n      if len(relative_name.split(\"/\")) >= self.args.max_depth:\n        self.Log(\"Exceeded maximum path depth at %s.\",\n                 urn.RelativeName(self.state.first_directory))\n        return\n\n    for stat_response in responses:\n      # Queue a list directory for each directory here, but do not follow\n      # symlinks.\n      is_dir = stat.S_ISDIR(int(stat_response.st_mode))\n      if not stat_response.symlink and is_dir:\n        self.CallClient(\n            server_stubs.ListDirectory,\n            pathspec=stat_response.pathspec,\n            next_state=\"ProcessDirectory\")\n        self.state.dir_count += 1\n        if self.state.dir_count % 100 == 0:  # Log every 100 directories\n          self.Log(\"Reading %s. (%d nodes, %d directories done)\",\n                   urn.RelativeName(self.state.first_directory),\n                   self.state.file_count, self.state.dir_count)\n\n    self.state.file_count += len(responses)",
+    "satd_comment": "# TODO: The split call from should be removed from\n# the exit condition. Also one extra iteration is done with this\n# exit condition.",
+    "target_file": {
+      "ok": true,
+      "path": "grr/server/grr_response_server/flows/general/filesystem.py",
+      "sha": "17cc3a5a66d50dc0c634a843f820a19f095af983",
+      "download_url": "https://raw.githubusercontent.com/google/grr/master/grr/server/grr_response_server/flows/general/filesystem.py",
+      "content_excerpt": "#!/usr/bin/env python\n\"\"\"These are filesystem related flows.\"\"\"\n\nfrom collections.abc import Iterable\nimport os\nimport stat\nfrom typing import Optional\n\nfrom google.protobuf import any_pb2\nfrom grr_response_core.lib import rdfvalue\nfrom grr_response_core.lib.rdfvalues import client_fs as rdf_client_fs\nfrom grr_response_core.lib.rdfvalues import crypto as rdf_crypto\nfrom grr_response_core.lib.rdfvalues import file_finder as rdf_file_finder\nfrom grr_response_core.lib.rdfvalues import mig_client_fs\nfrom grr_response_core.lib.rdfvalues import mig_paths\nfrom grr_response_core.lib.rdfvalues import paths as rdf_paths\nfrom grr_response_core.lib.rdfvalues import structs as rdf_structs\nfrom grr_response_proto import flows_pb2\nfrom grr_response_proto import jobs_pb2\nfrom grr_response_proto import objects_pb2\nfrom grr_response_server import data_store\nfrom grr_response_server import flow_base\nfrom grr_response_server import flow_responses\nfrom grr_response_server import notification\nfrom grr_response_server import rrg_fs\nfrom grr_response_server import rrg_path\nfrom grr_response_server import rrg_stubs\nfrom grr_response_server import server_stubs\nfrom grr_response_server.rdfvalues import mig_objects\nfrom grr_response_server.rdfvalues import objects as rdf_objects\nfrom grr_response_proto.rrg import fs_pb2 as rrg_fs_pb2\nfrom grr_response_proto.rrg import os_pb2 as rrg_os_pb2\nfrom grr_response_proto.rrg.action import get_file_metadata_pb2 as rrg_get_file_metadata_pb2\n\n\n# This is all bits that define the type of the file in the stat mode. Equal to\n# 0b1111000000000000.\nstat_type_mask = (\n    stat.S_IFREG\n    | stat.S_IFDIR\n    | stat.S_IFLNK\n    | stat.S_IFBLK\n    | stat.S_IFCHR\n    | stat.S_IFIFO\n    | stat.S_IFSOCK\n)\n\n\ndef _FilterOutPathInfoDuplicates(path_infos):\n  \"\"\"Filters out duplicates from passed PathInfo objects.\n\n  Args:\n    path_infos: An iterable with PathInfo objects.\n\n  Returns:\n    A list of PathInfo objects with duplicates removed. Duplicates are\n    removed following this logic: they're sorted by (ctime, mtime, atime,\n    inode number) in the descending order and then the first one is taken\n    and the others are dropped.\n  \"\"\"\n  pi_dict = {}\n\n  for pi in path_infos:\n    path_key = (pi.path_type, pi.GetPathID())\n    pi_dict.setdefault(path_key, []).append(pi)\n\n  def _SortKey(pi):\n    return (\n        pi.stat_entry.st_ctime,\n        pi.stat_entry.st_mtime,\n        pi.stat_entry.st_atime,\n        pi.stat_entry.st_ino,\n    )\n\n  for pi_values in pi_dict.values():\n    if len(pi_values) > 1:\n      pi_values.sort(key=_SortKey, reverse=True)\n\n  return [v[0] for v in pi_dict.values()]\n\n\ndef WriteStatEntries(stat_entries, client_id):\n  \"\"\"Persists information about stat entries.\n\n  Args:\n    stat_entries: A list of `StatEntry` instances.\n    client_id: An id of a client the stat entries come from.\n  \"\"\"\n\n  for stat_response in stat_entries:\n    if stat_response.pathspec.last.stream_name:\n      # This is an ads. In that case we always need to create a file or\n      # we won't be able to access the data. New clients send the correct mode\n      # already but to make sure, we set this to a regular file anyways.\n      # Clear all file type bits:\n      stat_response.st_mode &= ~stat_type_mask\n      stat_response.st_mode |= stat.S_IFREG\n\n  path_infos = _FilterOutPathInfoDuplicates(\n      [rdf_objects.PathInfo.FromStatEntry(s) for s in stat_entries]\n  )\n  proto_path_infos = [mig_objects.ToProtoPathInfo(pi) for pi in path_infos]\n  # NOTE: TSK may return duplicate entries. This is may be either due to\n  # a bug in TSK implementation, or due to the fact that TSK is capable\n  # of returning deleted files information. Our VFS data model only supports\n  # storing multiple versions of the files when we collect the versions\n  # ourselves. At the moment we can't store multiple versions of the files\n  # \"as returned by TSK\".\n  #\n  # Current behaviour is to simply drop excessive version before the\n  # WritePathInfo call. This way files returned by TSK will still make it\n  # into the flow's results, but not into the VFS data.\n  data_store.REL_DB.WritePathInfos(client_id, proto_path_infos)\n\n\ndef WriteFileFinderResults(\n    file_finder_results: Iterable[rdf_file_finder.FileFinderResult],\n    client_id: str,\n) -> None:\n  \"\"\"Persists information about file finder results.\n\n  Args:\n    file_finder_results: A list of `FileFinderResult` instances.\n    client_id: An id of a client the stat entries come from.\n  \"\"\"\n\n  path_infos = []\n  for r in file_finder_results:\n    if r.stat_entry.pathspec.last.stream_name:\n      # This is an ADS. In this case we always need to create a file or\n      # we won't be able to access the data. New clients send the correct mode\n      # already but to make sure, we set this to a regular file anyways.\n      # Clear all file type bits:\n      r.stat_entry.st_mode &= ~stat_type_mask\n      r.stat_entry.st_mode |= stat.S_IFREG\n\n    path_info = rdf_objects.PathInfo.FromStatEntry(r.stat_entry)\n    if r.HasField(\"hash_entry\"):\n      path_info.hash_entry = r.hash_entry\n    path_infos.append(path_info)\n\n  path_infos = _FilterOutPathInfoDuplicates(path_infos)\n  proto_path_infos = [mig_objects.ToProtoPathInfo(pi) for pi in path_infos]\n  # NOTE: TSK may return duplicate entries. This is may be either due to\n  # a bug in TSK implementation, or due to the fact that TSK is capable\n  # of returning deleted files information. Our VFS data model only supports\n  # storing multiple versions of the files when we collect the versions\n  # ourselves. At the moment we can't store multiple versions of the files\n  # \"as returned by TSK\".\n  #\n  # Current behaviour is to simply drop excessive version before the\n  # WritePathInfo call. This way files returned by TSK will still make it\n  # into the flow's results, but not into the VFS data.\n  data_store.REL_DB.WritePathInfos(client_id, proto_path_infos)\n\n\ndef WritePartialFileResults(\n    client_id: str,\n    stat_entry: rdf_client_fs.StatEntry,\n    hash_entry: Optional[rdf_crypto.Hash] = None,\n) -> None:\n  \"\"\"Persists information about partial file results (without content).\n\n  Args:\n    client_id: An id of a client the stat entries come from.\n    stat_entry: A `StatEntry` instance.\n    hash_entry: An optional `Hash` instance.\n  \"\"\"\n  if stat_entry.pathspec.last.stream_name:\n    # This is an ADS. In this case we always need to create a file or\n    # we won't be able to access the data. New clients send the correct mode\n    # already but to make sure, we set this to a regular file anyways.\n    # Clear all file type bits:\n    stat_entry.st_mode &= ~stat_type_mask\n    stat_entry.st_mode |= stat.S_IFREG\n\n  path_info = rdf_objects.PathInfo.FromStatEntry(stat_entry)\n  if hash_entry:\n    path_info.hash_entry = hash_entry\n\n  data_store.REL_DB.WritePathInfos(\n      client_id, [mig_objects.ToProtoPathInfo(path_info)]\n  )\n\n\nclass ListDirectoryArgs(rdf_structs.RDFProtoStruct):\n  protobuf = flows_pb2.ListDirectoryArgs\n  rdf_deps = [\n      rdf_paths.PathSpec,\n  ]\n\n\nclass ListDirectory(\n    flow_base.FlowBase[\n        flows_pb2.ListDirectoryArgs,\n        flows_pb2.ListDirectoryStore,\n        flows_pb2.DefaultFlowProgress,\n    ]\n):\n  \"\"\"List files in a directory.\"\"\"\n\n  category = \"/Filesystem/\"\n  args_type = ListDirectoryArgs\n  behaviours = flow_base.BEHAVIOUR_ADVANCED\n  result_types = (rdf_client_fs.StatEntry,)\n\n  proto_args_type = flows_pb2.ListDirectoryArgs\n  proto_result_types = (jobs_pb2.StatEntry,)\n  proto_store_type = flows_pb2.ListDirectoryStore\n  only_protos_allowed = True\n\n  def Start(self):\n    \"\"\"Issue a request to list the directory.\"\"\"\n    if (\n        self.rrg_support\n        and self.proto_args.pathspec.pathtype == rdf_paths.PathSpec.PathType.OS\n    ):\n      path_raw_bytes = self.proto_args.pathspec.path.encode(\"utf-8\")  # pytype: disable=attribute-error\n\n      # TODO: Sometimes GRR \"fixes\" Windows paths and inserts a\n      # leading '/' in front (e.g. to have `/C:/Windows`). RRG does not treat it\n      # as a valid absolute path and so we need to \"unfix\" it here.\n      #\n      # We should fix GRR not to do this path fixing.\n      if self.rrg_os_type == rrg_os_pb2.WINDOWS:\n        path_raw_bytes = path_raw_bytes.removeprefix(b\"/\")\n\n      action = rrg_stubs.GetFileMetadata()\n      action.args.paths.add().raw_bytes = path_raw_bytes\n      action.args.max_depth = 1\n      action.Call(self.HandleRRGGetFileMetadata)\n    else:\n      request = jobs_pb2.GetFileStatRequest(\n          pathspec=self.proto_args.pathspec,\n          follow_symlink=True,\n      )\n      self.CallClientProto(\n          server_stubs.GetFileStat,\n          request,\n          next_state=self.Stat.__name__,\n      )\n\n      # We use data to pass the path to the callback:\n      self.CallClientProto(\n          server_stubs.ListDirectory,\n          jobs_pb2.ListDirRequest(pathspec=self.proto_args.pathspec),\n          next_state=self.List.__name__,\n      )\n\n  @flow_base.UseProto2AnyResponses\n  def HandleRRGGetFileMetadata(\n      self,\n      responses_any: flow_responses.Responses[any_pb2.Any],\n  ) -> None:\n    if not responses_any.success or not responses_any:\n      message = f\"File metadata collection failure: {responses_any.status}\"\n      raise flow_base.FlowError(message)\n\n    responses: list[rrg_get_file_metadata_pb2.Result] = []\n\n    for response_any in responses_any:\n      response = rrg_get_file_metadata_pb2.Result()\n      response.ParseFromString(response_any.value)\n\n      responses.append(response)\n\n    responses.sort(key=lambda _: _.path.raw_bytes)\n    response_dir, *responses = responses\n\n    dir_path = rrg_path.PurePath.For(self.rrg_os_type, response_dir.path)\n    dir_symlink = rrg_path.PurePath.For(self.rrg_os_type, response_dir.symlink)\n\n    path_info_dir = rrg_fs.PathInfo(response_dir.metadata)\n    path_info_dir.path_type = objects_pb2.PathInfo.PathType.OS\n    path_info_dir.components.extend(dir_path.components)\n    path_info_dir.stat_entry.pathspec.pathtype = jobs_pb2.PathSpec.PathType.OS\n    path_info_dir.stat_entry.pathspec.path = str(dir_path)\n\n    if response_dir.symlink.raw_bytes:\n      if responses:\n        raise flow_base.FlowError(\n            f\"Unexpected responses for symlink: {responses}\",\n        )\n\n      path_info_dir.stat_entry.symlink = str(dir_symlink)\n\n      # We are dealing with a symlink, so we it means we need to list contents\n      # of the folder it points to. Note that it may point to another symlink\n      # (or even form a cycle), so we put a limit on a depth of such recursion.\n      self.store.symlink_depth += 1\n      if self.store.symlink_depth > _SYMLINK_DEPTH_LIMIT:\n        raise flow_base.FlowError(\n            f\"Symlink depth reached: {_SYMLINK_DEPTH_LIMIT}\",\n        )\n\n      self.Log(\"Found symlink, listing '%s'\", dir_symlink)\n\n      get_file_metadata = rrg_stubs.GetFileMetadata()\n      get_file_metadata.args.paths.add().raw_bytes = bytes(\n          (dir_path.parent / dir_symlink).normal\n      )\n      get_file_metadata.args.max_depth = 1\n      get_file_metadata.Call(self.HandleRRGGetFileMetadata)\n\n    if response_dir.metadata.type not in [\n        rrg_fs_pb2.FileMetadata.Type.DIR,\n        rrg_fs_pb2.FileMetadata.Type.SYMLINK,\n    ]:\n      raise flow_base.FlowError(f\"Unexpected file type in: {response_dir}\")\n\n    self.store.stat_entry.CopyFrom(path_info_dir.stat_entry)\n    self.store.urn = str(\n        mig_client_fs.ToRDFStatEntry(path_info_dir.stat_entry).AFF4Path(\n            self.client_urn\n        )\n    )\n\n    path_infos = [path_info_dir]\n\n    for response in responses:\n      path = rrg_path.PurePath.For(self.rrg_os_type, response.path)\n      symlink = rrg_path.PurePath.For(self.rrg_os_type, response.symlink)\n\n      path_info = rrg_fs.PathInfo(response.metadata)\n      path_info.path_type = objects_pb2.PathInfo.PathType.OS\n      path_info.components.extend(path.components)\n      path_info.stat_entry.pathspec.pathtype = jobs_pb2.PathSpec.PathType.OS\n      path_info.stat_entry.pathspec.path = str(path)\n      # TODO: Fix path separator in stat entries.\n      i",
+      "total_lines": 563
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "collections.abc:Iterable",
+        "os",
+        "stat",
+        "typing:Optional",
+        "google.protobuf:any_pb2",
+        "grr_response_core.lib:rdfvalue",
+        "grr_response_core.lib.rdfvalues:client_fs",
+        "grr_response_core.lib.rdfvalues:crypto",
+        "grr_response_core.lib.rdfvalues:file_finder",
+        "grr_response_core.lib.rdfvalues:mig_client_fs",
+        "grr_response_core.lib.rdfvalues:mig_paths",
+        "grr_response_core.lib.rdfvalues:paths",
+        "grr_response_core.lib.rdfvalues:structs",
+        "grr_response_proto:flows_pb2",
+        "grr_response_proto:jobs_pb2",
+        "grr_response_proto:objects_pb2",
+        "grr_response_server:data_store",
+        "grr_response_server:flow_base",
+        "grr_response_server:flow_responses",
+        "grr_response_server:notification",
+        "grr_response_server:rrg_fs",
+        "grr_response_server:rrg_path",
+        "grr_response_server:rrg_stubs",
+        "grr_response_server:server_stubs",
+        "grr_response_server.rdfvalues:mig_objects",
+        "grr_response_server.rdfvalues:objects",
+        "grr_response_proto.rrg:fs_pb2",
+        "grr_response_proto.rrg:os_pb2",
+        "grr_response_proto.rrg.action:get_file_metadata_pb2"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/google/grr/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n<img src=\"https://raw.githubusercontent.com/google/grr/gh-pages/img/grr_logo_real_sm.png\" />\n\n<p align=\"center\">\nGRR Rapid Response is an incident response framework focused on remote live forensics.\n\n[![Build](https://github.com/google/grr/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/google/grr/actions/workflows/build.yml)\n\nGRR is a python client (agent) that is installed on target systems, and\npython server infrastructure that can manage and talk to clients.<br>\n\n\nDocumentation\n-------------\n\nPlease visit our [documentation website](https://grr-doc.readthedocs.io/) if you want to know more about GRR.\n\n\nContact Us\n----------\n\n* GitHub issues: [github.com/google/grr/issues](https://github.com/google/grr/issues)\n* GRR Users mailing list: [grr-users](https://groups.google.com/forum/#!forum/grr-users)\n* Follow us [on twitter](https://twitter.com/grrresponse) for announcements of GRR user meetups. We use [a gitter chat room](https://gitter.im/google/grr) during meetups.\n\n\nScreenshots\n-----------\n[<img src=\"https://github.com/google/grr/blob/gh-pages/screenshots/endpoint-overview.png\" width=\"330\">](https://github.com/google/grr/blob/gh-pages/screenshots/endpoint-overview.png)\n[<img src=\"https://github.com/google/grr/blob/gh-pages/screenshots/filesystem-overview.png\" width=\"330\">](https://github.com/google/grr/blob/gh-pages/screenshots/filesystem-overview.png)\n[<img src=\"https://github.com/google/grr/blob/gh-pages/screenshots/workflow-results.png\" width=\"330\">](https://github.com/google/grr/blob/gh-pages/screenshots/workflow-results."
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "ProcessDirectory test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"ProcessDirectory(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "filesystem.py",
+          "path": "grr/server/grr_response_server/flows/general/filesystem.py",
+          "sha": "17cc3a5a66d50dc0c634a843f820a19f095af983",
+          "html_url": "https://github.com/google/grr/blob/2d4cfd3c0b8fed46906222c87932d976dc0f4919/grr/server/grr_response_server/flows/general/filesystem.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "grr/server/grr_response_server/flows/general",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "grr/server/grr_response_server/flows/general/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "administrative.py",
+          "path": "grr/server/grr_response_server/flows/general/administrative.py",
+          "type": "file"
+        },
+        {
+          "name": "administrative_test.py",
+          "path": "grr/server/grr_response_server/flows/general/administrative_test.py",
+          "type": "file"
+        },
+        {
+          "name": "cloud.py",
+          "path": "grr/server/grr_response_server/flows/general/cloud.py",
+          "type": "file"
+        },
+        {
+          "name": "cloud_test.py",
+          "path": "grr/server/grr_response_server/flows/general/cloud_test.py",
+          "type": "file"
+        },
+        {
+          "name": "collectors.py",
+          "path": "grr/server/grr_response_server/flows/general/collectors.py",
+          "type": "file"
+        },
+        {
+          "name": "collectors_interactions_test.py",
+          "path": "grr/server/grr_response_server/flows/general/collectors_interactions_test.py",
+          "type": "file"
+        },
+        {
+          "name": "collectors_test.py",
+          "path": "grr/server/grr_response_server/flows/general/collectors_test.py",
+          "type": "file"
+        },
+        {
+          "name": "containers.py",
+          "path": "grr/server/grr_response_server/flows/general/containers.py",
+          "type": "file"
+        },
+        {
+          "name": "containers_test.py",
+          "path": "grr/server/grr_response_server/flows/general/containers_test.py",
+          "type": "file"
+        },
+        {
+          "name": "crowdstrike.py",
+          "path": "grr/server/grr_response_server/flows/general/crowdstrike.py",
+          "type": "file"
+        },
+        {
+          "name": "crowdstrike_test.py",
+          "path": "grr/server/grr_response_server/flows/general/crowdstrike_test.py",
+          "type": "file"
+        },
+        {
+          "name": "deprecated.py",
+          "path": "grr/server/grr_response_server/flows/general/deprecated.py",
+          "type": "file"
+        },
+        {
+          "name": "deprecated_test.py",
+          "path": "grr/server/grr_response_server/flows/general/deprecated_test.py",
+          "type": "file"
+        },
+        {
+          "name": "discovery.py",
+          "path": "grr/server/grr_response_server/flows/general/discovery.py",
+          "type": "file"
+        },
+        {
+          "name": "discovery_test.py",
+          "path": "grr/server/grr_response_server/flows/general/discovery_test.py",
+          "type": "file"
+        },
+        {
+          "name": "distro.py",
+          "path": "grr/server/grr_response_server/flows/general/distro.py",
+          "type": "file"
+        },
+        {
+          "name": "distro_test.py",
+          "path": "grr/server/grr_response_server/flows/general/distro_test.py",
+          "type": "file"
+        },
+        {
+          "name": "dummy.py",
+          "path": "grr/server/grr_response_server/flows/general/dummy.py",
+          "type": "file"
+        },
+        {
+          "name": "dummy_test.py",
+          "path": "grr/server/grr_response_server/flows/general/dummy_test.py",
+          "type": "file"
+        },
+        {
+          "name": "export.py",
+          "path": "grr/server/grr_response_server/flows/general/export.py",
+          "type": "file"
+        },
+        {
+          "name": "file_finder.py",
+          "path": "grr/server/grr_response_server/flows/general/file_finder.py",
+          "type": "file"
+        },
+        {
+          "name": "file_finder_test.py",
+          "path": "grr/server/grr_response_server/flows/general/file_finder_test.py",
+          "type": "file"
+        },
+        {
+          "name": "filesystem.py",
+          "path": "grr/server/grr_response_server/flows/general/filesystem.py",
+          "type": "file"
+        },
+        {
+          "name": "filesystem_test.py",
+          "path": "grr/server/grr_response_server/flows/general/filesystem_test.py",
+          "type": "file"
+        },
+        {
+          "name": "hardware.py",
+          "path": "grr/server/grr_response_server/flows/general/hardware.py",
+          "type": "file"
+        },
+        {
+          "name": "hardware_test.py",
+          "path": "grr/server/grr_response_server/flows/general/hardware_test.py",
+          "type": "file"
+        },
+        {
+          "name": "large_file.py",
+          "path": "grr/server/grr_response_server/flows/general/large_file.py",
+          "type": "file"
+        },
+        {
+          "name": "large_file_test.py",
+          "path": "grr/server/grr_response_server/flows/general/large_file_test.py",
+          "type": "file"
+        },
+        {
+          "name": "memory.py",
+          "path": "grr/server/grr_response_server/flows/general/memory.py",
+          "type": "file"
+        },
+        {
+          "name": "memory_test.py",
+          "path": "grr/server/grr_response_server/flows/general/memory_test.py",
+          "type": "file"
+        },
+        {
+          "name": "memsize.py",
+          "path": "grr/server/grr_response_server/flows/general/memsize.py",
+          "type": "file"
+        },
+        {
+          "name": "memsize_test.py",
+          "path": "grr/server/grr_response_server/flows/general/memsize_test.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_administrative.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_administrative.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_crowdstrike.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_crowdstrike.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_discovery.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_discovery.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_dummy.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_dummy.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_filesystem.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_filesystem.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_large_file.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_large_file.py",
+          "type": "file"
+        },
+        {
+          "name": "mig_network.py",
+          "path": "grr/server/grr_response_server/flows/general/mig_network.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "grr/server/grr_response_server/flows/general/__init__.py"
+        },
+        {
+          "name": "administrative.py",
+          "path": "grr/server/grr_response_server/flows/general/administrative.py"
+        },
+        {
+          "name": "administrative_test.py",
+          "path": "grr/server/grr_response_server/flows/general/administrative_test.py"
+        },
+        {
+          "name": "cloud.py",
+          "path": "grr/server/grr_response_server/flows/general/cloud.py"
+        },
+        {
+          "name": "cloud_test.py",
+          "path": "grr/server/grr_response_server/flows/general/cloud_test.py"
+        },
+        {
+          "name": "collectors.py",
+          "path": "grr/server/grr_response_server/flows/general/collectors.py"
+        },
+        {
+          "name": "collectors_interactions_test.py",
+          "path": "grr/server/grr_response_server/flows/general/collectors_interactions_test.py"
+        },
+        {
+          "name": "collectors_test.py",
+          "path": "grr/server/grr_response_server/flows/general/collectors_test.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "grr/server/grr_response_server/flows/general/filesystem.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "442d02304a3704cd3ed52b949a9d47d524b8e89e",
+          "html_url": "https://github.com/google/grr/commit/442d02304a3704cd3ed52b949a9d47d524b8e89e",
+          "message": "Syncing recent changes - Release GRR version 4.0.0 (#1149)",
+          "author": "Susanne Westphal",
+          "date": "2025-12-15T17:10:02Z"
+        },
+        {
+          "sha": "4b19726b7781e652ee47199ab00d95cd9d448a71",
+          "html_url": "https://github.com/google/grr/commit/4b19726b7781e652ee47199ab00d95cd9d448a71",
+          "message": "Syncing recent changes. (#1124)\n\n* Syncing recent changes.\n* Update client_build.py: fix the config check.\n* Add executable bit to the grr_fleetspeak_client.sh.\n* Expose mysql port 3306 in Docker compose config to ensure e2e tests complete.",
+          "author": "mbushkov",
+          "date": "2025-02-26T15:57:57Z"
+        },
+        {
+          "sha": "d0156fd1dd478d632ab17b5cad1b440e32645fab",
+          "html_url": "https://github.com/google/grr/commit/d0156fd1dd478d632ab17b5cad1b440e32645fab",
+          "message": "Syncing recent changes. (#1088)\n\n* Syncing recent changes.\r\n\r\nNotable changes:\r\n\r\n* Parsers support fully removed from the artifacts collector.\r\n* Interrogate is no longer artifact-collector based.\r\n* RDFProtoStruct -> plain protos migration in progress.\r\n* Text type no longer used (replaced with 's",
+          "author": "mbushkov",
+          "date": "2024-05-27T12:08:51Z"
+        },
+        {
+          "sha": "ad7e59c4b1ae7c5cf7121b1ddd7bea765d11c994",
+          "html_url": "https://github.com/google/grr/commit/ad7e59c4b1ae7c5cf7121b1ddd7bea765d11c994",
+          "message": "Syncing recent changes. (#1079)",
+          "author": "Susanne Westphal",
+          "date": "2024-04-17T10:11:59Z"
+        },
+        {
+          "sha": "55f3e61839c23ea63404027e7390439ee1e208e2",
+          "html_url": "https://github.com/google/grr/commit/55f3e61839c23ea63404027e7390439ee1e208e2",
+          "message": "Syncing recent changes. (#1055)\n\n* Removed support for Chipsec based flows.\r\n* Removed ClientArtifactCollector flow and related client actions.\r\n* Removed indexing endpoints on snapshot uname (searching is still possible by individual and combination of system name, release and version).\r\n* Removed ",
+          "author": "Susanne Westphal",
+          "date": "2024-01-30T17:56:08Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "ProcessDirectory TODO split call from should",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "grr/server/grr_response_server/flows/general/filesystem.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "442d02304a3704cd3ed52b949a9d47d524b8e89e",
+        "html_url": "https://github.com/google/grr/commit/442d02304a3704cd3ed52b949a9d47d524b8e89e",
+        "message": "Syncing recent changes - Release GRR version 4.0.0 (#1149)",
+        "author": "Susanne Westphal",
+        "date": "2025-12-15T17:10:02Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

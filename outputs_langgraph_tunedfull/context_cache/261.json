@@ -1,0 +1,406 @@
+{
+  "task_id": "261",
+  "repo_owner": "vijos",
+  "repo_name": "vj4",
+  "file_path": "vj4/handler/record.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T16:38:20+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 5,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T16:38:33+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T16:38:46+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "vj4/handler/record.py",
+    "original_code": "async def get(self, *, rid: objectid.ObjectId):\n  # TODO(twd2): check permission or own\n  rdoc = await record.get(rid)\n  if not rdoc:\n    raise error.RecordNotFoundError(rid)\n  ddoc = await document.get(rdoc['domain_id'], document.TYPE_PRETEST_DATA, rdoc['data_id'])\n  if not ddoc:\n    raise error.ProblemDataNotFoundError(rdoc['pid'])\n\n  output_buffer = io.BytesIO()\n  zip_file = zipfile.ZipFile(output_buffer, 'a', zipfile.ZIP_DEFLATED)\n  config_content = str(len(ddoc['data_input'])) + \"\\n\"\n  for i, (data_input, data_output) in enumerate(zip(ddoc['data_input'], ddoc['data_output'])):\n    input_file = 'input{0}.txt'.format(i)\n    output_file = 'output{0}.txt'.format(i)\n    config_content += '{0}|{1}|1|10|1024\\n'.format(input_file, output_file)\n    zip_file.writestr('Input/{0}'.format(input_file), data_input)\n    zip_file.writestr('Output/{0}'.format(output_file), data_output)\n  zip_file.writestr('Config.ini', config_content)\n\n  # mark all files as created in Windows :p\n  for zfile in zip_file.filelist:\n    zfile.create_system = 0\n\n  zip_file.close()\n  await self.binary(output_buffer.getvalue())",
+    "satd_comment": "# TODO(twd2): check permission or own",
+    "target_file": {
+      "ok": true,
+      "path": "vj4/handler/record.py",
+      "sha": "cc5b57086629830c7388fa07bea5ad8a3344418e",
+      "download_url": "https://raw.githubusercontent.com/vijos/vj4/master/vj4/handler/record.py",
+      "content_excerpt": "import asyncio\nimport calendar\nimport datetime\nimport struct\nimport urllib.parse\nfrom bson import objectid\n\nfrom vj4 import app\nfrom vj4 import constant\nfrom vj4 import error\nfrom vj4.handler import base\nfrom vj4.model import builtin\nfrom vj4.model import document\nfrom vj4.model import domain\nfrom vj4.model import fs\nfrom vj4.model import record\nfrom vj4.model import user\nfrom vj4.model.adaptor import contest\nfrom vj4.model.adaptor import problem\nfrom vj4.service import bus\nfrom vj4.util import options\n\n\nclass RecordVisibilityMixin(contest.ContestVisibilityMixin):\n  async def rdoc_contest_visible(self, rdoc):\n    tdoc = await contest.get(rdoc['domain_id'], rdoc.get('ttype', document.TYPE_CONTEST), rdoc['tid'])\n    if self.user['_id'] == rdoc['uid']:\n      return self.can_show_record(tdoc), tdoc\n    else:\n      return self.can_show_scoreboard(tdoc), tdoc\n\n\nclass RecordCommonOperationMixin(object):\n  async def get_filter_query(self, uid_or_name, pid, tid):\n    query = dict()\n    if uid_or_name:\n      try:\n        query['uid'] = int(uid_or_name)\n      except ValueError:\n        udoc = await user.get_by_uname(uid_or_name)\n        if not udoc:\n          raise error.UserNotFoundError(uid_or_name) from None\n        query['uid'] = udoc['_id']\n    if pid or tid:\n      query['domain_id'] = self.domain_id\n      if pid:\n        query['pid'] = document.convert_doc_id(pid)\n      if tid:\n        query['tid'] = document.convert_doc_id(tid)\n    return query\n\n\nclass RecordMixin(RecordVisibilityMixin, RecordCommonOperationMixin):\n  pass\n\n\n@app.route('/records', 'record_main')\nclass RecordMainHandler(RecordMixin, base.Handler):\n  @base.get_argument\n  @base.sanitize\n  async def get(self, *, start: str='', uid_or_name: str='', pid: str='', tid: str=''):\n    if not self.has_priv(builtin.PRIV_VIEW_JUDGE_STATISTICS):\n      start = ''\n    if start:\n      try:\n        start = objectid.ObjectId(start)\n      except Exception:\n        raise error.InvalidArgumentError('start')\n    else:\n      start = None\n    query = await self.get_filter_query(uid_or_name, pid, tid)\n    # TODO(iceboy): projection, pagination.\n    rdocs = await record.get_all_multi(**query, end_id=start,\n      get_hidden=self.has_priv(builtin.PRIV_VIEW_HIDDEN_RECORD)).sort([('_id', -1)]).limit(50).to_list()\n    # TODO(iceboy): projection.\n    udict, dudict, pdict = await asyncio.gather(\n        user.get_dict(rdoc['uid'] for rdoc in rdocs),\n        domain.get_dict_user_by_uid(domain_id=self.domain_id, uids=(rdoc['uid'] for rdoc in rdocs)),\n        problem.get_dict_multi_domain((rdoc['domain_id'], rdoc['pid']) for rdoc in rdocs))\n    # statistics\n    statistics = None\n    if self.has_priv(builtin.PRIV_VIEW_JUDGE_STATISTICS):\n      ts = calendar.timegm(datetime.datetime.utcnow().utctimetuple())\n      day_count, week_count, month_count, year_count, rcount = await asyncio.gather(\n          record.get_count(objectid.ObjectId(\n              struct.pack('>i', ts - 24 * 3600) + struct.pack('b', -1) * 8)),\n          record.get_count(objectid.ObjectId(\n              struct.pack('>i', ts - 7 * 24 * 3600) + struct.pack('b', -1) * 8)),\n          record.get_count(objectid.ObjectId(\n              struct.pack('>i', ts - 30 * 24 * 3600) + struct.pack('b', -1) * 8)),\n          record.get_count(objectid.ObjectId(\n              struct.pack('>i', ts - int(365.2425 * 24 * 3600)) + struct.pack('b', -1) * 8)),\n          record.get_count())\n      statistics = {'day': day_count, 'week': week_count, 'month': month_count,\n                    'year': year_count, 'total': rcount}\n    url_prefix = '/d/{}'.format(urllib.parse.quote(self.domain_id))\n    query_string = urllib.parse.urlencode(\n      [('uid_or_name', uid_or_name), ('pid', pid), ('tid', tid)])\n    self.render(\n        'record_main.html', rdocs=rdocs, udict=udict, dudict=dudict, pdict=pdict,\n        statistics=statistics, filter_uid_or_name=uid_or_name, filter_pid=pid, filter_tid=tid,\n        socket_url=url_prefix + '/records-conn?' + query_string, # FIXME(twd2): magic\n        query_string=query_string)\n\n\n@app.connection_route('/records-conn', 'record_main-conn')\nclass RecordMainConnection(RecordMixin, base.Connection):\n  @base.get_argument\n  @base.sanitize\n  async def on_open(self, *, uid_or_name: str='', pid: str='', tid: str=''):\n    await super(RecordMainConnection, self).on_open()\n    self.query = await self.get_filter_query(uid_or_name, pid, tid)\n    bus.subscribe(self.on_record_change, ['record_change'])\n\n  async def on_record_change(self, e):\n    rdoc = e['value']\n    for key, value in self.query.items():\n      if rdoc[key] != value:\n        return\n    if rdoc['tid']:\n      show_status, tdoc = await self.rdoc_contest_visible(rdoc)\n      if not show_status:\n        return\n    # TODO(iceboy): projection.\n    udoc, dudoc, pdoc = await asyncio.gather(user.get_by_uid(rdoc['uid']),\n                                             domain.get_user(self.domain_id, rdoc['uid']),\n                                             problem.get(rdoc['domain_id'], rdoc['pid']))\n    # check permission for visibility: hidden problem\n    if pdoc.get('hidden', False) and (pdoc['domain_id'] != self.domain_id\n                                      or not self.has_perm(builtin.PERM_VIEW_PROBLEM_HIDDEN)):\n      pdoc = None\n    self.send(html=self.render_html('record_main_tr.html', rdoc=rdoc, udoc=udoc, dudoc=dudoc, pdoc=pdoc))\n\n  async def on_close(self):\n    bus.unsubscribe(self.on_record_change)\n\n\n@app.route('/records/{rid}', 'record_detail')\nclass RecordDetailHandler(RecordMixin, base.Handler):\n  @base.route_argument\n  @base.sanitize\n  async def get(self, *, rid: objectid.ObjectId):\n    rdoc = await record.get(rid)\n    if not rdoc:\n      raise error.RecordNotFoundError(rid)\n    # TODO(iceboy): Check domain permission, permission for visibility in place.\n    if rdoc['domain_id'] != self.domain_id:\n      self.redirect(self.reverse_url('record_detail', rid=rid, domain_id=rdoc['domain_id']))\n      return\n    if rdoc['tid']:\n      show_status, tdoc = await self.rdoc_contest_visible(rdoc)\n    else:\n      show_status, tdoc = True, None\n    # TODO(twd2): futher check permission for visibility.\n    if (not self.own(rdoc, field='uid')\n        and not self.has_perm(builtin.PERM_READ_RECORD_CODE)\n        and not self.has_priv(builtin.PRIV_READ_RECORD_CODE)):\n      del rdoc['code']\n    if not show_status and 'code' not in rdoc:\n      if tdoc['doc_type'] == document.TYPE_CONTEST:\n        raise error.PermissionError(builtin.PERM_VIEW_CONTEST_HIDDEN_SCOREBOARD)\n      else: # TYPE_HOMEWORK\n        raise error.PermissionError(builtin.PERM_VIEW_HOMEWORK_HIDDEN_SCOREBOARD)\n    udoc, dudoc = await asyncio.gather(\n        user.get_by_uid(rdoc['uid']),\n        domain.get_user(self.domain_id, rdoc['uid']))\n    try:\n      pdoc = await problem.get(rdoc['domain_id'], rdoc['pid'])\n    except error.ProblemNotFoundError:\n      pdoc = {}\n    if show_status and 'judge_uid' in rdoc:\n      judge_udoc = await user.get_by_uid(rdoc['judge_uid'])\n    else:\n      judge_udoc = None\n    # check permission for visibility: hidden problem\n    if pdoc.get('hidden', False) and not self.has_perm(builtin.PERM_VIEW_PROBLEM_HIDDEN):\n      pdoc = None\n    url_prefix = '/d/{}'.format(urllib.parse.quote(self.domain_id))\n    self.render('record_detail.html', rdoc=rdoc, udoc=udoc, dudoc=dudoc, pdoc=pdoc, tdoc=tdoc,\n                judge_udoc=judge_udoc, show_status=show_status,\n                socket_url=url_prefix + '/records/{}/conn'.format(rid)) # FIXME(twd2): magic\n\n\n@app.connection_route('/records/{rid}/conn', 'record_detail-conn')\nclass RecordDetailConnection(RecordMixin, base.Connection):\n  async def on_open(self):\n    await super(RecordDetailConnection, self).on_open()\n    self.rid = objectid.ObjectId(self.request.match_info['rid'])\n    rdoc = await record.get(self.rid, record.PROJECTION_PUBLIC)\n    if rdoc['tid']:\n      show_status, tdoc = await self.rdoc_contest_visible(rdoc)\n      if not show_status:\n        self.close()\n        return\n    bus.subscribe(self.on_record_change, ['record_change'])\n    self.send_record(rdoc)\n\n  async def on_record_change(self, e):\n    rdoc = e['value']\n    if rdoc['_id'] != self.rid:\n      return\n    self.send_record(rdoc)\n\n  def send_record(self, rdoc):\n    self.send(status_html=self.render_html('record_detail_status.html', rdoc=rdoc),\n              summary_html=self.render_html('record_detail_summary.html', rdoc=rdoc))\n\n  async def on_close(self):\n    bus.unsubscribe(self.on_record_change)\n\n\n@app.route('/records/{rid}/rejudge', 'record_rejudge')\nclass RecordRejudgeHandler(base.Handler):\n  @base.route_argument\n  @base.post_argument\n  @base.require_csrf_token\n  @base.sanitize\n  async def post(self, *, rid: objectid.ObjectId):\n    rdoc = await record.get(rid)\n    if rdoc['domain_id'] == self.domain_id:\n      self.check_perm(builtin.PERM_REJUDGE)\n    else:\n      self.check_priv(builtin.PRIV_REJUDGE)\n    await record.rejudge(rdoc['_id'])\n    self.json_or_redirect(self.referer_or_main)\n\n\n@app.route('/records/{rid}/data', 'record_pretest_data')\nclass RecordPretestDataHandler(base.Handler):\n  @base.route_argument\n  @base.sanitize\n  async def get(self, *, rid: objectid.ObjectId):\n    rdoc = await record.get(rid)\n    if not rdoc or rdoc['type'] != constant.record.TYPE_PRETEST:\n      raise error.RecordNotFoundError(rid)\n    if not self.own(rdoc, builtin.PRIV_READ_PRETEST_DATA_SELF, 'uid'):\n      self.check_priv(builtin.PRIV_READ_PRETEST_DATA)\n    if not rdoc.get('data_id'):\n      raise error.RecordDataNotFoundError(rdoc['_id'])\n    secret = await fs.get_secret(rdoc['data_id'])\n    if not secret:\n      raise error.RecordDataNotFoundError(rdoc['_id'])\n    self.redirect(options.cdn_prefix.rstrip('/') + \\\n                  self.reverse_url('fs_get', domain_id=builtin.DOMAIN_ID_SYSTEM,\n                                   secret=secret))\n",
+      "total_lines": 245
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "asyncio",
+        "calendar",
+        "datetime",
+        "struct",
+        "urllib.parse",
+        "bson:objectid",
+        "vj4:app",
+        "vj4:constant",
+        "vj4:error",
+        "vj4.handler:base",
+        "vj4.model:builtin",
+        "vj4.model:document",
+        "vj4.model:domain",
+        "vj4.model:fs",
+        "vj4.model:record",
+        "vj4.model:user",
+        "vj4.model.adaptor:contest",
+        "vj4.model.adaptor:problem",
+        "vj4.service:bus",
+        "vj4.util:options"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/vijos/vj4/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <a href=\"https://github.com/vijos/vj4\">\n    <img src=\"https://rawgit.com/vijos/vj4/master/.github_banner.png\" alt=\"vj4\" width=\"100%\" align=\"middle\" />\n  </a>\n</p>\n\n<p align=\"center\">\n  <a href=\"https://github.com/vijos/vj4/actions\" target=\"_blank\"><img src=\"https://github.com/vijos/vj4/actions/workflows/test.yml/badge.svg?branch=master\"></a>\n  <a href=\"https://codeclimate.com/github/vijos/vj4/maintainability\" target=\"_blank\"><img src=\"https://api.codeclimate.com/v1/badges/1e9710a66983c8124712/maintainability\"></a>\n  <a href=\"https://www.versioneye.com/user/projects/598d6f846725bd005228a0e4\" target=\"_blank\"><img src=\"https://www.versioneye.com/user/projects/598d6f846725bd005228a0e4/badge.svg?style=flat-square\"></a>\n  <a href=\"https://raw.githubusercontent.com/vijos/vj4/master/LICENSE\" target=\"_blank\"><img src=\"https://img.shields.io/badge/license-AGPLv3-blue.svg?style=flat-square\"></a>\n</p>\n\n<p align=\"center\">\n  Next generation of <a href=\"https://vijos.org\" target=\"_blank\">Vijos</a>, built with asyncio on Python 3.\n</p>\n\n***\n\n## Overview\n\n- Problem Categories and Tags\n- Solution Sharing & Voting\n- Online Coding and Testing (a.k.a. Scratchpad Mode)\n- Discussions & Comments\n- Trainings\n- Contests (ACM & OI)\n- Dynamic Ranking System\n- Real-time Status Updates\n- Online Judge as a Service (a.k.a. Domain): create your own OJ website without dev-ops!\n- Management UI\n- Sandboxed & Distributed Judging: see [jd4](https://github.com/vijos/jd4), [winjudge](https://github.com/iceb0y/winjudge) and [windows-container](https://github.com/iceb0y/windows-container)\n- Sec"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "get test",
+      "count": 5,
+      "items": [
+        {
+          "name": "test_model.py",
+          "path": "vj4/test/test_model.py",
+          "sha": "9f3971607cf43930a81d6322eb23125cf0bb47ab",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/test/test_model.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_contest.py",
+          "path": "vj4/test/test_contest.py",
+          "sha": "1749fa7ca5390c4f6fe0c87d5fba27e41871afc8",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/test/test_contest.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_smallcache.py",
+          "path": "vj4/test/test_smallcache.py",
+          "sha": "0963e75625750e86bf72214680516e515f967302",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/test/test_smallcache.py",
+          "score": 1.0
+        },
+        {
+          "name": "base.py",
+          "path": "vj4/test/base.py",
+          "sha": "492e8d86289814cc931f8461dad95a7ae165bba5",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/test/base.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_problem.py",
+          "path": "vj4/test/test_problem.py",
+          "sha": "2b4ee902a047bc61db67a416d67b83a41c0939c7",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/test/test_problem.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"get(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "fs.py",
+          "path": "vj4/job/fs.py",
+          "sha": "c27a5ba570650d5e90a21a6a3346ab527eb8dad4",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/job/fs.py",
+          "score": 1.0
+        },
+        {
+          "name": "record.py",
+          "path": "vj4/job/record.py",
+          "sha": "894166e8a4c18e50558e7709e99d396c4187a804",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/job/record.py",
+          "score": 1.0
+        },
+        {
+          "name": "Entry.js",
+          "path": "vj4/ui/Entry.js",
+          "sha": "8124d37cb3b34bbeffb49a9c9e8e28b41901d59b",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/ui/Entry.js",
+          "score": 1.0
+        },
+        {
+          "name": "user.py",
+          "path": "vj4/handler/user.py",
+          "sha": "812b375d8cb915cd13beb7c2d40881b0feb64a31",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/handler/user.py",
+          "score": 1.0
+        },
+        {
+          "name": "Tab.js",
+          "path": "vj4/ui/components/tab/Tab.js",
+          "sha": "8d9724215df739d1d13b9d67ee91722a6995e9dd",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/ui/components/tab/Tab.js",
+          "score": 1.0
+        },
+        {
+          "name": "version.py",
+          "path": "vj4/util/version.py",
+          "sha": "5dacfb7ce719222c37a370826afe159bc0e73fcf",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/util/version.py",
+          "score": 1.0
+        },
+        {
+          "name": "home.py",
+          "path": "vj4/handler/home.py",
+          "sha": "2a5e6413900e29ad68d7c3d60d495fe6368e85b9",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/handler/home.py",
+          "score": 1.0
+        },
+        {
+          "name": "user_detail.page.js",
+          "path": "vj4/ui/pages/user_detail.page.js",
+          "sha": "5b685b8611ce41eb9c13388b2a303619a2369a9c",
+          "html_url": "https://github.com/vijos/vj4/blob/7ce61263b163a6b6a6cb6de41dfd9c4b17709de2/vj4/ui/pages/user_detail.page.js",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "vj4/handler",
+      "count": 17,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "vj4/handler/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "vj4/handler/base.py",
+          "type": "file"
+        },
+        {
+          "name": "contest.py",
+          "path": "vj4/handler/contest.py",
+          "type": "file"
+        },
+        {
+          "name": "discussion.py",
+          "path": "vj4/handler/discussion.py",
+          "type": "file"
+        },
+        {
+          "name": "domain.py",
+          "path": "vj4/handler/domain.py",
+          "type": "file"
+        },
+        {
+          "name": "error.py",
+          "path": "vj4/handler/error.py",
+          "type": "file"
+        },
+        {
+          "name": "fs.py",
+          "path": "vj4/handler/fs.py",
+          "type": "file"
+        },
+        {
+          "name": "home.py",
+          "path": "vj4/handler/home.py",
+          "type": "file"
+        },
+        {
+          "name": "homework.py",
+          "path": "vj4/handler/homework.py",
+          "type": "file"
+        },
+        {
+          "name": "i18n.py",
+          "path": "vj4/handler/i18n.py",
+          "type": "file"
+        },
+        {
+          "name": "judge.py",
+          "path": "vj4/handler/judge.py",
+          "type": "file"
+        },
+        {
+          "name": "misc.py",
+          "path": "vj4/handler/misc.py",
+          "type": "file"
+        },
+        {
+          "name": "problem.py",
+          "path": "vj4/handler/problem.py",
+          "type": "file"
+        },
+        {
+          "name": "ranking.py",
+          "path": "vj4/handler/ranking.py",
+          "type": "file"
+        },
+        {
+          "name": "record.py",
+          "path": "vj4/handler/record.py",
+          "type": "file"
+        },
+        {
+          "name": "training.py",
+          "path": "vj4/handler/training.py",
+          "type": "file"
+        },
+        {
+          "name": "user.py",
+          "path": "vj4/handler/user.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "vj4/handler/__init__.py"
+        },
+        {
+          "name": "base.py",
+          "path": "vj4/handler/base.py"
+        },
+        {
+          "name": "contest.py",
+          "path": "vj4/handler/contest.py"
+        },
+        {
+          "name": "discussion.py",
+          "path": "vj4/handler/discussion.py"
+        },
+        {
+          "name": "domain.py",
+          "path": "vj4/handler/domain.py"
+        },
+        {
+          "name": "error.py",
+          "path": "vj4/handler/error.py"
+        },
+        {
+          "name": "fs.py",
+          "path": "vj4/handler/fs.py"
+        },
+        {
+          "name": "home.py",
+          "path": "vj4/handler/home.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "vj4/handler/record.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "989c16744d462e82af83b254140fa4cf673da0b9",
+          "html_url": "https://github.com/vijos/vj4/commit/989c16744d462e82af83b254140fa4cf673da0b9",
+          "message": "fix multi arg (#483)",
+          "author": "Wende Tan",
+          "date": "2019-03-18T04:32:16Z"
+        },
+        {
+          "sha": "36df00a42842055af7e32f3595111344bd08ab62",
+          "html_url": "https://github.com/vijos/vj4/commit/36df00a42842055af7e32f3595111344bd08ab62",
+          "message": "Homework System (#460)",
+          "author": "Soha Jin",
+          "date": "2019-02-24T10:06:45Z"
+        },
+        {
+          "sha": "8d945a67cb9c52536e903fe490b350c19f7e0310",
+          "html_url": "https://github.com/vijos/vj4/commit/8d945a67cb9c52536e903fe490b350c19f7e0310",
+          "message": "Add user alias/real name in each domain (#436)",
+          "author": "Soha Jin",
+          "date": "2018-12-16T00:07:18Z"
+        },
+        {
+          "sha": "61361d3913d46b99420a5504af3b7df8d6acb504",
+          "html_url": "https://github.com/vijos/vj4/commit/61361d3913d46b99420a5504af3b7df8d6acb504",
+          "message": "Separate show_func into show_record_func, show_scoreboard_func (#347)",
+          "author": "Wenxuan Shi",
+          "date": "2017-09-18T14:22:21Z"
+        },
+        {
+          "sha": "9b0087623e42be7379372dd85efba3492fe072b1",
+          "html_url": "https://github.com/vijos/vj4/commit/9b0087623e42be7379372dd85efba3492fe072b1",
+          "message": "scoreboard_func (#345)",
+          "author": "Wenxuan Shi",
+          "date": "2017-09-17T15:17:54Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "get TODO twd2 check permission",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "vj4/handler/record.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "989c16744d462e82af83b254140fa4cf673da0b9",
+        "html_url": "https://github.com/vijos/vj4/commit/989c16744d462e82af83b254140fa4cf673da0b9",
+        "message": "fix multi arg (#483)",
+        "author": "Wende Tan",
+        "date": "2019-03-18T04:32:16Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying permission check",
+        "code snippet localized to one async function",
+        "existing error handling for missing records",
+        "repository context confirms related permission checks elsewhere",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 5,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

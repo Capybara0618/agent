@@ -1,0 +1,234 @@
+{
+  "task_id": "771",
+  "repo_owner": "octoprint",
+  "repo_name": "octoprint",
+  "file_path": "src/octoprint/plugin/core.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:12:04+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "is_editable_install",
+    "satd_line": 2391,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:12:11+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:12:16+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/octoprint/plugin/core.py",
+    "original_code": "def read(self):\n\timport warnings\n\n\tmetadata_files = (\"METADATA\",  # wheel\n\t                  \"PKG-INFO\")  # egg\n\n\tif self.entry_point and self.entry_point.dist:\n\t\tfor metadata_file in metadata_files:\n\t\t\ttry:\n\t\t\t\treturn self.entry_point.dist.get_metadata(metadata_file)\n\t\t\texcept Exception:\n\t\t\t\traise # TODO really ignore this?\n\t\t\t\tpass\n\n\twarnings.warn('No package metadata found for package: {}'.format(self.entry_point.module_name))",
+    "satd_comment": "# TODO really ignore this?",
+    "target_file": {
+      "ok": true,
+      "path": "src/octoprint/plugin/core.py",
+      "sha": "5d1f2ee4fd4fdd9d19f715d6c7e49e4da55f2ce7",
+      "download_url": "https://raw.githubusercontent.com/OctoPrint/OctoPrint/dev/src/octoprint/plugin/core.py",
+      "content_excerpt": "\"\"\"\nIn this module resides the core data structures and logic of the plugin system.\n\n.. autoclass:: PluginManager\n   :members:\n\n.. autoclass:: PluginInfo\n   :members:\n\n.. autoclass:: Plugin\n   :members:\n\n.. autoclass:: RestartNeedingPlugin\n   :members:\n\n.. autoclass:: SortablePlugin\n   :members:\n\n\"\"\"\n\n__license__ = \"GNU Affero General Public License http://www.gnu.org/licenses/agpl.html\"\n__copyright__ = \"Copyright (C) 2014 The OctoPrint Project - Released under terms of the AGPLv3 License\"\n\n\nimport fnmatch\nimport importlib.machinery\nimport importlib.metadata as meta\nimport importlib.util\nimport inspect\nimport logging\nimport os\nimport string\nimport sys\nimport threading\nfrom collections import OrderedDict, defaultdict, namedtuple\nfrom os import scandir\n\nfrom packaging.specifiers import SpecifierSet\n\nfrom octoprint.util import deprecated, sv, time_this, to_unicode\nfrom octoprint.util.version import get_python_version_string, is_python_compatible\n\nSUFFIXES = importlib.machinery.SOURCE_SUFFIXES + importlib.machinery.BYTECODE_SUFFIXES\n\n\n# noinspection PyDeprecation\ndef _find_spec(module_name, name=None, path=None):\n    if path is not None:\n        if name is None:\n            name = module_name\n\n        candidates = [os.path.join(path, name, f\"__init__{ext}\") for ext in SUFFIXES] + [\n            os.path.join(path, f\"{name}{ext}\") for ext in SUFFIXES\n        ]\n\n        for p in candidates:\n            if os.path.exists(p):\n                return importlib.util.spec_from_file_location(module_name, p)\n        else:\n            return None\n\n    else:\n        return importlib.util.find_spec(module_name)\n\n\n# noinspection PyDeprecation\ndef _load_module(spec):\n    module = importlib.util.module_from_spec(spec)\n    if spec.name not in sys.modules:\n        sys.modules[spec.name] = module\n    spec.loader.exec_module(sys.modules[spec.name])\n    return sys.modules[spec.name]\n\n\ndef parse_plugin_metadata(path):\n    result = {}\n    logger = logging.getLogger(__name__)\n\n    if not path:\n        return result\n\n    if os.path.isdir(path):\n        path = os.path.join(path, \"__init__.py\")\n\n    if not os.path.isfile(path):\n        return result\n\n    if not path.endswith(\".py\"):\n        # we only support parsing plain text source files\n        return result\n\n    logger.debug(f\"Parsing plugin metadata from AST of {path}\")\n\n    try:\n        import ast\n\n        with open(path, \"rb\") as f:\n            root = ast.parse(f.read(), filename=path)\n\n        assignments = list(\n            filter(lambda x: isinstance(x, ast.Assign) and x.targets, root.body)\n        )\n        function_defs = list(\n            filter(lambda x: isinstance(x, ast.FunctionDef) and x.name, root.body)\n        )\n        all_relevant = assignments + function_defs\n\n        def extract_target_ids(node):\n            return [x.id for x in filter(lambda x: isinstance(x, ast.Name), node.targets)]\n\n        def extract_value(node):\n            if isinstance(node, ast.Constant):\n                return node.value\n\n            elif (\n                isinstance(node, ast.Call)\n                and hasattr(node, \"func\")\n                and node.func.id == \"gettext\"\n                and node.args\n                and isinstance(node.args[0], ast.Constant)\n            ):\n                return node.args[0].value\n\n            return None\n\n        def extract_names(node):\n            if isinstance(node, ast.Assign):\n                return extract_target_ids(node)\n            elif isinstance(node, ast.FunctionDef):\n                return [\n                    node.name,\n                ]\n            else:\n                return []\n\n        for key in (\n            ControlProperties.attr_name,\n            ControlProperties.attr_version,\n            ControlProperties.attr_author,\n            ControlProperties.attr_description,\n            ControlProperties.attr_url,\n            ControlProperties.attr_license,\n            ControlProperties.attr_pythoncompat,\n        ):\n            for a in reversed(assignments):\n                targets = extract_target_ids(a)\n                if key in targets:\n                    value = extract_value(a.value)\n                    if value:\n                        result[key] = value\n                    break\n\n        for key in (ControlProperties.attr_hidden,):\n            for a in reversed(assignments):\n                targets = extract_target_ids(a)\n                if key in targets:\n                    if isinstance(a.value, ast.Name) and a.value.id in (\n                        \"True\",\n                        \"False\",\n                    ):\n                        result[key] = bool(a.value.id)\n\n                    break\n\n        for a in reversed(all_relevant):\n            targets = extract_names(a)\n            if any(x in targets for x in ControlProperties.all()):\n                result[\"has_control_properties\"] = True\n                break\n\n    except SyntaxError:\n        raise\n    except Exception:\n        logger.exception(f\"Error while parsing AST from {path}\")\n\n    return result\n\n\nclass ControlProperties:\n    attr_name = \"__plugin_name__\"\n    \"\"\" Module attribute from which to retrieve the plugin's human readable name. \"\"\"\n\n    attr_description = \"__plugin_description__\"\n    \"\"\" Module attribute from which to retrieve the plugin's description. \"\"\"\n\n    attr_disabling_DISCOURAGED = \"__plugin_disabling_discouraged__\"\n    \"\"\" Module attribute from which to retrieve the reason why disabling the plugin is discouraged. Only effective if ``self.bundled`` is True. \"\"\"\n\n    attr_version = \"__plugin_version__\"\n    \"\"\" Module attribute from which to retrieve the plugin's version. \"\"\"\n\n    attr_author = \"__plugin_author__\"\n    \"\"\" Module attribute from which to retrieve the plugin's author. \"\"\"\n\n    attr_url = \"__plugin_url__\"\n    \"\"\" Module attribute from which to retrieve the plugin's website URL. \"\"\"\n\n    attr_license = \"__plugin_license__\"\n    \"\"\" Module attribute from which to retrieve the plugin's license. \"\"\"\n\n    attr_privacypolicy = \"__plugin_privacypolicy__\"\n    \"\"\" Module attribute from which to retrieve the plugin's privacy policy URL, if any. \"\"\"\n\n    attr_pythoncompat = \"__plugin_pythoncompat__\"\n    \"\"\"\n    Module attribute from which to retrieve the plugin's python compatibility string.\n\n    If unset a default of ``>=2.7,<3`` will be assumed, meaning that the plugin will be considered compatible to\n    Python 2 but not Python 3.\n\n    To mark a plugin as Python 3 compatible, a string of ``>=2.7,<4`` is recommended.\n\n    Bundled plugins will automatically be assumed to be compatible.\n    \"\"\"\n\n    attr_hidden = \"__plugin_hidden__\"\n    \"\"\"\n    Module attribute from which to determine if the plugin's hidden or not.\n\n    Only evaluated for bundled plugins, in order to hide them from the Plugin Manager\n    and similar places.\n    \"\"\"\n\n    attr_hooks = \"__plugin_hooks__\"\n    \"\"\" Module attribute from which to retrieve the plugin's provided hooks. \"\"\"\n\n    attr_implementation = \"__plugin_implementation__\"\n    \"\"\" Module attribute from which to retrieve the plugin's provided mixin implementation. \"\"\"\n\n    attr_helpers = \"__plugin_helpers__\"\n    \"\"\" Module attribute from which to retrieve the plugin's provided helpers. \"\"\"\n\n    attr_check = \"__plugin_check__\"\n    \"\"\" Module attribute which to call to determine if the plugin can be loaded. \"\"\"\n\n    attr_load = \"__plugin_load__\"\n    \"\"\" Module attribute which to call when loading the plugin. \"\"\"\n\n    attr_unload = \"__plugin_unload__\"\n    \"\"\" Module attribute which to call when unloading the plugin. \"\"\"\n\n    attr_enable = \"__plugin_enable__\"\n    \"\"\" Module attribute which to call when enabling the plugin. \"\"\"\n\n    attr_disable = \"__plugin_disable__\"\n    \"\"\" Module attribute which to call when disabling the plugin. \"\"\"\n\n    default_pythoncompat = \">=2.7,<3\"\n\n    @classmethod\n    def all(cls):\n        return [getattr(cls, key) for key in dir(cls) if key.startswith(\"attr_\")]\n\n\n_EntryPointOrigin = namedtuple(\n    \"EntryPointOrigin\", \"type, entry_point, module_name, package_name, package_version\"\n)\n\n\nclass EntryPointOrigin(_EntryPointOrigin):\n    \"\"\"\n    Origin of a plugin registered via an entry point.\n\n    .. attribute:: type\n\n       Always ``entry_point``.\n\n    .. attribute:: entry_point\n\n       Name of the entry point, usually ``octoprint.plugin``.\n\n    .. attribute:: module_name\n\n       Module registered to the entry point.\n\n    .. attribute:: package_name\n\n       Python package containing the entry point.\n\n    .. attribute:: package_version\n\n       Version of the python package containing the entry point.\n    \"\"\"\n\n\n_FolderOrigin = namedtuple(\"FolderOrigin\", \"type, folder\")\n\n\nclass FolderOrigin(_FolderOrigin):\n    \"\"\"\n    Origin of a (single file) plugin loaded from a plugin folder.\n\n    .. attribute:: type\n\n       Always `folder`.\n\n    .. attribute:: folder\n\n       Folder path from which the plugin was loaded.\n    \"\"\"\n\n\n_ModuleOrigin = namedtuple(\"ModuleOrigin\", \"type, module_name, folder\")\n\n\nclass ModuleOrigin(_ModuleOrigin):\n    \"\"\"\n    Origin of a (single file) plugin loaded from a plugin folder.\n\n    .. attribute:: type\n\n       Always `module`.\n\n    .. attribute:: module_name\n\n       Name of the module from which the plugin was loaded.\n\n    .. attribute:: folder\n\n       Folder path from which the plugin was loaded.\n    \"\"\"\n\n\nclass PluginInfo:\n    \"\"\"\n    The :class:`PluginInfo` class wraps all available information about a registered plugin.\n\n    This includes its meta data (like name, description, version, etc) as well as the actual plugin extensions like\n    implementations, hooks and helpers.\n\n    It works on Python module objects and extracts the relevant data from those via accessing the\n    :ref:`control properties <sec-plugins-controlproperties>`.\n\n    Arguments:\n        key (str): Identifier of the plugin\n        location (str): Installation folder of the plugin\n        instance (module): Plugin module instance - this may be ``None`` if the plugin has been blocklisted!\n        name (str): Human readable name of the plugin\n        version (str): Version of the plugin\n        description (str): Description of the plugin\n        author (str): Author of the plugin\n        url (str): URL of the website of the plugin\n        license (str): License of the plugin\n    \"\"\"\n\n    def __init__(\n        self,\n        key,\n        location,\n        instance,\n        name=None,\n        version=None,\n        description=None,\n        author=None,\n        url=None,\n        license=None,\n        parsed_metadata=None,\n    ):\n        self.key = key\n        self.location = location\n        self.instance = instance\n\n        self.origin = None\n        \"\"\"\n        The origin from which this plugin was loaded, either a :class:`EntryPointOrigin`, :class:`FolderOrigin`\n        or :class:`ModuleOrigin` instance. Set during loading, initially ``None``.\n        \"\"\"\n\n        self.enabled = True\n        \"\"\"Whether the plugin is enabled.\"\"\"\n\n        self.blocklisted = False\n        \"\"\"Whether the plugin is blocklisted.\"\"\"\n\n        self.forced_disabled = False\n        \"\"\"Whether the plugin has been force disabled by the system, e.g. due to safe mode blocklisting.\"\"\"\n\n        self.incompatible = False\n        \"\"\"Whether this plugin has been detected as incompatible.\"\"\"\n\n        self.bundled = False\n        \"\"\"Whether this plugin is bundled with OctoPrint.\"\"\"\n\n        self.loaded = False\n        \"\"\"Whether this plugin has been loaded.\"\"\"\n\n        self.managable = True\n        \"\"\"Whether this plugin can be managed by OctoPrint.\"\"\"\n\n        self.needs_restart = False\n        \"\"\"Whether this plugin needs a restart of OctoPrint after enabling/disabling.\"\"\"\n\n        self.invalid_syntax = False\n        \"\"\"Whether invalid syntax was encountered while trying to load this plugin.\"\"\"\n\n        self.flags = []\n        \"\"\"Additional flags assigned to the plugin through config.\"\"\"\n\n        self._name = name\n        self._version = version\n        self._description = description\n        self._author = author\n      ",
+      "total_lines": 2526
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 2391,
+      "start_line": 2371,
+      "end_line": 2411,
+      "matched_line": "            raise  # TODO really ignore this?",
+      "excerpt": "2371:     True\n2372:     \"\"\"\n2373:     rel_path = os.path.relpath(os.path.realpath(path), os.path.realpath(parent))\n2374:     return not (rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep))\n2375: \n2376: \n2377: def is_editable_install(install_dir, package, module, location):\n2378:     package_link = os.path.join(install_dir, f\"{package}.egg-link\")\n2379:     if os.path.isfile(package_link):\n2380:         expected_target = os.path.normcase(os.path.realpath(location))\n2381:         try:\n2382:             with open(package_link, encoding=\"utf-8\") as f:\n2383:                 contents = f.readlines()\n2384:             for line in contents:\n2385:                 target = os.path.normcase(\n2386:                     os.path.realpath(os.path.join(line.strip(), module))\n2387:                 )\n2388:                 if target == expected_target:\n2389:                     return True\n2390:         except Exception:\n2391:             raise  # TODO really ignore this?\n2392:             pass\n2393:     return False\n2394: \n2395: \n2396: def normalize_project_url_label(label: str) -> str:\n2397:     # https://packaging.python.org/en/latest/specifications/well-known-project-urls/#label-normalization\n2398:     chars_to_remove = string.punctuation + string.whitespace\n2399:     removal_map = str.maketrans(\"\", \"\", chars_to_remove)\n2400:     return label.translate(removal_map).lower()\n2401: \n2402: \n2403: class Plugin:\n2404:     \"\"\"\n2405:     The parent class of all plugin implementations.\n2406: \n2407:     .. attribute:: _identifier\n2408: \n2409:        The identifier of the plugin. Injected by the plugin core system upon initialization of the implementation.\n2410: \n2411:     .. attribute:: _plugin_name"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "is_editable_install",
+      "start_line": 2377,
+      "end_line": 2393,
+      "source": "def is_editable_install(install_dir, package, module, location):\n    package_link = os.path.join(install_dir, f\"{package}.egg-link\")\n    if os.path.isfile(package_link):\n        expected_target = os.path.normcase(os.path.realpath(location))\n        try:\n            with open(package_link, encoding=\"utf-8\") as f:\n                contents = f.readlines()\n            for line in contents:\n                target = os.path.normcase(\n                    os.path.realpath(os.path.join(line.strip(), module))\n                )\n                if target == expected_target:\n                    return True\n        except Exception:\n            raise  # TODO really ignore this?\n            pass\n    return False"
+    },
+    "imports": {
+      "imports": [
+        "fnmatch",
+        "importlib.machinery",
+        "importlib.metadata",
+        "importlib.util",
+        "inspect",
+        "logging",
+        "os",
+        "string",
+        "sys",
+        "threading",
+        "collections:OrderedDict",
+        "collections:defaultdict",
+        "collections:namedtuple",
+        "os:scandir",
+        "packaging.specifiers:SpecifierSet",
+        "octoprint.util:deprecated",
+        "octoprint.util:sv",
+        "octoprint.util:time_this",
+        "octoprint.util:to_unicode",
+        "octoprint.util.version:get_python_version_string",
+        "octoprint.util.version:is_python_compatible",
+        "ast",
+        "sys",
+        "sysconfig",
+        "octoprint.util:generate_api_key",
+        "octoprint.logging"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/OctoPrint/OctoPrint/dev/README.md",
+      "content_excerpt": "<p align=\"center\"><img src=\"https://octoprint.org/assets/img/logo.png\" alt=\"OctoPrint's logo\" /></p>\n\n<h1 align=\"center\">OctoPrint</h1>\n\n<p align=\"center\">\n  <img src=\"https://img.shields.io/github/v/release/OctoPrint/OctoPrint?logo=github&logoColor=white\" alt=\"GitHub release\"/>\n  <img src=\"https://img.shields.io/pypi/v/OctoPrint?logo=python&logoColor=white\" alt=\"PyPI\"/>\n  <img src=\"https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2FOctoPrint%2FOctoPrint%2Frefs%2Fheads%2Fdev%2Fpyproject.toml&query=%24.project.requires-python&prefix=Python%20&label=supports\" alt=\"Supported Python versions\">\n\n  <img src=\"https://img.shields.io/github/actions/workflow/status/OctoPrint/OctoPrint/build.yml?branch=master\" alt=\"Build status\"/>\n  <a href=\"https://community.octoprint.org\"><img src=\"https://img.shields.io/discourse/users?label=forum&logo=discourse&logoColor=white&server=https%3A%2F%2Fcommunity.octoprint.org\" alt=\"Community Forum\"/></a>\n  <a href=\"https://discord.octoprint.org\"><img src=\"https://img.shields.io/discord/704958479194128507?label=discord&logo=discord&logoColor=white\" alt=\"Discord\"/></a>\n  <a href=\"https://octoprint.org/conduct/\"><img src=\"https://img.shields.io/badge/Contributor%20Covenant-v2.0%20adopted-ff69b4.svg\" alt=\"Contributor Covenant\"/></a>\n  <a href=\"https://github.com/astral-sh/ruff\"><img src=\"https://img.shields.io/badge/code%20style-ruff-261230\" alt=\"Linting & formatting python: ruff\"/></a>\n  <a href=\"https://github.com/djlint/djlint\"><img src=\"https://img.shields.io/badge/html%20style-djLint-blue.svg\" alt=\"Linting & format"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "is_editable_install test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"is_editable_install(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "core.py",
+          "path": "src/octoprint/plugin/core.py",
+          "sha": "5d1f2ee4fd4fdd9d19f715d6c7e49e4da55f2ce7",
+          "html_url": "https://github.com/OctoPrint/OctoPrint/blob/fe8d4a7df536cee21706a20859d7fa854e68c5fe/src/octoprint/plugin/core.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/octoprint/plugin",
+      "count": 3,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/octoprint/plugin/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "core.py",
+          "path": "src/octoprint/plugin/core.py",
+          "type": "file"
+        },
+        {
+          "name": "types.py",
+          "path": "src/octoprint/plugin/types.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 2,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/octoprint/plugin/__init__.py"
+        },
+        {
+          "name": "types.py",
+          "path": "src/octoprint/plugin/types.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/octoprint/plugin/core.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "29dbb91dd2b21c0a19da1ee42ab58de47e70a5f9",
+          "html_url": "https://github.com/OctoPrint/OctoPrint/commit/29dbb91dd2b21c0a19da1ee42ab58de47e70a5f9",
+          "message": "ux: internal white/blacklist -> allow/blocklist\n\nIncludes settings migration and API compat layers where necessary.\n\nImplements #5207",
+          "author": "Gina Häußge",
+          "date": "2026-02-02T16:34:14Z"
+        },
+        {
+          "sha": "5229c24e4c8a0addb69af67d46186631685e9b44",
+          "html_url": "https://github.com/OctoPrint/OctoPrint/commit/5229c24e4c8a0addb69af67d46186631685e9b44",
+          "message": "ux: blacklist -> blocklist (#5211)\n\nUser facing part of #5207",
+          "author": "John Brady",
+          "date": "2025-12-08T09:48:15Z"
+        },
+        {
+          "sha": "addcec56bbdef0d28a12ded97aa81b75e6666608",
+          "html_url": "https://github.com/OctoPrint/OctoPrint/commit/addcec56bbdef0d28a12ded97aa81b75e6666608",
+          "message": "feat: add support for plugin apikeys (#5192)\n\nPlugins may request a single-use api key with full access\nto make requests to the http endpoints of other plugins on the\nsame instance via OctoPrintPlugin.plugin_apikey.\n\nValidity of such API keys is restricted to loopback clients.\n\nSee #5191",
+          "author": "Gina Häußge",
+          "date": "2025-09-15T10:19:32Z"
+        },
+        {
+          "sha": "75a82736d932dd93e15475d24f5624dd80f8c795",
+          "html_url": "https://github.com/OctoPrint/OctoPrint/commit/75a82736d932dd93e15475d24f5624dd80f8c795",
+          "message": "Merge branch 'staging/bugfix' into maintenance",
+          "author": "Gina Häußge",
+          "date": "2025-06-04T16:30:10Z"
+        },
+        {
+          "sha": "d44278c5210f0c99c7ebc515d342a54c0f758f16",
+          "html_url": "https://github.com/OctoPrint/OctoPrint/commit/d44278c5210f0c99c7ebc515d342a54c0f758f16",
+          "message": "fix: fix a typo in a method call",
+          "author": "Gina Häußge",
+          "date": "2025-06-04T16:26:05Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "is_editable_install TODO really ignore this",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/octoprint/plugin/core.py",
+      "satd_line": 2391,
+      "last_commit": {
+        "sha": "29dbb91dd2b21c0a19da1ee42ab58de47e70a5f9",
+        "html_url": "https://github.com/OctoPrint/OctoPrint/commit/29dbb91dd2b21c0a19da1ee42ab58de47e70a5f9",
+        "message": "ux: internal white/blacklist -> allow/blocklist\n\nIncludes settings migration and API compat layers where necessary.\n\nImplements #5207",
+        "author": "Gina Häußge",
+        "date": "2026-02-02T16:34:14Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "is_editable_install",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

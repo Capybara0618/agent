@@ -1,0 +1,370 @@
+{
+  "task_id": "988",
+  "repo_owner": "br-idl",
+  "repo_name": "paddlevit",
+  "file_path": "image_classification/T2T_ViT/t2t_vit.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T20:24:46+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__init__",
+    "satd_line": 408,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 1,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T20:24:55+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T20:25:04+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "image_classification/T2T_ViT/t2t_vit.py",
+    "original_code": "def __init__(self, dim, in_dim, num_heads=1, kernel_ratio=0.5, dropout=0.1):\n    super().__init__()\n    self.embed_dim = in_dim * num_heads\n    self.kqv = nn.Linear(dim, 3 * self.embed_dim)\n    self.dropout = nn.Dropout(dropout)\n    self.proj = nn.Linear(self.embed_dim, self.embed_dim)\n    self.num_heads = num_heads\n    self.norm1 = nn.LayerNorm(dim, epsilon=1e-6)\n    self.norm2 = nn.LayerNorm(self.embed_dim, epsilon=1e-6)\n\n    self.mlp = nn.Sequential(nn.Linear(self.embed_dim, self.embed_dim),\n                             nn.GELU(),\n                             nn.Linear(self.embed_dim, self.embed_dim),\n                             nn.Dropout(dropout))\n\n    self.m = int(self.embed_dim  * kernel_ratio)\n\n    self.w = np.random.random(size=(int(self.embed_dim * kernel_ratio), self.embed_dim))\n    # TODO: init with orthognal matrix\n    #self.w, _ = np.linalg.qr(self.w)\n\n    self.w = paddle.create_parameter(\n        shape=[int(self.embed_dim * kernel_ratio), self.embed_dim],\n        dtype='float32',\n        default_initializer=nn.initializer.Assign(self.w / math.sqrt(self.m)))",
+    "satd_comment": "# TODO: init with orthognal matrix\n#self.w, _ = np.linalg.qr(self.w)",
+    "target_file": {
+      "ok": true,
+      "path": "image_classification/T2T_ViT/t2t_vit.py",
+      "sha": "fe7eef9d5ca87c91b99f5da5eca8849dec24ebc5",
+      "download_url": "https://raw.githubusercontent.com/BR-IDL/PaddleViT/develop/image_classification/T2T_ViT/t2t_vit.py",
+      "content_excerpt": "# Copyright (c) 2021 PPViT Authors. All Rights Reserved.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"\nT2T-ViT Transformer in Paddle\n\nA Paddle Implementation of Tokens-to-Token ViT (T2T-ViT) as describted in:\n\n\"Tokens-to-Token ViT: Training Vision Transformers from Scratch on ImageNet\"\n\t- Paper Link: https://arxiv.org/abs/2101.11986\n\"\"\"\n\nimport math\nimport numpy as np\nimport paddle\nimport paddle.nn as nn\nfrom droppath import DropPath\nfrom utils import orthogonal\n\n\nclass Identity(nn.Layer):\n    \"\"\" Identity layer\n    The output of this layer is the input without any change.\n    Use this layer to avoid if condition in some forward methods\n    \"\"\"\n    def forward(self, x):\n        return x\n\n\nclass PatchEmbedding(nn.Layer):\n    \"\"\"Patch embedding layer\n\n    Apply patch embeddings (tokens-to-token) on input images. Embeddings is\n    implemented using one of the following ops: Performer, Transformer.\n\n    Attributes:\n        image_size: int, input image size, default: 224\n        token_type: string, type of token embedding, in ['performer', 'transformer', 'convolution'], default: 'performer'\n        patch_size: int, size of patch, default: 4\n        in_channels: int, input image channels, default: 3\n        embed_dim: int, embedding dimension, default: 96\n        token_dim: int, intermediate dim for patch_embedding module, default: 64\n    \"\"\"\n    def __init__(self,\n                 image_size=224,\n                 token_type='performer',\n                 in_channels=3,\n                 embed_dim=768,\n                 token_dim=64):\n        super().__init__()\n        if token_type == 'transformer':\n            # paddle v 2.1 has bugs on nn.Unfold,\n            # use paddle.nn.functional.unfold method instead\n            # replacements see forward method.\n            #self.soft_split0 = nn.Unfold(kernel_size=7, strides=4, paddings=2)\n            #self.soft_split1 = nn.Unfold(kernel_size=3, strides=2, paddings=1)\n            #self.soft_split2 = nn.Unfold(kernel_size=3, strides=2, paddings=1)\n\n            self.attn1 = TokenTransformer(dim=in_channels * 7 * 7,\n                                          in_dim=token_dim,\n                                          num_heads=1,\n                                          mlp_ratio=1.0)\n            self.attn2 = TokenTransformer(dim=token_dim * 3 * 3,\n                                          in_dim=token_dim,\n                                          num_heads=1,\n                                          mlp_ratio=1.0)\n\n            w_attr_1, b_attr_1 = self._init_weights() # init for linear\n            self.proj = nn.Linear(token_dim * 3 * 3,\n                                  embed_dim,\n                                  weight_attr=w_attr_1,\n                                  bias_attr=b_attr_1)\n\n        elif token_type == 'performer':\n            # paddle v 2.1 has bugs on nn.Unfold,\n            # use paddle.nn.functional.unfold method instead\n            # replacements see forward method.\n            #self.soft_split0 = nn.Unfold(kernel_sizes=7, strides=4, paddings=2)\n            #self.soft_split1 = nn.Unfold(kernel_sizes=3, strides=2, paddings=1)\n            #self.soft_split2 = nn.Unfold(kernel_sizes=3, strides=2, paddings=1)\n\n            self.attn1 = TokenPerformer(dim=in_channels * 7 * 7,\n                                        in_dim=token_dim,\n                                        kernel_ratio=0.5)\n            self.attn2 = TokenPerformer(dim=token_dim * 3 * 3,\n                                        in_dim=token_dim,\n                                        kernel_ratio=0.5)\n\n            w_attr_1, b_attr_1 = self._init_weights() # init for linear\n            self.proj = nn.Linear(token_dim * 3 * 3,\n                                  embed_dim,\n                                  weight_attr=w_attr_1,\n                                  bias_attr=b_attr_1)\n\n        elif token_type == 'convolution': # NOTE: currently not supported!!!\n            # 1st conv\n            self.soft_split0 = nn.Conv2D(in_channels=in_channels,\n                                         out_channels=token_dim,\n                                         kernel_size=7,\n                                         stride=4,\n                                         padding=2)\n            # 2nd conv\n            self.soft_split1 = nn.Conv2D(in_channels=token_dim,\n                                         out_channels=token_dim,\n                                         kernel_size=3,\n                                         stride=2,\n                                         padding=1)\n            # 3rd conv\n            self.proj = nn.Conv2D(in_channels=token_dim,\n                                  out_channels=embed_dim,\n                                  kernel_size=3,\n                                  stride=2,\n                                  padding=1)\n        else:\n            raise ValueError(f'token_type: {token_type} is not supported!')\n\n        # 3 soft splits, each has stride 4, 2, 2, respectively.\n        self.num_patches = (image_size // (4 * 2 * 2)) * (image_size // (4 * 2 * 2))\n\n    def _init_weights(self):\n        weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.TruncatedNormal(std=.02))\n        bias_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.Constant(0.0))\n        return weight_attr, bias_attr\n\n    def forward(self, x):\n        # x = self.soft_split0(x)\n        # input x: [B, C, IMAGE_H, IMAGE_W]\n        x = paddle.nn.functional.unfold(x, kernel_sizes=7, strides=4, paddings=2)\n        # unfolded x: [B, C * k * k, k * k * num_patches]\n        x = x.transpose([0, 2, 1])\n        # transposed x: [B, k * k * num_patches, C * k * k]\n\n        x = self.attn1(x)\n        B, HW, C = x.shape\n        x = x.transpose([0, 2, 1])\n        x = x.reshape([B, C, int(np.sqrt(HW)), int(np.sqrt(HW))])\n        #x = self.soft_split1(x)\n        x = paddle.nn.functional.unfold(x, kernel_sizes=3, strides=2, paddings=1)\n        x = x.transpose([0, 2, 1])\n\n        x = self.attn2(x)\n        B, HW, C = x.shape\n        x = x.transpose([0, 2, 1])\n        x = x.reshape([B, C, int(np.sqrt(HW)), int(np.sqrt(HW))])\n        #x = self.soft_split2(x)\n        x = paddle.nn.functional.unfold(x, kernel_sizes=3, strides=2, paddings=1)\n        x = x.transpose([0, 2, 1])\n\n        x = self.proj(x)\n        return x\n\n\nclass Mlp(nn.Layer):\n    \"\"\" MLP module\n\n    Impl using nn.Linear and activation is GELU, dropout is applied.\n    Ops: fc -> act -> dropout -> fc -> dropout\n\n    Attributes:\n        fc1: nn.Linear\n        fc2: nn.Linear\n        act: GELU\n        dropout1: dropout after fc1\n        dropout2: dropout after fc2\n    \"\"\"\n\n    def __init__(self, in_features, hidden_features=None, out_features=None, dropout=0.):\n        super().__init__()\n        out_features = out_features or in_features\n        hidden_features = hidden_features or in_features\n\n        w_attr_1, b_attr_1 = self._init_weights()\n        self.fc1 = nn.Linear(in_features,\n                             hidden_features,\n                             weight_attr=w_attr_1,\n                             bias_attr=b_attr_1)\n\n        w_attr_2, b_attr_2 = self._init_weights()\n        self.fc2 = nn.Linear(hidden_features,\n                             out_features,\n                             weight_attr=w_attr_2,\n                             bias_attr=b_attr_2)\n        self.act = nn.GELU()\n        self.dropout = nn.Dropout(dropout)\n\n    def _init_weights(self):\n        weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.TruncatedNormal(std=.02))\n        bias_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.Constant(0.0))\n        return weight_attr, bias_attr\n\n    def forward(self, x):\n        x = self.fc1(x)\n        x = self.act(x)\n        x = self.dropout(x)\n        x = self.fc2(x)\n        x = self.dropout(x)\n        return x\n\n\nclass Attention(nn.Layer):\n    \"\"\" Self-Attention\n\n    Args:\n        dim: int, all heads dimension\n        dim_head: int, single heads dimension, default: None\n        num_heads: int, num of heads\n        qkv_bias: bool, if True, qkv linear layer is using bias, default: False\n        qk_scale: float, if None, qk_scale is dim_head ** -0.5, default: None\n        attention_dropout: float, dropout rate for attention dropout, default: 0.\n        dropout: float, dropout rate for projection dropout, default: 0.\n        skip_connection: bool, if Ture, use v to do skip connection, used in TokenTransformer\n    \"\"\"\n    def __init__(self,\n                 dim,\n                 in_dim=None,\n                 num_heads=8,\n                 qkv_bias=False,\n                 qk_scale=None,\n                 attention_dropout=0.,\n                 dropout=0.,\n                 skip_connection=False):\n        super().__init__()\n        self.num_heads = num_heads\n        self.in_dim = in_dim or dim\n        self.dim_head = dim // num_heads\n        self.scale = qk_scale or self.dim_head ** -0.5\n        # same as original repo\n        w_attr_1, b_attr_1 = self._init_weights() # init for linear\n        self.qkv = nn.Linear(dim,\n                             self.in_dim * 3,\n                             weight_attr=w_attr_1,\n                             bias_attr=b_attr_1 if qkv_bias else False)\n\n        self.attn_dropout = nn.Dropout(attention_dropout)\n        w_attr_2, b_attr_2 = self._init_weights() # init for linear\n        self.proj = nn.Linear(self.in_dim,\n                              self.in_dim,\n                              weight_attr=w_attr_2,\n                              bias_attr=b_attr_2)\n        self.proj_dropout = nn.Dropout(dropout)\n        self.softmax = nn.Softmax(axis=-1)\n\n        # use V to do skip connection, used in TokenTransformer\n        self.skip = skip_connection\n\n    def _init_weights(self):\n        weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.TruncatedNormal(std=.02))\n        bias_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.Constant(0.0))\n        return weight_attr, bias_attr\n\n    def transpose_multihead(self, x):\n        if self.skip: # token transformer\n            #new_shape = x.shape[:-1] + [self.num_heads, self.in_dim]\n            new_shape = tuple(x.shape[:-1]) + ([self.num_heads, self.in_dim])\n        else: # regular attention\n            #new_shape = x.shape[:-1] + [self.num_heads, self.dim_head]\n            new_shape = tuple(x.shape[:-1]) + (self.num_heads, self.dim_head)\n        x = x.reshape(new_shape)\n        x = x.transpose([0, 2, 1, 3])\n        return x\n\n    def forward(self, x):\n        B, H, C = x.shape\n        qkv = self.qkv(x).chunk(3, axis=-1)\n        q, k, v = map(self.transpose_multihead, qkv)\n        q = q * self.scale\n        attn = paddle.matmul(q, k, transpose_y=True)\n        attn = self.softmax(attn)\n        attn = self.attn_dropout(attn)\n\n        z = paddle.matmul(attn, v)\n        z = z.transpose([0, 2, 1, 3])\n        if self.skip: # token transformer\n            z = z.reshape([B, -1, self.in_dim])\n        else: # regular attention\n            z = z.reshape([B, H, C])\n            #z = z.reshape([B, -1, C])\n        z = self.proj(z)\n        z = self.proj_dropout(z)\n\n        # skip connection\n        if self.skip:\n            z = z + v.squeeze(1)\n\n        return z\n\n\nclass Block(nn.Layer):\n    \"\"\" Transformer block layers\n\n    Transformer block layers contains regular self-attention layers,\n    mlp layers, norms layers and residual blocks.\n\n    Args:\n        dim: int, all heads dimension\n        num_heads: int, num of heads\n",
+      "total_lines": 663
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 408,
+      "start_line": 388,
+      "end_line": 428,
+      "matched_line": "        # init with orthognal matrix",
+      "excerpt": "388:         w_attr_4, b_attr_4 = self._init_weights_layernorm() # init for layernorm\n389:         self.norm1 = nn.LayerNorm(dim, epsilon=1e-6, weight_attr=w_attr_3, bias_attr=b_attr_3)\n390:         self.norm2 = nn.LayerNorm(self.embed_dim, epsilon=1e-6, weight_attr=w_attr_4, bias_attr=b_attr_4)\n391: \n392:         w_attr_5, b_attr_5 = self._init_weights() # init for linear\n393:         w_attr_6, b_attr_6 = self._init_weights() # init for linear\n394:         self.mlp = nn.Sequential(nn.Linear(self.embed_dim,\n395:                                            self.embed_dim,\n396:                                            weight_attr=w_attr_5,\n397:                                            bias_attr=b_attr_5),\n398:                                  nn.GELU(),\n399:                                  nn.Linear(self.embed_dim,\n400:                                            self.embed_dim,\n401:                                            weight_attr=w_attr_6,\n402:                                            bias_attr=b_attr_6),\n403:                                  nn.Dropout(dropout))\n404: \n405:         self.m = int(self.embed_dim  * kernel_ratio)\n406: \n407:         self.w = np.random.random(size=(int(self.embed_dim * kernel_ratio), self.embed_dim))\n408:         # init with orthognal matrix\n409:         self.w = orthogonal(self.w)\n410: \n411:         self.w = paddle.create_parameter(\n412:             shape=[int(self.embed_dim * kernel_ratio), self.embed_dim],\n413:             dtype='float32',\n414:             default_initializer=nn.initializer.Assign(self.w / math.sqrt(self.m)))\n415: \n416:     def _init_weights_layernorm(self):\n417:         weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.Constant(1.0))\n418:         bias_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.Constant(0.0))\n419:         return weight_attr, bias_attr\n420: \n421:     def _init_weights(self):\n422:         weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.TruncatedNormal(std=.02))\n423:         bias_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.Constant(0.0))\n424:         return weight_attr, bias_attr\n425: \n426:     # paddle version 2.1 does not support einsum\n427:     def prm_exp(self, x):\n428:         # x: [B, T, hs]"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__init__",
+      "start_line": 375,
+      "end_line": 414,
+      "source": "    def __init__(self, dim, in_dim, num_heads=1, kernel_ratio=0.5, dropout=0.1):\n        super().__init__()\n        self.embed_dim = in_dim * num_heads\n        w_attr_1, b_attr_1 = self._init_weights() # init for linear\n        self.kqv = nn.Linear(dim, 3 * self.embed_dim, weight_attr=w_attr_1, bias_attr=b_attr_1)\n        self.dropout = nn.Dropout(dropout)\n        w_attr_2, b_attr_2 = self._init_weights() # init for linear\n        self.proj = nn.Linear(self.embed_dim,\n                              self.embed_dim,\n                              weight_attr=w_attr_2,\n                              bias_attr=b_attr_2)\n        self.num_heads = num_heads\n        w_attr_3, b_attr_3 = self._init_weights_layernorm() # init for layernorm\n        w_attr_4, b_attr_4 = self._init_weights_layernorm() # init for layernorm\n        self.norm1 = nn.LayerNorm(dim, epsilon=1e-6, weight_attr=w_attr_3, bias_attr=b_attr_3)\n        self.norm2 = nn.LayerNorm(self.embed_dim, epsilon=1e-6, weight_attr=w_attr_4, bias_attr=b_attr_4)\n\n        w_attr_5, b_attr_5 = self._init_weights() # init for linear\n        w_attr_6, b_attr_6 = self._init_weights() # init for linear\n        self.mlp = nn.Sequential(nn.Linear(self.embed_dim,\n                                           self.embed_dim,\n                                           weight_attr=w_attr_5,\n                                           bias_attr=b_attr_5),\n                                 nn.GELU(),\n                                 nn.Linear(self.embed_dim,\n                                           self.embed_dim,\n                                           weight_attr=w_attr_6,\n                                           bias_attr=b_attr_6),\n                                 nn.Dropout(dropout))\n\n        self.m = int(self.embed_dim  * kernel_ratio)\n\n        self.w = np.random.random(size=(int(self.embed_dim * kernel_ratio), self.embed_dim))\n        # init with orthognal matrix\n        self.w = orthogonal(self.w)\n\n        self.w = paddle.create_parameter(\n            shape=[int(self.embed_dim * kernel_ratio), self.embed_dim],\n            dtype='float32',\n            default_initializer=nn.initializer.Assign(self.w / math.sqrt(self.m)))"
+    },
+    "imports": {
+      "imports": [
+        "math",
+        "numpy",
+        "paddle",
+        "paddle.nn",
+        "droppath:DropPath",
+        "utils:orthogonal"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "image_classification/T2T_ViT/README.md",
+      "download_url": "https://raw.githubusercontent.com/BR-IDL/PaddleViT/develop/image_classification/T2T_ViT/README.md",
+      "content_excerpt": "# Tokens-to-Token ViT: Training Vision Transformers from Scratch on ImageNet, [arxiv](https://arxiv.org/abs/2101.11986) \n\nPaddlePaddle training/validation code and pretrained models for **T2T-ViT**.\n\nThe official pytorch implementation is [here](https://github.com/yitu-opensource/T2T-ViT).\n\nThis implementation is developed by [PaddleViT](https://github.com/BR-IDL/PaddleViT.git).\n\n\n<p align=\"center\">\n<img src=\"./t2t_vit.png\" alt=\"drawing\" width=\"100%\" height=\"100%\"/>\n    <h4 align=\"center\">T2T-ViT Model Overview</h4>\n</p>\n\n\n### Update \n- Update (2022-03-24): Code is refactored and bugs are fixed.\n- Update (2021-09-27): Model FLOPs and # params are uploaded.\n- Update (2021-08-18): Code is released and ported weights are uploaded.\n\n## Models Zoo\n| Model                         | Acc@1 | Acc@5 | #Params | FLOPs  | Image Size | Crop_pct | Interpolation | Link         |\n|-------------------------------|-------|-------|---------|--------|------------|----------|---------------|--------------|\n| t2t_vit_7      \t\t\t\t| 71.68 | 90.89 | 4.3M    | 1.0G   | 224   \t    | 0.9      | bicubic       | [google](https://drive.google.com/file/d/1YkuPs1ku7B_udydOf_ls1LQvpJDg_c_j/view?usp=sharing)/[baidu](https://pan.baidu.com/s/1jVNsz37gatLCDaOoU3NaMA?pwd=1hpa) |\n| t2t_vit_10     \t\t\t\t| 75.15 | 92.80 | 5.8M    | 1.3G   | 224   \t    | 0.9      | bicubic       | [google](https://drive.google.com/file/d/1H--55RxliMDlOCekn7FpKrHDGsUkyrJZ/view?usp=sharing)/[baidu](https://pan.baidu.com/s/1nbdb4PFMq4nsIp8HrNxLQg?pwd=ixug) |\n| t2t_vit_12     \t\t\t\t| 76.48 | 93.49 | 6.9M    | 1.5G   | 224   \t    | 0.9      |"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_datasets.py",
+          "path": "image_classification/MAE/tests/test_datasets.py",
+          "sha": "799521378f9feb51c5bea417ab365198f26f9e69",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/image_classification/MAE/tests/test_datasets.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "paddlevit-coco-cn.md",
+          "path": "docs/paddlevit-coco-cn.md",
+          "sha": "c1b2df11ed9729a7ab89277b1ce632de70e74f18",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/docs/paddlevit-coco-cn.md",
+          "score": 1.0
+        },
+        {
+          "name": "resnet.py",
+          "path": "object_detection/DETR/resnet.py",
+          "sha": "de803e6a28e4b5c32a7695049df441b9be938fde",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/object_detection/DETR/resnet.py",
+          "score": 1.0
+        },
+        {
+          "name": "droppath.py",
+          "path": "self_supervised_learning/dino/droppath.py",
+          "sha": "f3b6c40453f92950e521bfc9aff65c965338da97",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/self_supervised_learning/dino/droppath.py",
+          "score": 1.0
+        },
+        {
+          "name": "cyclemlp.py",
+          "path": "image_classification/CycleMLP/cyclemlp.py",
+          "sha": "6ecbf7ea76ff341c7f71160ee7464adae9bf12f9",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/image_classification/CycleMLP/cyclemlp.py",
+          "score": 1.0
+        },
+        {
+          "name": "coco.py",
+          "path": "object_detection/PVTv2/coco.py",
+          "sha": "5015ca7a71e2f91a4e378f4305e678730a50a109",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/object_detection/PVTv2/coco.py",
+          "score": 1.0
+        },
+        {
+          "name": "transforms.py",
+          "path": "object_detection/DETR/transforms.py",
+          "sha": "2be62a273bb20548a808d844cf748806e33d60d5",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/object_detection/DETR/transforms.py",
+          "score": 1.0
+        },
+        {
+          "name": "upfirdn2d.py",
+          "path": "gan/Styleformer/utils/upfirdn2d.py",
+          "sha": "678292fb80c74cf62cf573cc2b9ce773f1640732",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/gan/Styleformer/utils/upfirdn2d.py",
+          "score": 1.0
+        },
+        {
+          "name": "uper_head.py",
+          "path": "semantic_segmentation/src/models/decoders/uper_head.py",
+          "sha": "191c4b0ced459a281a02e74be19be01739e153b0",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/blob/5ac7d89d4fd0e3235d055ff15d5b1b1315499d70/semantic_segmentation/src/models/decoders/uper_head.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "image_classification/T2T_ViT",
+      "count": 18,
+      "entries": [
+        {
+          "name": "README.md",
+          "path": "image_classification/T2T_ViT/README.md",
+          "type": "file"
+        },
+        {
+          "name": "augment.py",
+          "path": "image_classification/T2T_ViT/augment.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "image_classification/T2T_ViT/config.py",
+          "type": "file"
+        },
+        {
+          "name": "configs",
+          "path": "image_classification/T2T_ViT/configs",
+          "type": "dir"
+        },
+        {
+          "name": "datasets.py",
+          "path": "image_classification/T2T_ViT/datasets.py",
+          "type": "file"
+        },
+        {
+          "name": "droppath.py",
+          "path": "image_classification/T2T_ViT/droppath.py",
+          "type": "file"
+        },
+        {
+          "name": "export_models.py",
+          "path": "image_classification/T2T_ViT/export_models.py",
+          "type": "file"
+        },
+        {
+          "name": "load_pytorch_weights.py",
+          "path": "image_classification/T2T_ViT/load_pytorch_weights.py",
+          "type": "file"
+        },
+        {
+          "name": "losses.py",
+          "path": "image_classification/T2T_ViT/losses.py",
+          "type": "file"
+        },
+        {
+          "name": "main_multi_gpu.py",
+          "path": "image_classification/T2T_ViT/main_multi_gpu.py",
+          "type": "file"
+        },
+        {
+          "name": "mixup.py",
+          "path": "image_classification/T2T_ViT/mixup.py",
+          "type": "file"
+        },
+        {
+          "name": "model_ema.py",
+          "path": "image_classification/T2T_ViT/model_ema.py",
+          "type": "file"
+        },
+        {
+          "name": "random_erasing.py",
+          "path": "image_classification/T2T_ViT/random_erasing.py",
+          "type": "file"
+        },
+        {
+          "name": "run_eval_multi.sh",
+          "path": "image_classification/T2T_ViT/run_eval_multi.sh",
+          "type": "file"
+        },
+        {
+          "name": "run_train_multi.sh",
+          "path": "image_classification/T2T_ViT/run_train_multi.sh",
+          "type": "file"
+        },
+        {
+          "name": "t2t_vit.png",
+          "path": "image_classification/T2T_ViT/t2t_vit.png",
+          "type": "file"
+        },
+        {
+          "name": "t2t_vit.py",
+          "path": "image_classification/T2T_ViT/t2t_vit.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "image_classification/T2T_ViT/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "README.md",
+          "path": "image_classification/T2T_ViT/README.md"
+        },
+        {
+          "name": "augment.py",
+          "path": "image_classification/T2T_ViT/augment.py"
+        },
+        {
+          "name": "config.py",
+          "path": "image_classification/T2T_ViT/config.py"
+        },
+        {
+          "name": "datasets.py",
+          "path": "image_classification/T2T_ViT/datasets.py"
+        },
+        {
+          "name": "droppath.py",
+          "path": "image_classification/T2T_ViT/droppath.py"
+        },
+        {
+          "name": "export_models.py",
+          "path": "image_classification/T2T_ViT/export_models.py"
+        },
+        {
+          "name": "load_pytorch_weights.py",
+          "path": "image_classification/T2T_ViT/load_pytorch_weights.py"
+        },
+        {
+          "name": "losses.py",
+          "path": "image_classification/T2T_ViT/losses.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "image_classification/T2T_ViT/t2t_vit.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b1da9f33a851ddd89f32df08394d628ea64ce73f",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/commit/b1da9f33a851ddd89f32df08394d628ea64ce73f",
+          "message": "update t2t-vit for export models",
+          "author": "xperzy",
+          "date": "2022-06-28T09:15:27Z"
+        },
+        {
+          "sha": "5e97ce72cfcf4d0e75226804ebba929da4369218",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/commit/5e97ce72cfcf4d0e75226804ebba929da4369218",
+          "message": "add t2tvit, add shuffle transformer, fix bugs",
+          "author": "xperzy",
+          "date": "2022-03-24T03:12:46Z"
+        },
+        {
+          "sha": "4edd947ac822e1bc222709884cd080ca44ac26f6",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/commit/4edd947ac822e1bc222709884cd080ca44ac26f6",
+          "message": "add training for classification models",
+          "author": "xperzy",
+          "date": "2022-01-10T14:15:25Z"
+        },
+        {
+          "sha": "770080c5d1e3ef7c6d799b68fc19ef83c4f229cc",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/commit/770080c5d1e3ef7c6d799b68fc19ef83c4f229cc",
+          "message": "fix t2t annotation about einsum",
+          "author": "Mike",
+          "date": "2021-11-18T09:45:15Z"
+        },
+        {
+          "sha": "3d9a217dfb130b02a0e469fcc22caf3cfdbd5fd2",
+          "html_url": "https://github.com/BR-IDL/PaddleViT/commit/3d9a217dfb130b02a0e469fcc22caf3cfdbd5fd2",
+          "message": "fix training bugs",
+          "author": "xperzy",
+          "date": "2021-10-28T02:56:11Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO init with orthognal matrix",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "image_classification/T2T_ViT/t2t_vit.py",
+      "satd_line": 408,
+      "last_commit": {
+        "sha": "b1da9f33a851ddd89f32df08394d628ea64ce73f",
+        "html_url": "https://github.com/BR-IDL/PaddleViT/commit/b1da9f33a851ddd89f32df08394d628ea64ce73f",
+        "message": "update t2t-vit for export models",
+        "author": "xperzy",
+        "date": "2022-06-28T09:15:27Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 1,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

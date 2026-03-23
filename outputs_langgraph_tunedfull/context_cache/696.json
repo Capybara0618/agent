@@ -1,0 +1,245 @@
+{
+  "task_id": "696",
+  "repo_owner": "aws",
+  "repo_name": "aws-parallelcluster",
+  "file_path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:53:51+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:54:02+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:54:06+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+    "original_code": "def _check_whoami(users):\n    logging.info(\"Checking whoami\")\n    for user in users:\n        result = user.run_remote_command(\"whoami\").stdout\n        # TODO: Change the assertion to check the output is just the Username\n        assert_that(result).contains(user.alias)\n        result = user.run_remote_command(\"srun whoami\").stdout\n        assert_that(result).contains(user.alias)",
+    "satd_comment": "# TODO: Change the assertion to check the output is just the Username",
+    "target_file": {
+      "ok": true,
+      "path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+      "sha": "43e7ff71ea9176b60195f447ce905d194a64ce6b",
+      "download_url": "https://raw.githubusercontent.com/aws/aws-parallelcluster/develop/tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+      "content_excerpt": "# Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\").\n# You may not use this file except in compliance with the License.\n# A copy of the License is located at\n#\n# http://aws.amazon.com/apache2.0/\n#\n# or in the \"LICENSE.txt\" file accompanying this file.\n# This file is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied.\n# See the License for the specific language governing permissions and limitations under the License.\n\nimport io\nimport logging\nimport os\nimport os as os_lib\nimport random\nimport string\nimport time\nimport zipfile\nfrom pathlib import Path\n\nimport boto3\nimport pytest\nfrom assertpy import assert_that\nfrom cfn_stacks_factory import CfnStack, CfnVpcStack\nfrom framework.fixture_utils import SharedFixture, xdist_session_fixture\nfrom paramiko import Ed25519Key\nfrom remote_command_executor import RemoteCommandExecutor\nfrom retrying import retry\nfrom time_utils import seconds\nfrom utils import find_stack_by_tag, generate_stack_name, is_directory_supported, random_alphanumeric\nfrom xdist import get_xdist_worker_id\n\nfrom tests.ad_integration.cluster_user import ClusterUser\nfrom tests.common.utils import run_system_analyzer\n\nNUM_USERS_TO_CREATE = 5\nNUM_USERS_TO_TEST = 3\n\n\ndef get_infra_stack_outputs(stack_name):\n    cfn = boto3.client(\"cloudformation\")\n    return {\n        entry.get(\"OutputKey\"): entry.get(\"OutputValue\")\n        for entry in cfn.describe_stacks(StackName=stack_name)[\"Stacks\"][0][\"Outputs\"]\n    }\n\n\ndef get_user_password(secret_arn):\n    client = boto3.client(\"secretsmanager\")\n    return client.get_secret_value(SecretId=secret_arn)[\"SecretString\"]\n\n\ndef get_vpc_public_subnet(vpc_id):\n    ec2 = boto3.client(\"ec2\")\n    for entry in ec2.describe_subnets(Filters=[{\"Name\": \"vpc-id\", \"Values\": [vpc_id]}])[\"Subnets\"]:\n        if entry.get(\"MapPublicIpOnLaunch\"):\n            return {\"public_subnet_id\": entry.get(\"SubnetId\")}\n    return None\n\n\ndef get_infra_stack_parameters(stack_name):\n    cfn = boto3.client(\"cloudformation\")\n    return {\n        entry.get(\"ParameterKey\"): entry.get(\"ParameterValue\")\n        for entry in cfn.describe_stacks(StackName=stack_name)[\"Stacks\"][0][\"Parameters\"]\n    }\n\n\ndef _get_ldap_base_search(domain_name):\n    return \",\".join([f\"dc={domain_component}\" for domain_component in domain_name.split(\".\")])\n\n\ndef get_ad_config_param_vals(\n    directory_stack_outputs,\n    ldap_tls_ca_cert,\n    directory_type,\n    directory_protocol,\n    directory_certificate_verification,\n):\n    \"\"\"Return a dict used to set values for config file parameters.\"\"\"\n    if directory_type not in (\"MicrosoftAD\", \"SimpleAD\"):\n        raise Exception(f\"Unknown directory type: {directory_type}\")\n\n    if directory_protocol == \"ldaps\":\n        ldap_uri = directory_stack_outputs.get(\"DomainAddrLdaps\")\n    elif directory_protocol == \"ldap\":\n        ldap_uri = directory_stack_outputs.get(\"DomainAddrLdap\")\n    else:\n        raise Exception(f\"Unknown directory protocol: {directory_protocol}\")\n    return {\n        \"ldap_uri\": ldap_uri,\n        \"domain_name\": directory_stack_outputs.get(\"DomainName\"),\n        \"domain_read_only_user\": directory_stack_outputs.get(\"DomainReadOnlyUser\"),\n        \"password_secret_arn\": directory_stack_outputs.get(\"PasswordSecretArn\"),\n        \"ldap_tls_ca_cert\": ldap_tls_ca_cert,\n        \"directory_protocol\": directory_protocol,\n        \"ldap_tls_req_cert\": \"never\" if directory_certificate_verification is False else \"hard\",\n        \"private_subnet_id\": directory_stack_outputs.get(\"PrivateSubnetIds\").split(\",\")[0],\n    }\n\n\ndef _add_file_to_zip(zip_file, path, arcname):\n    \"\"\"\n    Add the file at path under the name arcname to the archive represented by zip_file.\n\n    :param zip_file: zipfile.ZipFile object\n    :param path: string; path to file being added\n    :param arcname: string; filename to put bytes from path under in created archive\n    \"\"\"\n    with open(path, \"rb\") as input_file:\n        zinfo = zipfile.ZipInfo(filename=arcname)\n        zinfo.external_attr = 0o644 << 16\n        zip_file.writestr(zinfo, input_file.read())\n\n\ndef add_tag_to_stack(stack_name, key, value):\n    cfn = boto3.resource(\"cloudformation\")\n    stack = cfn.Stack(stack_name)\n    add_tag = True\n    for tag in stack.tags:\n        if tag.get(\"Key\") == \"DO-NOT-DELETE\":\n            add_tag = False\n            break\n    if add_tag:\n        stack.update(\n            UsePreviousTemplate=True,\n            Capabilities=[\"CAPABILITY_IAM\"],\n            Tags=[\n                {\"Key\": key, \"Value\": value},\n            ],\n        )\n\n\ndef zip_dir(path):\n    \"\"\"\n    Create a zip archive containing all files and dirs rooted in path.\n\n    The archive is created in memory and a file handler is returned by the function.\n    :param path: directory containing the resources to archive.\n    :return: file handler pointing to the compressed archive.\n    \"\"\"\n    file_out = io.BytesIO()\n    with zipfile.ZipFile(file_out, \"w\", zipfile.ZIP_DEFLATED) as ziph:\n        for root, _, files in os_lib.walk(path):\n            for file in files:\n                _add_file_to_zip(\n                    ziph,\n                    os_lib.path.join(root, file),\n                    os_lib.path.relpath(os_lib.path.join(root, file), start=path),\n                )\n    file_out.seek(0)\n    return file_out\n\n\ndef _get_stack_parameters(directory_type, vpc_stack, keypair):\n    private_subnet = vpc_stack.get_private_subnet()\n    private_subnets = vpc_stack.get_all_private_subnets().copy()\n    private_subnets.remove(private_subnet)\n\n    users = \"\"\n    for i in range(NUM_USERS_TO_CREATE):\n        users += f\"PclusterUser{i},\"\n\n    stack_parameters = [\n        {\n            \"ParameterKey\": \"DomainName\",\n            \"ParameterValue\": f\"{directory_type.lower()}.{random_alphanumeric(size=10)}.multiuser.pcluster\",\n        },\n        {\n            \"ParameterKey\": \"AdminPassword\",\n            \"ParameterValue\": \"\".join(random.choices(string.ascii_letters + string.digits, k=60)),\n        },\n        {\n            \"ParameterKey\": \"ReadOnlyPassword\",\n            \"ParameterValue\": \"\".join(random.choices(string.ascii_letters + string.digits, k=60)),\n        },\n        {\"ParameterKey\": \"UserNames\", \"ParameterValue\": users[:-1]},\n        {\n            \"ParameterKey\": \"UserPassword\",\n            \"ParameterValue\": \"\".join(random.choices(string.ascii_letters + string.digits, k=60)),\n        },\n        {\"ParameterKey\": \"DirectoryType\", \"ParameterValue\": directory_type},\n        {\"ParameterKey\": \"Vpc\", \"ParameterValue\": vpc_stack.cfn_outputs[\"VpcId\"]},\n        {\"ParameterKey\": \"PrivateSubnetOne\", \"ParameterValue\": private_subnet},\n        {\"ParameterKey\": \"PrivateSubnetTwo\", \"ParameterValue\": private_subnets[0]},\n        {\"ParameterKey\": \"Keypair\", \"ParameterValue\": keypair},\n    ]\n    return stack_parameters\n\n\ndef _create_directory_stack(cfn_stacks_factory, request, directory_type, region, vpc_stack: CfnVpcStack):\n    directory_stack_name = generate_stack_name(\n        f\"integ-tests-MultiUserInfraStack{directory_type}\", request.config.getoption(\"stackname_suffix\")\n    )\n\n    if directory_type not in (\"MicrosoftAD\", \"SimpleAD\"):\n        raise Exception(f\"Unknown directory type: {directory_type}\")\n\n    directory_stack_template_path = \"../../cloudformation/ad/ad-integration.yaml\"\n\n    logging.info(\"Creating stack %s\", directory_stack_name)\n\n    with open(directory_stack_template_path) as directory_stack_template:\n        stack_parameters = _get_stack_parameters(directory_type, vpc_stack, request.config.getoption(\"key_name\"))\n        tags = [{\"Key\": \"parallelcluster:integ-tests-ad-stack\", \"Value\": directory_type}]\n        if request.config.getoption(\"retain_ad_stack\"):\n            tags.append({\"Key\": \"DO-NOT-DELETE\", \"Value\": \"Retained for integration testing\"})\n\n        directory_stack = CfnStack(\n            name=directory_stack_name,\n            region=region,\n            template=directory_stack_template.read(),\n            parameters=stack_parameters,\n            capabilities=[\"CAPABILITY_IAM\", \"CAPABILITY_NAMED_IAM\", \"CAPABILITY_AUTO_EXPAND\"],\n            tags=tags,\n        )\n    cfn_stacks_factory.create_stack(directory_stack)\n    logging.info(\"Creation of stack %s complete\", directory_stack_name)\n\n    return directory_stack\n\n\n@retry(wait_fixed=seconds(20), stop_max_delay=seconds(700))\ndef _check_ssm_success(ssm_client, command_id, instance_id):\n    assert_that(\n        ssm_client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)[\"Status\"] == \"Success\"\n    ).is_true()\n\n\n@xdist_session_fixture(autouse=True)\ndef directory_shared_namespace(request):\n    \"\"\"\n    Session-scoped, cross-worker shared namespace (a directory path) for per-key SharedFixtures.\n    IMPORTANT: This fixture does NOT create any AD stacks. It only returns a path that all workers can use.\n    Returning a plain string keeps it picklable for SharedFixture.\n    \"\"\"\n    base_dir = Path(f\"{request.config.getoption('output_dir', '')}/tmp/shared_fixtures\")\n    base_dir.mkdir(parents=True, exist_ok=True)\n    # Return a simple, picklable value (string path)\n    return str(base_dir)\n\n\ndef _directory_stack_resource_generator(\n    existing_directory_stack_name,\n    directory_type,\n    region,\n    vpc_stack,\n    cfn_stacks_factory,\n    request,\n):\n    \"\"\"\n    Generator used by SharedFixture to provide a shared value (stack info) and run cleanup.\n    Yields a picklable dict: {\"name\": <stack_name>, \"managed\": <bool>}\n    \"\"\"\n    managed = False\n    if existing_directory_stack_name:\n        name = existing_directory_stack_name\n    else:\n        # Try to reuse an existing tagged stack; if not found, create a new one.\n        stack_prefix = f\"integ-tests-MultiUserInfraStack{directory_type}\"\n        name = find_stack_by_tag(\"parallelcluster:integ-tests-ad-stack\", region, stack_prefix)\n        if not name:\n            directory_stack = _create_directory_stack(cfn_stacks_factory, request, directory_type, region, vpc_stack)\n            name = directory_stack.name\n            managed = True\n\n    try:\n        yield {\"name\": name, \"managed\": managed}\n    finally:\n        # Only delete stacks created by this fixture, and only if not retained/no-delete.\n        if managed and not (request.config.getoption(\"no_delete\") or request.config.getoption(\"retain_ad_stack\")):\n            try:\n                cfn_stacks_factory.delete_stack(name, region)\n                logging.info(\"Deleted directory stack %s in %s\", name, region)\n            except Exception as e:\n                logging.warning(\"Failed deleting directory stack %s: %s\", name, e)\n\n\n@pytest.fixture(scope=\"class\")\ndef directory_factory(directory_shared_namespace, vpc_stacks_shared, cfn_stacks_factory, request):\n    \"\"\"\n    Class-scoped factory: build a per-(region, directory_type) SharedFixture and acquire it on call.\n    We purposely track only the last acquire (per worker) and release it once in teardown,\n    based on the current assumption that each worker invokes this factory only once.\n    \"\"\"\n    base_dir = Path(directory_shared_namespace)  # shared path provided by the session fixture\n    last_shared_fixture = None\n\n    def _factory(existing_directory_stack_name: str, directory_type: str, region: str) -> str:\n        xdist_worker_id = get_xdist_worker_id(request)\n        nodeid = getattr(request.node, \"nodeid\", \"N/A\")\n        logging.info(\n            \"directory_factory invoked: region=%s, directory_type=%s, existing_provided=%s, worker=%s, nodeid=%s\",\n            region,\n            directory_type,\n            bool(existing_directory_stack_name),\n            xdist_worker_id,\n            nodeid,\n        )\n\n        # Use-only path: explicit stack name, no sharing/cleanup.\n        if existing_directory_stack_name:\n            return existing_directory_stack_name\n\n        if not is_directory_supported(region, directory_type):\n            raise RuntimeError(f\"Directory type {directory_type} not suppor",
+      "total_lines": 773
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "io",
+        "logging",
+        "os",
+        "os",
+        "random",
+        "string",
+        "time",
+        "zipfile",
+        "pathlib:Path",
+        "boto3",
+        "pytest",
+        "assertpy:assert_that",
+        "cfn_stacks_factory:CfnStack",
+        "cfn_stacks_factory:CfnVpcStack",
+        "framework.fixture_utils:SharedFixture",
+        "framework.fixture_utils:xdist_session_fixture",
+        "paramiko:Ed25519Key",
+        "remote_command_executor:RemoteCommandExecutor",
+        "retrying:retry",
+        "time_utils:seconds",
+        "utils:find_stack_by_tag",
+        "utils:generate_stack_name",
+        "utils:is_directory_supported",
+        "utils:random_alphanumeric",
+        "xdist:get_xdist_worker_id",
+        "tests.ad_integration.cluster_user:ClusterUser",
+        "tests.common.utils:run_system_analyzer"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/aws/aws-parallelcluster/develop/README.md",
+      "content_excerpt": "AWS ParallelCluster - HPC for the Cloud\n=======================================\n\n[![PyPI Version](https://img.shields.io/pypi/v/aws-parallelcluster)](https://pypi.org/project/aws-parallelcluster/)\n[![Spack Version](https://img.shields.io/spack/v/aws-parallelcluster)](https://spack.readthedocs.io/en/latest/package_list.html#aws-parallelcluster)\n[![Conda Verseion](https://img.shields.io/conda/vn/conda-forge/aws-parallelcluster)](https://anaconda.org/conda-forge/aws-parallelcluster)\n[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)\n[![codecov](https://codecov.io/gh/aws/aws-parallelcluster/branch/develop/graph/badge.svg)](https://codecov.io/gh/aws/aws-parallelcluster)\n[![ParallelCluster CI](https://github.com/aws/aws-parallelcluster/workflows/ParallelCluster%20CI/badge.svg)](https://github.com/aws/aws-parallelcluster/actions)\n\nAWS ParallelCluster is an AWS supported Open Source cluster management tool that makes it easy for you to deploy and\nmanage High Performance Computing (HPC) clusters in the AWS cloud.\nBuilt on the Open Source CfnCluster project, AWS ParallelCluster enables you to quickly build an HPC compute environment in AWS.\nIt automatically sets up the required compute resources and a shared filesystem and offers a variety of batch schedulers such as AWS Batch and Slurm.\nAWS ParallelCluster facilitates both quick start proof of concepts (POCs) and production deployments.\nYou can build higher level workflows, such as a Genomics portal that automates the entire DNA sequencing workflow, on top of AWS Para"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_check_whoami test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_ad_integration.py",
+          "path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+          "sha": "43e7ff71ea9176b60195f447ce905d194a64ce6b",
+          "html_url": "https://github.com/aws/aws-parallelcluster/blob/0a83ff229f89e29d1b1891d8fa2aeb51039e93da/tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_check_whoami(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_ad_integration.py",
+          "path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+          "sha": "43e7ff71ea9176b60195f447ce905d194a64ce6b",
+          "html_url": "https://github.com/aws/aws-parallelcluster/blob/0a83ff229f89e29d1b1891d8fa2aeb51039e93da/tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "tests/integration-tests/tests/ad_integration",
+      "count": 4,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "tests/integration-tests/tests/ad_integration/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "cluster_user.py",
+          "path": "tests/integration-tests/tests/ad_integration/cluster_user.py",
+          "type": "file"
+        },
+        {
+          "name": "test_ad_integration.py",
+          "path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+          "type": "file"
+        },
+        {
+          "name": "test_ad_integration",
+          "path": "tests/integration-tests/tests/ad_integration/test_ad_integration",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 2,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "tests/integration-tests/tests/ad_integration/__init__.py"
+        },
+        {
+          "name": "cluster_user.py",
+          "path": "tests/integration-tests/tests/ad_integration/cluster_user.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "7f65bd7a6f94bf811198239cf26f1c17f39b640d",
+          "html_url": "https://github.com/aws/aws-parallelcluster/commit/7f65bd7a6f94bf811198239cf26f1c17f39b640d",
+          "message": "Reformat",
+          "author": "Xuanqi He",
+          "date": "2025-11-07T20:35:47Z"
+        },
+        {
+          "sha": "8b00849e70d81a5a587bfc22e3f37111335ec862",
+          "html_url": "https://github.com/aws/aws-parallelcluster/commit/8b00849e70d81a5a587bfc22e3f37111335ec862",
+          "message": "Remove the local cache based on the current assumption that each worker invokes this factory only once. Add log to show directory_factory invoked info for future debug",
+          "author": "Xuanqi He",
+          "date": "2025-11-06T17:46:54Z"
+        },
+        {
+          "sha": "3e21bdbfb95e3b0461a03204a352cf6871542628",
+          "html_url": "https://github.com/aws/aws-parallelcluster/commit/3e21bdbfb95e3b0461a03204a352cf6871542628",
+          "message": "Return a picklable string in shared resources instead of a object to avoid _pickle.PicklingError error",
+          "author": "Xuanqi He",
+          "date": "2025-11-05T16:27:54Z"
+        },
+        {
+          "sha": "e20d12bb16c6256fd24af6765075973bca1a38a4",
+          "html_url": "https://github.com/aws/aws-parallelcluster/commit/e20d12bb16c6256fd24af6765075973bca1a38a4",
+          "message": "Lazy create AD directory stacks on first use via SharedFixture, instead of pre-create stacks in all regions for all directory types.",
+          "author": "Xuanqi He",
+          "date": "2025-11-04T20:33:45Z"
+        },
+        {
+          "sha": "8a35c0950cf7ab9e69d82ebd5bec9033efcf34f5",
+          "html_url": "https://github.com/aws/aws-parallelcluster/commit/8a35c0950cf7ab9e69d82ebd5bec9033efcf34f5",
+          "message": "Remove import os",
+          "author": "Xuanqi He",
+          "date": "2025-11-03T21:46:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_check_whoami TODO Change assertion check output",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "tests/integration-tests/tests/ad_integration/test_ad_integration.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "7f65bd7a6f94bf811198239cf26f1c17f39b640d",
+        "html_url": "https://github.com/aws/aws-parallelcluster/commit/7f65bd7a6f94bf811198239cf26f1c17f39b640d",
+        "message": "Reformat",
+        "author": "Xuanqi He",
+        "date": "2025-11-07T20:35:47Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying the intended change",
+        "local function with simple assertions",
+        "no external dependencies blocking change",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

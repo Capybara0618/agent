@@ -1,0 +1,336 @@
+{
+  "task_id": "375",
+  "repo_owner": "hasgeek",
+  "repo_name": "hasjob",
+  "file_path": "hasjob/views/helper.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:16:36+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:16:45+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:16:52+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "hasjob/views/helper.py",
+    "original_code": "def getposts(basequery=None, pinned=False, showall=False, statuses=None):\n    if not statuses:\n        statuses = POSTSTATUS.LISTED\n\n    if basequery is None:\n        basequery = JobPost.query\n\n    query = basequery.filter(JobPost.status.in_(statuses)).options(*JobPost._defercols)\n\n    if showall:\n        query = query.filter(JobPost.datetime > datetime.utcnow() - agelimit)\n    else:\n        if pinned:\n            # FIXME: Also check for g.board here\n            query = query.filter(\n                db.or_(\n                    db.and_(JobPost.pinned == True, JobPost.datetime > datetime.utcnow() - agelimit),\n                    db.and_(JobPost.pinned == False, JobPost.datetime > datetime.utcnow() - newlimit)))  # NOQA\n        else:\n            query = query.filter(JobPost.datetime > datetime.utcnow() - newlimit)\n\n    if g.board and g.board.name != u'www':\n        query = query.join(JobPost.postboards).filter(BoardJobPost.board == g.board)\n\n    if pinned:\n        if g.board:\n            query = query.order_by(db.desc(BoardJobPost.pinned))\n        else:\n            query = query.order_by(db.desc(JobPost.pinned))\n\n    return query.order_by(db.desc(JobPost.datetime))",
+    "satd_comment": "# FIXME: Also check for g.board here",
+    "target_file": {
+      "ok": true,
+      "path": "hasjob/views/helper.py",
+      "sha": "1c22443ac9820ddb8c0e2ebae50197888ea28efe",
+      "download_url": "https://raw.githubusercontent.com/hasgeek/hasjob/main/hasjob/views/helper.py",
+      "content_excerpt": "import hashlib\nfrom base64 import b64decode\nfrom datetime import timedelta\nfrom os import path\nfrom types import SimpleNamespace\nfrom urllib.parse import quote, quote_plus\nfrom uuid import uuid4\n\nimport bleach\nfrom flask import copy_current_request_context, g, request, session\nfrom geoip2.errors import AddressNotFoundError\nfrom markupsafe import Markup\nfrom pytz import UTC\nfrom sqlalchemy.exc import IntegrityError\n\nfrom baseframe import _, cache\nfrom baseframe.signals import form_validation_error, form_validation_success\nfrom coaster.sqlalchemy import failsafe_add\nfrom coaster.utils import utcnow\nfrom flask_lastuser import signal_user_looked_up\n\nfrom .. import app, lastuser, redis_store, rq\nfrom ..extapi import location_geodata\nfrom ..models import (\n    PAY_TYPE,\n    AnonUser,\n    BoardJobPost,\n    Campaign,\n    CampaignAnonView,\n    CampaignView,\n    EventSession,\n    EventSessionBase,\n    JobCategory,\n    JobImpression,\n    JobLocation,\n    JobPost,\n    JobPostTag,\n    JobType,\n    JobViewSession,\n    Tag,\n    UserEvent,\n    UserEventBase,\n    campaign_event_session_table,\n    db,\n    sa,\n)\nfrom ..utils import cointoss, redactemail, scrubemail\n\ngif1x1 = b64decode(b'R0lGODlhAQABAJAAAP8AAAAAACH5BAUQAAAALAAAAAABAAEAAAICBAEAOw==')\nMAX_COUNTS_KEY = 'maxcounts'\nALLOWED_TAGS = ['strong', 'em', 'p', 'ol', 'ul', 'li', 'br', 'a']\n\n\n@app.route('/_sniffle.gif')\ndef sniffle():\n    return (\n        gif1x1,\n        200,\n        {\n            'Content-Type': 'image/gif',\n            'Cache-Control': 'no-cache, no-store, must-revalidate',\n            'Pragma': 'no-cache',\n            'Expires': '0',\n        },\n    )\n\n\ndef index_is_paginated():\n    return request.method == 'POST' and 'startdate' in request.values\n\n\ndef has_post_stats(post):\n    is_siteadmin = lastuser.has_permission('siteadmin')\n    return (\n        is_siteadmin\n        or post.admin_is(g.user)\n        or (g.user and g.user.flags.get('is_employer_month'))\n    )\n\n\n@form_validation_success.connect\ndef event_form_validation_success(form):\n    g.event_data['form_validation'] = 'ok'\n\n\n@form_validation_error.connect\ndef event_form_validation_error(form):\n    g.event_data['form_validation'] = 'error'\n    if hasattr(form, 'errors_with_data'):\n        g.event_data['form_errors'] = form.errors_with_data()\n    else:\n        g.event_data['form_errors'] = form.errors  # Dict of field: [errors]\n\n\n@signal_user_looked_up.connect\ndef load_user_data(user):\n    \"\"\"\n    All pre-request utilities, run after g.user becomes available.\n\n    Part 1: Load anon user:\n\n    1. If there's g.user and session['anon_user'], it loads that anon_user and tags with user=g.user, then removes anon\n    2. If there's no g.user and no session['anon_user'], sets session['anon_user'] = 'test'\n    3. If there's no g.user and there is session['anon_user'] = 'test', creates a new anon user, then saves to cookie\n    4. If there's no g.user and there is session['anon_user'] != 'test', loads g.anon_user\n\n    Part 2: Are we in kiosk mode? Is there a preview campaign?\n    Part 3: Look up user's IP address location as geonameids for use in targeting.\n    \"\"\"\n    g.anon_user = None  # Could change below\n    g.event_data = {}  # Views can add data to the current pageview event\n    g.esession = None\n    g.viewcounts = {}\n    # Retrieve from cookie session if present there\n    g.impressions = session.pop('impressions', {})\n    g.campaign_views = []\n    g.jobpost_viewed = None, None\n    g.bgroup = None\n    now = utcnow()\n\n    if request.endpoint not in ('static', 'baseframe.static'):\n        # Loading an anon user only if we're not rendering static resources\n        if user:\n            if (\n                'au' in session\n                and session['au'] is not None\n                and not str(session['au']).startswith('test')\n            ):\n                anon_user = AnonUser.query.get(session['au'])\n                if anon_user:\n                    anon_user.user = user\n            session.pop('au', None)\n        else:\n            if not session.get('au'):\n                session['au'] = 'test-' + str(uuid4())\n                g.esession = EventSessionBase.new_from_request(request)\n                g.event_data['anon_cookie_test'] = session['au']\n            # elif session['au'] == 'test':  # Legacy test cookie, original request now lost\n            #     g.anon_user = AnonUser()\n            #     db.session.add(g.anon_user)\n            #     g.esession = EventSession.new_from_request(request)\n            #     g.esession.anon_user = g.anon_user\n            #     db.session.add(g.esession)\n            #     # We'll update session['au'] below after database commit\n            # elif unicode(session['au']).startswith('test-'):  # Newer redis-backed test cookie\n            #     # This client sent us back our test cookie, so set a real value now\n            #     g.anon_user = AnonUser()\n            #     db.session.add(g.anon_user)\n            #     g.esession = EventSession.new_from_request(request)\n            #     g.esession.anon_user = g.anon_user\n            #     db.session.add(g.esession)\n            #     g.esession.load_from_cache(session['au'], UserEvent)\n            #     # We'll update session['au'] below after database commit\n            else:\n                anon_user = None  # AnonUser.query.get(session['au'])\n                if not anon_user:\n                    # XXX: We got a fake value? This shouldn't happen\n                    g.event_data['anon_cookie_test'] = session['au']\n                    session['au'] = 'test-' + str(uuid4())  # Try again\n                    g.esession = EventSessionBase.new_from_request(request)\n                else:\n                    g.anon_user = anon_user\n\n    # Prepare event session if it's not already present\n    if g.user or g.anon_user and not g.esession:\n        g.esession = EventSession.get_session(\n            uuid=session.get('es'), user=g.user, anon_user=g.anon_user\n        )\n    if g.esession:\n        session['es'] = g.esession.uuid\n\n    # Don't commit here. It flushes SQLAlchemy's session cache and forces\n    # fresh database hits. Let after_request commit. (Commented out 30-03-2016)\n    # db.session.commit()\n    g.db_commit_needed = True\n\n    if g.anon_user:\n        session['au'] = g.anon_user.id\n        session.permanent = True\n        if 'impressions' in session:\n            # Run this in the foreground since we need this later in the request for A/B display consistency.\n            # This is most likely being called from the UI-non-blocking sniffle.gif anyway.\n            save_impressions(\n                g.esession.id, list(session.pop('impressions').values()), now\n            )\n\n    # We have a user, now look up everything else\n\n    if session.get('kiosk'):\n        g.kiosk = True\n    else:\n        g.kiosk = False\n    g.peopleflow_url = session.get('peopleflow')\n\n    if 'preview' in request.args:\n        preview_campaign = Campaign.get(request.args['preview'])\n    else:\n        preview_campaign = None\n\n    g.preview_campaign = preview_campaign\n\n    # Look up user's location\n    if app.geoip:\n        ipaddr = session.get('ipaddr')\n        ipts = session.get('ipts')\n        if ipts is not None and ipts.tzinfo is None:\n            ipts = UTC.localize(ipts)\n        now = utcnow()\n        if (\n            not ipts\n            or ipaddr != request.environ['REMOTE_ADDR']\n            or 'geonameids' not in session\n            or (ipts < now - timedelta(days=7))\n        ):\n            # IP has changed or timed out or wasn't saved to the user's session. Look up location\n            ipaddr = request.environ['REMOTE_ADDR']\n            try:\n                ipdata = app.geoip.city(ipaddr)\n                geonameids = [\n                    item.geoname_id\n                    for sublist in [\n                        [ipdata.city],\n                        ipdata.subdivisions,\n                        [ipdata.country],\n                        [ipdata.continent],\n                    ]\n                    for item in sublist\n                    if item.geoname_id\n                ]\n            except AddressNotFoundError:\n                # Private IP range (127.0.0.1, etc). Should only happen in dev mode\n                geonameids = []\n            session['ipaddr'] = ipaddr\n            session['geonameids'] = geonameids\n            session['ipts'] = now\n            g.user_geonameids = geonameids\n        else:\n            g.user_geonameids = session['geonameids']\n    else:\n        g.user_geonameids = []\n\n\n@app.after_request\ndef record_views_and_events(response):\n    if hasattr(g, 'db_commit_needed') and g.db_commit_needed:\n        db.session.commit()\n\n    # g.* variables will be missing for static URLs because :func:`load_user_data`\n    # above skips them\n\n    missing_in_context = []\n    now = utcnow()\n    if not hasattr(g, 'esession'):\n        g.esession = None\n        missing_in_context.append('esession')\n\n    if not hasattr(g, 'response_code'):\n        g.response_code = None\n    if not hasattr(g, 'campaign_views'):\n        g.campaign_views = []\n        missing_in_context.append('campaign_views')\n    if not hasattr(g, 'user'):\n        g.user = None\n        missing_in_context.append('user')\n    if not hasattr(g, 'anon_user'):\n        g.anon_user = None\n        missing_in_context.append('anon_user')\n    if not hasattr(g, 'event_data'):\n        g.event_data = {}\n        missing_in_context.append('event_data')\n    if not hasattr(g, 'user_geonameids'):\n        g.user_geonameids = {}\n        missing_in_context.append('user_geonameids')\n    if not hasattr(g, 'impressions'):\n        g.impressions = {}\n        missing_in_context.append('impressions')\n    if not hasattr(g, 'jobpost_viewed'):\n        g.jobpost_viewed = None, None\n        missing_in_context.append('jobpost_viewed')\n\n    if missing_in_context:\n        g.event_data['missing_in_context'] = missing_in_context\n\n    # Now log whatever needs to be logged\n    if response.status_code in (301, 302, 303, 307, 308):\n        g.event_data['location'] = response.headers.get('Location')\n\n    # g.esession will be None for anon static requests\n    if g.esession and not g.esession.persistent:\n        g.esession.save_to_cache(session['au'])\n        if g.impressions:\n            # Save impressions to user's cookie session to write to db later\n            session['impressions'] = g.impressions\n\n    # Make a copy for the process_after_response closure\n    lg = SimpleNamespace(**vars(g))\n\n    @response.call_on_close\n    @copy_current_request_context\n    def process_after_response():\n        if lg.esession and lg.esession.persistent:\n            db.session.add(lg.esession)\n        if lg.user:\n            db.session.add(lg.user)\n        if lg.anon_user:\n            db.session.add(lg.anon_user)\n\n        # TODO: Consider moving this to a background job\n        if lg.campaign_views:\n            for campaign in lg.campaign_views:\n                db.session.add(campaign)\n            lg.event_data['campaign_views'] = [c.id for c in lg.campaign_views]\n            if lg.esession and lg.esession.persistent:\n                for campaign in lg.campaign_views:\n                    if lg.esession not in campaign.session_views:\n                        campaign.session_views.append(lg.esession)\n                try:\n                    db.session.commit()\n                except IntegrityError:  # Race condition from parallel requests\n                    db.session.rollback()\n\n        if lg.user_geonameids:\n            lg.event_data['user_geonameids'] = lg.user_geonameids\n\n        if lg.impressions:\n            lg.event_data['impressions'] = list(lg.impressions.values())\n\n        if lg.user:\n            for campaign in lg.campaign_views:\n                if not CampaignView.exists(campaign, lg.user):\n                    try:\n                        with db.session.begin_nested():\n                            db.session.add(\n                                CampaignView(campaign=campaign, user=lg.user)\n                  ",
+      "total_lines": 1117
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "hashlib",
+        "base64:b64decode",
+        "datetime:timedelta",
+        "os:path",
+        "types:SimpleNamespace",
+        "urllib.parse:quote",
+        "urllib.parse:quote_plus",
+        "uuid:uuid4",
+        "bleach",
+        "flask:copy_current_request_context",
+        "flask:g",
+        "flask:request",
+        "flask:session",
+        "geoip2.errors:AddressNotFoundError",
+        "markupsafe:Markup",
+        "pytz:UTC",
+        "sqlalchemy.exc:IntegrityError",
+        "baseframe:_",
+        "baseframe:cache",
+        "baseframe.signals:form_validation_error",
+        "baseframe.signals:form_validation_success",
+        "coaster.sqlalchemy:failsafe_add",
+        "coaster.utils:utcnow",
+        "flask_lastuser:signal_user_looked_up",
+        ":app",
+        ":lastuser",
+        ":redis_store",
+        ":rq",
+        "extapi:location_geodata",
+        "models:PAY_TYPE"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/hasgeek/hasjob/main/README.md",
+      "content_excerpt": "# Hasjob\n\nCode for Hasjob, Hasgeek’s job board at https://hasjob.co/\n\nCopyright © 2010-2021 by Hasgeek\n\nHasjob’s code is open source under the AGPL v3 license (see LICENSE.txt). We welcome your examination of our code to:\n\n- Establish trust and transparency on how it works, and\n- Allow contributions to Hasjob.\n\nOur workflow assumes this code is for use on a single production website. Using this to operate your own job board is not recommended. The name ‘Hasjob’ and the distinctive appearance of the job board are not part of the open source code.\n\nTo establish our intent, we use the AGPL v3 license, which requires you to release all your modifications to the public under the same license. You may not make a proprietary fork. To have your contributions merged back into the master repository, you must agree to assign copyright to Hasgeek, and must assert that you have the right to make this assignment. (You may not like this condition, and we understand. If you have a better idea, tell us!)\n\n## Installation\n\nInstallation is a multi-step process. If any of this is outdated, consult the `.travis.yml` file. That tends to be better maintained.\n\n### Pick an environment\n\nHasjob requires a `FLASK_ENV` environment variable set to one of the following values, depending on whether the deployment is in development or production:\n\n- `DEVELOPMENT` or `development` or `dev` (default)\n- `PRODUCTION` or `production` or `prod`\n\nIn a production environment, you must set `FLASK_ENV` globally for it to be available across processes. On Ubuntu/Debian systems, add it to `/etc/environment` and reboo"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "getposts test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"getposts(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "index.py",
+          "path": "hasjob/views/index.py",
+          "sha": "57cd3f616f9004632d920cdf6adc841bedf67059",
+          "html_url": "https://github.com/hasgeek/hasjob/blob/76aec255dbe16dabf9e220964e63f1b1118279b5/hasjob/views/index.py",
+          "score": 1.0
+        },
+        {
+          "name": "helper.py",
+          "path": "hasjob/views/helper.py",
+          "sha": "1c22443ac9820ddb8c0e2ebae50197888ea28efe",
+          "html_url": "https://github.com/hasgeek/hasjob/blob/76aec255dbe16dabf9e220964e63f1b1118279b5/hasjob/views/helper.py",
+          "score": 1.0
+        },
+        {
+          "name": "kiosk.py",
+          "path": "hasjob/views/kiosk.py",
+          "sha": "3283729704b6a99c8b36be535d1c30087f388768",
+          "html_url": "https://github.com/hasgeek/hasjob/blob/76aec255dbe16dabf9e220964e63f1b1118279b5/hasjob/views/kiosk.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "hasjob/views",
+      "count": 16,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "hasjob/views/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "admin.py",
+          "path": "hasjob/views/admin.py",
+          "type": "file"
+        },
+        {
+          "name": "admin_filterset.py",
+          "path": "hasjob/views/admin_filterset.py",
+          "type": "file"
+        },
+        {
+          "name": "admindash.py",
+          "path": "hasjob/views/admindash.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "hasjob/views/api.py",
+          "type": "file"
+        },
+        {
+          "name": "board.py",
+          "path": "hasjob/views/board.py",
+          "type": "file"
+        },
+        {
+          "name": "campaign.py",
+          "path": "hasjob/views/campaign.py",
+          "type": "file"
+        },
+        {
+          "name": "domain.py",
+          "path": "hasjob/views/domain.py",
+          "type": "file"
+        },
+        {
+          "name": "error_handling.py",
+          "path": "hasjob/views/error_handling.py",
+          "type": "file"
+        },
+        {
+          "name": "helper.py",
+          "path": "hasjob/views/helper.py",
+          "type": "file"
+        },
+        {
+          "name": "index.py",
+          "path": "hasjob/views/index.py",
+          "type": "file"
+        },
+        {
+          "name": "kiosk.py",
+          "path": "hasjob/views/kiosk.py",
+          "type": "file"
+        },
+        {
+          "name": "listing.py",
+          "path": "hasjob/views/listing.py",
+          "type": "file"
+        },
+        {
+          "name": "location.py",
+          "path": "hasjob/views/location.py",
+          "type": "file"
+        },
+        {
+          "name": "login.py",
+          "path": "hasjob/views/login.py",
+          "type": "file"
+        },
+        {
+          "name": "static.py",
+          "path": "hasjob/views/static.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "hasjob/views/__init__.py"
+        },
+        {
+          "name": "admin.py",
+          "path": "hasjob/views/admin.py"
+        },
+        {
+          "name": "admin_filterset.py",
+          "path": "hasjob/views/admin_filterset.py"
+        },
+        {
+          "name": "admindash.py",
+          "path": "hasjob/views/admindash.py"
+        },
+        {
+          "name": "api.py",
+          "path": "hasjob/views/api.py"
+        },
+        {
+          "name": "board.py",
+          "path": "hasjob/views/board.py"
+        },
+        {
+          "name": "campaign.py",
+          "path": "hasjob/views/campaign.py"
+        },
+        {
+          "name": "domain.py",
+          "path": "hasjob/views/domain.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "hasjob/views/helper.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f6bf8576f4d9b56002b9189c76efeed4897a655c",
+          "html_url": "https://github.com/hasgeek/hasjob/commit/f6bf8576f4d9b56002b9189c76efeed4897a655c",
+          "message": "[pre-commit.ci] pre-commit autoupdate (#777)\n\n* [pre-commit.ci] pre-commit autoupdate\r\n\r\nupdates:\r\n- [github.com/asottile/pyupgrade: v3.16.0 → v3.17.0](https://github.com/asottile/pyupgrade/compare/v3.16.0...v3.17.0)\r\n- [github.com/astral-sh/ruff-pre-commit: v0.4.10 → v0.6.1](https://github.com/astr",
+          "author": "pre-commit-ci[bot]",
+          "date": "2024-08-20T06:32:39Z"
+        },
+        {
+          "sha": "0b84f87b517888d152e5fb68df18bcec993be1be",
+          "html_url": "https://github.com/hasgeek/hasjob/commit/0b84f87b517888d152e5fb68df18bcec993be1be",
+          "message": "Move over NLTK code from Coaster; revise Ruff config (#768)",
+          "author": "Kiran Jonnalagadda",
+          "date": "2024-05-13T19:07:25Z"
+        },
+        {
+          "sha": "d7068c49487a9d56bd99d46f21e295403e067077",
+          "html_url": "https://github.com/hasgeek/hasjob/commit/d7068c49487a9d56bd99d46f21e295403e067077",
+          "message": "[pre-commit.ci] pre-commit autoupdate (#750)\n\n* [pre-commit.ci] pre-commit autoupdate\r\n\r\nupdates:\r\n- [github.com/psf/black: 23.12.1 → 24.1.1](https://github.com/psf/black/compare/23.12.1...24.1.1)\r\n- [github.com/PyCQA/bandit: 1.7.6 → 1.7.7](https://github.com/PyCQA/bandit/compare/1.7.6...1.7.7)\r\n\r\n*",
+          "author": "pre-commit-ci[bot]",
+          "date": "2024-01-31T06:04:57Z"
+        },
+        {
+          "sha": "11254b3c4680388c57cc4ce1b4bfd6d8be18e96b",
+          "html_url": "https://github.com/hasgeek/hasjob/commit/11254b3c4680388c57cc4ce1b4bfd6d8be18e96b",
+          "message": "Upgrade Hasjob for new functionality in Coaster (#717)",
+          "author": "Kiran Jonnalagadda",
+          "date": "2023-06-20T19:23:34Z"
+        },
+        {
+          "sha": "9f7c0a60c73a2aeb4ca349456d4fe735ac6e1b23",
+          "html_url": "https://github.com/hasgeek/hasjob/commit/9f7c0a60c73a2aeb4ca349456d4fe735ac6e1b23",
+          "message": "Drop use of StateManager.is_state aliases (#714)",
+          "author": "Kiran Jonnalagadda",
+          "date": "2023-05-21T07:30:04Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "getposts FIXME Also check board here",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "hasjob/views/helper.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "f6bf8576f4d9b56002b9189c76efeed4897a655c",
+        "html_url": "https://github.com/hasgeek/hasjob/commit/f6bf8576f4d9b56002b9189c76efeed4897a655c",
+        "message": "[pre-commit.ci] pre-commit autoupdate (#777)\n\n* [pre-commit.ci] pre-commit autoupdate\r\n\r\nupdates:\r\n- [github.com/asottile/pyupgrade: v3.16.0 → v3.17.0](https://github.com/asottile/pyupgrade/compare/v3.16.0...v3.17.0)\r\n- [github.com/astral-sh/ruff-pre-commit: v0.4.10 → v0.6.1](https://github.com/astr",
+        "author": "pre-commit-ci[bot]",
+        "date": "2024-08-20T06:32:39Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

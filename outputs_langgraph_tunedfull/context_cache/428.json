@@ -1,0 +1,409 @@
+{
+  "task_id": "428",
+  "repo_owner": "mamba-org",
+  "repo_name": "quetz",
+  "file_path": "quetz/main.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:34:01+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:34:11+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:34:17+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "quetz/main.py",
+    "original_code": "def get_package_members(\n    package: db_models.Package = Depends(get_package_or_fail),\n    dao: Dao = Depends(get_dao),\n):\n\n    member_list = dao.get_package_members(package.channel.name, package.name)\n\n    for member in member_list:\n        # force loading of profile before changing attributes to prevent sqlalchemy\n        # errors.\n        # TODO: don't abuse db models for this.\n        member.user.profile\n        setattr(member.user, \"id\", str(uuid.UUID(bytes=member.user.id)))\n\n    return member_list",
+    "satd_comment": "# TODO: don't abuse db models for this.",
+    "target_file": {
+      "ok": true,
+      "path": "quetz/main.py",
+      "sha": "db1a36be3550a9bb6b45a85bd0e4984e2f8f3693",
+      "download_url": "https://raw.githubusercontent.com/mamba-org/quetz/main/quetz/main.py",
+      "content_excerpt": "# Copyright 2020 QuantStack\n# Distributed under the terms of the Modified BSD License.\nimport asyncio\nimport datetime\nimport hashlib\nimport json\nimport logging\nimport os\nimport re\nimport time\nimport uuid\nfrom collections import Counter\nfrom concurrent.futures import ThreadPoolExecutor\nfrom contextlib import contextmanager\nfrom email.utils import formatdate\nfrom tempfile import SpooledTemporaryFile, TemporaryFile\nfrom typing import Awaitable, Callable, List, Optional, Tuple, Type\n\nimport pydantic\nimport requests\nfrom fastapi import (\n    APIRouter,\n    BackgroundTasks,\n    Depends,\n    FastAPI,\n    File,\n    Form,\n    Header,\n    HTTPException,\n    Request,\n    Response,\n    UploadFile,\n    responses,\n    status,\n)\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse\nfrom importlib_metadata import entry_points\nfrom sqlalchemy.exc import IntegrityError\nfrom sqlalchemy.orm import Session\nfrom starlette.concurrency import run_in_threadpool\nfrom starlette.middleware.base import BaseHTTPMiddleware\nfrom starlette.middleware.httpsredirect import HTTPSRedirectMiddleware\nfrom starlette.middleware.sessions import SessionMiddleware\nfrom tenacity import retry\nfrom tenacity.after import after_log\nfrom tenacity.retry import retry_if_result\nfrom tenacity.stop import stop_after_attempt\nfrom tenacity.wait import wait_exponential\n\nfrom quetz import (\n    authorization,\n    db_models,\n    errors,\n    exceptions,\n    frontend,\n    metrics,\n    rest_models,\n)\nfrom quetz.authentication import AuthenticatorRegistry, BaseAuthenticator\nfrom quetz.authentication import github as auth_github\nfrom quetz.authentication import gitlab as auth_gitlab\nfrom quetz.authentication import google as auth_google\nfrom quetz.authentication.azuread import AzureADAuthenticator\nfrom quetz.authentication.jupyterhub import JupyterhubAuthenticator\nfrom quetz.authentication.pam import PAMAuthenticator\nfrom quetz.config import PAGINATION_LIMIT, Config, configure_logger, get_plugin_manager\nfrom quetz.dao import Dao\nfrom quetz.deps import (\n    ChannelChecker,\n    get_channel_allow_proxy,\n    get_channel_or_fail,\n    get_config,\n    get_dao,\n    get_db,\n    get_package_or_fail,\n    get_remote_session,\n    get_rules,\n    get_session,\n    get_tasks_worker,\n)\nfrom quetz.jobs import api as jobs_api\nfrom quetz.jobs import rest_models as jobs_rest\nfrom quetz.metrics import api as metrics_api\nfrom quetz.metrics.middleware import DOWNLOAD_COUNT, UPLOAD_COUNT\nfrom quetz.rest_models import ChannelActionEnum, CPRole\nfrom quetz.tasks import indexing\nfrom quetz.tasks.common import Task\nfrom quetz.tasks.mirror import RemoteRepository, download_remote_file\nfrom quetz.utils import (\n    TicToc,\n    background_task_wrapper,\n    generate_random_key,\n    parse_query,\n)\n\nfrom .condainfo import CondaInfo\n\napp = FastAPI()\n\nconfig = Config()\n\nconfigure_logger(config)\n\nlogger = logging.getLogger(\"quetz\")\n\nif config.general_redirect_http_to_https:\n    logger.info(\"Configuring http to https redirect \")\n    app.add_middleware(HTTPSRedirectMiddleware)\n\nmetrics.init(app)\n\nif config.configured_section(\"cors\"):\n    logger.info(\"Configuring CORS with \")\n    logger.info(f\"allow_origins     = {config.cors_allow_origins}\")\n    logger.info(f\"allow_credentials = {config.cors_allow_credentials}\")\n    logger.info(f\"allow_methods     = {config.cors_allow_methods}\")\n    logger.info(f\"allow_headers     = {config.cors_allow_headers}\")\n    app.add_middleware(\n        CORSMiddleware,\n        allow_origins=config.cors_allow_origins,\n        allow_credentials=config.cors_allow_credentials,\n        allow_methods=config.cors_allow_methods,\n        allow_headers=config.cors_allow_headers,\n    )\n\n# global variables for batching download counts\n\ndownload_counts: Counter = Counter()\n\nDOWNLOAD_INCREMENT_DELAY_SECONDS = 10\nDOWNLOAD_INCREMENT_MAX_DOWNLOADS = 50\n\n\nclass CondaTokenMiddleware(BaseHTTPMiddleware):\n    \"\"\"Removes /t/<QUETZ_API_KEY> prefix, adds QUETZ_APY_KEY to the headers and passes\n    on the rest of the path to be routed.\"\"\"\n\n    def __init__(self, app):\n        super().__init__(app)\n        self.token_pattern = re.compile(\"^/t/([^/]+?)/\")\n\n    async def dispatch(self, request, call_next):\n        path = request.scope[\"path\"]\n        match = self.token_pattern.search(path)\n        if match:\n            prefix_length = len(match.group(0)) - 1\n            new_path = path[prefix_length:]\n            api_key = match.group(1)\n            request.scope[\"path\"] = new_path\n            request.scope[\"headers\"].append((b\"x-api-key\", api_key.encode()))\n\n        response = await call_next(request)\n\n        return response\n\n\napp.add_middleware(CondaTokenMiddleware)\n\nplugin_middlewares: List[Type[BaseHTTPMiddleware]] = [\n    ep.load() for ep in entry_points().select(group=\"quetz.middlewares\")\n]\n\nfor middleware in plugin_middlewares:\n    app.add_middleware(middleware.middleware(), config=config)\n\napp.add_middleware(\n    SessionMiddleware,\n    secret_key=config.session_secret,\n    https_only=config.session_https_only,\n)\n\nif config.configured_section(\"profiling\") and config.profiling_enable_sampling:\n    from pyinstrument.profiler import Profiler\n\n    @app.middleware(\"http\")\n    async def profile_request(\n        request: Request,\n        call_next: Callable[[Request], Awaitable[Response]],\n    ):\n        if not request.query_params.get(\"profile\", False):\n            return await call_next(request)\n        profiler = Profiler(\n            interval=config.profiling_interval_seconds,\n            async_mode=\"enabled\",\n        )\n        profiler.start()\n        await call_next(request)\n        profiler.stop()\n        return HTMLResponse(profiler.output_html())\n\n\npkgstore = config.get_package_store()\n\n# authenticators\nbuiltin_authenticators: List[Type[BaseAuthenticator]] = [\n    authenticator\n    for authenticator in [\n        auth_github.GithubAuthenticator,\n        auth_gitlab.GitlabAuthenticator,\n        auth_google.GoogleAuthenticator,\n        JupyterhubAuthenticator,\n        PAMAuthenticator,\n        AzureADAuthenticator,\n    ]\n    if authenticator is not None\n]\n\nplugin_authenticators: List[Type[BaseAuthenticator]] = [\n    ep.load() for ep in entry_points().select(group=\"quetz.authenticator\")\n]\n\n\nauth_registry = AuthenticatorRegistry()\nauth_registry.set_router(app)\n\nfor auth_cls in builtin_authenticators + plugin_authenticators:\n    auth_obj = auth_cls(config)\n    if auth_obj.is_enabled:\n        auth_registry.register(auth_obj)\n\n# other routers\n\npm = get_plugin_manager()\napi_router = APIRouter()\nplugin_routers = pm.hook.register_router()\n\nfor router in plugin_routers:\n    app.include_router(router)\napp.include_router(jobs_api.get_router())\napp.include_router(metrics_api.get_router())\n\n\n# helper functions\nasync def check_token_revocation(session):\n    valid = True\n    identity_provider = session.get(\"identity_provider\")\n\n    if identity_provider is None:\n        valid = False\n    elif identity_provider != \"dummy\":\n        auth_obj = auth_registry.enabled_authenticators[identity_provider]\n        valid = await auth_obj.validate_token(session.get(\"token\"))\n    if not valid:\n        logout(session)\n        raise HTTPException(\n            status_code=status.HTTP_401_UNAUTHORIZED,\n            detail=\"Not logged in\",\n        )\n\n\ndef logout(session):\n    session.pop(\"user_id\", None)\n    session.pop(\"identity_provider\", None)\n    session.pop(\"token\", None)\n\n\n# custom exception handlers\n@app.exception_handler(errors.ValidationError)\nasync def unicorn_exception_handler(request: Request, exc: errors.ValidationError):\n    return responses.JSONResponse(\n        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={\"detail\": str(exc)}\n    )\n\n\n# endpoints\n@app.route(\"/auth/logout\")\nasync def route_logout(request):\n    logout(request.session)\n    return RedirectResponse(\"/\")\n\n\n@api_router.get(\"/dummylogin/{username}\", tags=[\"dev\"])\ndef dummy_login(\n    username: str, dao: Dao = Depends(get_dao), session=Depends(get_session)\n):\n    user = dao.get_user_by_username(username)\n    if user is None:\n        raise HTTPException(\n            status_code=status.HTTP_404_NOT_FOUND,\n            detail=f\"User '{username}' not found\",\n        )\n\n    logout(session)\n    session[\"user_id\"] = str(uuid.UUID(bytes=user.id))\n\n    session[\"identity_provider\"] = \"dummy\"\n    return RedirectResponse(\"/\")\n\n\n@api_router.get(\"/me\", response_model=rest_models.Profile, tags=[\"users\"])\nasync def me(\n    session: dict = Depends(get_session),\n    dao: Dao = Depends(get_dao),\n    auth: authorization.Rules = Depends(get_rules),\n):\n    \"\"\"Returns your quetz profile\"\"\"\n\n    # Check if token is still valid\n    await check_token_revocation(session)\n\n    user_id = auth.assert_user()\n\n    profile = dao.get_profile(user_id)\n    if profile:\n        profile.user.id = str(uuid.UUID(bytes=profile.user.id))\n\n    return profile\n\n\ndef get_users_handler(dao, q, auth, skip, limit):\n    user_id = auth.assert_user()\n\n    results = dao.get_users(skip, limit, q)\n\n    user_list = results[\"result\"] if \"result\" in results else results\n\n    if not auth.is_user_elevated(user_id):\n        append_user = None\n        for user in user_list:\n            if user.id == user_id:\n                append_user = user\n        user_list.clear()\n        if append_user:\n            user_list.append(append_user)\n\n    return results\n\n\n@api_router.get(\"/users\", response_model=List[rest_models.User], tags=[\"users\"])\ndef get_users(\n    dao: Dao = Depends(get_dao),\n    q: str = None,\n    auth: authorization.Rules = Depends(get_rules),\n):\n    return get_users_handler(dao, q, auth, 0, -1)\n\n\n@api_router.get(\n    \"/paginated/users\",\n    response_model=rest_models.PaginatedResponse[rest_models.User],\n    tags=[\"users\"],\n)\ndef get_paginated_users(\n    dao: Dao = Depends(get_dao),\n    skip: int = 0,\n    limit: int = PAGINATION_LIMIT,\n    q: str = None,\n    auth: authorization.Rules = Depends(get_rules),\n):\n    return get_users_handler(dao, q, auth, skip, limit)\n\n\n@api_router.get(\"/users/{username}\", response_model=rest_models.User, tags=[\"users\"])\ndef get_user(\n    username: str,\n    dao: Dao = Depends(get_dao),\n    auth: authorization.Rules = Depends(get_rules),\n):\n    user = dao.get_user_by_username(username)\n\n    if not user or not user.profile:\n        raise HTTPException(\n            status_code=status.HTTP_404_NOT_FOUND, detail=f\"User {username} not found\"\n        )\n\n    auth.assert_read_user_data(user.id)\n\n    return user\n\n\n@api_router.get(\n    \"/users/{username}/channels\",\n    response_model=List[rest_models.ChannelRole],\n    tags=[\"users\"],\n)\ndef get_user_channels(\n    username: str,\n    dao: Dao = Depends(get_dao),\n    auth: authorization.Rules = Depends(get_rules),\n):\n    return list_user_channels(username, dao, auth, 0, -1)\n\n\n@api_router.get(\n    \"/users/{username}/packages\",\n    response_model=List[rest_models.PackageRole],\n    tags=[\"users\"],\n)\ndef get_user_packages(\n    username: str,\n    dao: Dao = Depends(get_dao),\n    auth: authorization.Rules = Depends(get_rules),\n):\n    return list_user_packages(username, dao, auth, 0, -1)\n\n\n@api_router.get(\n    \"/paginated/users/{username}/channels\",\n    response_model=rest_models.PaginatedResponse[rest_models.ChannelRole],\n    tags=[\"users\"],\n)\ndef get_paginated_user_channels(\n    username: str,\n    skip: int = 0,\n    limit: int = PAGINATION_LIMIT,\n    dao: Dao = Depends(get_dao),\n    auth: authorization.Rules = Depends(get_rules),\n):\n    return list_user_channels(username, dao, auth, skip, limit)\n\n\n@api_router.get(\n    \"/paginated/users/{username}/packages\",\n    response_model=rest_models.PaginatedResponse[rest_models.PackageRole],\n    tags=[\"users\"],\n)\ndef get_paginated_user_packages(\n    username: str,\n    dao: Dao = Depends(get_dao),\n    auth: authorization.Rules = Depends(get_rules),\n    skip: int = 0,\n    limit: int = PAGINATION_LIMIT,\n):\n    return list_user_packages(username, dao, auth, skip, limit)\n\n\ndef list_user_packages(\n    usernam",
+      "total_lines": 1994
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "asyncio",
+        "datetime",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "time",
+        "uuid",
+        "collections:Counter",
+        "concurrent.futures:ThreadPoolExecutor",
+        "contextlib:contextmanager",
+        "email.utils:formatdate",
+        "tempfile:SpooledTemporaryFile",
+        "tempfile:TemporaryFile",
+        "typing:Awaitable",
+        "typing:Callable",
+        "typing:List",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:Type",
+        "pydantic",
+        "requests",
+        "fastapi:APIRouter",
+        "fastapi:BackgroundTasks",
+        "fastapi:Depends",
+        "fastapi:FastAPI",
+        "fastapi:File",
+        "fastapi:Form",
+        "fastapi:Header"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/mamba-org/quetz/main/README.md",
+      "content_excerpt": "![quetz header image](docs/assets/quetz_header.png)\n\n## The Open-Source Server for Conda Packages\n\n<table>\n<thead align=\"center\" cellspacing=\"10\">\n  <tr>\n    <th colspan=\"3\" align=\"center\" border=\"\">part of mamba-org</th>\n  </tr>\n</thead>\n<tbody>\n  <tr background=\"#FFF\">\n    <td align=\"center\">Package Manager <a href=\"https://github.com/mamba-org/mamba\">mamba</a></td>\n    <td align=\"center\">Package Server <a href=\"https://github.com/mamba-org/quetz\">quetz</a></td>\n    <td align=\"center\">Package Builder <a href=\"https://github.com/mamba-org/boa\">boa</a></td>\n  </tr>\n</tbody>\n</table>\n\n# Quetz\n\n[![Documentation Status](https://readthedocs.org/projects/quetz/badge/?version=latest)](https://quetz.readthedocs.io/en/latest/?badge=latest)\n[![Docker Version](https://img.shields.io/docker/v/mambaorg/quetz/latest?label=docker)](https://hub.docker.com/r/mambaorg/quetz/tags)\n\nThe quetz project is an open source server for conda packages.\nIt is built upon FastAPI with an API-first approach.\nA quetz server can have many users, channels and packages.\nWith quetz, fine-grained permissions on channel and package-name level will be possible.\n\nQuetz has an optional client [`quetz-client`](https://github.com/mamba-org/quetz-client) that can be used to upload packages to a quetz server instance.\n\n## Usage\n\nYou should have [mamba](https://github.com/mamba-org/mamba) or conda installed.\n\nGet `Quetz` sources:\n\n```bash\ngit clone https://github.com/mamba-org/quetz.git\n```\n\nThen create an environment:\n\n```bash\ncd quetz\nmamba env create -f environment.yml\nconda activate quetz\nln -s \"${CONDA_PREFIX}\" .v"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "get_package_members test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"get_package_members(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "main.py",
+          "path": "quetz/main.py",
+          "sha": "db1a36be3550a9bb6b45a85bd0e4984e2f8f3693",
+          "html_url": "https://github.com/mamba-org/quetz/blob/56ab2cfc58c89111637c62f9fc54bec8c97f522e/quetz/main.py",
+          "score": 1.0
+        },
+        {
+          "name": "dao.py",
+          "path": "quetz/dao.py",
+          "sha": "7455ccff12f2e2df9bde5f47f401cebad614c4a3",
+          "html_url": "https://github.com/mamba-org/quetz/blob/56ab2cfc58c89111637c62f9fc54bec8c97f522e/quetz/dao.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "quetz",
+      "count": 32,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "quetz/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_version.py",
+          "path": "quetz/_version.py",
+          "type": "file"
+        },
+        {
+          "name": "authentication",
+          "path": "quetz/authentication",
+          "type": "dir"
+        },
+        {
+          "name": "authorization.py",
+          "path": "quetz/authorization.py",
+          "type": "file"
+        },
+        {
+          "name": "basic_frontend",
+          "path": "quetz/basic_frontend",
+          "type": "dir"
+        },
+        {
+          "name": "channel_data.py",
+          "path": "quetz/channel_data.py",
+          "type": "file"
+        },
+        {
+          "name": "cli.py",
+          "path": "quetz/cli.py",
+          "type": "file"
+        },
+        {
+          "name": "condainfo.py",
+          "path": "quetz/condainfo.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "quetz/config.py",
+          "type": "file"
+        },
+        {
+          "name": "config.toml",
+          "path": "quetz/config.toml",
+          "type": "file"
+        },
+        {
+          "name": "dao.py",
+          "path": "quetz/dao.py",
+          "type": "file"
+        },
+        {
+          "name": "database.py",
+          "path": "quetz/database.py",
+          "type": "file"
+        },
+        {
+          "name": "database_extensions.py",
+          "path": "quetz/database_extensions.py",
+          "type": "file"
+        },
+        {
+          "name": "db_models.py",
+          "path": "quetz/db_models.py",
+          "type": "file"
+        },
+        {
+          "name": "deps.py",
+          "path": "quetz/deps.py",
+          "type": "file"
+        },
+        {
+          "name": "errors.py",
+          "path": "quetz/errors.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "quetz/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "frontend.py",
+          "path": "quetz/frontend.py",
+          "type": "file"
+        },
+        {
+          "name": "hooks.py",
+          "path": "quetz/hooks.py",
+          "type": "file"
+        },
+        {
+          "name": "jobs",
+          "path": "quetz/jobs",
+          "type": "dir"
+        },
+        {
+          "name": "main.py",
+          "path": "quetz/main.py",
+          "type": "file"
+        },
+        {
+          "name": "metrics",
+          "path": "quetz/metrics",
+          "type": "dir"
+        },
+        {
+          "name": "migrations",
+          "path": "quetz/migrations",
+          "type": "dir"
+        },
+        {
+          "name": "pkgstores.py",
+          "path": "quetz/pkgstores.py",
+          "type": "file"
+        },
+        {
+          "name": "repo_data.py",
+          "path": "quetz/repo_data.py",
+          "type": "file"
+        },
+        {
+          "name": "rest_models.py",
+          "path": "quetz/rest_models.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks",
+          "path": "quetz/tasks",
+          "type": "dir"
+        },
+        {
+          "name": "templates",
+          "path": "quetz/templates",
+          "type": "dir"
+        },
+        {
+          "name": "testing",
+          "path": "quetz/testing",
+          "type": "dir"
+        },
+        {
+          "name": "tests",
+          "path": "quetz/tests",
+          "type": "dir"
+        },
+        {
+          "name": "utils.py",
+          "path": "quetz/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "versionorder.py",
+          "path": "quetz/versionorder.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "quetz/__init__.py"
+        },
+        {
+          "name": "_version.py",
+          "path": "quetz/_version.py"
+        },
+        {
+          "name": "authorization.py",
+          "path": "quetz/authorization.py"
+        },
+        {
+          "name": "channel_data.py",
+          "path": "quetz/channel_data.py"
+        },
+        {
+          "name": "cli.py",
+          "path": "quetz/cli.py"
+        },
+        {
+          "name": "condainfo.py",
+          "path": "quetz/condainfo.py"
+        },
+        {
+          "name": "config.py",
+          "path": "quetz/config.py"
+        },
+        {
+          "name": "config.toml",
+          "path": "quetz/config.toml"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "quetz/main.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "0f91f08799289b371d3d638d4e7539502fcae5b6",
+          "html_url": "https://github.com/mamba-org/quetz/commit/0f91f08799289b371d3d638d4e7539502fcae5b6",
+          "message": "chore: update linters (#694)",
+          "author": "Wolf Vollprecht",
+          "date": "2024-04-25T13:47:49Z"
+        },
+        {
+          "sha": "ce3aeb73c6f740fe618f2e36cddf376dd89394a9",
+          "html_url": "https://github.com/mamba-org/quetz/commit/ce3aeb73c6f740fe618f2e36cddf376dd89394a9",
+          "message": "feat: support for copying packages from one channel to another (#680)",
+          "author": "Wolf Vollprecht",
+          "date": "2024-01-31T16:07:35Z"
+        },
+        {
+          "sha": "fd3003ae6e51305d752c0fdc2ac51af554758ce3",
+          "html_url": "https://github.com/mamba-org/quetz/commit/fd3003ae6e51305d752c0fdc2ac51af554758ce3",
+          "message": "chore: introduce typo checker to pre-commit and fix typos (#686)",
+          "author": "Robin Holzinger",
+          "date": "2024-01-31T14:38:07Z"
+        },
+        {
+          "sha": "2d7baeafe7a73f52a20b4d8824927d6c0c61d4f6",
+          "html_url": "https://github.com/mamba-org/quetz/commit/2d7baeafe7a73f52a20b4d8824927d6c0c61d4f6",
+          "message": "feat: add options for soft-deletion of channels and packages (#681)",
+          "author": "Wolf Vollprecht",
+          "date": "2024-01-30T16:16:25Z"
+        },
+        {
+          "sha": "e7b39401781e89f9dadb0f8ed2e9dea43f113c80",
+          "html_url": "https://github.com/mamba-org/quetz/commit/e7b39401781e89f9dadb0f8ed2e9dea43f113c80",
+          "message": "feat: add google authentication proxy middleware plugin (#683)",
+          "author": "Wolf Vollprecht",
+          "date": "2024-01-30T16:01:43Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "get_package_members TODO abuse models this",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "quetz/main.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "0f91f08799289b371d3d638d4e7539502fcae5b6",
+        "html_url": "https://github.com/mamba-org/quetz/commit/0f91f08799289b371d3d638d4e7539502fcae5b6",
+        "message": "chore: update linters (#694)",
+        "author": "Wolf Vollprecht",
+        "date": "2024-04-25T13:47:49Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

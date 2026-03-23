@@ -1,0 +1,506 @@
+{
+  "task_id": "537",
+  "repo_owner": "voxel51",
+  "repo_name": "fiftyone",
+  "file_path": "fiftyone/core/runs.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:09:10+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:09:19+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:09:24+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "fiftyone/core/runs.py",
+    "original_code": "def save_run_results(\n    cls, samples, key, run_results, overwrite=True, cache=True\n):\n    \"\"\"Saves the run results on the collection.\n\n    Args:\n        samples: a :class:`fiftyone.core.collections.SampleCollection`\n        key: a run key\n        run_results: a :class:`RunResults`, or None\n        overwrite (True): whether to overwrite an existing result with the\n            same key\n        cache (True): whether to cache the results on the collection\n    \"\"\"\n    if key is None:\n        return\n\n    dataset = samples._root_dataset\n    run_docs = getattr(dataset._doc, cls._runs_field())\n    run_doc = run_docs[key]\n\n    if run_doc.results:\n        if overwrite:\n            # Must manually delete existing result from GridFS\n            run_doc.results.delete()\n        else:\n            raise ValueError(\n                \"%s with key '%s' already has results\"\n                % (cls._run_str().capitalize(), key)\n            )\n\n    if run_results is None:\n        run_doc.results = None\n    else:\n        # Write run result to GridFS\n        # @todo should we allow `run_results` to contain BSON?\n        results_bytes = run_results.to_str().encode()\n        run_doc.results.put(results_bytes, content_type=\"application/json\")\n\n    # Cache the results for future use in this session\n    if cache:\n        results_cache = getattr(dataset, cls._results_cache_field())\n        results_cache[key] = run_results\n\n    dataset._doc.save()",
+    "satd_comment": "# @todo should we allow `run_results` to contain BSON?",
+    "target_file": {
+      "ok": true,
+      "path": "fiftyone/core/runs.py",
+      "sha": "d4547c0f1697efe4d77ccbbcafe828a4ea8dd008",
+      "download_url": "https://raw.githubusercontent.com/voxel51/fiftyone/develop/fiftyone/core/runs.py",
+      "content_excerpt": "\"\"\"\nDataset runs framework.\n\n| Copyright 2017-2026, Voxel51, Inc.\n| `voxel51.com <https://voxel51.com/>`_\n|\n\"\"\"\nfrom copy import copy, deepcopy\nimport datetime\nimport logging\n\nfrom bson import json_util, DBRef\n\nimport eta.core.serial as etas\nimport eta.core.utils as etau\n\nimport fiftyone.constants as foc\nfrom fiftyone.core.config import Config, Configurable\nfrom fiftyone.core.odm import patch_runs\nfrom fiftyone.core.odm.runs import RunDocument\n\n\nlogger = logging.getLogger(__name__)\n\n\nclass BaseRunInfo(Config):\n    \"\"\"Information about a run on a dataset.\n\n    Args:\n        key: the run key\n        version (None): the version of FiftyOne when the run was executed\n        timestamp (None): the UTC ``datetime`` of the run\n        config (None): the :class:`BaseRunConfig` for the run\n    \"\"\"\n\n    def __init__(self, key, version=None, timestamp=None, config=None):\n        self.key = key\n        self.version = version\n        self.timestamp = timestamp\n        self.config = config\n\n    @classmethod\n    def config_cls(cls):\n        \"\"\"The :class:`BaseRunConfig` class associated with this class.\"\"\"\n        raise NotImplementedError(\"subclass must implement config_cls\")\n\n    @classmethod\n    def _from_doc(cls, doc):\n        return cls(\n            key=doc.key,\n            version=doc.version,\n            timestamp=doc.timestamp,\n            config=cls.config_cls().from_dict(deepcopy(doc.config)),\n        )\n\n\nclass BaseRunConfig(Config):\n    \"\"\"Base class for configuring :class:`BaseRun` instances.\n\n    Args:\n        **kwargs: any leftover keyword arguments after subclasses have done\n            their parsing\n    \"\"\"\n\n    def __init__(self, **kwargs):\n        for key, value in kwargs.items():\n            setattr(self, key, value)\n\n    @property\n    def type(self):\n        \"\"\"The type of run.\"\"\"\n        raise NotImplementedError(\"subclass must implement type\")\n\n    @property\n    def method(self):\n        \"\"\"The name of the method.\"\"\"\n        raise NotImplementedError(\"subclass must implement method\")\n\n    @property\n    def cls(self):\n        \"\"\"The fully-qualified name of this :class:`BaseRunConfig` class.\"\"\"\n        return etau.get_class_name(self)\n\n    @property\n    def run_cls(self):\n        \"\"\"The :class:`BaseRun` class associated with this config.\"\"\"\n        return etau.get_class(self.cls[: -len(\"Config\")])\n\n    def load_credentials(self, **kwargs):\n        \"\"\"Loads any necessary credentials from the given keyword arguments or\n        the relevant FiftyOne config.\n\n        Args:\n            **kwargs: subclass-specific credentials\n        \"\"\"\n        pass\n\n    def build(self):\n        \"\"\"Builds the :class:`BaseRun` instance associated with this config.\n\n        Returns:\n            a :class:`BaseRun` instance\n        \"\"\"\n        return self.run_cls(self)\n\n    def attributes(self):\n        \"\"\"Returns the list of class attributes that will be serialized by\n        :meth:`serialize`.\n\n        Returns:\n            a list of attributes\n        \"\"\"\n        return [\"cls\", \"type\", \"method\"] + super().attributes()\n\n    @classmethod\n    def _virtual_attributes(cls):\n        \"\"\"A list of attributes that are serialized but should *not* be treated\n        as parameters when loading the config class from the database.\n        \"\"\"\n        return [\"cls\", \"type\", \"method\"]\n\n    @classmethod\n    def from_dict(cls, d):\n        \"\"\"Constructs a :class:`BaseRunConfig` from a serialized JSON dict\n        representation of it.\n\n        Args:\n            d: a JSON dict\n\n        Returns:\n            a :class:`BaseRunConfig`\n        \"\"\"\n        config_cls = d.get(\"cls\", None)\n        type = d.get(\"type\", None)\n\n        try:\n            config_cls = etau.get_class(config_cls)\n        except Exception as e:\n            logger.warning(\n                f\"Unable to load {config_cls}; falling back to base class\",\n                exc_info=True,\n            )\n            config_cls = cls.base_config_cls(type)\n\n        for key in config_cls._virtual_attributes():\n            d.pop(key, None)\n\n        return config_cls(**d)\n\n    @staticmethod\n    def base_config_cls(type):\n        \"\"\"Returns the config class for the given run type.\n\n        Args:\n            type: a :attr:`BaseRunConfig.type`\n\n        Returns:\n            a :class:`BaseRunConfig` subclass\n        \"\"\"\n        import fiftyone.core.annotation as foa\n        import fiftyone.core.brain as fob\n        import fiftyone.core.evaluation as foe\n        import fiftyone.utils.eval as foue\n\n        # pylint: disable=import-error,no-name-in-module\n        import fiftyone.brain.similarity as fbs\n        import fiftyone.brain.visualization as fbv\n        import fiftyone.brain.internal.core.hardness as fbh\n        import fiftyone.brain.internal.core.mistakenness as fbm\n        import fiftyone.brain.internal.core.uniqueness as fbu\n\n        if type == \"annotation\":\n            return foa.AnnotationMethodConfig\n        if type == \"brain\":\n            return fob.BrainMethodConfig\n        if type == \"evaluation\":\n            return foe.EvaluationMethodConfig\n        if type == \"run\":\n            return RunConfig\n\n        if type == \"regression\":\n            return foue.RegressionEvaluationConfig\n        if type == \"classification\":\n            return foue.ClassificationEvaluationConfig\n        if type == \"detection\":\n            return foue.DetectionEvaluationConfig\n        if type == \"segmentation\":\n            return foue.SegmentationEvaluationConfig\n\n        if type == \"similarity\":\n            return fbs.SimilarityConfig\n        if type == \"visualization\":\n            return fbv.VisualizationConfig\n        if type == \"hardness\":\n            return fbh.HardnessConfig\n        if type == \"mistakenness\":\n            return fbm.MistakennessMethodConfig\n        if type == \"uniqueness\":\n            return fbu.UniquenessConfig\n\n        logger.debug(\"Unrecognized run type '%s'\", type)\n        return RunConfig\n\n\nclass BaseRun(Configurable):\n    \"\"\"Base class for methods that can be run on a dataset.\n\n    Subclasses will typically declare an interface method that handles\n    performing the actual run. The function of this base class is to declare\n    how to validate that a run is valid and how to cleanup after a run.\n\n    Args:\n        config: a :class:`BaseRunConfig`\n    \"\"\"\n\n    @classmethod\n    def run_info_cls(cls):\n        \"\"\"The :class:`BaseRunInfo` class associated with this class.\"\"\"\n        raise NotImplementedError(\"subclass must implement run_info_cls()\")\n\n    @classmethod\n    def _runs_field(cls):\n        \"\"\"The :class:`fiftyone.core.odm.dataset.DatasetDocument` field in\n        which these runs are stored.\n        \"\"\"\n        raise NotImplementedError(\"subclass must implement _runs_field()\")\n\n    @classmethod\n    def _run_str(cls):\n        \"\"\"A string to use when referring to these runs in log messages.\"\"\"\n        raise NotImplementedError(\"subclass must implement _run_str()\")\n\n    @classmethod\n    def _patch_function(cls):\n        \"\"\"A function that can patch any ReferenceField issues with a dataset's\n        runs.\n        \"\"\"\n        raise NotImplementedError(\"subclass must implement _patch_function()\")\n\n    @classmethod\n    def _results_cache_field(cls):\n        \"\"\"The :class:`fiftyone.core.dataset.Dataset` field that stores the\n        results cache for these runs.\n        \"\"\"\n        raise NotImplementedError(\n            \"subclass must implement _results_cache_field()\"\n        )\n\n    def ensure_requirements(self):\n        \"\"\"Ensures that any necessary packages to execute this run are\n        installed.\n\n        Runs should respect ``fiftyone.config.requirement_error_level`` when\n        handling errors.\n        \"\"\"\n        pass\n\n    def ensure_usage_requirements(self):\n        \"\"\"Ensures that any necessary packages to use existing results for this\n        run are installed.\n\n        Runs should respect ``fiftyone.config.requirement_error_level`` when\n        handling errors.\n        \"\"\"\n        pass\n\n    def get_fields(self, samples, key):\n        \"\"\"Gets the fields that were involved in the given run.\n\n        Args:\n            samples: a :class:`fiftyone.core.collections.SampleCollection`\n            key: a run key\n\n        Returns:\n            a list of fields\n        \"\"\"\n        return []\n\n    def rename(self, samples, key, new_key):\n        \"\"\"Performs any necessary operations required to rename this run's key.\n\n        Args:\n            samples: a :class:`fiftyone.core.collections.SampleCollection`\n            key: a run key\n            new_key: a new run key\n        \"\"\"\n        pass\n\n    def cleanup(self, samples, key):\n        \"\"\"Cleans up the results of the run with the given key from the\n        collection.\n\n        Args:\n            samples: a :class:`fiftyone.core.collections.SampleCollection`\n            key: a run key\n        \"\"\"\n        pass\n\n    def register_run(self, samples, key, overwrite=True, cleanup=True):\n        \"\"\"Registers a run of this method under the given key on the given\n        collection.\n\n        Args:\n            samples: a :class:`fiftyone.core.collections.SampleCollection`\n            key: a run key\n            overwrite (True): whether to allow overwriting an existing run of\n                the same type\n            cleanup (True): whether to execute an existing run's\n                :meth:`BaseRun.cleanup` method when overwriting it\n        \"\"\"\n        if key is None:\n            return\n\n        self.validate_run(samples, key, overwrite=overwrite)\n        version = foc.VERSION\n        timestamp = datetime.datetime.utcnow()\n        run_info_cls = self.run_info_cls()\n        run_info = run_info_cls(\n            key, version=version, timestamp=timestamp, config=self.config\n        )\n        self.save_run_info(\n            samples, run_info, overwrite=overwrite, cleanup=cleanup\n        )\n\n    def validate_run(self, samples, key, overwrite=True):\n        \"\"\"Validates that the collection can accept this run.\n\n        The run may be invalid if, for example, a run of a different type has\n        already been run under the same key and thus overwriting it would cause\n        ambiguity on how to cleanup the results.\n\n        Args:\n            samples: a :class:`fiftyone.core.collections.SampleCollection`\n            key: a run key\n            overwrite (True): whether to allow overwriting an existing run of\n                the same type\n\n        Raises:\n            ValueError: if the run is invalid\n        \"\"\"\n        if not etau.is_str(key) or not key.isidentifier():\n            raise ValueError(\n                \"Invalid %s key '%s'. Keys must be valid variable names\"\n                % (self._run_str(), key)\n            )\n\n        if key not in self.list_runs(samples):\n            return\n\n        if not overwrite:\n            raise ValueError(\n                \"%s with key '%s' already exists\"\n                % (self._run_str().capitalize(), key)\n            )\n\n        try:\n            existing_info = self.get_run_info(samples, key)\n        except:\n            # If the old info can't be loaded, always let the user overwrite it\n            return\n\n        if type(self.config) != type(existing_info.config):\n            raise ValueError(\n                \"Cannot overwrite existing %s '%s' of type %s with one of \"\n                \"type %s; please choose a different key or delete the \"\n                \"existing one first\"\n                % (\n                    self._run_str(),\n                    key,\n                    type(existing_info.config),\n                    type(self.config),\n                )\n            )\n\n        self._validate_run(samples, key, existing_info)\n\n    def _validate_run(self, samples, key, existing_info):\n        \"\"\"Subclass-specific validation when a run with the given key already\n        exists.\n\n        Args:\n            samples: a :class:`fiftyone.core.collections.SampleCollection`\n            key: a run key\n            existing_info: a :class:`BaseRunInfo`\n\n        Raises:\n            ValueError: if th",
+      "total_lines": 1174
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "copy:copy",
+        "copy:deepcopy",
+        "datetime",
+        "logging",
+        "bson:json_util",
+        "bson:DBRef",
+        "eta.core.serial",
+        "eta.core.utils",
+        "fiftyone.constants",
+        "fiftyone.core.config:Config",
+        "fiftyone.core.config:Configurable",
+        "fiftyone.core.odm:patch_runs",
+        "fiftyone.core.odm.runs:RunDocument",
+        "fiftyone.core.annotation",
+        "fiftyone.core.brain",
+        "fiftyone.core.evaluation",
+        "fiftyone.utils.eval",
+        "fiftyone.brain.similarity",
+        "fiftyone.brain.visualization",
+        "fiftyone.brain.internal.core.hardness",
+        "fiftyone.brain.internal.core.mistakenness",
+        "fiftyone.brain.internal.core.uniqueness",
+        "fiftyone.core.view",
+        "fiftyone.core.view",
+        "fiftyone.core.annotation",
+        "fiftyone.core.brain",
+        "fiftyone.core.evaluation",
+        "fiftyone.utils.eval",
+        "fiftyone.brain.similarity",
+        "fiftyone.brain.visualization"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/voxel51/fiftyone/develop/README.md",
+      "content_excerpt": "<div align=\"center\">\n<p align=\"center\">\n\n<!-- prettier-ignore -->\n<img src=\"https://user-images.githubusercontent.com/25985824/106288517-2422e000-6216-11eb-871d-26ad2e7b1e59.png\" height=\"55px\"> &nbsp;\n<img src=\"https://user-images.githubusercontent.com/25985824/106288518-24bb7680-6216-11eb-8f10-60052c519586.png\" height=\"50px\">\n\n**The open-source tool for building high-quality datasets and computer vision\nmodels**\n\n---\n\n<!-- prettier-ignore -->\n<a href=\"https://voxel51.com/fiftyone\">Website</a> •\n<a href=\"https://voxel51.com/docs/fiftyone\">Docs</a> •\n<a href=\"https://colab.research.google.com/github/voxel51/fiftyone-examples/blob/master/examples/quickstart.ipynb\">Try it Now</a> •\n<a href=\"https://voxel51.com/docs/fiftyone/getting_started_guides/index.html\">Getting Started Guides</a> •\n<a href=\"https://voxel51.com/docs/fiftyone/tutorials/index.html\">Tutorials</a> •\n<a href=\"https://voxel51.com/blog/\">Blog</a> •\n<a href=\"https://discord.gg/fiftyone-community\">Community</a>\n\n[![PyPI python](https://img.shields.io/pypi/pyversions/fiftyone)](https://pypi.org/project/fiftyone)\n[![PyPI version](https://badge.fury.io/py/fiftyone.svg)](https://pypi.org/project/fiftyone)\n[![Downloads](https://static.pepy.tech/badge/fiftyone)](https://pepy.tech/project/fiftyone)\n[![Docker Pulls](https://badgen.net/docker/pulls/voxel51/fiftyone?icon=docker&label=pulls)](https://hub.docker.com/r/voxel51/fiftyone/)\n[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)\n[![Discord](https://img.shields.io/badge/Discord-7289DA?logo=discord&logoColor=white)](https://discord.gg/fifty"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "save_run_results test",
+      "count": 2,
+      "items": [
+        {
+          "name": "run_tests.py",
+          "path": "tests/unittests/run_tests.py",
+          "sha": "b410e8852b24d8b5169b92f34fcaa45a1a8bc1bd",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/tests/unittests/run_tests.py",
+          "score": 1.0
+        },
+        {
+          "name": "import_export_tests.py",
+          "path": "tests/unittests/import_export_tests.py",
+          "sha": "b7c4fead14c9f921fcb61b1841591889d1be2732",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/tests/unittests/import_export_tests.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"save_run_results(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "runs.py",
+          "path": "fiftyone/core/runs.py",
+          "sha": "d4547c0f1697efe4d77ccbbcafe828a4ea8dd008",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/core/runs.py",
+          "score": 1.0
+        },
+        {
+          "name": "developing_plugins.rst",
+          "path": "docs/source/plugins/developing_plugins.rst",
+          "sha": "d29ce20063f7d686a3389dd08e3ddc51b7ac973b",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/docs/source/plugins/developing_plugins.rst",
+          "score": 1.0
+        },
+        {
+          "name": "cvat.py",
+          "path": "fiftyone/utils/cvat.py",
+          "sha": "cfa45e22a48e5863464885c6bdff6ba81e8bbd4d",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/utils/cvat.py",
+          "score": 1.0
+        },
+        {
+          "name": "annotations.py",
+          "path": "fiftyone/utils/annotations.py",
+          "sha": "891310cceca1d1a37d0dc39f384d3cb4e79c2ae8",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/utils/annotations.py",
+          "score": 1.0
+        },
+        {
+          "name": "detection.py",
+          "path": "fiftyone/utils/eval/detection.py",
+          "sha": "6dd1f46645e0f33a7ce3950ea673f19af7d635ea",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/utils/eval/detection.py",
+          "score": 1.0
+        },
+        {
+          "name": "importers.py",
+          "path": "fiftyone/utils/data/importers.py",
+          "sha": "41392b50f6c174929b338f7af27d3b7246ca641d",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/utils/data/importers.py",
+          "score": 1.0
+        },
+        {
+          "name": "segmentation.py",
+          "path": "fiftyone/utils/eval/segmentation.py",
+          "sha": "e2b13cebdaa64c2eaaa3d3b6ab38f9c606737da4",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/utils/eval/segmentation.py",
+          "score": 1.0
+        },
+        {
+          "name": "regression.py",
+          "path": "fiftyone/utils/eval/regression.py",
+          "sha": "76b1d248a74382beeb35e57ff785549a152b32a1",
+          "html_url": "https://github.com/voxel51/fiftyone/blob/884f6681cf9ebe60966ff4269fb5429a473307ff/fiftyone/utils/eval/regression.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "fiftyone/core",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "fiftyone/core/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aggregations.py",
+          "path": "fiftyone/core/aggregations.py",
+          "type": "file"
+        },
+        {
+          "name": "annotation",
+          "path": "fiftyone/core/annotation",
+          "type": "dir"
+        },
+        {
+          "name": "brain.py",
+          "path": "fiftyone/core/brain.py",
+          "type": "file"
+        },
+        {
+          "name": "camera.py",
+          "path": "fiftyone/core/camera.py",
+          "type": "file"
+        },
+        {
+          "name": "cli.py",
+          "path": "fiftyone/core/cli.py",
+          "type": "file"
+        },
+        {
+          "name": "clips.py",
+          "path": "fiftyone/core/clips.py",
+          "type": "file"
+        },
+        {
+          "name": "collections.py",
+          "path": "fiftyone/core/collections.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "fiftyone/core/config.py",
+          "type": "file"
+        },
+        {
+          "name": "context.py",
+          "path": "fiftyone/core/context.py",
+          "type": "file"
+        },
+        {
+          "name": "dataset.py",
+          "path": "fiftyone/core/dataset.py",
+          "type": "file"
+        },
+        {
+          "name": "document.py",
+          "path": "fiftyone/core/document.py",
+          "type": "file"
+        },
+        {
+          "name": "evaluation.py",
+          "path": "fiftyone/core/evaluation.py",
+          "type": "file"
+        },
+        {
+          "name": "expressions.py",
+          "path": "fiftyone/core/expressions.py",
+          "type": "file"
+        },
+        {
+          "name": "fields.py",
+          "path": "fiftyone/core/fields.py",
+          "type": "file"
+        },
+        {
+          "name": "frame.py",
+          "path": "fiftyone/core/frame.py",
+          "type": "file"
+        },
+        {
+          "name": "frame_utils.py",
+          "path": "fiftyone/core/frame_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "groups.py",
+          "path": "fiftyone/core/groups.py",
+          "type": "file"
+        },
+        {
+          "name": "json.py",
+          "path": "fiftyone/core/json.py",
+          "type": "file"
+        },
+        {
+          "name": "labels.py",
+          "path": "fiftyone/core/labels.py",
+          "type": "file"
+        },
+        {
+          "name": "logging.py",
+          "path": "fiftyone/core/logging.py",
+          "type": "file"
+        },
+        {
+          "name": "map",
+          "path": "fiftyone/core/map",
+          "type": "dir"
+        },
+        {
+          "name": "media.py",
+          "path": "fiftyone/core/media.py",
+          "type": "file"
+        },
+        {
+          "name": "metadata.py",
+          "path": "fiftyone/core/metadata.py",
+          "type": "file"
+        },
+        {
+          "name": "models.py",
+          "path": "fiftyone/core/models.py",
+          "type": "file"
+        },
+        {
+          "name": "odm",
+          "path": "fiftyone/core/odm",
+          "type": "dir"
+        },
+        {
+          "name": "patches.py",
+          "path": "fiftyone/core/patches.py",
+          "type": "file"
+        },
+        {
+          "name": "plots",
+          "path": "fiftyone/core/plots",
+          "type": "dir"
+        },
+        {
+          "name": "runs.py",
+          "path": "fiftyone/core/runs.py",
+          "type": "file"
+        },
+        {
+          "name": "sample.py",
+          "path": "fiftyone/core/sample.py",
+          "type": "file"
+        },
+        {
+          "name": "service.py",
+          "path": "fiftyone/core/service.py",
+          "type": "file"
+        },
+        {
+          "name": "session",
+          "path": "fiftyone/core/session",
+          "type": "dir"
+        },
+        {
+          "name": "singletons.py",
+          "path": "fiftyone/core/singletons.py",
+          "type": "file"
+        },
+        {
+          "name": "stages.py",
+          "path": "fiftyone/core/stages.py",
+          "type": "file"
+        },
+        {
+          "name": "state.py",
+          "path": "fiftyone/core/state.py",
+          "type": "file"
+        },
+        {
+          "name": "storage.py",
+          "path": "fiftyone/core/storage.py",
+          "type": "file"
+        },
+        {
+          "name": "threed",
+          "path": "fiftyone/core/threed",
+          "type": "dir"
+        },
+        {
+          "name": "uid.py",
+          "path": "fiftyone/core/uid.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "fiftyone/core/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "validation.py",
+          "path": "fiftyone/core/validation.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "fiftyone/core/__init__.py"
+        },
+        {
+          "name": "aggregations.py",
+          "path": "fiftyone/core/aggregations.py"
+        },
+        {
+          "name": "brain.py",
+          "path": "fiftyone/core/brain.py"
+        },
+        {
+          "name": "camera.py",
+          "path": "fiftyone/core/camera.py"
+        },
+        {
+          "name": "cli.py",
+          "path": "fiftyone/core/cli.py"
+        },
+        {
+          "name": "clips.py",
+          "path": "fiftyone/core/clips.py"
+        },
+        {
+          "name": "collections.py",
+          "path": "fiftyone/core/collections.py"
+        },
+        {
+          "name": "config.py",
+          "path": "fiftyone/core/config.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "fiftyone/core/runs.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f488054dabf83489ad898241c0990e93ef1ab67c",
+          "html_url": "https://github.com/voxel51/fiftyone/commit/f488054dabf83489ad898241c0990e93ef1ab67c",
+          "message": "FOEPD-2833: Update copyright notices to 2026 (#6708)",
+          "author": "Eric Shull",
+          "date": "2026-01-05T16:39:45Z"
+        },
+        {
+          "sha": "a39b22b90f39ecba3c4dc6bd0d774cc209542298",
+          "html_url": "https://github.com/voxel51/fiftyone/commit/a39b22b90f39ecba3c4dc6bd0d774cc209542298",
+          "message": "Improve error messages for loading failures (#6573)\n\n* Improve error messages for loading failures\n\n* lint",
+          "author": "Eric Hofesmann",
+          "date": "2025-11-13T19:34:14Z"
+        },
+        {
+          "sha": "a5b651383a5317d59c4d1bc78c6701934b2f9aad",
+          "html_url": "https://github.com/voxel51/fiftyone/commit/a5b651383a5317d59c4d1bc78c6701934b2f9aad",
+          "message": "allow runs to be associated will full datasets",
+          "author": "brimoor",
+          "date": "2025-02-26T05:32:22Z"
+        },
+        {
+          "sha": "574a5776c232381a8c6c5375c41cdcda3bbbb93a",
+          "html_url": "https://github.com/voxel51/fiftyone/commit/574a5776c232381a8c6c5375c41cdcda3bbbb93a",
+          "message": "2025 copyright (#5346)",
+          "author": "Benjamin Kane",
+          "date": "2025-01-06T15:11:39Z"
+        },
+        {
+          "sha": "b2734ab695e94bf42bf226ae7dfa4c9a7ebe1378",
+          "html_url": "https://github.com/voxel51/fiftyone/commit/b2734ab695e94bf42bf226ae7dfa4c9a7ebe1378",
+          "message": "Capturing error in loading a specific config class better and bumping log level (#5213)\n\n* Capturing the error better and bumping log level\r\n\r\n* Updating error message",
+          "author": "prerna",
+          "date": "2024-12-13T20:57:22Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "save_run_results todo should allow run_results contain",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "fiftyone/core/runs.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "f488054dabf83489ad898241c0990e93ef1ab67c",
+        "html_url": "https://github.com/voxel51/fiftyone/commit/f488054dabf83489ad898241c0990e93ef1ab67c",
+        "message": "FOEPD-2833: Update copyright notices to 2026 (#6708)",
+        "author": "Eric Shull",
+        "date": "2026-01-05T16:39:45Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

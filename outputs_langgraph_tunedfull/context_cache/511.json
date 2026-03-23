@@ -1,0 +1,387 @@
+{
+  "task_id": "511",
+  "repo_owner": "canonical",
+  "repo_name": "operator",
+  "file_path": "test/test_pebble.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:02:37+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "test_change_error",
+    "satd_line": 104,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 1,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:02:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:02:51+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "test/test_pebble.py",
+    "original_code": "def test_exec_streaming(self):\n    process = self.client.exec(['cat'])\n\n    def stdin_thread():\n        for line in ['one\\n', '2\\n', 'THREE\\n']:\n            process.stdin.write(line)\n            process.stdin.flush()\n            time.sleep(0.1)\n        process.stdin.close()\n\n    threading.Thread(target=stdin_thread).start()\n\n    # TODO: fix OSError with \"for line in process.stdout: ...\":\n    # OSError: read() should have returned a bytes object, not 'str'\n    reads = []\n    while True:\n        chunk = process.stdout.read()\n        if not chunk:\n            break\n        reads.append(chunk)\n\n    process.wait()\n\n    self.assertEqual(reads, ['one\\n', '2\\n', 'THREE\\n'])",
+    "satd_comment": "# TODO: fix OSError with \"for line in process.stdout: ...\":\n# OSError: read() should have returned a bytes object, not 'str'",
+    "target_file": {
+      "ok": true,
+      "path": "test/test_pebble.py",
+      "sha": "8b97f18cd2ac2d255da80a2b6629459a534251f1",
+      "download_url": "https://raw.githubusercontent.com/canonical/operator/main/test/test_pebble.py",
+      "content_excerpt": "# Copyright 2021 Canonical Ltd.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nfrom __future__ import annotations\n\nimport dataclasses\nimport datetime\nimport email.message\nimport email.parser\nimport io\nimport json\nimport signal\nimport tempfile\nimport typing\nimport unittest\nimport unittest.util\n\nimport pytest\nimport websocket\n\nimport test.fake_pebble as fake_pebble\nfrom ops import pebble\nfrom ops._private import yaml\n\n# Ensure unittest diffs don't get truncated like \"[17 chars]\"\nunittest.util._MAX_LENGTH = 1000\n\n\ndef datetime_utc(y: int, m: int, d: int, hour: int, min: int, sec: int, micro: int = 0):\n    tz = datetime.timezone.utc\n    return datetime.datetime(y, m, d, hour, min, sec, micro, tzinfo=tz)\n\n\ndef datetime_nzdt(y: int, m: int, d: int, hour: int, min: int, sec: int, micro: int = 0):\n    tz = datetime.timezone(datetime.timedelta(hours=13))\n    return datetime.datetime(y, m, d, hour, min, sec, micro, tzinfo=tz)\n\n\nclass TestTypes:\n    def test_error(self):\n        error = pebble.Error('error')\n        assert isinstance(error, Exception)\n\n    def test_timeout_error(self):\n        error = pebble.TimeoutError('timeout!')\n        assert isinstance(error, pebble.Error)\n        assert isinstance(error, TimeoutError)\n        assert str(error) == 'timeout!'\n\n    def test_connection_error(self):\n        error = pebble.ConnectionError('connerr!')\n        assert isinstance(error, pebble.Error)\n        assert str(error) == 'connerr!'\n\n    def test_protocol_error(self):\n        error = pebble.ProtocolError('protoerr!')\n        assert isinstance(error, pebble.Error)\n        assert str(error) == 'protoerr!'\n\n    def test_path_error(self):\n        error = pebble.PathError('not-found', 'thing not found')\n        assert isinstance(error, pebble.Error)\n        assert error.kind == 'not-found'\n        assert error.message == 'thing not found'\n        assert str(error) == 'not-found - thing not found'\n\n    def test_api_error(self):\n        body = {\n            'result': {'message': 'no services to start provided'},\n            'status': 'Bad Request',\n            'status-code': 400,\n            'type': 'error',\n        }\n        error = pebble.APIError(body, 400, 'Bad Request', 'no services')\n        assert isinstance(error, pebble.Error)\n        assert error.body == body\n        assert error.code == 400\n        assert error.status == 'Bad Request'\n        assert error.message == 'no services'\n        assert str(error) == 'no services'\n\n    def test_change_error(self):\n        change = pebble.Change(\n            id=pebble.ChangeID('1234'),\n            kind='start',\n            summary='Start service \"foo\"',\n            status='Done',\n            tasks=[],\n            ready=True,\n            err='Some error',\n            spawn_time=datetime.datetime.now(),\n            ready_time=datetime.datetime.now(),\n        )\n        assert change.err is not None\n        error = pebble.ChangeError(change.err, change)\n        assert isinstance(error, pebble.Error)\n        assert error.err == 'Some error'\n        assert error.change == change\n        assert str(error) == 'Some error'\n\n    def test_change_error_with_task_logs(self):\n        change = pebble.Change(\n            id=pebble.ChangeID('1234'),\n            kind='start',\n            summary='Start service \"foo\"',\n            status='Done',\n            tasks=[\n                pebble.Task(\n                    id=pebble.TaskID('12345'),\n                    kind='start',\n                    summary='Start service \"foo\"',\n                    status='Error',\n                    log=['LINE1', 'LINE2'],\n                    progress=pebble.TaskProgress(label='foo', done=3, total=7),\n                    spawn_time=datetime_nzdt(2021, 1, 28, 14, 37, 3, 270218),\n                    ready_time=datetime_nzdt(2021, 1, 28, 14, 37, 2, 247158),\n                ),\n                pebble.Task(\n                    id=pebble.TaskID('12346'),\n                    kind='start',\n                    summary='Start service \"bar\"',\n                    status='Error',\n                    log=[],\n                    progress=pebble.TaskProgress(label='foo', done=3, total=7),\n                    spawn_time=datetime_nzdt(2021, 1, 28, 14, 37, 3, 270218),\n                    ready_time=datetime_nzdt(2021, 1, 28, 14, 37, 2, 247158),\n                ),\n                pebble.Task(\n                    id=pebble.TaskID('12347'),\n                    kind='start',\n                    summary='Start service \"bazz\"',\n                    status='Error',\n                    log=['single log'],\n                    progress=pebble.TaskProgress(label='foo', done=3, total=7),\n                    spawn_time=datetime_nzdt(2021, 1, 28, 14, 37, 3, 270218),\n                    ready_time=datetime_nzdt(2021, 1, 28, 14, 37, 2, 247158),\n                ),\n            ],\n            ready=True,\n            err='Some error',\n            spawn_time=datetime.datetime.now(),\n            ready_time=datetime.datetime.now(),\n        )\n        assert change.err is not None\n        error = pebble.ChangeError(change.err, change)\n        assert isinstance(error, pebble.Error)\n        assert error.err == 'Some error'\n        assert error.change == change\n        assert (\n            str(error)\n            == \"\"\"Some error\n----- Logs from task 0 -----\nLINE1\nLINE2\n----- Logs from task 2 -----\nsingle log\n-----\"\"\"\n        )\n\n    def test_warning_state(self):\n        assert list(pebble.WarningState) == [\n            pebble.WarningState.ALL,\n            pebble.WarningState.PENDING,\n        ]\n        assert pebble.WarningState.ALL.value == 'all'\n        assert pebble.WarningState.PENDING.value == 'pending'\n\n    def test_change_state(self):\n        assert list(pebble.ChangeState) == [\n            pebble.ChangeState.ALL,\n            pebble.ChangeState.IN_PROGRESS,\n            pebble.ChangeState.READY,\n        ]\n        assert pebble.ChangeState.ALL.value == 'all'\n        assert pebble.ChangeState.IN_PROGRESS.value == 'in-progress'\n        assert pebble.ChangeState.READY.value == 'ready'\n\n    def test_system_info_init(self):\n        info = pebble.SystemInfo(version='1.2.3')\n        assert info.version == '1.2.3'\n\n    def test_system_info_from_dict(self):\n        info = pebble.SystemInfo.from_dict({'version': '3.2.1'})\n        assert info.version == '3.2.1'\n\n    def test_warning_init(self):\n        warning = pebble.Warning(\n            message='Beware!',\n            first_added=datetime_utc(2021, 1, 1, 1, 1, 1),\n            last_added=datetime_utc(2021, 1, 26, 2, 3, 4),\n            last_shown=None,\n            expire_after='1s',\n            repeat_after='2s',\n        )\n        assert warning.message == 'Beware!'\n        assert warning.first_added == datetime_utc(2021, 1, 1, 1, 1, 1)\n        assert warning.last_added == datetime_utc(2021, 1, 26, 2, 3, 4)\n        assert warning.last_shown is None\n        assert warning.expire_after == '1s'\n        assert warning.repeat_after == '2s'\n\n    def test_warning_from_dict(self):\n        d: pebble._WarningDict = {\n            'message': 'Look out...',\n            'first-added': '2020-12-25T17:18:54.016273778+13:00',\n            'last-added': '2021-01-26T17:01:02.12345+13:00',\n            'expire-after': '1s',\n            'repeat-after': '2s',\n        }\n        warning = pebble.Warning.from_dict(d)\n        assert warning.message == 'Look out...'\n        assert warning.first_added == datetime_nzdt(2020, 12, 25, 17, 18, 54, 16274)\n        assert warning.last_added == datetime_nzdt(2021, 1, 26, 17, 1, 2, 123450)\n        assert warning.last_shown is None\n        assert warning.expire_after == '1s'\n        assert warning.repeat_after == '2s'\n\n        d['last-shown'] = None\n        warning = pebble.Warning.from_dict(d)\n        assert warning.last_shown is None\n\n        d['last-shown'] = '2021-08-04T03:02:01.000000000+13:00'\n        warning = pebble.Warning.from_dict(d)\n        assert warning.last_shown == datetime_nzdt(2021, 8, 4, 3, 2, 1)\n\n        d['first-added'] = '2020-02-03T02:00:40.000000+00:00'\n        d['last-added'] = '2021-03-04T03:01:41.100000+00:00'\n        d['last-shown'] = '2022-04-05T06:02:42.200000+00:00'\n        warning = pebble.Warning.from_dict(d)\n        assert warning.first_added == datetime_utc(2020, 2, 3, 2, 0, 40, 0)\n        assert warning.last_added == datetime_utc(2021, 3, 4, 3, 1, 41, 100000)\n        assert warning.last_shown == datetime_utc(2022, 4, 5, 6, 2, 42, 200000)\n\n    def test_task_progress_init(self):\n        tp = pebble.TaskProgress(label='foo', done=3, total=7)\n        assert tp.label == 'foo'\n        assert tp.done == 3\n        assert tp.total == 7\n\n    def test_task_progress_from_dict(self):\n        tp = pebble.TaskProgress.from_dict({\n            'label': 'foo',\n            'done': 3,\n            'total': 7,\n        })\n        assert tp.label == 'foo'\n        assert tp.done == 3\n        assert tp.total == 7\n\n    def test_task_id(self):\n        task_id = pebble.TaskID('1234')\n        assert task_id == '1234'\n\n    def test_task_init(self):\n        task = pebble.Task(\n            id=pebble.TaskID('42'),\n            kind='start',\n            summary='Start service \"svc\"',\n            status='Done',\n            log=[],\n            progress=pebble.TaskProgress(label='foo', done=3, total=7),\n            spawn_time=datetime_nzdt(2021, 1, 28, 14, 37, 3, 270218),\n            ready_time=datetime_nzdt(2021, 1, 28, 14, 37, 2, 247158),\n        )\n        assert task.id == '42'\n        assert task.kind == 'start'\n        assert task.summary == 'Start service \"svc\"'\n        assert task.status == 'Done'\n        assert task.log == []\n        assert task.progress.label == 'foo'\n        assert task.progress.done == 3\n        assert task.progress.total == 7\n        assert task.spawn_time == datetime_nzdt(2021, 1, 28, 14, 37, 3, 270218)\n        assert task.ready_time == datetime_nzdt(2021, 1, 28, 14, 37, 2, 247158)\n        assert task.data == {}\n\n    def test_task_from_dict(self):\n        d: pebble._TaskDict = {\n            'id': '78',\n            'kind': 'start',\n            'progress': {\n                'done': 1,\n                'label': '',\n                'total': 1,\n            },\n            'ready-time': '2021-01-28T14:37:03.270218778+13:00',\n            'spawn-time': '2021-01-28T14:37:02.247158162+13:00',\n            'status': 'Done',\n            'summary': 'Start service \"svc\"',\n            'data': {'exit-code': 42},\n        }\n        task = pebble.Task.from_dict(d)\n        assert task.id == '78'\n        assert task.kind == 'start'\n        assert task.summary == 'Start service \"svc\"'\n        assert task.status == 'Done'\n        assert task.log == []\n        assert task.progress.label == ''\n        assert task.progress.done == 1\n        assert task.progress.total == 1\n        assert task.ready_time == datetime_nzdt(2021, 1, 28, 14, 37, 3, 270219)\n        assert task.spawn_time == datetime_nzdt(2021, 1, 28, 14, 37, 2, 247158)\n        assert task.data == {'exit-code': 42}\n\n        d['ready-time'] = '2021-01-28T14:37:03.270218778+00:00'\n        d['spawn-time'] = '2021-01-28T14:37:02.247158162+00:00'\n        task = pebble.Task.from_dict(d)\n        assert task.ready_time == datetime_utc(2021, 1, 28, 14, 37, 3, 270219)\n        assert task.spawn_time == datetime_utc(2021, 1, 28, 14, 37, 2, 247158)\n\n    def test_change_id(self):\n        change_id = pebble.ChangeID('1234')\n        assert change_id == '1234'\n\n    def test_change_init(self):\n        change = pebble.Change(\n            id=pe",
+      "total_lines": 4105
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 104,
+      "start_line": 84,
+      "end_line": 124,
+      "matched_line": "        )",
+      "excerpt": "84:         }\n85:         error = pebble.APIError(body, 400, 'Bad Request', 'no services')\n86:         assert isinstance(error, pebble.Error)\n87:         assert error.body == body\n88:         assert error.code == 400\n89:         assert error.status == 'Bad Request'\n90:         assert error.message == 'no services'\n91:         assert str(error) == 'no services'\n92: \n93:     def test_change_error(self):\n94:         change = pebble.Change(\n95:             id=pebble.ChangeID('1234'),\n96:             kind='start',\n97:             summary='Start service \"foo\"',\n98:             status='Done',\n99:             tasks=[],\n100:             ready=True,\n101:             err='Some error',\n102:             spawn_time=datetime.datetime.now(),\n103:             ready_time=datetime.datetime.now(),\n104:         )\n105:         assert change.err is not None\n106:         error = pebble.ChangeError(change.err, change)\n107:         assert isinstance(error, pebble.Error)\n108:         assert error.err == 'Some error'\n109:         assert error.change == change\n110:         assert str(error) == 'Some error'\n111: \n112:     def test_change_error_with_task_logs(self):\n113:         change = pebble.Change(\n114:             id=pebble.ChangeID('1234'),\n115:             kind='start',\n116:             summary='Start service \"foo\"',\n117:             status='Done',\n118:             tasks=[\n119:                 pebble.Task(\n120:                     id=pebble.TaskID('12345'),\n121:                     kind='start',\n122:                     summary='Start service \"foo\"',\n123:                     status='Error',\n124:                     log=['LINE1', 'LINE2'],"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "test_change_error",
+      "start_line": 93,
+      "end_line": 110,
+      "source": "    def test_change_error(self):\n        change = pebble.Change(\n            id=pebble.ChangeID('1234'),\n            kind='start',\n            summary='Start service \"foo\"',\n            status='Done',\n            tasks=[],\n            ready=True,\n            err='Some error',\n            spawn_time=datetime.datetime.now(),\n            ready_time=datetime.datetime.now(),\n        )\n        assert change.err is not None\n        error = pebble.ChangeError(change.err, change)\n        assert isinstance(error, pebble.Error)\n        assert error.err == 'Some error'\n        assert error.change == change\n        assert str(error) == 'Some error'"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "dataclasses",
+        "datetime",
+        "email.message",
+        "email.parser",
+        "io",
+        "json",
+        "signal",
+        "tempfile",
+        "typing",
+        "unittest",
+        "unittest.util",
+        "pytest",
+        "websocket",
+        "test.fake_pebble",
+        "ops:pebble",
+        "ops._private:yaml"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/canonical/operator/main/README.md",
+      "content_excerpt": "# The `ops` library\n\n![CI Status](https://github.com/canonical/operator/actions/workflows/framework-tests.yaml/badge.svg)\n\nThe `ops` library is a Python framework for developing and testing Kubernetes and machine [charms](https://charmhub.io/). While charms can be written in any language, `ops` defines the latest standard, and charmers are encouraged to use Python with `ops` for all charms. The library is an official component of the Charm SDK, itself a part of [the Juju universe](https://canonical.com/juju).\n\n> - `ops` is  [available on PyPI](https://pypi.org/project/ops/).\n> - The latest version of `ops` requires Python 3.10 or above.\n> - Read our [docs](https://documentation.ubuntu.com/ops/latest/) for tutorials, how-to guides, the library reference, and more.\n\n## Give it a try\n\nLet's use `ops` to build a Kubernetes charm:\n\n### Set up\n\n> See [Juju | Set things up](https://documentation.ubuntu.com/juju/3.6/howto/manage-your-juju-deployment/set-up-your-juju-deployment/). <br> Choose the automatic track and MicroK8s.\n\n\n### Write your charm\n\nOn your Multipass VM, create a charm directory and use Charmcraft to initialise your charm file structure:\n\n```shell-script\nmkdir ops-example\ncd ops-example\ncharmcraft init\n```\nThis has created a standard charm directory structure:\n\n```shell-script\n$ ls -R\n.:\nCONTRIBUTING.md  README.md        pyproject.toml    src    tox.ini\nLICENSE          charmcraft.yaml  requirements.txt  tests\n\n./src:\ncharm.py\n\n./tests:\nintegration  unit\n\n./tests/integration:\ntest_charm.py\n\n./tests/unit:\ntest_charm.py\n```\n\nThings to note:\n\n- The `charmcraft.yaml` fi"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "test_change_error test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_pebble.py",
+          "path": "test/test_pebble.py",
+          "sha": "8b97f18cd2ac2d255da80a2b6629459a534251f1",
+          "html_url": "https://github.com/canonical/operator/blob/8743e69efb24d67e0d7a3c7c1f150bf1812bbe66/test/test_pebble.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"test_change_error(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_pebble.py",
+          "path": "test/test_pebble.py",
+          "sha": "8b97f18cd2ac2d255da80a2b6629459a534251f1",
+          "html_url": "https://github.com/canonical/operator/blob/8743e69efb24d67e0d7a3c7c1f150bf1812bbe66/test/test_pebble.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "test",
+      "count": 29,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "test/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "benchmark",
+          "path": "test/benchmark",
+          "type": "dir"
+        },
+        {
+          "name": "bin",
+          "path": "test/bin",
+          "type": "dir"
+        },
+        {
+          "name": "charms",
+          "path": "test/charms",
+          "type": "dir"
+        },
+        {
+          "name": "conftest.py",
+          "path": "test/conftest.py",
+          "type": "file"
+        },
+        {
+          "name": "fake_pebble.py",
+          "path": "test/fake_pebble.py",
+          "type": "file"
+        },
+        {
+          "name": "integration",
+          "path": "test/integration",
+          "type": "dir"
+        },
+        {
+          "name": "pebble_cli.py",
+          "path": "test/pebble_cli.py",
+          "type": "file"
+        },
+        {
+          "name": "smoke",
+          "path": "test/smoke",
+          "type": "dir"
+        },
+        {
+          "name": "test_charm.py",
+          "path": "test/test_charm.py",
+          "type": "file"
+        },
+        {
+          "name": "test_framework.py",
+          "path": "test/test_framework.py",
+          "type": "file"
+        },
+        {
+          "name": "test_helpers.py",
+          "path": "test/test_helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "test_hookcmds.py",
+          "path": "test/test_hookcmds.py",
+          "type": "file"
+        },
+        {
+          "name": "test_infra.py",
+          "path": "test/test_infra.py",
+          "type": "file"
+        },
+        {
+          "name": "test_jujucontext.py",
+          "path": "test/test_jujucontext.py",
+          "type": "file"
+        },
+        {
+          "name": "test_jujuversion.py",
+          "path": "test/test_jujuversion.py",
+          "type": "file"
+        },
+        {
+          "name": "test_lib.py",
+          "path": "test/test_lib.py",
+          "type": "file"
+        },
+        {
+          "name": "test_log.py",
+          "path": "test/test_log.py",
+          "type": "file"
+        },
+        {
+          "name": "test_main.py",
+          "path": "test/test_main.py",
+          "type": "file"
+        },
+        {
+          "name": "test_main_invocation.py",
+          "path": "test/test_main_invocation.py",
+          "type": "file"
+        },
+        {
+          "name": "test_main_type_hint.py",
+          "path": "test/test_main_type_hint.py",
+          "type": "file"
+        },
+        {
+          "name": "test_model.py",
+          "path": "test/test_model.py",
+          "type": "file"
+        },
+        {
+          "name": "test_model_relation_data_class.py",
+          "path": "test/test_model_relation_data_class.py",
+          "type": "file"
+        },
+        {
+          "name": "test_pebble.py",
+          "path": "test/test_pebble.py",
+          "type": "file"
+        },
+        {
+          "name": "test_real_pebble.py",
+          "path": "test/test_real_pebble.py",
+          "type": "file"
+        },
+        {
+          "name": "test_storage.py",
+          "path": "test/test_storage.py",
+          "type": "file"
+        },
+        {
+          "name": "test_testing.py",
+          "path": "test/test_testing.py",
+          "type": "file"
+        },
+        {
+          "name": "test_timeconv.py",
+          "path": "test/test_timeconv.py",
+          "type": "file"
+        },
+        {
+          "name": "test_yaml.py",
+          "path": "test/test_yaml.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "test/__init__.py"
+        },
+        {
+          "name": "conftest.py",
+          "path": "test/conftest.py"
+        },
+        {
+          "name": "fake_pebble.py",
+          "path": "test/fake_pebble.py"
+        },
+        {
+          "name": "pebble_cli.py",
+          "path": "test/pebble_cli.py"
+        },
+        {
+          "name": "test_charm.py",
+          "path": "test/test_charm.py"
+        },
+        {
+          "name": "test_framework.py",
+          "path": "test/test_framework.py"
+        },
+        {
+          "name": "test_helpers.py",
+          "path": "test/test_helpers.py"
+        },
+        {
+          "name": "test_hookcmds.py",
+          "path": "test/test_hookcmds.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "test/test_pebble.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "0ce8a0fdbe89ce4d55b7f23fd245366d4d83698f",
+          "html_url": "https://github.com/canonical/operator/commit/0ce8a0fdbe89ce4d55b7f23fd245366d4d83698f",
+          "message": "fix: only show executable in ExecError.__str__, not full command line (#2336)\n\nThis is to avoid credentials or sensitive data passed in command line\nargs showing up in exception messages and logs. Sensitive data\n*shouldn't* be passed in command line args, but it sometimes is, so\nbetter to be cautiou",
+          "author": "Ben Hoyt",
+          "date": "2026-02-22T19:48:38Z"
+        },
+        {
+          "sha": "379d01322b02119a6110094495ea3bacca39b0f5",
+          "html_url": "https://github.com/canonical/operator/commit/379d01322b02119a6110094495ea3bacca39b0f5",
+          "message": "fix: _checks_action should return empty list when there are no changes. (#2270)\n\n_checks_action cannot return None\nFix: #2269\n\n---------\n\nCo-authored-by: Tony Meyer <tony.meyer@gmail.com>\nCo-authored-by: Dima Tisnek <dimaqq@gmail.com>",
+          "author": "Gabriel Cocenza",
+          "date": "2026-01-15T19:33:11Z"
+        },
+        {
+          "sha": "c5484e3f8c6d056ad314bee2ecb89b5ecde0e35f",
+          "html_url": "https://github.com/canonical/operator/commit/c5484e3f8c6d056ad314bee2ecb89b5ecde0e35f",
+          "message": "chore: ruff for Python 3.10 (#2120)\n\nWe've left ruff at py38 when we dropped Python 3.8 support because the\nPR would've gotten too big.\nNow I want to use `match/case` in another PR, so I figured I'd ruff up\nthe codebase with Python 3.10 setting.",
+          "author": "Dima Tisnek",
+          "date": "2025-10-22T05:58:39Z"
+        },
+        {
+          "sha": "b52f159564cb8b417cf00bdfc1ee277850fbb3e9",
+          "html_url": "https://github.com/canonical/operator/commit/b52f159564cb8b417cf00bdfc1ee277850fbb3e9",
+          "message": "chore: upgrade pyright (#1967)\n\nSince we've dropped Python 3.8, we can use latest pyright again.\n\nMostly, it just has gotten stricter.\n\nBut there are a couple of bits that are worth reviewing, see my\ncomments.\n\nFixes #1953",
+          "author": "Dima Tisnek",
+          "date": "2025-08-12T05:35:24Z"
+        },
+        {
+          "sha": "819af18ad97648d599135e83d3608f2548039a69",
+          "html_url": "https://github.com/canonical/operator/commit/819af18ad97648d599135e83d3608f2548039a69",
+          "message": "chore: minor type checking fixes (#1903)\n\nFix a variety of small type annotation issues.\n\nThese are found with `ty` and missed by `pyright` but should be fixed\nboth because they are issues and because it would be good to be more\nprepared for a stronger type checker in the future. (Note that we can't",
+          "author": "Tony Meyer",
+          "date": "2025-07-17T04:58:47Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "test_change_error TODO OSError with line process",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "test/test_pebble.py",
+      "satd_line": 104,
+      "last_commit": {
+        "sha": "0ce8a0fdbe89ce4d55b7f23fd245366d4d83698f",
+        "html_url": "https://github.com/canonical/operator/commit/0ce8a0fdbe89ce4d55b7f23fd245366d4d83698f",
+        "message": "fix: only show executable in ExecError.__str__, not full command line (#2336)\n\nThis is to avoid credentials or sensitive data passed in command line\nargs showing up in exception messages and logs. Sensitive data\n*shouldn't* be passed in command line args, but it sometimes is, so\nbetter to be cautiou",
+        "author": "Ben Hoyt",
+        "date": "2026-02-22T19:48:38Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "test_exec_streaming"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "test_change_error",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

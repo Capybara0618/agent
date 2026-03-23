@@ -1,0 +1,88 @@
+{
+  "task_id": "898",
+  "repo_owner": "openwisp",
+  "repo_name": "openwisp-monitoring",
+  "file_path": "openwisp_monitoring/monitoring/base/models.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:59:23+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": false,
+    "review_cached": false
+  },
+  "base_context": {
+    "file_path": "openwisp_monitoring/monitoring/base/models.py",
+    "original_code": "def json(self, time=DEFAULT_TIME, **kwargs):\n    try:\n        # unit needs to be passed for chart_inline\n        data = self.read(time=time)\n        data.update({'unit': self.unit})\n        return json.dumps(data, **kwargs)\n    except KeyError:\n        # TODO: this should be improved\n        pass",
+    "satd_comment": "# TODO: this should be improved",
+    "target_file": {
+      "ok": true,
+      "path": "openwisp_monitoring/monitoring/base/models.py",
+      "sha": "7c5c7ad9249cdd1ce0a299856c442ce1caa7fdfa",
+      "download_url": "https://raw.githubusercontent.com/openwisp/openwisp-monitoring/master/openwisp_monitoring/monitoring/base/models.py",
+      "content_excerpt": "import json\nimport logging\nfrom collections import OrderedDict\nfrom copy import deepcopy\nfrom datetime import date, datetime, timedelta\n\nimport django\nfrom cache_memoize import cache_memoize\nfrom dateutil.parser import parse as parse_date\nfrom django.conf import settings\nfrom django.contrib.auth import get_user_model\nfrom django.contrib.contenttypes.fields import GenericForeignKey\nfrom django.contrib.contenttypes.models import ContentType\nfrom django.core.exceptions import ObjectDoesNotExist, ValidationError\nfrom django.core.validators import MaxValueValidator\nfrom django.db import IntegrityError, models\nfrom django.utils import timezone\nfrom django.utils.translation import gettext_lazy as _\nfrom jsonfield import JSONField\nfrom openwisp_notifications.signals import notify\nfrom pytz import timezone as tz\nfrom pytz import utc\nfrom swapper import get_model_name\n\nfrom openwisp_monitoring.monitoring.utils import clean_timeseries_data_key\nfrom openwisp_utils.base import TimeStampedEditableModel\n\nfrom ...db import default_chart_query, timeseries_db\nfrom ...settings import CACHE_TIMEOUT, DEFAULT_CHART_TIME\nfrom .. import settings as app_settings\nfrom ..configuration import (\n    CHART_CONFIGURATION_CHOICES,\n    DEFAULT_COLORS,\n    METRIC_CONFIGURATION_CHOICES,\n    get_chart_configuration,\n    get_chart_configuration_choices,\n    get_metric_configuration,\n    get_metric_configuration_choices,\n)\nfrom ..exceptions import InvalidChartConfigException, InvalidMetricConfigException\nfrom ..signals import pre_metric_write, threshold_crossed\nfrom ..tasks import _timeseries_batch_write, _timeseries_write, delete_timeseries\n\nUser = get_user_model()\nlogger = logging.getLogger(__name__)\n\n\ndef get_metric_cache_key(*args, **kwargs):\n    cache_key = [\n        \"get_or_create_metric\",\n    ]\n    cache_key.append(\n        \"key={}\".format(\n            kwargs.get(\"key\", kwargs.get(\"name\", kwargs.get(\"configuration\")))\n        )\n    )\n    for key in [\"content_type_id\", \"object_id\", \"configuration\"]:\n        cache_key.append(\"{}={}\".format(key, kwargs.get(key)))\n    cache_key.append(\"main_tags={}\".format(kwargs.get(\"main_tags\", OrderedDict())))\n    cache_key = \",\".join(cache_key)\n    return cache_key\n\n\nclass AbstractMetric(TimeStampedEditableModel):\n    name = models.CharField(max_length=64)\n    key = models.SlugField(\n        max_length=64, blank=True, help_text=_(\"leave blank to determine automatically\")\n    )\n    field_name = models.CharField(\n        max_length=16,\n        default=\"value\",\n        blank=True,\n        help_text=_(\"leave blank to determine automatically\"),\n    )\n    configuration = models.CharField(\n        max_length=16,\n        null=True,\n        choices=(\n            METRIC_CONFIGURATION_CHOICES\n            if django.VERSION < (5, 0)\n            # TODO: Remove when dropping support for Django 4.2\n            # In Django 5.0+, choices are normalized at model definition,\n            # creating a static list of tuples that doesn't update when metrics\n            # are dynamically registered or unregistered. Using a callable\n            # ensures we always get the current choices from the registry.\n            else get_metric_configuration_choices\n        ),\n    )\n    content_type = models.ForeignKey(\n        ContentType, on_delete=models.CASCADE, null=True, blank=True\n    )\n    object_id = models.CharField(max_length=36, db_index=True, blank=True, null=True)\n    content_object = GenericForeignKey(\"content_type\", \"object_id\")\n    main_tags = JSONField(\n        _(\"main tags\"),\n        default=dict,\n        blank=True,\n        load_kwargs={\"object_pairs_hook\": OrderedDict},\n        dump_kwargs={\"indent\": 4},\n        db_index=True,\n    )\n    extra_tags = JSONField(\n        _(\"extra tags\"),\n        default=dict,\n        blank=True,\n        load_kwargs={\"object_pairs_hook\": OrderedDict},\n        dump_kwargs={\"indent\": 4},\n    )\n    # NULL means the health has yet to be assessed\n    is_healthy = models.BooleanField(default=None, null=True, blank=True, db_index=True)\n    # Like \"is_healthy\", but respects tolerance of alert settings\n    is_healthy_tolerant = models.BooleanField(default=None, null=True, blank=True)\n\n    class Meta:\n        abstract = True\n        unique_together = (\n            \"key\",\n            \"field_name\",\n            \"content_type\",\n            \"object_id\",\n            \"main_tags\",\n        )\n\n    def __str__(self):\n        obj = self.content_object\n        if not obj:\n            return self.name\n        model_name = obj.__class__.__name__\n        return \"{0} ({1}: {2})\".format(self.name, model_name, obj)\n\n    def __setattr__(self, attrname, value):\n        if attrname in [\"main_tags\", \"extra_tags\"]:\n            value = self._sort_dict(value)\n        return super().__setattr__(attrname, value)\n\n    def clean(self):\n        if self.key:\n            return\n        elif self.config_dict[\"key\"] != \"{key}\":\n            self.key = self.config_dict[\"key\"]\n        else:\n            self.key = self.codename\n\n    def validate_alert_fields(self):\n        # When field_name is not provided while creating a metric\n        # then use config_dict['field_name] as metric field_name\n        if self.config_dict[\"field_name\"] != \"{field_name}\":\n            if self.field_name in [\"\", \"value\"]:\n                self.field_name = self.config_dict[\"field_name\"]\n                return\n            # field_name must be one of the metric fields\n            alert_fields = [self.config_dict[\"field_name\"]] + self.related_fields\n            if self.field_name not in alert_fields:\n                raise ValidationError(\n                    f'\"{self.field_name}\" must be one of the following metric fields ie. {alert_fields}'\n                )\n\n    def full_clean(self, *args, **kwargs):\n        # The name of the metric will be the same as the\n        # configuration chosen by the user only when the\n        # name field is empty (useful for AlertSettingsInline)\n        if not self.name:\n            self.name = self.get_configuration_display()\n        # clean up key before field validation\n        self.key = self._makekey(self.key)\n        # validate metric field_name for alerts\n        self.validate_alert_fields()\n        return super().full_clean(*args, **kwargs)\n\n    @classmethod\n    def post_delete_receiver(cls, instance, *args, **kwargs):\n        delete_timeseries.delay(instance.key, instance.tags)\n\n    @classmethod\n    def _get_or_create(\n        cls,\n        **kwargs,\n    ):\n        \"\"\"Gets or creates a metric.\n\n        Like ``get_or_create`` method of django model managers but with\n        validation before creation.\n        \"\"\"\n        if \"key\" in kwargs:\n            kwargs[\"key\"] = cls._makekey(kwargs[\"key\"])\n        try:\n            lookup_kwargs = deepcopy(kwargs)\n            if lookup_kwargs.get(\"name\"):\n                del lookup_kwargs[\"name\"]\n            extra_tags = lookup_kwargs.pop(\"extra_tags\", {})\n            metric = cls._get_metric(**lookup_kwargs)\n            created = False\n            if extra_tags != metric.extra_tags:\n                metric.extra_tags.update(kwargs[\"extra_tags\"])\n                metric.extra_tags = cls._sort_dict(metric.extra_tags)\n                metric.save()\n        except cls.DoesNotExist:\n            try:\n                metric = cls(**kwargs)\n                metric.full_clean()\n                metric.save()\n                created = True\n            except IntegrityError:\n                # Potential race conditions may arise when multiple\n                # celery workers concurrently write data to InfluxDB.\n                # These simultaneous writes can result in the database\n                # processing transactions from another \"metric.save()\"\n                # call, potentially leading to IntegrityError exceptions.\n                return cls._get_or_create(**kwargs)\n        return metric, created\n\n    @classmethod\n    @cache_memoize(CACHE_TIMEOUT, key_generator_callable=get_metric_cache_key)\n    def _get_metric(cls, *args, **kwargs):\n        return cls.objects.get(**kwargs)\n\n    @classmethod\n    def invalidate_cache(cls, instance, *args, **kwargs):\n        if kwargs.get(\"created\", False):\n            return\n        cls._get_metric.invalidate(\n            **{\n                \"name\": instance.name,\n                \"key\": instance.key,\n                \"content_type_id\": instance.content_type_id,\n                \"object_id\": instance.object_id,\n                \"configuration\": instance.configuration,\n                \"main_tags\": instance.main_tags,\n            }\n        )\n\n    @property\n    def codename(self):\n        \"\"\"Identifier stored in timeseries db.\"\"\"\n        return self._makekey(self.name)\n\n    @property\n    def config_dict(self):\n        try:\n            return get_metric_configuration()[self.configuration]\n        except KeyError:\n            raise InvalidMetricConfigException(\n                f'Invalid metric configuration: \"{self.configuration}\"'\n            )\n\n    @property\n    def related_fields(self):\n        return self.config_dict.get(\"related_fields\", [])\n\n    # TODO: This method needs to be refactored when adding the other db\n    @staticmethod\n    def _makekey(value):\n        \"\"\"Produces a valid InfluxDB key from ``value``.\n\n        Takes ``value`` as input argument and returs a valid InfluxDB key.\n        \"\"\"\n        return clean_timeseries_data_key(value)\n\n    @property\n    def tags(self):\n        tags = {}\n        if self.content_type_id and self.object_id:\n            tags.update(\n                {\n                    \"content_type\": self.content_type_key,\n                    \"object_id\": str(self.object_id),\n                }\n            )\n        if self.main_tags:\n            tags.update(self.main_tags)\n        if self.extra_tags:\n            tags.update(self.extra_tags)\n        return tags\n\n    @staticmethod\n    def _sort_dict(dict_):\n        \"\"\"Ensures the order of the keys in the dict is predictable.\"\"\"\n        if not isinstance(dict_, OrderedDict):\n            return OrderedDict(sorted(dict_.items()))\n        return dict_\n\n    @property\n    def content_type_key(self):\n        try:\n            content_type = ContentType.objects.get_for_id(self.content_type_id)\n            return \".\".join(content_type.natural_key())\n        except AttributeError:\n            return None\n\n    @property\n    def alert_field(self):\n        if self.field_name != self.config_dict[\"field_name\"]:\n            return self.field_name\n        return self.config_dict.get(\"alert_field\", self.field_name)\n\n    @property\n    def alert_on_related_field(self):\n        return self.alert_field in self.related_fields\n\n    def _get_time(self, time):\n        \"\"\"If time is a string, it converts it to a datetime.\"\"\"\n        if isinstance(time, str):\n            return parse_date(time)\n        return time\n\n    def _set_is_healthy(self, alert_settings, value):\n        \"\"\"Sets the value of \"is_healthy\" field when necessary.\n\n        Executes only if \"value\" crosses the threshold defined in\n        \"alert_settings\". Returns \"True\" if \"is_healthy\" field is changed.\n        Otherwise, returns \"None\".\n\n        This method does not take into account the alert settings\n        tolerance, which is done by \"_set_is_healthy_tolerant\" method.\n        \"\"\"\n        crossed = alert_settings._value_crossed(value)\n        if (not crossed and self.is_healthy) or (crossed and self.is_healthy is False):\n            return\n        # problem: not within threshold limit\n        elif crossed and self.is_healthy in [True, None]:\n            self.is_healthy = False\n        # ok: returned within threshold limit\n        elif not crossed and self.is_healthy in [False, None]:\n            self.is_healthy = True\n        return True\n\n    def _set_is_healthy_tolerant(\n        self, alert_settings, value, time, retention_policy, send_alert\n    ):\n        \"\"\"Sets the value of \"is_tolerance_healthy\" if necessary.\n\n        Executes only if \"value\" crosses the threshold for more than the\n        amount of seconds de",
+      "total_lines": 1038
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "logging",
+        "collections:OrderedDict",
+        "copy:deepcopy",
+        "datetime:date",
+        "datetime:datetime",
+        "datetime:timedelta",
+        "django",
+        "cache_memoize:cache_memoize",
+        "dateutil.parser:parse",
+        "django.conf:settings",
+        "django.contrib.auth:get_user_model",
+        "django.contrib.contenttypes.fields:GenericForeignKey",
+        "django.contrib.contenttypes.models:ContentType",
+        "django.core.exceptions:ObjectDoesNotExist",
+        "django.core.exceptions:ValidationError",
+        "django.core.validators:MaxValueValidator",
+        "django.db:IntegrityError",
+        "django.db:models",
+        "django.utils:timezone",
+        "django.utils.translation:gettext_lazy",
+        "jsonfield:JSONField",
+        "openwisp_notifications.signals:notify",
+        "pytz:timezone",
+        "pytz:utc",
+        "swapper:get_model_name",
+        "openwisp_monitoring.monitoring.utils:clean_timeseries_data_key",
+        "openwisp_utils.base:TimeStampedEditableModel",
+        "db:default_chart_query",
+        "db:timeseries_db"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openwisp/openwisp-monitoring/master/README.rst",
+      "content_excerpt": "openwisp-monitoring\n===================\n\n.. image:: https://github.com/openwisp/openwisp-monitoring/actions/workflows/ci.yml/badge.svg\n    :target: https://github.com/openwisp/openwisp-monitoring/actions/workflows/ci.yml\n    :alt: CI build status\n\n.. image:: https://coveralls.io/repos/github/openwisp/openwisp-monitoring/badge.svg?branch=master\n    :target: https://coveralls.io/github/openwisp/openwisp-monitoring?branch=master\n    :alt: Test coverage\n\n.. image:: https://img.shields.io/librariesio/github/openwisp/openwisp-monitoring\n    :target: https://libraries.io/github/openwisp/openwisp-monitoring#repository_dependencies\n    :alt: Dependency monitoring\n\n.. image:: https://badge.fury.io/py/openwisp-monitoring.svg\n    :target: http://badge.fury.io/py/openwisp-monitoring\n    :alt: pypi\n\n.. image:: https://pepy.tech/badge/openwisp-monitoring\n    :target: https://pepy.tech/project/openwisp-monitoring\n    :alt: downloads\n\n.. image:: https://img.shields.io/gitter/room/nwjs/nw.js.svg?style=flat-square\n    :target: https://gitter.im/openwisp/monitoring\n    :alt: support chat\n\n.. image:: https://img.shields.io/badge/code%20style-black-000000.svg\n    :target: https://pypi.org/project/black/\n    :alt: code style: black\n\n.. image:: https://github.com/openwisp/openwisp-monitoring/raw/docs/docs/monitoring-demo.gif\n    :target: https://github.com/openwisp/openwisp-monitoring/tree/docs/docs/monitoring-demo.gif\n    :alt: Feature Highlights\n\n----\n\n**Need a quick overview?** `Try the OpenWISP Demo\n<https://openwisp.org/demo.html>`_.\n\nOpenWISP Monitoring is a network monitoring system written"
+    }
+  },
+  "repair_context": {},
+  "review_context": {}
+}

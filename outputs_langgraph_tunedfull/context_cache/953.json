@@ -1,0 +1,315 @@
+{
+  "task_id": "953",
+  "repo_owner": "kashifrazzaqui",
+  "repo_name": "vyked",
+  "file_path": "vyked/bus.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T20:15:52+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 5,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T20:15:59+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T20:16:02+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "vyked/bus.py",
+    "original_code": "def receive(self, packet, transport, protocol):\n    if packet['type'] == 'ack':\n        # TODO : remove from retrial\n        pass",
+    "satd_comment": "# TODO : remove from retrial",
+    "target_file": {
+      "ok": true,
+      "path": "vyked/bus.py",
+      "sha": "90b6c42c88eb06f1ad6b6010d6d3b68ae9a196c4",
+      "download_url": "https://raw.githubusercontent.com/kashifrazzaqui/vyked/develop/vyked/bus.py",
+      "content_excerpt": "import asyncio\nfrom collections import defaultdict\nfrom functools import partial\nimport json\nimport logging\nimport random\nimport uuid\n\nfrom again.utils import unique_hex\nimport aiohttp\nfrom retrial.retrial import retry\n\nfrom .services import TCPServiceClient, HTTPServiceClient\nfrom .pubsub import PubSub\nfrom .packet import ControlPacket, MessagePacket\nfrom .protocol_factory import get_vyked_protocol\nfrom .utils.jsonencoder import VykedEncoder\nfrom .exceptions import ClientNotFoundError, ClientDisconnected\n\nHTTP = 'http'\nTCP = 'tcp'\n\n\ndef _retry_for_pub(result):\n    return not result\n\n\ndef _retry_for_exception(_):\n    return True\n\n\nclass HTTPBus:\n    def __init__(self, registry_client):\n        self._registry_client = registry_client\n\n    def send_http_request(self, app: str, service: str, version: str, method: str, entity: str, params: dict):\n        \"\"\"\n        A convenience method that allows you to send a well formatted http request to another service\n        \"\"\"\n        host, port, node_id, service_type = self._registry_client.resolve(service, version, entity, HTTP)\n\n        url = 'http://{}:{}{}'.format(host, port, params.pop('path'))\n\n        http_keys = ['data', 'headers', 'cookies', 'auth', 'allow_redirects', 'compress', 'chunked']\n        kwargs = {k: params[k] for k in http_keys if k in params}\n\n        query_params = params.pop('params', {})\n\n        if app is not None:\n            query_params['app'] = app\n\n        query_params['version'] = version\n        query_params['service'] = service\n\n        response = yield from aiohttp.request(method, url, params=query_params, **kwargs)\n        return response\n\n\nclass TCPBus:\n    def __init__(self, registry_client):\n        registry_client.conn_handler = self\n        self._registry_client = registry_client\n        self._client_protocols = {}\n        self._pingers = {}\n        self._node_clients = {}\n        self._service_clients = []\n        self.hosts = {'tcp_host': None, 'http_host': None}\n        self._host_id = unique_hex()\n        self._ronin = False\n        self._registered = False\n        self._logger = logging.getLogger(__name__)\n\n    def _create_service_clients(self):\n        futures = []\n        for sc in self._service_clients:\n            for host, port, node_id, service_type in self._registry_client.get_all_addresses(*sc.properties):\n                if service_type == 'tcp':\n                    self._node_clients[node_id] = sc\n                    future = self._connect_to_client(host, node_id, port, service_type, sc)\n                    futures.append(future)\n        return asyncio.gather(*futures, return_exceptions=False)\n\n    def connect(self):\n        clients = []\n        for host in self.hosts.values():\n            if host:\n                clients = host.clients\n        for client in clients:\n            if isinstance(client, (TCPServiceClient, HTTPServiceClient)):\n                client.bus = self\n        self._service_clients = clients\n        yield from self._registry_client.connect()\n\n    def register(self):\n        for key, host in self.hosts.items():\n            if host:\n                self._registry_client.register(host.host, host.port, host.name, host.version, host.node_id,\n                                               host.clients, key.split('_')[0])\n\n    def registration_complete(self):\n        if not self._registered:\n            self._create_service_clients()\n            self._registered = True\n\n    def new_instance(self, service, version, host, port, node_id, type):\n        sc = next(sc for sc in self._service_clients if sc.name == service and sc.version == version)\n        if type == 'tcp':\n            self._node_clients[node_id] = sc\n            asyncio.async(self._connect_to_client(host, node_id, port, type, sc))\n\n    def send(self, packet: dict):\n        packet['from'] = self._host_id\n        func = getattr(self, '_' + packet['type'] + '_sender')\n        asyncio.async(func(packet))\n\n    @retry(should_retry_for_result=lambda x: not x, should_retry_for_exception=lambda x: True, timeout=None,\n           max_attempts=5, multiplier=2)\n    def _request_sender(self, packet: dict):\n        \"\"\"\n        Sends a request to a server from a ServiceClient\n        auto dispatch method called from self.send()\n        \"\"\"\n        node_id = self._get_node_id_for_packet(packet)\n        client_protocol = self._client_protocols.get(node_id)\n\n        if node_id and client_protocol:\n            if client_protocol.is_connected():\n                packet['to'] = node_id\n                client_protocol.send(packet)\n                return True\n            else:\n                self._logger.error('Client protocol is not connected for packet %s', packet)\n                raise ClientDisconnected()\n        else:\n            # No node found to send request\n            self._logger.error('Out of %s, Client Not found for packet %s', self._client_protocols.keys(), packet)\n            raise ClientNotFoundError()\n\n    def _connect_to_client(self, host, node_id, port, service_type, service_client):\n\n        future = asyncio.async(\n            asyncio.get_event_loop().create_connection(partial(get_vyked_protocol, service_client), host, port,\n                                                       ssl=service_client._ssl_context))\n        future.add_done_callback(\n            partial(self._service_client_connection_callback, self._node_clients[node_id], node_id, service_type))\n        return future\n\n    def _service_client_connection_callback(self, sc, node_id, service_type, future):\n        _, protocol = future.result()\n        # TODO : handle pinging\n        # if service_type == TCP:\n        #     pinger = Pinger(self, asyncio.get_event_loop())\n        #     self._pingers[node_id] = pinger\n        #     pinger.register_tcp_service(protocol, node_id)\n        #     asyncio.async(pinger.start_ping())\n        self._client_protocols[node_id] = protocol\n\n    @staticmethod\n    def _create_json_service_name(app, service, version):\n        return {'app': app, 'name': service, 'version': version}\n\n    @staticmethod\n    def _handle_ping(packet, protocol):\n        protocol.send(ControlPacket.pong(packet['node_id']))\n\n    def _handle_pong(self, node_id, count):\n        pinger = self._pingers[node_id]\n        asyncio.async(pinger.pong_received(count))\n\n    def _get_node_id_for_packet(self, packet):\n        service, version, entity = packet['name'], packet['version'], packet['entity']\n        node = self._registry_client.resolve(service, version, entity, TCP)\n        return node[2] if node else None\n\n    def handle_ping_timeout(self, node_id):\n        self._logger.info(\"Service client connection timed out {}\".format(node_id))\n        self._pingers.pop(node_id, None)\n        service_props = self._registry_client.get_for_node(node_id)\n        self._logger.info('service client props {}'.format(service_props))\n        if service_props is not None:\n            host, port, _node_id, _type = service_props\n            asyncio.async(self._connect_to_client(host, _node_id, port, _type))\n\n    def receive(self, packet: dict, protocol, transport):\n        if packet['type'] == 'ping':\n            self._handle_ping(packet, protocol)\n        elif packet['type'] == 'pong':\n            self._handle_pong(packet['node_id'], packet['count'])\n        else:\n            if self.hosts['tcp_host'].is_for_me(packet['name'], packet['version']):\n                func = getattr(self, '_' + packet['type'] + '_receiver')\n                func(packet, protocol)\n            else:\n                self._logger.warn('wrongly routed packet: ', packet)\n\n    def _request_receiver(self, packet, protocol):\n        api_fn = getattr(self.hosts['tcp_host'], packet['endpoint'])\n        if api_fn.is_api:\n            from_node_id = packet['from']\n            entity = packet['entity']\n            future = asyncio.async(api_fn(from_id=from_node_id, entity=entity, **packet['payload']))\n\n            def send_result(f):\n                result_packet = f.result()\n                protocol.send(result_packet)\n\n            future.add_done_callback(send_result)\n        else:\n            print('no api found for packet: ', packet)\n\n    def handle_connected(self):\n        for host in self.hosts.values():\n            if host:\n                yield from host.initiate()\n\n\nclass PubSubBus:\n    PUBSUB_DELAY = 5\n\n    def __init__(self, pubsub_host, pubsub_port, registry_client, ssl_context=None):\n        self._host = pubsub_host\n        self._port = pubsub_port\n        self._pubsub_handler = None\n        self._registry_client = registry_client\n        self._clients = None\n        self._pending_publishes = {}\n        self._ssl_context = ssl_context\n\n    def create_pubsub_handler(self):\n        self._pubsub_handler = PubSub(self._host, self._port)\n        yield from self._pubsub_handler.connect()\n\n    def register_for_subscription(self, host, port, node_id, clients):\n        self._clients = clients\n        subs_list = []\n        xsubs_list4registry = []\n        xsubs_list4redis = []\n        for client in clients:\n            if isinstance(client, TCPServiceClient):\n                for each in dir(client):\n                    fn = getattr(client, each)\n                    if callable(fn) and getattr(fn, 'is_subscribe', False):\n                        subs_list.append(self._get_pubsub_key(client.name, client.version, fn.__name__))\n                    elif callable(fn) and getattr(fn, 'is_xsubscribe', False):\n                        xsubs_list4registry.append((client.name, client.version, fn.__name__, getattr(fn, 'strategy')))\n                        xsubs_list4redis.append(self._get_pubsub_key(client.name, client.version, fn.__name__,\n                                                                     node_id=node_id))\n        self._registry_client.x_subscribe(host, port, node_id, xsubs_list4registry)\n        yield from self._pubsub_handler.subscribe(subs_list + xsubs_list4redis, handler=self.subscription_handler)\n\n    def publish(self, service, version, endpoint, payload):\n        endpoint_key = self._get_pubsub_key(service, version, endpoint)\n        asyncio.async(self._pubsub_handler.publish(endpoint_key, json.dumps(payload, cls=VykedEncoder)))\n        asyncio.async(self.xpublish(service, version, endpoint, payload))\n\n    def xpublish(self, service, version, endpoint, payload):\n        subscribers = yield from self._registry_client.get_subscribers(service, version, endpoint)\n        strategies = defaultdict(list)\n        for subscriber in subscribers:\n            strategies[(subscriber['name'], subscriber['version'])].append(\n                (subscriber['host'], subscriber['port'], subscriber['node_id'], subscriber['strategy']))\n        for key, value in strategies.items():\n            if value[0][3] == 'LEADER':\n                node_id = value[0][2]\n            else:\n                random_metadata = random.choice(value)\n                node_id = random_metadata[2]\n            endpoint_key = self._get_pubsub_key(service, version, endpoint, node_id=node_id)\n            asyncio.async(self._pubsub_handler.publish(endpoint_key, json.dumps(payload, cls=VykedEncoder)))\n\n    def subscription_handler(self, endpoint, payload):\n        elements = endpoint.split('/')\n        if len(elements) > 3:\n            service, version, endpoint, node_id = elements\n        else:\n            service, version, endpoint = elements\n        client = [sc for sc in self._clients if (sc.name == service and sc.version == version)][0]\n        func = getattr(client, endpoint)\n        asyncio.async(func(**json.loads(payload)))\n\n    @staticmethod\n    def _get_pubsub_key(service, version, endpoint, node_id=None):\n        if node_id:\n            return '/'.join((service, str(version), endpoint, node_id))\n        return '/'.join((service, str(version), endpoint))\n",
+      "total_lines": 285
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [],
+      "error": "syntax_error: invalid syntax (<unknown>, line 109)"
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/kashifrazzaqui/vyked/develop/README.rst",
+      "content_excerpt": "Vyked\n============================\n.. image:: https://api.travis-ci.org/kashifrazzaqui/vyked.svg?branch=master\n    :target: https://travis-ci.org/kashifrazzaqui/vyked\n    \n\nVyked is an asyncio based python framework for service oriented architectures. It is tested and used in production successfully.\n\nRequirements\n------------\n- Python >= 3.3\n- asyncio https://pypi.python.org/pypi/asyncio\n\nInstallation\n------------\n\n.. code-block:: bash\n\n    $ pip install vyked\n    \nVyked uses jsonstreamer_, a fast streaming JSON parser for Python that \ngenerates SAX-like events using the yajl C library. To install yajl:\n\n.. code-block:: bash\n\n    $ git clone git@github.com:lloyd/yajl.git\n    $ cd yajl\n    $ ./configure && make install\n\n.. _jsonstreamer: https://github.com/kashifrazzaqui/json-streamer\n\nGetting Started\n---------------\n\nService Registry\n^^^^^^^^^^^^^^^^\nWhen Vyked services start they register with the service registry by advertising their name, ip,port and the names of other Vyked services they might require to function. The registry then co-ordinates all Vyked services and even balances loads across multiple instances of each service.\n\nVyked uses redis for pub-sub and registry storage, you must start a redis instance before you start the vyked registry.\n\nYou must start the Vyked registry before any services, as such:\n\n.. code-block:: bash\n\n    $ python -m vyked.registry\n\nor :\n\n.. code-block:: python\n    \n    from vyked import Registry\n    \n    registry = Registry('127.0.0.1', 4500)\n    registry.start()\n\nService\n^^^^^^^\nVyked allows you to host WS(Websocket), HTTP and TCP ser"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "receive test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"receive(\"",
+      "count": 5,
+      "items": [
+        {
+          "name": "services.py",
+          "path": "vyked/services.py",
+          "sha": "25ce73a713c632e35534328318686e9da7e3a686",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/blob/a58144de04efc12546d7a9a3f1d3fbe372f77fb9/vyked/services.py",
+          "score": 1.0
+        },
+        {
+          "name": "jsonprotocol.py",
+          "path": "vyked/jsonprotocol.py",
+          "sha": "dfd7146ab9e6336662c0ad4e78993f003c684432",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/blob/a58144de04efc12546d7a9a3f1d3fbe372f77fb9/vyked/jsonprotocol.py",
+          "score": 1.0
+        },
+        {
+          "name": "registry.py",
+          "path": "vyked/registry.py",
+          "sha": "3df6d6ac41cd57fa463fe552f3a52bcca8eb29ea",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/blob/a58144de04efc12546d7a9a3f1d3fbe372f77fb9/vyked/registry.py",
+          "score": 1.0
+        },
+        {
+          "name": "registry_client.py",
+          "path": "vyked/registry_client.py",
+          "sha": "d2ef52816089667834d88b86cb98fd3e4caa5fc6",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/blob/a58144de04efc12546d7a9a3f1d3fbe372f77fb9/vyked/registry_client.py",
+          "score": 1.0
+        },
+        {
+          "name": "bus.py",
+          "path": "vyked/bus.py",
+          "sha": "90b6c42c88eb06f1ad6b6010d6d3b68ae9a196c4",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/blob/a58144de04efc12546d7a9a3f1d3fbe372f77fb9/vyked/bus.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "vyked",
+      "count": 15,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "vyked/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "bus.py",
+          "path": "vyked/bus.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "vyked/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "host.py",
+          "path": "vyked/host.py",
+          "type": "file"
+        },
+        {
+          "name": "jsonprotocol.py",
+          "path": "vyked/jsonprotocol.py",
+          "type": "file"
+        },
+        {
+          "name": "packet.py",
+          "path": "vyked/packet.py",
+          "type": "file"
+        },
+        {
+          "name": "pinger.py",
+          "path": "vyked/pinger.py",
+          "type": "file"
+        },
+        {
+          "name": "protocol_factory.py",
+          "path": "vyked/protocol_factory.py",
+          "type": "file"
+        },
+        {
+          "name": "pubsub.py",
+          "path": "vyked/pubsub.py",
+          "type": "file"
+        },
+        {
+          "name": "registry.py",
+          "path": "vyked/registry.py",
+          "type": "file"
+        },
+        {
+          "name": "registry_client.py",
+          "path": "vyked/registry_client.py",
+          "type": "file"
+        },
+        {
+          "name": "sendqueue.py",
+          "path": "vyked/sendqueue.py",
+          "type": "file"
+        },
+        {
+          "name": "services.py",
+          "path": "vyked/services.py",
+          "type": "file"
+        },
+        {
+          "name": "utils",
+          "path": "vyked/utils",
+          "type": "dir"
+        },
+        {
+          "name": "wrappers.py",
+          "path": "vyked/wrappers.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "vyked/__init__.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "vyked/exceptions.py"
+        },
+        {
+          "name": "host.py",
+          "path": "vyked/host.py"
+        },
+        {
+          "name": "jsonprotocol.py",
+          "path": "vyked/jsonprotocol.py"
+        },
+        {
+          "name": "packet.py",
+          "path": "vyked/packet.py"
+        },
+        {
+          "name": "pinger.py",
+          "path": "vyked/pinger.py"
+        },
+        {
+          "name": "protocol_factory.py",
+          "path": "vyked/protocol_factory.py"
+        },
+        {
+          "name": "pubsub.py",
+          "path": "vyked/pubsub.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "vyked/bus.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "94d858e939cb9a723c3bfb5176a93b46ad3422e2",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/commit/94d858e939cb9a723c3bfb5176a93b46ad3422e2",
+          "message": "Merge pull request #136 from amanwriter/issue_135_fix\n\nIssue 135 fix",
+          "author": "Kashif Razzaqui",
+          "date": "2018-03-23T15:41:50Z"
+        },
+        {
+          "sha": "6f8f0c5bb3e3a4da8acaac3e0928791b9f6f986d",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/commit/6f8f0c5bb3e3a4da8acaac3e0928791b9f6f986d",
+          "message": "Removed WSService, websocket decorator can be used inside HTTPServices",
+          "author": "Aman Mathur",
+          "date": "2015-12-10T12:06:12Z"
+        },
+        {
+          "sha": "4d959a6c49c169b1ed4659a34186a0f936c47b4c",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/commit/4d959a6c49c169b1ed4659a34186a0f936c47b4c",
+          "message": "Renamed \"service\" to \"name\" to fix key error",
+          "author": "Aman Mathur",
+          "date": "2015-12-07T12:00:50Z"
+        },
+        {
+          "sha": "d8430ee4671955271571460fd5db36329f42d076",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/commit/d8430ee4671955271571460fd5db36329f42d076",
+          "message": "Fixed merged conflicts",
+          "author": "Aman Mathur",
+          "date": "2015-12-07T08:58:01Z"
+        },
+        {
+          "sha": "ec9cc054d53770547c9e8f9fa9f5b24d3e47decd",
+          "html_url": "https://github.com/kashifrazzaqui/vyked/commit/ec9cc054d53770547c9e8f9fa9f5b24d3e47decd",
+          "message": "Fixed merge conflicts",
+          "author": "Aman Mathur",
+          "date": "2015-12-07T08:33:57Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "receive TODO remove from retrial",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "vyked/bus.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "94d858e939cb9a723c3bfb5176a93b46ad3422e2",
+        "html_url": "https://github.com/kashifrazzaqui/vyked/commit/94d858e939cb9a723c3bfb5176a93b46ad3422e2",
+        "message": "Merge pull request #136 from amanwriter/issue_135_fix\n\nIssue 135 fix",
+        "author": "Kashif Razzaqui",
+        "date": "2018-03-23T15:41:50Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 5,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "task_id": "690",
+  "repo_owner": "teemtee",
+  "repo_name": "tmt",
+  "file_path": "tmt/steps/execute/__init__.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:52:48+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": false,
+    "review_cached": false
+  },
+  "base_context": {
+    "file_path": "tmt/steps/execute/__init__.py",
+    "original_code": "def __init__(self, plan: \"tmt.Plan\", data: tmt.steps.RawStepDataArgument) -> None:\n    \"\"\" Initialize execute step data \"\"\"\n    super().__init__(plan=plan, data=data)\n    # List of Result() objects representing test results\n    self._results: List[tmt.Result] = []\n\n    # Default test framework and mapping old methods\n    # FIXME remove when we drop the old execution methods\n    self._framework = DEFAULT_FRAMEWORK",
+    "satd_comment": "# FIXME remove when we drop the old execution methods",
+    "target_file": {
+      "ok": true,
+      "path": "tmt/steps/execute/__init__.py",
+      "sha": "d21d072652752a979aadb7c36e7f0a123d6b50a3",
+      "download_url": "https://raw.githubusercontent.com/teemtee/tmt/main/tmt/steps/execute/__init__.py",
+      "content_excerpt": "import abc\nimport copy\nimport functools\nimport itertools\nimport signal as _signal\nimport subprocess\nimport threading\nfrom collections.abc import Iterator, Sequence\nfrom typing import TYPE_CHECKING, Any, Optional, TypeVar, Union, cast\n\nimport fmf.utils\n\nimport tmt\nimport tmt.base.core\nimport tmt.log\nimport tmt.steps\nimport tmt.steps.scripts\nimport tmt.utils\nimport tmt.utils.signals\nfrom tmt.checks import Check, CheckEvent, CheckPlugin\nfrom tmt.container import container, field, simple_field\nfrom tmt.guest import Guest\nfrom tmt.plugins import PluginRegistry\nfrom tmt.result import (\n    CheckResult,\n    Result,\n    ResultGuestData,\n    ResultInterpret,\n    ResultOutcome,\n)\nfrom tmt.steps import Action, ActionTask, PhaseQueue, PluginTask, Step\nfrom tmt.steps.context.abort import AbortContext, AbortStep\nfrom tmt.steps.context.pidfile import PidFileContext\nfrom tmt.steps.context.reboot import RebootContext\nfrom tmt.steps.context.restart import RestartContext\nfrom tmt.steps.context.restraint import RestraintContext\nfrom tmt.steps.discover import Discover, DiscoverPlugin, DiscoverStepData\nfrom tmt.utils import (\n    Command,\n    CommandOutput,\n    Environment,\n    EnvVarValue,\n    GeneralError,\n    HasEnvironment,\n    HasStepWorkdir,\n    Path,\n    ProcessExitCodes,\n    ShellScript,\n    Stopwatch,\n    configure_bool_constant,\n)\n\nif TYPE_CHECKING:\n    import tmt.base.plan\n    import tmt.result\n    import tmt.steps.discover\n\n# Test data and checks directory names\nTEST_DATA = 'data'\nCHECK_DATA = 'checks'\n\n# Default test framework\nDEFAULT_FRAMEWORK = 'shell'\n\n# The main test output filename\nTEST_OUTPUT_FILENAME = 'output.txt'\n\n# Metadata file with details about the current test\nTEST_METADATA_FILENAME = 'metadata.yaml'\n\n# File containing test failures\nTEST_FAILURES_FILENAME = 'failures.yaml'\n\n# File containing paths of submitted files\nSUBMITTED_FILES_FILENAME = \"submitted-files.log\"\n\n\n@container\nclass ExecuteStepData(tmt.steps.WhereableStepData, tmt.steps.StepData):\n    duration: str = field(\n        # TODO: ugly circular dependency (see tmt.base.core.DEFAULT_TEST_DURATION_L2)\n        default='1h',\n        option='--duration',\n        help=\"\"\"\n             The maximum time test specified by ``script`` is allowed to run.\n             This option does not affect the duration defined in test metadata.\n             \"\"\",\n    )\n    ignore_duration: bool = field(\n        default=configure_bool_constant(False, 'TMT_PLUGIN_EXECUTE_TMT_IGNORE_DURATION'),\n        option='--ignore-duration',\n        is_flag=True,\n        envvar=\"TMT_PLUGIN_EXECUTE_TMT_IGNORE_DURATION\",\n        help=\"\"\"\n             Ignore test duration value and allow test to run forever.\n             Can be set by environment variable even when step is not\n             specified on the commandline. This environment variable\n             will be replaced by fmf config file or CLI arguments.\n             \"\"\",\n    )\n    exit_first: bool = field(\n        default=False,\n        option=('-x', '--exit-first'),\n        is_flag=True,\n        help='Stop execution after the first test failure or error.',\n    )\n\n\nExecuteStepDataT = TypeVar('ExecuteStepDataT', bound=ExecuteStepData)\n\n\n@container\nclass TestInvocation(HasStepWorkdir, HasEnvironment):\n    \"\"\"\n    A bundle describing one test invocation.\n\n    Describes a ``test`` invoked on a particular ``guest`` under the\n    supervision of an ``execute`` plugin ``phase``.\n    \"\"\"\n\n    logger: tmt.log.Logger\n\n    phase: 'ExecutePlugin[Any]'\n    test: 'tmt.base.core.Test'\n    guest: Guest\n\n    #: Environment variables for this invocation.\n    #:\n    #: .. note::\n    #:\n    #:    We need to present environment as a single, updateable\n    #:    :py:class:`Environment` instance. Unfortunately, ``@property``\n    #:    would return new instance every time, and\n    #:    :py:func:`functools.cached_property` would needed to be\n    #:    \"manually\" invalidated so we could refresh the dynamic portion\n    #:    of the environment. Therefore this instance to hold the\n    #:    environment, and the :py:attr:`environment` property to\n    #:    include the up-to-date values.\n    _environment: Optional[Environment] = None\n\n    #: Process running the test. What binary it is depends on the guest\n    #: implementation and the test, it may be, for example, a shell process,\n    #: SSH process, or a ``podman`` process.\n    process: Optional[subprocess.Popen[bytes]] = None\n    process_lock: threading.Lock = simple_field(default_factory=threading.Lock)\n\n    #: If set, there is a callback registered through\n    #: :py:func:`tmt.utils.signals.add_callback` which would be called when\n    #: tmt gets terminated.\n    on_interrupt_callback_token: Optional[int] = None\n\n    results: list[Result] = simple_field(default_factory=list)\n    check_results: list[CheckResult] = simple_field(default_factory=list)\n\n    check_data: dict[str, Any] = simple_field(default_factory=dict)\n\n    return_code: Optional[int] = None\n    start_time: Optional[str] = None\n    end_time: Optional[str] = None\n    real_duration: Optional[str] = None\n\n    #: List of exceptions encountered by the invocation.\n    exceptions: list[Exception] = simple_field(default_factory=list)\n\n    @property\n    def step_workdir(self) -> Path:\n        return self.phase.step_workdir\n\n    @functools.cached_property\n    def path(self) -> Path:\n        \"\"\"\n        Absolute path to invocation directory\n        \"\"\"\n\n        path = (\n            self.step_workdir\n            / TEST_DATA\n            / 'guest'\n            / self.guest.safe_name\n            / f'{self.test.safe_name.lstrip(\"/\") or \"default\"}-{self.test.serial_number}'\n        )\n\n        path.mkdir(parents=True, exist_ok=True)\n\n        # Pre-create also the test data and checks path - cannot use\n        # `self.test_data_path`, that would be an endless recursion.\n        (path / TEST_DATA).mkdir(parents=True, exist_ok=True)\n        (path / CHECK_DATA).mkdir(parents=True, exist_ok=True)\n\n        return path\n\n    @functools.cached_property\n    def relative_path(self) -> Path:\n        \"\"\"\n        Invocation directory path relative to step workdir\n        \"\"\"\n\n        return self.path.relative_to(self.step_workdir)\n\n    @functools.cached_property\n    def test_data_path(self) -> Path:\n        \"\"\"\n        Absolute path to test data directory\n        \"\"\"\n\n        return self.path / TEST_DATA\n\n    @functools.cached_property\n    def relative_test_data_path(self) -> Path:\n        \"\"\"\n        Test data path relative to step workdir\n        \"\"\"\n\n        return self.relative_path / TEST_DATA\n\n    @functools.cached_property\n    def check_files_path(self) -> Path:\n        \"\"\"\n        Construct a directory path for check files needed by tmt\n        \"\"\"\n\n        return self.path / CHECK_DATA\n\n    @functools.cached_property\n    def submission_log_path(self) -> Path:\n        \"\"\"\n        A path to log containing submitted files paths\n        \"\"\"\n\n        return self.path / SUBMITTED_FILES_FILENAME\n\n    @property\n    def is_guest_healthy(self) -> bool:\n        \"\"\"\n        Whether the guest is deemed to be healthy and responsive.\n\n        .. note::\n\n            The answer is deduced from various flags set by execute code\n            while observing the test, no additional checks are\n            performed.\n        \"\"\"\n\n        if self.reboot.hard_requested:\n            return False\n\n        if self.restart.requested:\n            return False\n\n        return True\n\n    @property\n    def submitted_files(self) -> list[Path]:\n        \"\"\"\n        Paths of all files submitted during test\n        \"\"\"\n\n        if not self.submission_log_path.exists():\n            return []\n\n        # * `self.test_data_path / line` -> absolute log path (`line`\n        #   shall be relative to test data)\n        # * .resolve() -> absolute log path without any `../`,\n        # * .relative_to(...) -> *relative* log path, relative to the\n        #    step workdir, as expected from log paths attached to results\n        #\n        # Note `step_workdir.resolve()`: `resolve()` resolves symlinks\n        # as well, and `relative_to()` might consider `step_workdir`\n        # a different tree if it contains symlinks. Compare resolved\n        # paths then.\n        return [\n            (self.test_data_path / line).resolve().relative_to(self.step_workdir.resolve())\n            for line in self.submission_log_path.read_text().splitlines()\n        ]\n\n    @functools.cached_property\n    def reboot(self) -> RebootContext:\n        \"\"\"\n        Reboot context for this invocation.\n        \"\"\"\n\n        return RebootContext(\n            owner_label=f\"test '{self.test}'\",\n            guest=self.guest,\n            path=self.test_data_path,\n            logger=self.logger,\n        )\n\n    def _is_restart_requested(self) -> bool:\n        return self.return_code in self.test.restart_on_exit_code\n\n    @functools.cached_property\n    def restart(self) -> RestartContext:\n        \"\"\"\n        Restart context for this invocation.\n        \"\"\"\n\n        return RestartContext(\n            owner_label=f\"test '{self.test}'\",\n            guest=self.guest,\n            is_requested_test=self._is_restart_requested,\n            restart_limit=self.test.restart_max_count,\n            restart_with_reboot=self.test.restart_with_reboot,\n            logger=self.logger,\n        )\n\n    @functools.cached_property\n    def abort(self) -> AbortContext:\n        \"\"\"\n        Abort context for this invocation.\n        \"\"\"\n\n        return AbortContext(path=self.test_data_path, logger=self.logger)\n\n    @functools.cached_property\n    def pidfile(self) -> PidFileContext:\n        \"\"\"\n        Pidfile context for this invocation.\n        \"\"\"\n\n        return PidFileContext(phase=self.phase, guest=self.guest, logger=self.logger)\n\n    @functools.cached_property\n    def restraint(self) -> RestraintContext:\n        \"\"\"\n        Restraint context for this invocation.\n        \"\"\"\n\n        return RestraintContext(\n            enabled=self.phase.data.restraint_compatible,\n            taskname=self.test.name,\n            logger=self.logger,\n        )\n\n    @property\n    def environment(self) -> Environment:\n        if self._environment is None:\n            # narrow type\n            assert isinstance(self.phase.parent, Execute)\n\n            # narrow type\n            assert isinstance(self.phase.parent.plan.my_run, tmt.base.core.Run)\n\n            environment = Environment()\n\n            environment.update(\n                self.guest.environment,\n                self.test.environment,\n                self.phase.parent.plan.environment,\n            )\n\n            environment[\"TMT_TEST_NAME\"] = EnvVarValue(self.test.name)\n            environment[\"TMT_TEST_INVOCATION_PATH\"] = EnvVarValue(self.path)\n            environment[\"TMT_TEST_DATA\"] = EnvVarValue(self.test_data_path)\n            environment[\"TMT_TEST_SUBMITTED_FILES\"] = EnvVarValue(self.submission_log_path)\n            environment['TMT_TEST_SERIAL_NUMBER'] = EnvVarValue(str(self.test.serial_number))\n            environment[\"TMT_TEST_METADATA\"] = EnvVarValue(self.path / TEST_METADATA_FILENAME)\n\n            environment['TMT_TEST_ITERATION_ID'] = EnvVarValue(\n                f\"{self.phase.parent.plan.my_run.unique_id}-{self.test.serial_number}\"\n            )\n\n        else:\n            environment = self._environment\n\n        environment.update(\n            # Add variables from invocation contexts\n            self.abort,\n            self.reboot,\n            self.restart,\n            self.pidfile,\n            self.restraint,\n            # Add variables the framework wants to expose\n            self.test.test_framework.get_environment_variables(self, self.logger),\n        )\n\n        self._environment = environment\n\n        return environment\n\n    def invoke_check(self, event: CheckEvent, check: Check) -> list[CheckResult]:\n        with Stopwatch() as timer:\n            results = check.go(\n                event=event,\n                invocation=self,\n                environment=self.environment,\n              ",
+      "total_lines": 1349
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "abc",
+        "copy",
+        "functools",
+        "itertools",
+        "signal",
+        "subprocess",
+        "threading",
+        "collections.abc:Iterator",
+        "collections.abc:Sequence",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Optional",
+        "typing:TypeVar",
+        "typing:Union",
+        "typing:cast",
+        "fmf.utils",
+        "tmt",
+        "tmt.base.core",
+        "tmt.log",
+        "tmt.steps",
+        "tmt.steps.scripts",
+        "tmt.utils",
+        "tmt.utils.signals",
+        "tmt.checks:Check",
+        "tmt.checks:CheckEvent",
+        "tmt.checks:CheckPlugin",
+        "tmt.container:container",
+        "tmt.container:field",
+        "tmt.container:simple_field",
+        "tmt.guest:Guest"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/teemtee/tmt/main/README.rst",
+      "content_excerpt": "\n==================================================================\n                    tmt - Test Management Tool\n==================================================================\n\n|docs| |deepwiki| |matrix| |fedora-pkg| |copr-build| |pypi-version| |license|\n\nThe ``tmt`` tool provides a user-friendly way to work with tests.\nYou can comfortably create new tests, safely and easily run tests\nacross different environments, review test results, debug test\ncode and enable tests in the CI using a consistent and concise\nconfig.\n\nThe python module and command-line tool implement the Metadata\nSpecification which allows storing all needed test execution data\ndirectly within a git repository. Together with the possibility to\nreference remote repositories, it makes it easy to share test\ncoverage across projects and distros.\n\nThe Flexible Metadata Format ``fmf`` is used to store data in both\nhuman and machine readable way close to the source code. Thanks to\ninheritance and elasticity metadata are organized in the structure\nefficiently, preventing unnecessary duplication.\n\n\n| Check the `overview`__ section for `install`__ instructions and\n  a couple of inspirative `examples`__.\n| See the `guide`__ for a more detailed introduction to available\n  features.\n| Find detailed descriptions of the options in the\n  `specification`__ and `plugins`__ section.\n\n__ https://tmt.readthedocs.io/en/stable/overview.html\n__ https://tmt.readthedocs.io/en/stable/overview.html#install\n__ https://tmt.readthedocs.io/en/stable/overview.html#examples\n__ https://tmt.readthedocs.io/en/stable/guide.html\n__ https://"
+    }
+  },
+  "repair_context": {},
+  "review_context": {}
+}

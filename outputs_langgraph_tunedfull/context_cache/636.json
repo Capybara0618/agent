@@ -1,0 +1,217 @@
+{
+  "task_id": "636",
+  "repo_owner": "edbeeching",
+  "repo_name": "godot_rl_agents",
+  "file_path": "godot_rl/core/godot_env.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:37:31+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:37:39+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:37:41+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "godot_rl/core/godot_env.py",
+    "original_code": "def _get_data(self):\n    try:\n        data = self.connection.recv(4)\n        if not data:\n            time.sleep(0.000001)\n            return self._get_data()\n        length = int.from_bytes(data, \"little\")\n        string = \"\"\n        while len(string) != length:  # TODO: refactor as string concatenation could be slow\n            string += self.connection.recv(length).decode()\n\n        return string\n    except socket.timeout as e:\n        print(\"env timed out\", e)\n\n    return None",
+    "satd_comment": "# TODO: refactor as string concatenation could be slow",
+    "target_file": {
+      "ok": true,
+      "path": "godot_rl/core/godot_env.py",
+      "sha": "72ed89487ffa7799092963044a84a424a1f81637",
+      "download_url": "https://raw.githubusercontent.com/edbeeching/godot_rl_agents/main/godot_rl/core/godot_env.py",
+      "content_excerpt": "import atexit\nimport json\nimport os\nimport pathlib\nimport socket\nimport subprocess\nimport time\nfrom collections import OrderedDict\nfrom sys import platform\nfrom typing import Optional\n\nimport numpy as np\nfrom gymnasium import spaces\n\nfrom godot_rl.core.utils import ActionSpaceProcessor, convert_macos_path\n\n\nclass GodotEnv:\n    MAJOR_VERSION = \"0\"  # Versioning for the environment\n    MINOR_VERSION = \"7\"\n    DEFAULT_PORT = 11008  # Default port for communication with Godot Game\n    DEFAULT_TIMEOUT = 60  # Default socket timeout TODO\n\n    def __init__(\n        self,\n        env_path: str = None,\n        port: int = DEFAULT_PORT,\n        show_window: bool = False,\n        seed: int = 0,\n        framerate: Optional[int] = None,\n        action_repeat: Optional[int] = None,\n        speedup: Optional[int] = None,\n        convert_action_space: bool = False,\n        **kwargs,\n    ):\n        \"\"\"\n        Initialize a new instance of GodotEnv\n\n        Args:\n            env_path (str): path to the godot binary environment.\n            port (int): Port number for communication.\n            show_window (bool): flag to display Godot game window.\n            seed (int): seed to initialize the environment.\n            framerate (int): the framerate to run the Godot game at.\n            action_repeat (int): the number of frames to repeat an action for.\n            speedup (int): the factor to speedup game time by.\n            convert_action_space (bool): flag to convert action space.\n        \"\"\"\n\n        self.proc = None\n        if env_path is not None and env_path != \"debug\":\n            env_path = self._set_platform_suffix(env_path)\n\n            self.check_platform(env_path)\n            self._launch_env(\n                env_path,\n                port,\n                show_window,\n                framerate,\n                seed,\n                action_repeat,\n                speedup,\n                **kwargs,\n            )\n        else:\n            print(\"No game binary has been provided, please press PLAY in the Godot editor\")\n\n        self.port = port\n        self.host_binding = kwargs.get(\"host_binding\", False)\n        self.connection = self._start_server()\n        self.num_envs = None\n        self._handshake()\n\n        # Action and observation spaces for each in-game agent/env/AIController (used only for multi-agent case with Rllib for now)\n        self.action_spaces = []\n        self.observation_spaces = []\n\n        self._get_env_info()\n\n        # Single-agent observation space\n        self.observation_space = self.observation_spaces[0]\n\n        # sf2 requires a tuple action space\n        # Multiple agents' action space(s)\n        self.tuple_action_spaces = [\n            spaces.Tuple([v for _, v in action_space.items()]) for action_space in self.action_spaces\n        ]\n        # Single agent action space processor using the action space(s) of the first agent\n        self.action_space_processor = ActionSpaceProcessor(self.tuple_action_spaces[0], convert_action_space)\n\n        # For multi-policy envs: The name of each agent's policy set in the env itself (any training_mode\n        # AIController instance is treated as an agent)\n        self.agent_policy_names\n\n        atexit.register(self._close)\n\n    def _set_platform_suffix(self, env_path: str) -> str:\n        \"\"\"\n        Set the platform suffix for the given environment path based on the platform.\n\n        Args:\n            env_path (str): The environment path.\n\n        Returns:\n            str: The environment path with the platform suffix.\n        \"\"\"\n        suffixes = {\n            \"linux\": \".x86_64\",\n            \"linux2\": \".x86_64\",\n            \"darwin\": \".app\",\n            \"win32\": \".exe\",\n        }\n        suffix = suffixes[platform]\n        return str(pathlib.Path(env_path).with_suffix(suffix))\n\n    def check_platform(self, filename: str):\n        \"\"\"\n        Check the platform and assert the file type\n\n        Args:\n            filename (str): Path of the file to check.\n\n        Raises:\n            AssertionError: If the file type does not match with the platform or file does not exist.\n        \"\"\"\n        if platform == \"linux\" or platform == \"linux2\":\n            # Linux\n            assert (\n                pathlib.Path(filename).suffix == \".x86_64\"\n            ), f\"Incorrect file suffix for {filename=} {pathlib.Path(filename).suffix=}. Please provide a .x86_64 file\"\n        elif platform == \"darwin\":\n            # OSX\n            assert (\n                pathlib.Path(filename).suffix == \".app\"\n            ), f\"Incorrect file suffix for {filename=} {pathlib.Path(filename).suffix=}. Please provide a .app file\"\n        elif platform == \"win32\":\n            # Windows...\n            assert (\n                pathlib.Path(filename).suffix == \".exe\"\n            ), f\"Incorrect file suffix for {filename=} {pathlib.Path(filename).suffix=}. Please provide a .exe file\"\n        else:\n            assert 0, f\"unknown filetype {pathlib.Path(filename).suffix}\"\n\n        assert os.path.exists(filename)\n\n    def from_numpy(self, action, order_ij=False):\n        \"\"\"\n        Handles dict to tuple actions\n\n        Args:\n            action: The action to be converted.\n            order_ij (bool): Order flag.\n\n        Returns:\n            list: The converted action.\n        \"\"\"\n        result = []\n\n        for agent_idx in range(self.num_envs):\n            env_action = {}\n            for j, k in enumerate(self.action_spaces[agent_idx].keys()):\n                if order_ij is True:\n                    v = action[agent_idx][j]\n                else:\n                    v = action[j][agent_idx]\n\n                if isinstance(v, np.ndarray):\n                    env_action[k] = v.tolist()\n                else:\n                    env_action[k] = int(v)  # cannot serialize int32\n\n            result.append(env_action)\n        return result\n\n    def step(self, action, order_ij=False):\n        \"\"\"\n        Perform one step in the environment.\n\n        Args:\n            action: Action to be taken.\n            order_ij (bool): Order flag.\n\n        Returns:\n            tuple: Tuple containing observation, reward, done flag, termination flag, and info.\n        \"\"\"\n        self.step_send(action, order_ij=order_ij)\n        return self.step_recv()\n\n    def step_send(self, action, order_ij=False):\n        \"\"\"\n        Send the action to the Godot environment.\n\n        Args:\n            action: Action to be sent.\n            order_ij (bool): Order flag.\n        \"\"\"\n        action = self.action_space_processor.to_original_dist(action)\n\n        message = {\n            \"type\": \"action\",\n            \"action\": self.from_numpy(action, order_ij=order_ij),\n        }\n        self._send_as_json(message)\n\n    def step_recv(self):\n        \"\"\"\n        Receive the step response from the Godot environment.\n\n        Returns:\n            tuple: Tuple containing observation, reward, done flag, termination flag, and info.\n        \"\"\"\n        response = self._get_json_dict()\n        response[\"obs\"] = self._process_obs(response[\"obs\"])\n\n        # Kept for backward compatibility if the plugin doesn't send info.\n        default_info = [{}] * len(response[\"done\"])\n\n        return (\n            response[\"obs\"],\n            response[\"reward\"],\n            np.array(response[\"done\"]).tolist(),\n            np.array(response[\"done\"]).tolist(),  # TODO update API to term, trunc\n            response.get(\"info\", default_info),\n        )\n\n    def _process_obs(self, response_obs: dict):\n        \"\"\"\n        Process observation data.\n\n        Args:\n            response_obs (dict): The response observation to be processed.\n\n        Returns:\n            dict: The processed observation data.\n        \"\"\"\n        for k in response_obs[0].keys():\n            if \"2d\" in k:\n                for sub in response_obs:\n                    sub[k] = self._decode_2d_obs_from_string(sub[k], self.observation_space[k].shape)\n\n        return response_obs\n\n    def reset(self, seed=None):\n        \"\"\"\n        Reset the Godot environment.\n\n        Returns:\n            dict: The initial observation data.\n        \"\"\"\n        message = {\n            \"type\": \"reset\",\n        }\n        self._send_as_json(message)\n        response = self._get_json_dict()\n        response[\"obs\"] = self._process_obs(response[\"obs\"])\n        assert response[\"type\"] == \"reset\"\n        obs = response[\"obs\"]\n        return obs, [{}] * self.num_envs\n\n    def call(self, method):\n        message = {\n            \"type\": \"call\",\n            \"method\": method,\n        }\n        self._send_as_json(message)\n        response = self._get_json_dict()\n\n        return response[\"returns\"]\n\n    def close(self):\n        message = {\n            \"type\": \"close\",\n        }\n        self._send_as_json(message)\n        print(\"close message sent\")\n        time.sleep(1.0)\n        self.connection.close()\n        try:\n            atexit.unregister(self._close)\n        except Exception as e:\n            print(\"exception unregistering close method\", e)\n\n    @property\n    def action_space(self):\n        \"\"\"\n        Returns a single action space.\n        \"\"\"\n        return self.action_space_processor.action_space\n\n    def _close(self):\n        print(\"exit was not clean, using atexit to close env\")\n        self.close()\n\n    def _launch_env(\n        self,\n        env_path,\n        port,\n        show_window,\n        framerate,\n        seed,\n        action_repeat,\n        speedup,\n        **kwargs,\n    ):\n        # --fixed-fps {framerate}\n        path = convert_macos_path(env_path) if platform == \"darwin\" else env_path\n\n        launch_cmd = [path]\n        launch_cmd.append(f\"--port={port}\")\n        launch_cmd.append(f\"--env_seed={seed}\")\n\n        if show_window is False:\n            launch_cmd.append(\"--disable-render-loop\")\n            launch_cmd.append(\"--headless\")\n        if framerate is not None:\n            launch_cmd.append(f\"--fixed-fps {framerate}\")\n        if action_repeat is not None:\n            launch_cmd.append(f\"--action_repeat={action_repeat}\")\n        if speedup is not None:\n            launch_cmd.append(f\"--speedup={speedup}\")\n        if len(kwargs) > 0:\n            for key, value in kwargs.items():\n                launch_cmd.append(f\"--{key}={value}\")\n\n        self.proc = subprocess.Popen(\n            launch_cmd,\n            start_new_session=True,\n            # shell=True,\n        )\n\n    def _start_server(self):\n        # Either launch a an exported Godot project or connect to a playing godot game\n        # connect to playing godot game\n\n        print(f\"waiting for remote GODOT connection on port {self.port}\")\n        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\n        # Bind the socket to the port, \"localhost\" was not working on windows VM, had to use the IP\n        address = \"0.0.0.0\" if self.host_binding else \"127.0.0.1\"\n        server_address = (address, self.port)\n        sock.bind(server_address)\n\n        # Listen for incoming connections\n        sock.listen(1)\n        sock.settimeout(GodotEnv.DEFAULT_TIMEOUT)\n        connection, client_address = sock.accept()\n        # connection.settimeout(GodotEnv.DEFAULT_TIMEOUT)\n        #        connection.setblocking(False) TODO\n        print(\"connection established\")\n        return connection\n\n    def _handshake(self):\n        message = {\n            \"type\": \"handshake\",\n            \"major_version\": GodotEnv.MAJOR_VERSION,\n            \"minor_version\": GodotEnv.MINOR_VERSION,\n        }\n\n        self._send_as_json(message)\n\n    def _get_env_info(self):\n        message = {\"type\": \"env_info\"}\n        self._send_as_json(message)\n\n        json_dict = self._get_json_dict()\n\n        assert json_dict[\"type\"] == \"env_info\"\n\n        # Number of AIController instances in a single Godot env/process\n        self.num_envs = json_dict[\"n_agents\"]\n\n        # actions can be \"single\" for a single action head\n        # or \"multi\" for several outputeads\n\n        pr",
+      "total_lines": 517
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "atexit",
+        "json",
+        "os",
+        "pathlib",
+        "socket",
+        "subprocess",
+        "time",
+        "collections:OrderedDict",
+        "sys:platform",
+        "typing:Optional",
+        "numpy",
+        "gymnasium:spaces",
+        "godot_rl.core.utils:ActionSpaceProcessor",
+        "godot_rl.core.utils:convert_macos_path"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/edbeeching/godot_rl_agents/main/README.md",
+      "content_excerpt": "# Godot RL Agents\n\nFeel free to join our [Discord](https://discord.gg/HMMD2J8SxY) for help and discussions about Godot RL Agents.\n\nGodot RL Agents is a fully Open Source package that allows video game creators, AI researchers and hobbyists the opportunity to learn complex behaviors for their Non Player Characters or agents.\nThis repository provides:\n\n- An interface between games created in the [Godot Engine](https://godotengine.org/) and Machine Learning algorithms running in Python\n- Wrappers for four well known rl frameworks: [StableBaselines3](https://stable-baselines3.readthedocs.io/en/master/), [Sample Factory](https://www.samplefactory.dev/), [Ray RLLib](https://docs.ray.io/en/latest/rllib-algorithms.html) and [CleanRL](https://github.com/vwxyzjn/cleanrl).\n- Support for memory-based agents, with LSTM or attention based interfaces\n- Support for 2D and 3D games\n- A suite of AI sensors to augment your agent's capacity to observe the game world\n- Godot and Godot RL Agents are completely free and open source under the very permissive MIT license. No strings attached, no royalties, nothing.\n\nYou can find out more about Godot RL agents in our AAAI-2022 Workshop [paper](https://arxiv.org/abs/2112.03636).\n\n[https://user-images.githubusercontent.com/7275864/140730165-dbfddb61-cc90-47c7-86b3-88086d376641.mp4](https://user-images.githubusercontent.com/7275864/140730165-dbfddb61-cc90-47c7-86b3-88086d376641.mp4)\n\n## Quickstart Guide\n\nThis quickstart guide will get you up and running using the Godot RL Agents library with the StableBaselines3 backend, as this supports Windows, Mac a"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_get_data test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_get_data(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "godot_env.py",
+          "path": "godot_rl/core/godot_env.py",
+          "sha": "72ed89487ffa7799092963044a84a424a1f81637",
+          "html_url": "https://github.com/edbeeching/godot_rl_agents/blob/ba844135474ecb5a5c4d74d152797248d570db09/godot_rl/core/godot_env.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "godot_rl/core",
+      "count": 3,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "godot_rl/core/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "godot_env.py",
+          "path": "godot_rl/core/godot_env.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "godot_rl/core/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 2,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "godot_rl/core/__init__.py"
+        },
+        {
+          "name": "utils.py",
+          "path": "godot_rl/core/utils.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "godot_rl/core/godot_env.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "03b89896f3a2e2dde5ce861bee563931eeb93bfb",
+          "html_url": "https://github.com/edbeeching/godot_rl_agents/commit/03b89896f3a2e2dde5ce861bee563931eeb93bfb",
+          "message": "made host binding optional",
+          "author": "GianiStatie",
+          "date": "2025-06-10T06:46:14Z"
+        },
+        {
+          "sha": "c13e99bbb26430c6a8c8da864b67e46c9014a6a4",
+          "html_url": "https://github.com/edbeeching/godot_rl_agents/commit/c13e99bbb26430c6a8c8da864b67e46c9014a6a4",
+          "message": "minor updates to godot-env",
+          "author": "GianiStatie",
+          "date": "2025-06-06T18:29:42Z"
+        },
+        {
+          "sha": "13baf29d80cbf7569b84d6870b64732e94d9bb87",
+          "html_url": "https://github.com/edbeeching/godot_rl_agents/commit/13baf29d80cbf7569b84d6870b64732e94d9bb87",
+          "message": "Fixed swapped action order in godot_env.py",
+          "author": "Ivan-267",
+          "date": "2025-05-15T13:20:00Z"
+        },
+        {
+          "sha": "70fb693958136c6730c6b88684a65652d7e7b820",
+          "html_url": "https://github.com/edbeeching/godot_rl_agents/commit/70fb693958136c6730c6b88684a65652d7e7b820",
+          "message": "Adds adjustable obs range",
+          "author": "Ivan-267",
+          "date": "2025-03-16T04:58:00Z"
+        },
+        {
+          "sha": "1bcd0067422531a24b15863878d302433b50c674",
+          "html_url": "https://github.com/edbeeching/godot_rl_agents/commit/1bcd0067422531a24b15863878d302433b50c674",
+          "message": "Merge pull request #208 from GianiStatie/giani/passing-info\n\nfeat: adding info - is_success",
+          "author": "Giani Statie",
+          "date": "2024-10-23T20:00:19Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_get_data TODO refactor string concatenation could",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "godot_rl/core/godot_env.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "03b89896f3a2e2dde5ce861bee563931eeb93bfb",
+        "html_url": "https://github.com/edbeeching/godot_rl_agents/commit/03b89896f3a2e2dde5ce861bee563931eeb93bfb",
+        "message": "made host binding optional",
+        "author": "GianiStatie",
+        "date": "2025-06-10T06:46:14Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

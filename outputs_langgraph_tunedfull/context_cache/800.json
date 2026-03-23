@@ -1,0 +1,336 @@
+{
+  "task_id": "800",
+  "repo_owner": "openstack",
+  "repo_name": "watcher",
+  "file_path": "watcher/applier/actions/migration.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:20:32+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:20:42+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:20:45+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "watcher/applier/actions/migration.py",
+    "original_code": "def abort(self):\n    # TODO(adisky): implement abort for migration\n    LOG.warning(\"Abort for migration not implemented\")",
+    "satd_comment": "# TODO(adisky): implement abort for migration",
+    "target_file": {
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "sha": "14283a6fc7a3555e5031e16da703df700b2118ba",
+      "download_url": "https://raw.githubusercontent.com/openstack/watcher/master/watcher/applier/actions/migration.py",
+      "content_excerpt": "# Copyright (c) 2015 b<>com\n#\n# Authors: Jean-Emile DARTOIS <jean-emile.dartois@b-com.com>\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n# implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n\nfrom oslo_log import log\nfrom watcher._i18n import _\nfrom watcher.applier.actions import base\nfrom watcher.common import exception\nfrom watcher.common import nova_helper\n\nLOG = log.getLogger(__name__)\n\n\nclass Migrate(base.BaseAction):\n    \"\"\"Migrates a server to a destination nova-compute host\n\n    This action will allow you to migrate a server to another compute\n    destination host.\n    Migration type 'live' can only be used for migrating active VMs.\n    Migration type 'cold' can be used for migrating non-active VMs\n    as well active VMs, which will be shut down while migrating.\n\n    The action schema is::\n\n        schema = Schema({\n         'resource_id': str,  # should be a UUID\n         'migration_type': str,  # choices -> \"live\", \"cold\"\n         'destination_node': str,\n         'source_node': str,\n        })\n\n    The `resource_id` is the UUID of the server to migrate.\n    The `source_node` and `destination_node` parameters are respectively the\n    source and the destination compute hostname.\n\n    .. note::\n\n        Nova API version must be 2.56 or above if `destination_node` parameter\n        is given.\n\n    \"\"\"\n\n    # input parameters constants\n    MIGRATION_TYPE = 'migration_type'\n    LIVE_MIGRATION = 'live'\n    COLD_MIGRATION = 'cold'\n    DESTINATION_NODE = 'destination_node'\n    SOURCE_NODE = 'source_node'\n\n    @property\n    def schema(self):\n        return {\n            'type': 'object',\n            'properties': {\n                'destination_node': {\n                    \"anyof\": [\n                        {'type': 'string', \"minLength\": 1},\n                        {'type': 'None'}\n                        ]\n                },\n                'migration_type': {\n                    'type': 'string',\n                    \"enum\": [\"live\", \"cold\"]\n                },\n                'resource_id': {\n                    'type': 'string',\n                    \"minlength\": 1,\n                    \"pattern\": (\"^([a-fA-F0-9]){8}-([a-fA-F0-9]){4}-\"\n                                \"([a-fA-F0-9]){4}-([a-fA-F0-9]){4}-\"\n                                \"([a-fA-F0-9]){12}$\")\n                },\n                'resource_name': {\n                    'type': 'string',\n                    \"minlength\": 1\n                },\n                'source_node': {\n                    'type': 'string',\n                    \"minLength\": 1\n                    }\n            },\n            'required': ['migration_type', 'resource_id', 'source_node'],\n            'additionalProperties': False,\n        }\n\n    @property\n    def instance_uuid(self):\n        return self.resource_id\n\n    @property\n    def migration_type(self):\n        return self.input_parameters.get(self.MIGRATION_TYPE)\n\n    @property\n    def destination_node(self):\n        return self.input_parameters.get(self.DESTINATION_NODE)\n\n    @property\n    def source_node(self):\n        return self.input_parameters.get(self.SOURCE_NODE)\n\n    def _live_migrate_instance(self, nova, destination):\n        result = None\n        try:\n            result = nova.live_migrate_instance(instance_id=self.instance_uuid,\n                                                dest_hostname=destination)\n        except exception.NovaClientError as e:\n            LOG.debug(\"Nova client exception occurred while live \"\n                      \"migrating instance \"\n                      \"%(instance)s.Exception: %(exception)s\",\n                      {'instance': self.instance_uuid, 'exception': e})\n\n        except Exception as e:\n            LOG.exception(e)\n            LOG.critical(\"Unexpected error occurred. Migration failed for \"\n                         \"instance %s. Leaving instance on previous \"\n                         \"host.\", self.instance_uuid)\n\n        return result\n\n    def _cold_migrate_instance(self, nova, destination):\n        result = None\n        try:\n            result = nova.watcher_non_live_migrate_instance(\n                instance_id=self.instance_uuid,\n                dest_hostname=destination)\n        except Exception as exc:\n            LOG.exception(exc)\n            LOG.critical(\"Unexpected error occurred. Migration failed for \"\n                         \"instance %s. Leaving instance on previous \"\n                         \"host.\", self.instance_uuid)\n        return result\n\n    def _abort_cold_migrate(self, nova):\n        # TODO(adisky): currently watcher uses its own version of cold migrate\n        # implement cold migrate using nova dependent on the blueprint\n        # https://blueprints.launchpad.net/nova/+spec/cold-migration-with-target\n        # Abort operation for cold migrate is dependent on blueprint\n        # https://blueprints.launchpad.net/nova/+spec/abort-cold-migration\n        LOG.warning(\"Abort operation for cold migration is not implemented\")\n\n    def _abort_live_migrate(self, nova, source, destination):\n        return nova.abort_live_migrate(instance_id=self.instance_uuid,\n                                       source=source, destination=destination)\n\n    def migrate(self, destination=None):\n        nova = nova_helper.NovaHelper(osc=self.osc)\n        if destination is None:\n            LOG.debug(\"Migrating instance %s, destination node will be \"\n                      \"determined by nova-scheduler\", self.instance_uuid)\n        else:\n            LOG.debug(\"Migrate instance %s to %s\", self.instance_uuid,\n                      destination)\n        try:\n            nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.InstanceNotFound(name=self.instance_uuid)\n\n        if self.migration_type == self.LIVE_MIGRATION:\n            return self._live_migrate_instance(nova, destination)\n        elif self.migration_type == self.COLD_MIGRATION:\n            return self._cold_migrate_instance(nova, destination)\n        else:\n            raise exception.Invalid(\n                message=(_(\"Migration of type '%(migration_type)s' is not \"\n                           \"supported.\") %\n                         {'migration_type': self.migration_type}))\n\n    def execute(self):\n        return self.migrate(destination=self.destination_node)\n\n    def revert(self):\n        return self.migrate(destination=self.source_node)\n\n    def abort(self):\n        nova = nova_helper.NovaHelper(osc=self.osc)\n        try:\n            nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.InstanceNotFound(name=self.instance_uuid)\n\n        if self.migration_type == self.COLD_MIGRATION:\n            return self._abort_cold_migrate(nova)\n        elif self.migration_type == self.LIVE_MIGRATION:\n            return self._abort_live_migrate(\n                nova, source=self.source_node,\n                destination=self.destination_node)\n\n    def pre_condition(self):\n        \"\"\"Check migration preconditions\n\n        Skipping conditions:\n        - Instance does not exist\n        - Instance is not running on the source_node\n        Failing conditions:\n        - Destination node (if specified) does not exist or is disabled\n        - Instance status is not ACTIVE for live migration\n        \"\"\"\n        nova = nova_helper.NovaHelper(osc=self.osc)\n\n        # Check that the instance exists\n        try:\n            instance = nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.ActionSkipped(\n                _(\"Instance %s not found\") % self.instance_uuid)\n\n        # Check that the instance is running on source_node\n        instance_host = instance.host\n        if instance_host != self.source_node:\n            raise exception.ActionSkipped(\n                _(\"Instance %(instance)s is not running on source node \"\n                  \"%(source)s (currently on %(current)s)\") %\n                {'instance': self.instance_uuid,\n                 'source': self.source_node,\n                 'current': instance_host})\n\n        # Check destination node if specified\n        if self.destination_node:\n            try:\n                # Find the compute node and check if service is enabled\n                dest_node = nova.get_compute_node_by_hostname(\n                    self.destination_node)\n\n                # Check if compute service is enabled\n                if dest_node.status != 'enabled':\n                    raise exception.ActionExecutionFailure(\n                        _(\"Destination node %s is not in enabled state\") %\n                        self.destination_node)\n            except exception.ComputeNodeNotFound:\n                raise exception.ActionExecutionFailure(\n                    _(\"Destination node %s not found\") %\n                    self.destination_node)\n\n        # Check instance status based on migration type\n        instance_status = instance.status\n        if self.migration_type == self.LIVE_MIGRATION:\n            if instance_status != 'ACTIVE':\n                raise exception.ActionExecutionFailure(\n                    _(\"Live migration requires instance %(instance)s to be \"\n                      \"in ACTIVE status (current status: %(status)s)\") %\n                    {'instance': self.instance_uuid,\n                     'status': instance_status})\n\n    def post_condition(self):\n        # TODO(jed): check extra parameters (network response, etc.)\n        pass\n\n    def get_description(self):\n        \"\"\"Description of the action\"\"\"\n        return \"Moving a VM instance from source_node to destination_node\"\n",
+      "total_lines": 265
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "oslo_log:log",
+        "watcher._i18n:_",
+        "watcher.applier.actions:base",
+        "watcher.common:exception",
+        "watcher.common:nova_helper"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/watcher/master/README.rst",
+      "content_excerpt": "=======\nWatcher\n=======\n\n.. image:: https://governance.openstack.org/tc/badges/watcher.svg\n\n.. Change things from this point on\n\n..\n      Except where otherwise noted, this document is licensed under Creative\n      Commons Attribution 3.0 License.  You can view the license at:\n\n          https://creativecommons.org/licenses/by/3.0/\n\nOpenStack Watcher provides a flexible and scalable resource optimization\nservice for multi-tenant OpenStack-based clouds.\nWatcher provides a robust framework to realize a wide range of cloud\noptimization goals, including the reduction of data center\noperating costs, increased system performance via intelligent virtual machine\nmigration, increased energy efficiency and more!\n\n* Free software: Apache license\n* Wiki: https://wiki.openstack.org/wiki/Watcher\n* Source: https://opendev.org/openstack/watcher\n* Bugs: https://bugs.launchpad.net/watcher\n* Documentation: https://docs.openstack.org/watcher/latest/\n* Release notes: https://docs.openstack.org/releasenotes/watcher/\n* Design specifications: https://specs.openstack.org/openstack/watcher-specs/\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "abort test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_migration.py",
+          "path": "watcher/tests/unit/applier/actions/test_migration.py",
+          "sha": "202f15c4c2536ab8aedc87091776c76c42d15ed8",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/tests/unit/applier/actions/test_migration.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_nova_helper.py",
+          "path": "watcher/tests/unit/common/test_nova_helper.py",
+          "sha": "bbdba4f2e4a90fb67374e4deeefd0973adcb6ba3",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/tests/unit/common/test_nova_helper.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"abort(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "base.py",
+          "path": "watcher/applier/workflow_engine/base.py",
+          "sha": "c4df9afb15f3bc0e331edadba39827fd8c7e7144",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/workflow_engine/base.py",
+          "score": 1.0
+        },
+        {
+          "name": "default.py",
+          "path": "watcher/applier/workflow_engine/default.py",
+          "sha": "df726d9813f3d6963039ebe13a1d89756dacbfc4",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/workflow_engine/default.py",
+          "score": 1.0
+        },
+        {
+          "name": "sleep.py",
+          "path": "watcher/applier/actions/sleep.py",
+          "sha": "70f2f44f441f3ac454860dc8f0ab77974b24bf58",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/sleep.py",
+          "score": 1.0
+        },
+        {
+          "name": "migration.py",
+          "path": "watcher/applier/actions/migration.py",
+          "sha": "14283a6fc7a3555e5031e16da703df700b2118ba",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/migration.py",
+          "score": 1.0
+        },
+        {
+          "name": "volume_migration.py",
+          "path": "watcher/applier/actions/volume_migration.py",
+          "sha": "344becedbbd00bf80e86d868f95dc43aa5054d31",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/volume_migration.py",
+          "score": 1.0
+        },
+        {
+          "name": "stop.py",
+          "path": "watcher/applier/actions/stop.py",
+          "sha": "5c78b20f7b4cecfc5c79fd93af7cab34511e86a7",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/stop.py",
+          "score": 1.0
+        },
+        {
+          "name": "nova_helper.py",
+          "path": "watcher/common/nova_helper.py",
+          "sha": "bbe6bf0138fe89c4e8ec6aa704f434ed8a3d13d2",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/common/nova_helper.py",
+          "score": 1.0
+        },
+        {
+          "name": "nop.py",
+          "path": "watcher/applier/actions/nop.py",
+          "sha": "cf0a801e3715668f2bfdbd0d2f7349e0407ea4d9",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/nop.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "watcher/applier/actions",
+      "count": 11,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "watcher/applier/actions/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "watcher/applier/actions/base.py",
+          "type": "file"
+        },
+        {
+          "name": "change_node_power_state.py",
+          "path": "watcher/applier/actions/change_node_power_state.py",
+          "type": "file"
+        },
+        {
+          "name": "change_nova_service_state.py",
+          "path": "watcher/applier/actions/change_nova_service_state.py",
+          "type": "file"
+        },
+        {
+          "name": "factory.py",
+          "path": "watcher/applier/actions/factory.py",
+          "type": "file"
+        },
+        {
+          "name": "migration.py",
+          "path": "watcher/applier/actions/migration.py",
+          "type": "file"
+        },
+        {
+          "name": "nop.py",
+          "path": "watcher/applier/actions/nop.py",
+          "type": "file"
+        },
+        {
+          "name": "resize.py",
+          "path": "watcher/applier/actions/resize.py",
+          "type": "file"
+        },
+        {
+          "name": "sleep.py",
+          "path": "watcher/applier/actions/sleep.py",
+          "type": "file"
+        },
+        {
+          "name": "stop.py",
+          "path": "watcher/applier/actions/stop.py",
+          "type": "file"
+        },
+        {
+          "name": "volume_migration.py",
+          "path": "watcher/applier/actions/volume_migration.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "watcher/applier/actions/__init__.py"
+        },
+        {
+          "name": "base.py",
+          "path": "watcher/applier/actions/base.py"
+        },
+        {
+          "name": "change_node_power_state.py",
+          "path": "watcher/applier/actions/change_node_power_state.py"
+        },
+        {
+          "name": "change_nova_service_state.py",
+          "path": "watcher/applier/actions/change_nova_service_state.py"
+        },
+        {
+          "name": "factory.py",
+          "path": "watcher/applier/actions/factory.py"
+        },
+        {
+          "name": "nop.py",
+          "path": "watcher/applier/actions/nop.py"
+        },
+        {
+          "name": "resize.py",
+          "path": "watcher/applier/actions/resize.py"
+        },
+        {
+          "name": "sleep.py",
+          "path": "watcher/applier/actions/sleep.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "40472f49b3299751090d6c42b474f1d98fb9afda",
+          "html_url": "https://github.com/openstack/watcher/commit/40472f49b3299751090d6c42b474f1d98fb9afda",
+          "message": "Fix exception handling for find_instance calls\n\nThe nova_helper.find_instance method raises ComputeResourceNotFound\nwhen an instance is not found (via the @handle_nova_error decorator),\nbut several callers were checking for None return values instead of\ncatching the exception. This caused uncaught e",
+          "author": "jgilaber",
+          "date": "2026-02-26T14:26:26Z"
+        },
+        {
+          "sha": "bf6c7e2e27b8c48941652e63d8f65e23e6f6a146",
+          "html_url": "https://github.com/openstack/watcher/commit/bf6c7e2e27b8c48941652e63d8f65e23e6f6a146",
+          "message": "Use wrapper classes for novaclient objects\n\nUpdated NovaHelper methods to return wrapped objects:\n- Hypervisor: get_compute_node_list, get_compute_node_by_name,\nget_compute_node_by_hostname, get_compute_node_by_uuid\n- Server: get_instance_list, get_instance_by_uuid, find_instance\n- Flavor: get_flavo",
+          "author": "jgilaber",
+          "date": "2026-01-09T15:52:42Z"
+        },
+        {
+          "sha": "c14f9098a608fb013a710dc9c4ca77fab96d148f",
+          "html_url": "https://github.com/openstack/watcher/commit/c14f9098a608fb013a710dc9c4ca77fab96d148f",
+          "message": "Skip migrate actions in pre_condition phase\n\nThis patch is implementing detection of certain conditions and moving\nthe action to SKIPPED status so that, execution is not started. We will\ncheck that:\n\n- The instance exists\n- The instance is running in the source_node\n\nOn other contitions the action w",
+          "author": "Alfredo Moralejo",
+          "date": "2025-10-28T08:28:17Z"
+        },
+        {
+          "sha": "a1fdc7a1edf9203153b8c2ba29f55d1ae04311b8",
+          "html_url": "https://github.com/openstack/watcher/commit/a1fdc7a1edf9203153b8c2ba29f55d1ae04311b8",
+          "message": "Apply pyupgrade\n\nThis change was generated with the following command\npyupgrade --keep-percent-format --keep-runtime-typing --py3-only $(git ls-files | grep .py)\nthen formated with pre-commit and autopep8\n\nChange-Id: Iefb974d448ab91a01b07656cc5f6590307020f3a\nSigned-off-by: Sean Mooney <work@seanmoon",
+          "author": "Sean Mooney",
+          "date": "2025-09-17T06:26:10Z"
+        },
+        {
+          "sha": "3f6c7e406af2e79c33e0c589a008bc94029dfa4f",
+          "html_url": "https://github.com/openstack/watcher/commit/3f6c7e406af2e79c33e0c589a008bc94029dfa4f",
+          "message": "Drop nova command reference from the code\n\nIn DevStack environment, nova service-list command does not\nexist. Distro suggests to install python-novaclient from package.\n\nIn Strategies documentation, we generate the docs from following\ncode.[1]\n```\n       * - ``migration``\n         - .. watcher-term:",
+          "author": "Chandan Kumar (raukadah)",
+          "date": "2025-04-22T12:46:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "abort TODO adisky implement abort migration",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "40472f49b3299751090d6c42b474f1d98fb9afda",
+        "html_url": "https://github.com/openstack/watcher/commit/40472f49b3299751090d6c42b474f1d98fb9afda",
+        "message": "Fix exception handling for find_instance calls\n\nThe nova_helper.find_instance method raises ComputeResourceNotFound\nwhen an instance is not found (via the @handle_nova_error decorator),\nbut several callers were checking for None return values instead of\ncatching the exception. This caused uncaught e",
+        "author": "jgilaber",
+        "date": "2026-02-26T14:26:26Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

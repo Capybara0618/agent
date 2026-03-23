@@ -1,0 +1,305 @@
+{
+  "task_id": "504",
+  "repo_owner": "johnmaguire",
+  "repo_name": "cardinal",
+  "file_path": "cardinal/plugins.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:57:44+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:57:54+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:57:59+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "cardinal/plugins.py",
+    "original_code": "def _close_plugin_instance(self, plugin):\n    \"\"\"Calls the close method on an instance of a plugin\n\n    If the plugin's module has a close() function, we will check whether\n    it expects an instance of CardinalBot or not by checking whether it\n    accepts an argument or not. If it does, we will pass in the instance of\n    CardinalBot. This method is called just prior to removing the internal\n    reference to the plugin's instance.\n\n    Keyword arguments:\n      plugin -- The name of the plugin to remove the instance of.\n\n    Raises:\n      ValueError -- When a plugin's close function has more than one\n        argument.\n    \"\"\"\n\n    instance = self.plugins[plugin]['instance']\n    module = self.plugins[plugin]['module']\n\n    if hasattr(instance, 'close') and inspect.ismethod(instance.close):\n        # The plugin has a close method, so we now need to check how\n        # many arguments the method has. If it only has one, then the\n        # argument must be 'self' and therefore they aren't expecting\n        # us to pass in an instance of CardinalBot. If there are two\n        # arguments, they expect CardinalBot. Anything else is invalid.\n        argspec = inspect.getargspec(\n            sinstance.close\n        )\n\n        if len(argspec.args) == 1:\n            module.close()\n        elif len(argspec.args) == 2:\n            module.close(self.cardinal)\n        else:\n        # TODO: Create an internal exception type for our own plugin rules.\n        raise ValueError(\"Plugin close function may not have more than \"\n            \"one argument\")",
+    "satd_comment": "# TODO: Create an internal exception type for our own plugin rules.",
+    "target_file": {
+      "ok": true,
+      "path": "cardinal/plugins.py",
+      "sha": "759d164f5b0bed5152905b8cd851896e25fb62de",
+      "download_url": "https://raw.githubusercontent.com/johnmaguire/Cardinal/master/cardinal/plugins.py",
+      "content_excerpt": "import os\nimport re\nimport string\nimport logging\nimport importlib\nimport inspect\nimport linecache\nimport random\nimport json\nfrom collections import defaultdict\nfrom copy import copy\nfrom importlib import reload\n\nfrom cardinal.exceptions import (\n    CommandNotFoundError,\n    ConfigNotFoundError,\n    EventAlreadyExistsError,\n    EventCallbackError,\n    EventDoesNotExistError,\n    EventRejectedMessage,\n    PluginError,\n)\n\nfrom twisted.internet import defer\n\n\nclass PluginManager:\n    \"\"\"Keeps track of, loads, and unloads plugins.\"\"\"\n\n    COMMAND_REGEX = re.compile(r'\\.([A-Za-z0-9_-]+)\\s?.*$')\n    \"\"\"Regex for matching standard commands.\n\n    This will check for anything beginning with a period (.) followed by any\n    alphanumeric character, then whitespace, then any character(s). This means\n    registered commands will be found so long as the registered command is\n    alphanumeric (or either _ or -), and any additional arguments will be up to\n    the plugin for handling.\n    \"\"\"\n\n    def __init__(self,\n                 cardinal,\n                 plugins,\n                 blacklist,\n                 _plugin_module_import_prefix='plugins',\n                 _plugin_module_directory=None):\n        \"\"\"Creates a new instance, optionally with a list of plugins to load\n\n        Keyword arguments:\n          cardinal -- An instance of `CardinalBot` to pass to plugins.\n          plugins -- A list of plugins to be loaded when instanced.\n\n        Raises:\n          TypeError -- When the `plugins` argument is not a list.\n\n        \"\"\"\n        self.logger = logging.getLogger(__name__)\n        self.cardinal = cardinal\n        self._blacklist = blacklist\n\n        # Module name from which plugins are imported. This exists to assist\n        # in unit testing.\n        self._plugin_module_import_prefix = _plugin_module_import_prefix\n        if _plugin_module_directory is None:\n            self.plugins_directory = os.path.abspath(os.path.join(\n                os.path.dirname(os.path.realpath(os.path.abspath(__file__))),\n                '..',\n                'plugins',\n            ))\n        else:\n            self.plugins_directory = _plugin_module_directory\n\n        # Used for iterating PluginManager plugins\n        self.iteration_counter = 0\n\n        self.plugins = {}\n        self._module_cache = {}\n\n        self.load(plugins)\n\n    def __iter__(self):\n        \"\"\"Part of the iterator protocol, returns iterator object.\n\n        In this case, this will return itself as it keeps track of the iterator\n        internally. Before returning itself, the iteration counter will be\n        reset to 0.\n\n        Returns:\n          PluginManager -- Returns the current instance.\n\n        \"\"\"\n        # Reset the iteration counter\n        self.iteration_counter = 0\n\n        return self\n\n    def __next__(self):\n        \"\"\"Part of the iterator protocol, returns the next plugin.\n\n        Returns:\n          dict -- Dictionary containing a plugin's data.\n\n        Raises:\n          StopIteration -- Raised when there are no plugins left.\n\n        \"\"\"\n        # Make sure we have the dictionary sorted so we return the proper\n        # element\n        keys = sorted(self.plugins.keys())\n\n        # Increment the counter\n        self.iteration_counter += 1\n\n        if self.iteration_counter > len(keys):\n            raise StopIteration\n\n        return self.plugins[keys[self.iteration_counter - 1]]\n\n    def _import_module(self, plugin, suffix='plugin'):\n        \"\"\"Given a plugin name, will import it from its directory or reload it.\n\n        Returns:\n          The module that was loaded.\n        \"\"\"\n        # Sort of a hack... this helps with debugging, as uncaught exceptions\n        # can show the wrong data (line numbers / relevant code) if linecache\n        # doesn't get cleared when a module is reloaded. This is Python's\n        # internal cache of code files and line numbers.\n        linecache.clearcache()\n\n        if plugin in self._module_cache:\n            module = reload(self._module_cache[plugin])\n        else:\n            module = importlib.import_module(\n                '%s.%s.%s' %\n                (self._plugin_module_import_prefix,\n                 plugin,\n                 suffix))\n\n        self._module_cache[plugin] = module\n\n        return module\n\n    def _instantiate_plugin(self, module, config=None):\n        \"\"\"Creates an instance of the plugin module.\n\n        If the setup() function of the plugin's module takes an argument then\n        we will provide the instance of CardinalBot to the plugin. If it takes\n        two, we will provide Cardinal, and its config.\n\n        Keyword arguments:\n          module -- The module to instantiate.\n          config -- A config, if any, belonging to the plugin.\n\n        Returns:\n          object -- The instance of the plugin.\n\n        Raises:\n          PluginError -- When a plugin's setup function has more than one\n            argument.\n        \"\"\"\n        if hasattr(module, 'entrypoint'):\n            entrypoint = module.entrypoint\n        # Old-style - will be deprecated in a future release of Cardinal\n        elif hasattr(module, 'setup') and inspect.isfunction(module.setup):\n            entrypoint = module.setup\n        else:\n            raise PluginError(\n                \"Plugin must define an entrypoint attribute pointing to \"\n                \"the plugin's class definition or factory method/function.\"\n            )\n\n        try:\n            signature = inspect.signature(entrypoint)\n        except TypeError:\n            raise PluginError(\n                \"Plugin's entrypoint must be a callable returning a new \"\n                \"instance of the plugin.\"\n            )\n\n        # Check whether the setup method on the module accepts an argument. If\n        # it does, they are expecting our instance of CardinalBot to be passed\n        # in. If not, just call setup. If there is more than one argument\n        # accepted, the method is invalid.\n        kwargs = {}\n        for param in signature.parameters:\n            if param == 'cardinal':\n                kwargs['cardinal'] = self.cardinal\n            elif param == 'config':\n                kwargs['config'] = config\n            else:\n                raise PluginError(\n                    \"Unknown parameter {} in entrypoint signature\"\n                    .format(param)\n                )\n\n        return entrypoint(**kwargs)\n\n    def _register_plugin_callbacks(self, callbacks):\n        \"\"\"Registers callbacks found in a plugin\n\n        Registers all event callbacks provided by _get_plugin_callbacks with\n        EventManager. Callback IDs will be stored in callback_ids so we can\n        remove them on unload. It is possible to have multiple methods as\n        callbacks for a single event, and to use the same method as a callback\n        for multiple events.\n\n        Keyword arguments:\n            callbacks - List of callbacks to register.\n\n        Returns:\n            dict -- Maps event names to a list of EventManager callback IDs.\n        \"\"\"\n        # Initialize variable to hold events callback IDs\n        callback_ids = defaultdict(list)\n\n        def rollback():\n            for event_name, ids in list(callback_ids.items()):\n                for id_ in ids:\n                    self.cardinal.event_manager.remove_callback(\n                        event_name, id_)\n\n        # Loop through list of dictionaries\n        try:\n            for callback in callbacks:\n                # Loop through all events the callback should be registered to\n                for event_name in callback['event_names']:\n                    # Get callback ID from register_callback method\n                    try:\n                        id_ = self.cardinal.event_manager.register_callback(\n                            event_name, callback['method'])\n                    except Exception:\n                        self.logger.exception(\n                            \"Error registering callback for event: {}\"\n                            .format(event_name))\n                        raise\n\n                    # Append to list of callbacks for given event_name\n                    callback_ids[event_name].append(id_)\n        except Exception:\n            rollback()\n            raise\n\n        return callback_ids\n\n    def _unregister_plugin_callbacks(self, plugin):\n        \"\"\"Unregisters all events found in a plugin.\n\n        Will remove all callbacks stored in callback_ids from EventManager.\n\n        Keyword arguments:\n            plugin - The name of plugin to unregister events for.\n        \"\"\"\n\n        # Reference to plugin\n        plugin = self.plugins[plugin]\n\n        # Loop though each event name\n        for event_name in list(plugin['callback_ids'].keys()):\n            # Loop tough callbacks\n            for callback_id in plugin['callback_ids'][event_name]:\n                self.cardinal.event_manager.remove_callback(\n                    event_name, callback_id)\n\n                # Remove callback ID from registered_events\n                plugin['callback_ids'][event_name].remove(callback_id)\n\n    def _close_plugin_instance(self, plugin):\n        \"\"\"Calls the close method on an instance of a plugin.\n\n        If the plugin's module has a close() function, we will check whether\n        it expects an instance of CardinalBot or not by checking whether it\n        accepts an argument or not. If it does, we will pass in the instance of\n        CardinalBot. This method is called just prior to removing the internal\n        reference to the plugin's instance.\n\n        Keyword arguments:\n          plugin -- The name of the plugin to remove the instance of.\n\n        Raises:\n          PluginError -- When a plugin's close function has more than one\n            argument.\n        \"\"\"\n\n        instance = self.plugins[plugin]['instance']\n\n        if hasattr(instance, 'close') and inspect.ismethod(instance.close):\n            # The plugin has a close method, so we now need to check how\n            # many arguments the method has. If it only has one, then the\n            # argument must be 'self' and therefore they aren't expecting\n            # us to pass in an instance of CardinalBot. If there are two\n            # arguments, they expect CardinalBot. Anything else is invalid.\n            argspec = inspect.getfullargspec(\n                instance.close\n            )\n\n            if len(argspec.args) == 1:\n                instance.close()\n            elif len(argspec.args) == 2:\n                instance.close(self.cardinal)\n            else:\n                raise PluginError(\"Unknown arguments for close function\")\n\n    def _load_plugin_config(self, plugin):\n        \"\"\"Loads a JSON config for a given plugin\n\n        Keyword arguments:\n          plugin -- Name of plugin to load config for.\n\n        Raises:\n          ConfigNotFoundError -- Raised when expected config isn't found.\n\n        \"\"\"\n        # Initialize variable to hold plugin config\n        config = None\n\n        # Attempt to load and parse JSON config file\n        file_ = os.path.join(\n            self.plugins_directory,\n            plugin,\n            'config.json'\n        )\n        try:\n            f = open(file_, 'r')\n            config = json.load(f)\n            f.close()\n        # File did not exist or we can't open it for another reason\n        except IOError:\n            self.logger.debug(\n                \"Can't open %s - maybe it doesn't exist?\" % file_\n            )\n        # Thrown by json.load() when the content isn't valid JSON\n        except ValueError:\n            self.logger.warning(\n                \"Invalid JSON in %s, skipping it\" % file_\n            )\n\n        # If neither config was found, raise an exception\n        if not config:\n            raise ConfigNotFoundError(\n                \"No config found for plugin: %s\" % plugin\n            )\n\n        # Return config\n        return config\n\n    def _get_plugin_commands(self, instance):\n        \"\"\"Find the commands in a plugin and return them as callables.\n\n        Key",
+      "total_lines": 1025
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "os",
+        "re",
+        "string",
+        "logging",
+        "importlib",
+        "inspect",
+        "linecache",
+        "random",
+        "json",
+        "collections:defaultdict",
+        "copy:copy",
+        "importlib:reload",
+        "cardinal.exceptions:CommandNotFoundError",
+        "cardinal.exceptions:ConfigNotFoundError",
+        "cardinal.exceptions:EventAlreadyExistsError",
+        "cardinal.exceptions:EventCallbackError",
+        "cardinal.exceptions:EventDoesNotExistError",
+        "cardinal.exceptions:EventRejectedMessage",
+        "cardinal.exceptions:PluginError",
+        "twisted.internet:defer"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/johnmaguire/Cardinal/master/README.md",
+      "content_excerpt": "[![Cardinal](./_assets/cardinal.svg)](https://github.com/JohnMaguire/Cardinal)\n\n# Meet Cardinal.\n\n[![Build Status](https://github.com/JohnMaguire/Cardinal/workflows/Cardinal/badge.svg)](https://github.com/JohnMaguire/Cardinal/actions?query=workflow%3ACardinal) [![Coverage Status](https://codecov.io/github/JohnMaguire/Cardinal/coverage.svg?branch=master)](https://codecov.io/github/JohnMaguire/Cardinal?branch=master)\n\nCardinal is a Python Twisted IRC bot with a focus on ease of development. It features reloadable asynchronous plugins, [Python decorators for commands](https://github.com/JohnMaguire/Cardinal/wiki/Writing-Plugins#adding-commands-to-a-plugin) and [IRC events](https://github.com/JohnMaguire/Cardinal/wiki/Cardinal-Events), [simple persistent JSON data storage](https://github.com/JohnMaguire/Cardinal/wiki/Database-Access), and [a well-documented API](https://github.com/JohnMaguire/Cardinal/wiki/Cardinal-Methods).\n\nYou can join [#cardinal](https://www.mibbit.com/#cardinal@irc.darkscience.net:+6697) on the [DarkScience](http://www.darkscience.net/) IRC network for questions or support. (irc.darkscience.net/+6697 &mdash; SSL required)\n\n## What can Cardinal do?\n\nAnything, if you're creative! Cardinal does come with some plugins to get you started...\n\n* Fetching URL titles\n* Wolfram Alpha calculations\n* Wikipedia definitions\n* Urban Dictionary definitions\n* Movie and TV show lookups\n* Weather reports\n* Reminders\n* Google searches\n* Now playing w/ Last.fm\n* Stock ticker\n* sed-like substitutions\n* ... and more!\n\nBut the best part of Cardinal is how easy it is to add more!\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_close_plugin_instance test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_close_plugin_instance(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "plugins.py",
+          "path": "cardinal/plugins.py",
+          "sha": "759d164f5b0bed5152905b8cd851896e25fb62de",
+          "html_url": "https://github.com/johnmaguire/Cardinal/blob/e2677864fc6ce04971da5eef34a45f94c2432955/cardinal/plugins.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "cardinal",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "cardinal/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "bot.py",
+          "path": "cardinal/bot.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "cardinal/config.py",
+          "type": "file"
+        },
+        {
+          "name": "decorators.py",
+          "path": "cardinal/decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "cardinal/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "fixtures",
+          "path": "cardinal/fixtures",
+          "type": "dir"
+        },
+        {
+          "name": "plugins.py",
+          "path": "cardinal/plugins.py",
+          "type": "file"
+        },
+        {
+          "name": "test_bot.py",
+          "path": "cardinal/test_bot.py",
+          "type": "file"
+        },
+        {
+          "name": "test_config.py",
+          "path": "cardinal/test_config.py",
+          "type": "file"
+        },
+        {
+          "name": "test_decorators.py",
+          "path": "cardinal/test_decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "test_plugins.py",
+          "path": "cardinal/test_plugins.py",
+          "type": "file"
+        },
+        {
+          "name": "test_util.py",
+          "path": "cardinal/test_util.py",
+          "type": "file"
+        },
+        {
+          "name": "unittest_util.py",
+          "path": "cardinal/unittest_util.py",
+          "type": "file"
+        },
+        {
+          "name": "util.py",
+          "path": "cardinal/util.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "cardinal/__init__.py"
+        },
+        {
+          "name": "bot.py",
+          "path": "cardinal/bot.py"
+        },
+        {
+          "name": "config.py",
+          "path": "cardinal/config.py"
+        },
+        {
+          "name": "decorators.py",
+          "path": "cardinal/decorators.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "cardinal/exceptions.py"
+        },
+        {
+          "name": "test_bot.py",
+          "path": "cardinal/test_bot.py"
+        },
+        {
+          "name": "test_config.py",
+          "path": "cardinal/test_config.py"
+        },
+        {
+          "name": "test_decorators.py",
+          "path": "cardinal/test_decorators.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "cardinal/plugins.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "0fafff2a04d07933c438c8f4f394b06402c44bca",
+          "html_url": "https://github.com/johnmaguire/Cardinal/commit/0fafff2a04d07933c438c8f4f394b06402c44bca",
+          "message": "Fix urls plugin reloading\n\nI accidentally removed the close() method that de-registers the\nurls.detection event in the plugin, when URL shortening was added. This\nputs it back, and also updates the core to avoid de-registering\ncallbacks. All the way back when I first created the event system, I\nmade",
+          "author": "John Maguire",
+          "date": "2025-02-10T21:48:30Z"
+        },
+        {
+          "sha": "28ab6ac1b949d5d4090dc9daab9d7e4bdd71ee08",
+          "html_url": "https://github.com/johnmaguire/Cardinal/commit/28ab6ac1b949d5d4090dc9daab9d7e4bdd71ee08",
+          "message": "Fix deprecation warning of imp import",
+          "author": "John Maguire",
+          "date": "2022-02-24T16:50:03Z"
+        },
+        {
+          "sha": "851e020a80a8cef62ea6a48185a5c29dd4c15923",
+          "html_url": "https://github.com/johnmaguire/Cardinal/commit/851e020a80a8cef62ea6a48185a5c29dd4c15923",
+          "message": "Remove a little event callback log spam",
+          "author": "John Maguire",
+          "date": "2021-07-30T17:09:25Z"
+        },
+        {
+          "sha": "73a0ce4ae22345a4303657e06fbbc5bc7d6568a7",
+          "html_url": "https://github.com/johnmaguire/Cardinal/commit/73a0ce4ae22345a4303657e06fbbc5bc7d6568a7",
+          "message": "Improve event callback registration\n\nThis handles additional edge cases around event callbacks that are\nwrapped with `@defer.inlineCallbacks`, take *args, **kwargs, or required\nkwargs.\n\nSpecifically, this fixes an issue with the `github` plugin where it\ncould fail to load on boot.",
+          "author": "John Maguire",
+          "date": "2021-02-11T00:08:52Z"
+        },
+        {
+          "sha": "f2e5a6556bb4fc741d05863b8428e979d444debe",
+          "html_url": "https://github.com/johnmaguire/Cardinal/commit/f2e5a6556bb4fc741d05863b8428e979d444debe",
+          "message": "Replace `setup()` with `entrypoint` (closes #186)\n\nThe goal here is two-fold: (a) To simplify (most) plugins which simply\npass through their arguments from `setup()` to the plugin, and (b) to\nmake `cardinal` optional when requesting `config`",
+          "author": "John Maguire",
+          "date": "2021-02-10T23:06:01Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_close_plugin_instance TODO Create internal exception type",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "cardinal/plugins.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "0fafff2a04d07933c438c8f4f394b06402c44bca",
+        "html_url": "https://github.com/johnmaguire/Cardinal/commit/0fafff2a04d07933c438c8f4f394b06402c44bca",
+        "message": "Fix urls plugin reloading\n\nI accidentally removed the close() method that de-registers the\nurls.detection event in the plugin, when URL shortening was added. This\nputs it back, and also updates the core to avoid de-registering\ncallbacks. All the way back when I first created the event system, I\nmade",
+        "author": "John Maguire",
+        "date": "2025-02-10T21:48:30Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying the task",
+        "localized code snippet with exception raising",
+        "existing exception handling pattern in method",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

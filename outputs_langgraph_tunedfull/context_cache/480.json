@@ -1,0 +1,449 @@
+{
+  "task_id": "480",
+  "repo_owner": "openstack",
+  "repo_name": "nova",
+  "file_path": "nova/compute/api.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:49:50+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "inner",
+    "satd_line": 310,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 8,
+    "call_sites_count": 6,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:50:01+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:50:07+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "nova/compute/api.py",
+    "original_code": "def backup(self, context, instance, name, backup_type, rotation,\n           extra_properties=None):\n    \"\"\"Backup the given instance\n\n    :param instance: nova.objects.instance.Instance object\n    :param name: name of the backup\n    :param backup_type: 'daily' or 'weekly'\n    :param rotation: int representing how many backups to keep around;\n        None if rotation shouldn't be used (as in the case of snapshots)\n    :param extra_properties: dict of extra image properties to include\n                             when creating the image.\n    :returns: A dict containing image metadata\n    \"\"\"\n    props_copy = dict(extra_properties, backup_type=backup_type)\n\n    if self.is_volume_backed_instance(context, instance):\n        # TODO(flwang): The log level will be changed to INFO after\n        # string freeze (Liberty).\n        LOG.debug(\"It's not supported to backup volume backed instance.\",\n                  context=context, instance=instance)\n        raise exception.InvalidRequest()\n    else:\n        image_meta = self._create_image(context, instance,\n                                        name, 'backup',\n                                        extra_properties=props_copy)\n\n    # NOTE(comstud): Any changes to this method should also be made\n    # to the backup_instance() method in nova/cells/messaging.py\n\n    instance.task_state = task_states.IMAGE_BACKUP\n    instance.save(expected_task_state=[None])\n\n    self.compute_rpcapi.backup_instance(context, instance,\n                                        image_meta['id'],\n                                        backup_type,\n                                        rotation)\n    return image_meta",
+    "satd_comment": "# TODO(flwang): The log level will be changed to INFO after\n# string freeze (Liberty).",
+    "target_file": {
+      "ok": true,
+      "path": "nova/compute/api.py",
+      "sha": "d31769c5f5d11fda6ff5fafd595953ececfc8fb1",
+      "download_url": "https://raw.githubusercontent.com/openstack/nova/master/nova/compute/api.py",
+      "content_excerpt": "# Copyright 2010 United States Government as represented by the\n# Administrator of the National Aeronautics and Space Administration.\n# Copyright 2011 Piston Cloud Computing, Inc.\n# Copyright 2012-2013 Red Hat, Inc.\n# All Rights Reserved.\n#\n#    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n#    not use this file except in compliance with the License. You may obtain\n#    a copy of the License at\n#\n#         http://www.apache.org/licenses/LICENSE-2.0\n#\n#    Unless required by applicable law or agreed to in writing, software\n#    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n#    License for the specific language governing permissions and limitations\n#    under the License.\n\n\"\"\"Handles all requests relating to compute resources (e.g. guest VMs,\nnetworking and storage of VMs, and compute hosts on which they run).\"\"\"\n\nimport collections\nfrom collections.abc import Mapping\nimport functools\nimport re\nimport typing as ty\n\nfrom castellan import key_manager\nimport os_traits\nfrom oslo_log import log as logging\nfrom oslo_messaging import exceptions as oslo_exceptions\nfrom oslo_serialization import base64 as base64utils\nfrom oslo_utils import excutils\nfrom oslo_utils import strutils\nfrom oslo_utils import timeutils\nfrom oslo_utils import units\nfrom oslo_utils import uuidutils\n\nfrom nova.accelerator import cyborg\nfrom nova import availability_zones\nfrom nova import block_device\nfrom nova.compute import flavors\nfrom nova.compute import instance_actions\nfrom nova.compute import instance_list\nfrom nova.compute import migration_list\nfrom nova.compute import power_state\nfrom nova.compute import rpcapi as compute_rpcapi\nfrom nova.compute import task_states\nfrom nova.compute import utils as compute_utils\nfrom nova.compute.utils import wrap_instance_event\nfrom nova.compute import vm_states\nfrom nova import conductor\nimport nova.conf\nfrom nova import context as nova_context\nfrom nova import crypto\nfrom nova.db.api import api as api_db_api\nfrom nova.db.main import api as main_db_api\nfrom nova import exception\nfrom nova import exception_wrapper\nfrom nova.i18n import _\nfrom nova.image import glance\nfrom nova.limit import local as local_limit\nfrom nova.limit import placement as placement_limits\nfrom nova.limit import utils as limit_utils\nfrom nova.network import constants\nfrom nova.network import model as network_model\nfrom nova.network import neutron\nfrom nova.network import security_group_api\nfrom nova import objects\nfrom nova.objects import block_device as block_device_obj\nfrom nova.objects import external_event as external_event_obj\nfrom nova.objects import fields as fields_obj\nfrom nova.objects import image_meta as image_meta_obj\nfrom nova.objects import keypair as keypair_obj\nfrom nova.objects import quotas as quotas_obj\nfrom nova.objects import service as service_obj\nfrom nova.pci import request as pci_request\nfrom nova.policies import servers as servers_policies\nfrom nova.policies import shelve as shelve_policies\nimport nova.policy\nfrom nova import profiler\nfrom nova import rpc\nfrom nova.scheduler.client import query\nfrom nova.scheduler.client import report\nfrom nova.scheduler import utils as scheduler_utils\nfrom nova import servicegroup\nfrom nova import utils\nfrom nova.virt import hardware\nfrom nova.volume import cinder\nfrom nova import vtpm\n\nLOG = logging.getLogger(__name__)\n\n# NOTE(gibi): legacy notification used compute as a service but these\n# calls still run on the client side of the compute service which is\n# nova-api. By setting the binary to nova-api below, we can make sure\n# that the new versioned notifications has the right publisher_id but the\n# legacy notifications does not change.\nwrap_exception = functools.partial(\n    exception_wrapper.wrap_exception, service='compute', binary='nova-api')\nCONF = nova.conf.CONF\n\nAGGREGATE_ACTION_UPDATE = 'Update'\nAGGREGATE_ACTION_UPDATE_META = 'UpdateMeta'\nAGGREGATE_ACTION_DELETE = 'Delete'\nAGGREGATE_ACTION_ADD = 'Add'\n\nMIN_COMPUTE_SYNC_COMPUTE_STATUS_DISABLED = 38\nMIN_COMPUTE_CROSS_CELL_RESIZE = 47\nMIN_COMPUTE_SAME_HOST_COLD_MIGRATE = 48\n\n# TODO(huaqiang): Remove in Wallaby\nMIN_VER_NOVA_COMPUTE_MIXED_POLICY = 52\n\nSUPPORT_ACCELERATOR_SERVICE_FOR_REBUILD = 53\n\nSUPPORT_VNIC_TYPE_ACCELERATOR = 57\n\nMIN_COMPUTE_BOOT_WITH_EXTENDED_RESOURCE_REQUEST = 58\nMIN_COMPUTE_MOVE_WITH_EXTENDED_RESOURCE_REQUEST = 59\nMIN_COMPUTE_INT_ATTACH_WITH_EXTENDED_RES_REQ = 60\n\nSUPPORT_VNIC_TYPE_REMOTE_MANAGED = 61\nMIN_COMPUTE_VDPA_ATTACH_DETACH = 62\nMIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION = 63\n\nSUPPORT_SHARES = 67\n\nMIN_COMPUTE_SOUND_MODEL_TRAITS = 69\nMIN_COMPUTE_USB_MODEL_TRAITS = 70\n\nMIN_COMPUTE_VTPM_LIVE_MIGRATION = 72\n\n# FIXME(danms): Keep a global cache of the cells we find the\n# first time we look. This needs to be refreshed on a timer or\n# trigger.\nCELLS = []\n\n\ndef check_instance_state(vm_state=None, task_state=(None,),\n                         must_have_launched=True):\n    \"\"\"Decorator to check VM and/or task state before entry to API functions.\n\n    If the instance is in the wrong state, or has not been successfully\n    started at least once the wrapper will raise an exception.\n    \"\"\"\n\n    if vm_state is not None and not isinstance(vm_state, set):\n        vm_state = set(vm_state)\n    if task_state is not None and not isinstance(task_state, set):\n        task_state = set(task_state)\n\n    def outer(f):\n        @functools.wraps(f)\n        def inner(self, context, instance, *args, **kw):\n            if vm_state is not None and instance.vm_state not in vm_state:\n                raise exception.InstanceInvalidState(\n                    attr='vm_state',\n                    instance_uuid=instance.uuid,\n                    state=instance.vm_state,\n                    method=f.__name__)\n            if (task_state is not None and\n                    instance.task_state not in task_state):\n                raise exception.InstanceInvalidState(\n                    attr='task_state',\n                    instance_uuid=instance.uuid,\n                    state=instance.task_state,\n                    method=f.__name__)\n            if must_have_launched and not instance.launched_at:\n                raise exception.InstanceInvalidState(\n                    attr='launched_at',\n                    instance_uuid=instance.uuid,\n                    state=instance.launched_at,\n                    method=f.__name__)\n\n            return f(self, context, instance, *args, **kw)\n        return inner\n    return outer\n\n\ndef _set_or_none(q):\n    return q if q is None or isinstance(q, set) else set(q)\n\n\ndef reject_instance_state(vm_state=None, task_state=None):\n    \"\"\"Decorator.  Raise InstanceInvalidState if instance is in any of the\n    given states.\n    \"\"\"\n\n    vm_state = _set_or_none(vm_state)\n    task_state = _set_or_none(task_state)\n\n    def outer(f):\n        @functools.wraps(f)\n        def inner(self, context, instance, *args, **kw):\n            _InstanceInvalidState = functools.partial(\n                exception.InstanceInvalidState,\n                instance_uuid=instance.uuid,\n                method=f.__name__)\n\n            if vm_state is not None and instance.vm_state in vm_state:\n                raise _InstanceInvalidState(\n                    attr='vm_state', state=instance.vm_state)\n\n            if task_state is not None and instance.task_state in task_state:\n                raise _InstanceInvalidState(\n                    attr='task_state', state=instance.task_state)\n\n            return f(self, context, instance, *args, **kw)\n        return inner\n    return outer\n\n\ndef check_instance_host(check_is_up=False):\n    \"\"\"Validate the instance.host before performing the operation.\n\n    At a minimum this method will check that the instance.host is set.\n\n    :param check_is_up: If True, check that the instance.host status is UP\n        or MAINTENANCE (disabled but not down).\n    :raises: InstanceNotReady if the instance.host is not set\n    :raises: ServiceUnavailable if check_is_up=True and the instance.host\n        compute service status is not UP or MAINTENANCE\n    \"\"\"\n    def outer(function):\n        @functools.wraps(function)\n        def wrapped(self, context, instance, *args, **kwargs):\n            if not instance.host:\n                raise exception.InstanceNotReady(instance_id=instance.uuid)\n            if check_is_up:\n                # Make sure the source compute service is not down otherwise we\n                # cannot proceed.\n                service = [\n                    service for service in instance.services\n                        if service.binary == 'nova-compute'][0]\n                if not self.servicegroup_api.service_is_up(service):\n                    # ComputeServiceUnavailable would make more sense here but\n                    # we do not want to leak hostnames to end users.\n                    raise exception.ServiceUnavailable()\n            return function(self, context, instance, *args, **kwargs)\n        return wrapped\n    return outer\n\n\ndef check_instance_lock(function):\n    @functools.wraps(function)\n    def inner(self, context, instance, *args, **kwargs):\n        if instance.locked and not context.is_admin:\n            raise exception.InstanceIsLocked(instance_uuid=instance.uuid)\n        return function(self, context, instance, *args, **kwargs)\n    return inner\n\n\ndef reject_sev_instances(operation):\n    \"\"\"Reject requests to decorated function if instance has SEV enabled.\n\n    Raise OperationNotSupportedForSEV if instance has SEV enabled.\n    \"\"\"\n\n    def outer(f):\n        @functools.wraps(f)\n        def inner(self, context, instance, *args, **kw):\n            if hardware.get_mem_encryption_constraint(instance.flavor,\n                                                      instance.image_meta):\n                raise exception.OperationNotSupportedForSEV(\n                    instance_uuid=instance.uuid,\n                    operation=operation)\n            return f(self, context, instance, *args, **kw)\n        return inner\n    return outer\n\n\ndef reject_legacy_vtpm_live_migration(function):\n\n    @functools.wraps(function)\n    def inner(self, context, instance, *args, **kwargs):\n        if hardware.get_vtpm_constraint(\n                instance.flavor, instance.image_meta):\n            # Only certain TPM secret security modes support live migration.\n            security = hardware.get_tpm_secret_security_constraint(\n                    instance.flavor) or 'user'\n            if security != 'host':\n                raise exception.OperationNotSupportedForVTPM(\n                    instance_uuid=instance.uuid,\n                    operation=instance_actions.LIVE_MIGRATION)\n            # We need not check all cells because live migration only works\n            # within a single cell.\n            im = objects.InstanceMapping.get_by_instance_uuid(context,\n                                                              instance.uuid)\n            with nova_context.target_cell(context, im.cell_mapping) as cctxt:\n                min_ver = objects.service.Service.get_minimum_version(\n                        cctxt, 'nova-compute')\n            if min_ver < MIN_COMPUTE_VTPM_LIVE_MIGRATION:\n                raise exception.VTPMOldCompute()\n        return function(self, context, instance, *args, **kwargs)\n    return inner\n\n\ndef reject_vtpm_instances(operation):\n    \"\"\"Reject requests to decorated function if instance has vTPM enabled.\n\n    Raise OperationNotSupportedForVTPM if instance has vTPM enabled.\n    \"\"\"\n\n    def outer(f):\n        @functools.wraps(f)\n        def inner(self, context, instance, *args, **kw):\n            if hardware.get_vtpm_constraint(\n                instance.flavor, instance.image_meta,\n            ):\n                raise exception.OperationNotSupportedForVTPM(\n                    instance_uuid=instance.uuid, operation=operation)\n            return f(self, context, instance, *args, **kw)\n        return inner\n    return outer\n\n\nde",
+      "total_lines": 7088
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 310,
+      "start_line": 290,
+      "end_line": 330,
+      "matched_line": "            ):",
+      "excerpt": "290:             with nova_context.target_cell(context, im.cell_mapping) as cctxt:\n291:                 min_ver = objects.service.Service.get_minimum_version(\n292:                         cctxt, 'nova-compute')\n293:             if min_ver < MIN_COMPUTE_VTPM_LIVE_MIGRATION:\n294:                 raise exception.VTPMOldCompute()\n295:         return function(self, context, instance, *args, **kwargs)\n296:     return inner\n297: \n298: \n299: def reject_vtpm_instances(operation):\n300:     \"\"\"Reject requests to decorated function if instance has vTPM enabled.\n301: \n302:     Raise OperationNotSupportedForVTPM if instance has vTPM enabled.\n303:     \"\"\"\n304: \n305:     def outer(f):\n306:         @functools.wraps(f)\n307:         def inner(self, context, instance, *args, **kw):\n308:             if hardware.get_vtpm_constraint(\n309:                 instance.flavor, instance.image_meta,\n310:             ):\n311:                 raise exception.OperationNotSupportedForVTPM(\n312:                     instance_uuid=instance.uuid, operation=operation)\n313:             return f(self, context, instance, *args, **kw)\n314:         return inner\n315:     return outer\n316: \n317: \n318: def reject_vdpa_instances(operation, until=None):\n319:     \"\"\"Reject requests to decorated function if instance has vDPA interfaces.\n320: \n321:     Raise OperationNotSupportedForVDPAInterfaces if operations involves one or\n322:         more vDPA interfaces.\n323:     \"\"\"\n324: \n325:     def outer(f):\n326:         @functools.wraps(f)\n327:         def inner(self, context, instance, *args, **kw):\n328:             if any(\n329:                 vif['vnic_type'] == network_model.VNIC_TYPE_VDPA\n330:                 for vif in instance.get_network_info()"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "inner",
+      "start_line": 307,
+      "end_line": 313,
+      "source": "        def inner(self, context, instance, *args, **kw):\n            if hardware.get_vtpm_constraint(\n                instance.flavor, instance.image_meta,\n            ):\n                raise exception.OperationNotSupportedForVTPM(\n                    instance_uuid=instance.uuid, operation=operation)\n            return f(self, context, instance, *args, **kw)"
+    },
+    "imports": {
+      "imports": [
+        "collections",
+        "collections.abc:Mapping",
+        "functools",
+        "re",
+        "typing",
+        "castellan:key_manager",
+        "os_traits",
+        "oslo_log:log",
+        "oslo_messaging:exceptions",
+        "oslo_serialization:base64",
+        "oslo_utils:excutils",
+        "oslo_utils:strutils",
+        "oslo_utils:timeutils",
+        "oslo_utils:units",
+        "oslo_utils:uuidutils",
+        "nova.accelerator:cyborg",
+        "nova:availability_zones",
+        "nova:block_device",
+        "nova.compute:flavors",
+        "nova.compute:instance_actions",
+        "nova.compute:instance_list",
+        "nova.compute:migration_list",
+        "nova.compute:power_state",
+        "nova.compute:rpcapi",
+        "nova.compute:task_states",
+        "nova.compute:utils",
+        "nova.compute.utils:wrap_instance_event",
+        "nova.compute:vm_states",
+        "nova:conductor",
+        "nova.conf"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/nova/master/README.rst",
+      "content_excerpt": "==============\nOpenStack Nova\n==============\n\nOpenStack Nova provides a cloud computing fabric controller, supporting a wide\nvariety of compute technologies, including: libvirt (KVM, Xen, LXC and more),\nVMware and OpenStack Ironic.\n\nUse the following resources to learn more.\n\nAPI\n---\n\nTo learn how to use Nova's API, consult the documentation available online at:\n\n- `Compute API Guide <https://docs.openstack.org/api-guide/compute/>`__\n- `Compute API Reference <https://docs.openstack.org/api-ref/compute/>`__\n\nFor more information on OpenStack APIs, SDKs and CLIs in general, refer to:\n\n- `OpenStack for App Developers <https://www.openstack.org/appdev/>`__\n- `Development resources for OpenStack clouds\n  <https://developer.openstack.org/>`__\n\nOperators\n---------\n\nTo learn how to deploy and configure OpenStack Nova, consult the documentation\navailable online at:\n\n- `OpenStack Nova <https://docs.openstack.org/nova/>`__\n\nIn the unfortunate event that bugs are discovered, they should be reported to\nthe appropriate bug tracker. If you obtained the software from a 3rd party\noperating system vendor, it is often wise to use their own bug tracker for\nreporting problems. In all other cases use the master OpenStack bug tracker,\navailable at:\n\n- `Bug Tracker <https://bugs.launchpad.net/nova>`__\n\nDevelopers\n----------\n\nFor information on how to contribute to Nova, please see the contents of the\nCONTRIBUTING.rst.\n\nAny new code must follow the development guidelines detailed in the HACKING.rst\nfile, and pass all unit tests.\n\nTo understand better the processes that the team is using, please ref"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "inner test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_nbd.py",
+          "path": "nova/tests/unit/virt/disk/mount/test_nbd.py",
+          "sha": "707cff25017f2d9e607f5ee4fb6c49cfd466d7b6",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/virt/disk/mount/test_nbd.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_linux_net.py",
+          "path": "nova/tests/unit/privsep/test_linux_net.py",
+          "sha": "6b226359c3c8ac7d128881314072463277b62c62",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/privsep/test_linux_net.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_vim_util.py",
+          "path": "nova/tests/unit/virt/vmwareapi/test_vim_util.py",
+          "sha": "b3057a99ac263afa9967b0acf5b15d0a59196ee9",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/virt/vmwareapi/test_vim_util.py",
+          "score": 1.0
+        },
+        {
+          "name": "test.py",
+          "path": "nova/test.py",
+          "sha": "6976f49bb9a15abe194a85e76a5879f12b97eb70",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/test.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_api.py",
+          "path": "nova/tests/unit/api/openstack/compute/test_api.py",
+          "sha": "d1bb6babb779b2053d7ea801cbd2beea7a0705dc",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/api/openstack/compute/test_api.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_storpool.py",
+          "path": "nova/tests/unit/virt/libvirt/volume/test_storpool.py",
+          "sha": "a3252b852593db4d4845d18625c2170e16024ad5",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/virt/libvirt/volume/test_storpool.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_metadata.py",
+          "path": "nova/tests/unit/test_metadata.py",
+          "sha": "5ece263c1b5117717bf2cf6a3020a3b8cd5a28c0",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/test_metadata.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_rbd.py",
+          "path": "nova/tests/unit/storage/test_rbd.py",
+          "sha": "6fd15a83fb247586ba22b4d5ac4944094404ca41",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/storage/test_rbd.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"inner(\"",
+      "count": 6,
+      "items": [
+        {
+          "name": "linux_net.py",
+          "path": "nova/privsep/linux_net.py",
+          "sha": "12a3b11c17402d73b046847d158b9f9a00a343a4",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/privsep/linux_net.py",
+          "score": 1.0
+        },
+        {
+          "name": "exception_wrapper.py",
+          "path": "nova/exception_wrapper.py",
+          "sha": "2a8bb236159ddc0249401a73a326491bebea7b68",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/exception_wrapper.py",
+          "score": 1.0
+        },
+        {
+          "name": "api.py",
+          "path": "nova/compute/api.py",
+          "sha": "d31769c5f5d11fda6ff5fafd595953ececfc8fb1",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/compute/api.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_rbd.py",
+          "path": "nova/tests/unit/storage/test_rbd.py",
+          "sha": "6fd15a83fb247586ba22b4d5ac4944094404ca41",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/storage/test_rbd.py",
+          "score": 1.0
+        },
+        {
+          "name": "test.py",
+          "path": "nova/test.py",
+          "sha": "6976f49bb9a15abe194a85e76a5879f12b97eb70",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/test.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_metadata.py",
+          "path": "nova/tests/unit/test_metadata.py",
+          "sha": "5ece263c1b5117717bf2cf6a3020a3b8cd5a28c0",
+          "html_url": "https://github.com/openstack/nova/blob/3be17878dcb42095f3ed3fc2819c2bf776c059b5/nova/tests/unit/test_metadata.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "nova/compute",
+      "count": 21,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "nova/compute/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "nova/compute/api.py",
+          "type": "file"
+        },
+        {
+          "name": "build_results.py",
+          "path": "nova/compute/build_results.py",
+          "type": "file"
+        },
+        {
+          "name": "claims.py",
+          "path": "nova/compute/claims.py",
+          "type": "file"
+        },
+        {
+          "name": "flavors.py",
+          "path": "nova/compute/flavors.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_actions.py",
+          "path": "nova/compute/instance_actions.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_list.py",
+          "path": "nova/compute/instance_list.py",
+          "type": "file"
+        },
+        {
+          "name": "manager.py",
+          "path": "nova/compute/manager.py",
+          "type": "file"
+        },
+        {
+          "name": "migration_list.py",
+          "path": "nova/compute/migration_list.py",
+          "type": "file"
+        },
+        {
+          "name": "monitors",
+          "path": "nova/compute/monitors",
+          "type": "dir"
+        },
+        {
+          "name": "multi_cell_list.py",
+          "path": "nova/compute/multi_cell_list.py",
+          "type": "file"
+        },
+        {
+          "name": "pci_placement_translator.py",
+          "path": "nova/compute/pci_placement_translator.py",
+          "type": "file"
+        },
+        {
+          "name": "power_state.py",
+          "path": "nova/compute/power_state.py",
+          "type": "file"
+        },
+        {
+          "name": "provider_config.py",
+          "path": "nova/compute/provider_config.py",
+          "type": "file"
+        },
+        {
+          "name": "provider_tree.py",
+          "path": "nova/compute/provider_tree.py",
+          "type": "file"
+        },
+        {
+          "name": "resource_tracker.py",
+          "path": "nova/compute/resource_tracker.py",
+          "type": "file"
+        },
+        {
+          "name": "rpcapi.py",
+          "path": "nova/compute/rpcapi.py",
+          "type": "file"
+        },
+        {
+          "name": "stats.py",
+          "path": "nova/compute/stats.py",
+          "type": "file"
+        },
+        {
+          "name": "task_states.py",
+          "path": "nova/compute/task_states.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "nova/compute/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "vm_states.py",
+          "path": "nova/compute/vm_states.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "nova/compute/__init__.py"
+        },
+        {
+          "name": "build_results.py",
+          "path": "nova/compute/build_results.py"
+        },
+        {
+          "name": "claims.py",
+          "path": "nova/compute/claims.py"
+        },
+        {
+          "name": "flavors.py",
+          "path": "nova/compute/flavors.py"
+        },
+        {
+          "name": "instance_actions.py",
+          "path": "nova/compute/instance_actions.py"
+        },
+        {
+          "name": "instance_list.py",
+          "path": "nova/compute/instance_list.py"
+        },
+        {
+          "name": "manager.py",
+          "path": "nova/compute/manager.py"
+        },
+        {
+          "name": "migration_list.py",
+          "path": "nova/compute/migration_list.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "nova/compute/api.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "47080f74572f4498481026ad22b33f4065fb6824",
+          "html_url": "https://github.com/openstack/nova/commit/47080f74572f4498481026ad22b33f4065fb6824",
+          "message": "Merge \"TPM: bump service version to enable live migration\"",
+          "author": "Zuul",
+          "date": "2026-02-27T18:21:33Z"
+        },
+        {
+          "sha": "2919e41560ea3305bc297476b508240575efdbff",
+          "html_url": "https://github.com/openstack/nova/commit/2919e41560ea3305bc297476b508240575efdbff",
+          "message": "TPM: bump service version to enable live migration\n\nLive migration of TPM instances is enabled only when the entire cloud\nhas been upgraded.\n\nRelated to blueprint vtpm-live-migration\n\nChange-Id: I718d8ad48b82336562a880467c3c7b12b1fb3512\nSigned-off-by: melanie witt <melwittt@gmail.com>",
+          "author": "melanie witt",
+          "date": "2026-02-04T23:36:24Z"
+        },
+        {
+          "sha": "2a51df27603cd07f8a4cd63276578f1815131e91",
+          "html_url": "https://github.com/openstack/nova/commit/2a51df27603cd07f8a4cd63276578f1815131e91",
+          "message": "Attaching a volume returns HTTP 202\n\nInstead of returning an HTTP 200 and a `volumeAttachment` object,\nattaching a volume to an instance returns HTTP 202 starting from API\nversion 2.101.\n\nTo keep the functionality for older API versions, we move the\n`_attach_volume()` method from n-api to n-conducto",
+          "author": "Johannes Kulik",
+          "date": "2025-12-15T15:27:49Z"
+        },
+        {
+          "sha": "2bdf12535c214a67381c890bdd415ba1779af231",
+          "html_url": "https://github.com/openstack/nova/commit/2bdf12535c214a67381c890bdd415ba1779af231",
+          "message": "TPM: prepare to bump service version for live migration\n\nThis prepares for a service version bump and adds a minimum service\nversion check in the API to reject live migration requests for vTPM\ninstances until the entire cloud is upgraded to the new version.\n\nThe actual service version bump will be i",
+          "author": "melanie witt",
+          "date": "2025-08-18T21:03:14Z"
+        },
+        {
+          "sha": "880019baafe23f46e59dee7debadf49b9177dc70",
+          "html_url": "https://github.com/openstack/nova/commit/880019baafe23f46e59dee7debadf49b9177dc70",
+          "message": "TPM: support instances with `deployment` secret security\n\nThis means authenticating as the Nova service user to Barbican,\nso that the latter can make the secret owned by Nova. This requires\nthe [service_user] config section to be set.\n\nAn API block is also added to prevent resizes to change to or fr",
+          "author": "Artom Lifshitz",
+          "date": "2025-02-17T23:22:58Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "inner TODO flwang level will changed",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "nova/compute/api.py",
+      "satd_line": 310,
+      "last_commit": {
+        "sha": "47080f74572f4498481026ad22b33f4065fb6824",
+        "html_url": "https://github.com/openstack/nova/commit/47080f74572f4498481026ad22b33f4065fb6824",
+        "message": "Merge \"TPM: bump service version to enable live migration\"",
+        "author": "Zuul",
+        "date": "2026-02-27T18:21:33Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying exact change",
+        "local code snippet with single log statement",
+        "no complex logic or architecture change",
+        "existing exception raising and logging present"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 6,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "inner",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

@@ -1,0 +1,344 @@
+{
+  "task_id": "83",
+  "repo_owner": "release-engineering",
+  "repo_name": "iib",
+  "file_path": "iib/workers/tasks/utils.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T15:30:03+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T15:30:21+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T15:30:32+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "iib/workers/tasks/utils.py",
+    "original_code": "def request_logger(func):\n    \"\"\"\n    Log messages relevant to the current request to a dedicated file.\n\n    If ``iib_request_logs_dir`` is set, a temporary log handler is added before the decorated\n    function is invoked. It's then removed once the decorated function completes execution.\n\n    If ``iib_request_logs_dir`` is not set, the temporary log handler will not be added.\n\n    :param function func: the function to be decorated. The function must take the ``request_id``\n        parameter.\n    :return: the decorated function\n    :rtype: function\n    \"\"\"\n    worker_config = get_worker_config()\n    log_dir = worker_config.iib_request_logs_dir\n    log_level = worker_config.iib_request_logs_level\n    log_format = worker_config.iib_request_logs_format\n\n    @functools.wraps(func)\n    def wrapper(*args, **kwargs):\n        request_log_handler = None\n        if log_dir:\n            request_id = _get_function_arg_value('request_id', func, args, kwargs)\n            if not request_id:\n                raise IIBError(f'Unable to get \"request_id\" from {func.__name__}')\n            # for better filtering of all logs for one build in SPLUNK\n            log_formatter = TaskFormatter(\n                log_format.format(request_id=f'request-{request_id}'), use_color=False\n            )\n            log_file_path = os.path.join(log_dir, f'{request_id}.log')\n            request_log_handler = logging.FileHandler(log_file_path)\n            request_log_handler.setLevel(log_level)\n            request_log_handler.setFormatter(log_formatter)\n            # FIXME: Bandit complaining on too permissive logs - CLOUDDST-11307\n            os.chmod(log_file_path, 0o775)  # nosec\n            logger = logging.getLogger()\n            logger.addHandler(request_log_handler)\n            worker_info = f'Host: {socket.getfqdn()}; User: {getpass.getuser()}'\n            logger.info(worker_info)\n        try:\n            return func(*args, **kwargs)\n        finally:\n            if request_log_handler:\n                logger.removeHandler(request_log_handler)\n                request_log_handler.flush()\n                if worker_config['iib_aws_s3_bucket_name']:\n                    upload_file_to_s3_bucket(log_file_path, 'request_logs', f'{request_id}.log')\n\n    return wrapper",
+    "satd_comment": "# FIXME: Bandit complaining on too permissive logs - CLOUDDST-11307",
+    "target_file": {
+      "ok": true,
+      "path": "iib/workers/tasks/utils.py",
+      "sha": "79b5920481bd466bfbb4095f10823c1c59ae005c",
+      "download_url": "https://raw.githubusercontent.com/release-engineering/iib/master/iib/workers/tasks/utils.py",
+      "content_excerpt": "# SPDX-License-Identifier: GPL-3.0-or-later\nimport base64\nimport getpass\nimport socket\nfrom typing import Any, Callable, Dict, Generator, List, Optional, Set, TYPE_CHECKING, Tuple, Union\nfrom contextlib import contextmanager\nimport functools\nimport hashlib\nimport inspect\nimport json\nimport logging\nimport os\nimport re\nimport sqlite3\nimport subprocess\n\nfrom pathlib import Path\nfrom tenacity import (\n    before_sleep_log,\n    retry,\n    retry_if_exception_type,\n    stop_after_attempt,\n    wait_exponential,\n    wait_chain,\n)\nfrom celery.app.log import TaskFormatter\nfrom operator_manifest.operator import ImageName, OperatorManifest\n\nfrom iib.common.common_utils import get_binary_versions\nfrom iib.workers.dogpile_cache import (\n    create_dogpile_region,\n    dogpile_cache,\n    skopeo_inspect_should_use_cache,\n)\n\nfrom iib.exceptions import IIBError, ExternalServiceError\nfrom iib.workers.config import get_worker_config\nfrom iib.workers.s3_utils import upload_file_to_s3_bucket\nfrom iib.workers.api_utils import set_request_state\nfrom iib.workers.tasks.opm_operations import get_list_bundles\nfrom iib.workers.tasks.iib_static_types import (\n    IndexImageInfo,\n    AllIndexImagesInfo,\n    PrebuildInfo,\n    BundleImage,\n    BundleMetadata,\n)\n\n# Add instrumentation\nfrom iib.common.tracing import instrument_tracing\n\nlog = logging.getLogger(__name__)\ndogpile_cache_region = create_dogpile_region()\n\n\ndef _add_property_to_index(db_path: str, property: Dict[str, str]) -> None:\n    \"\"\"\n    Add a property to the index.\n\n    :param str db_path: path to the index database\n    :param dict property: a dict representing a property to be added to the index.db\n    \"\"\"\n    insert = (\n        'INSERT INTO properties '\n        '(type, value, operatorbundle_name, operatorbundle_version, operatorbundle_path) '\n        'VALUES (?, ?, ?, ?, ?);'\n    )\n    con = sqlite3.connect(db_path)\n    # Insert property\n    con.execute(\n        insert,\n        (\n            property['type'],\n            property['value'],\n            property['operatorbundle_name'],\n            property['operatorbundle_version'],\n            property['operatorbundle_path'],\n        ),\n    )\n    con.commit()\n    con.close()\n\n\ndef add_max_ocp_version_property(resolved_bundles: List[str], temp_dir: str) -> None:\n    \"\"\"\n    Add the max ocp version property to bundles.\n\n    We need to ensure that any bundle which has deprecated/removed API(s) in 1.22/ocp 4.9\n    will have this property to prevent users from upgrading clusters to 4.9 before upgrading\n    the operator installed to a version that is compatible with 4.9\n\n    :param list resolved_bundles: list of resolved bundles to which the max ocp version property\n        will be added if missing\n    :param str temp_dir: directory location of the index image\n    \"\"\"\n    # Get the CSV name and version (not just the bundle path)\n    temp_index_db_path = get_worker_config()['temp_index_db_path']\n    db_path = os.path.join(temp_dir, temp_index_db_path)\n    bundles = get_list_bundles(input_data=db_path, base_dir=temp_dir)\n\n    # This branch is hit when `bundles` attribute is empty and the index image is empty.\n    # Ideally the code should not reach here if the bundles attribute is empty but adding\n    # this here as a failsafe if it's called from some other place. Also, if the bundles\n    # attribute is not empty, the index image cannot be empty here because we add the\n    # bundle to the index before adding the maxOpenShiftVersion property\n    if not bundles:\n        log.info('No bundles found in the index image')\n        return\n\n    # Filter index image bundles to get pull spec for bundles in the request\n    updated_bundles: List[BundleImage] = list(\n        filter(lambda b: b['bundlePath'] in resolved_bundles, bundles)\n    )\n\n    for bundle in updated_bundles:\n        if _requires_max_ocp_version(bundle['bundlePath']):\n            log.info('adding property for %s', bundle['bundlePath'])\n            max_openshift_version_property: Dict[str, str] = {\n                'type': 'olm.maxOpenShiftVersion',\n                'value': '4.8',\n                #  MYPY  error: Dict entry 2 has incompatible type \"str\": \"Optional[str]\";\n                #  expected \"str\": \"str\"\n                'operatorbundle_name': bundle['csvName'],  # type: ignore\n                'operatorbundle_version': bundle['version'],\n                'operatorbundle_path': bundle['bundlePath'],\n            }\n            _add_property_to_index(db_path, max_openshift_version_property)\n            log.info('property added for %s', bundle['bundlePath'])\n\n\ndef get_binary_image_from_config(\n    ocp_version: str,\n    distribution_scope: str,\n    binary_image_config: Dict[str, Dict[str, str]],\n) -> Optional[str]:\n    \"\"\"\n    Determine the binary image to be used to build the index image.\n\n    :param str ocp_version: the ocp_version label value of the index image.\n    :param str distribution_scope: the distribution_scope label value of the index image.\n    :param dict binary_image_config: the dict of config required to identify the appropriate\n        ``binary_image`` to use.\n    :return: pull specification of the binary_image to be used for this build when found.\n    :rtype: str\n    \"\"\"\n    binary_image_config = binary_image_config or {}\n    binary_image = binary_image_config.get(distribution_scope, {}).get(ocp_version, None)\n    return binary_image\n\n\ndef get_bundle_json(bundles: str) -> List[BundleImage]:\n    \"\"\"\n    Get bundle json from grpcurl response.\n\n    :param str bundles: response from grpcurl call to retrieve list of bundles in\n        an index\n    \"\"\"\n    return [json.loads(bundle) for bundle in re.split(r'(?<=})\\n(?={)', bundles)]\n\n\ndef _requires_max_ocp_version(bundle: str) -> bool:\n    \"\"\"\n    Check if the bundle requires the olm.maxOpenShiftVersion property.\n\n    This property is required for bundles using deprecated APIs that don't already\n    have the olm.maxOpenShiftVersion property set.\n\n    :param str bundle: a string representing the bundle pull specification\n    :returns bool:\n    \"\"\"\n    cmd = [\n        'operator-sdk',\n        'bundle',\n        'validate',\n        bundle,\n        '--select-optional',\n        'name=community',\n        '--output=json-alpha1',\n        '--image-builder',\n        'none',\n    ]\n    result = run_cmd(cmd, strict=False)\n    if result:\n        output = json.loads(result)\n        # check if the bundle validation failed\n        if not output['passed']:\n            # check if the failure is due to the presence of deprecated APIs\n            # and absence of the 'olm.maxOpenShiftVersion' property\n            # Note: there is no other error in the sdk that mentions this field\n            for msg in output['outputs']:\n                if 'olm.maxOpenShiftVersion' in msg['message']:\n                    return True\n    return False\n\n\nclass RequestConfig:\n    \"\"\"Request config abstract class.\n\n    :param str _binary_image:  the pull specification of the container image\n                          where the opm binary gets copied from.\n    :param str distribution_scope: the scope for distribution\n        of the index image, defaults to ``None``.\n    :param str source_from_index: the pull specification of the container image\n        containing the index that will be used\n        as a base of the merged index image.\n    :param str target_index: the pull specification of the container image\n        containing the index whose new data will be added\n        to the merged index image.\n    :param dict binary_image_config: the dict of config required to\n        identify the appropriate ``binary_image`` to use.\n    \"\"\"\n\n    # these attrs should not be printed out\n    _secret_attrs: List[str] = [\n        'cnr_token',\n        'overwrite_from_index_token',\n        'overwrite_target_index_token',\n        'registry_auths',\n    ]\n\n    _attrs: List[str] = [\"_binary_image\", \"distribution_scope\", \"binary_image_config\"]\n    __slots__ = _attrs\n    if TYPE_CHECKING:\n        _binary_image: str\n        distribution_scope: str\n        binary_image_config: Dict[str, Dict[str, str]]\n        overwrite_from_index_token: str\n        overwrite_target_index_token: str\n\n    def __init__(self, **kwargs):\n        \"\"\"\n        Request config __init__.\n\n        Do not use this directly, use subclasses instead.\n        :Keyword Arguments:\n            See `_attrs` to check accepted keyword arguments.\n        \"\"\"\n        for key in self.__slots__:\n            setattr(self, key, None)\n        for key, val in kwargs.items():\n            setattr(self, key, kwargs[key])\n\n    def __eq__(self, other: object) -> bool:\n        if type(self) == type(other) and [getattr(self, x) for x in self.__slots__] == [\n            getattr(self, x) for x in self.__slots__\n        ]:\n            return True\n        return False\n\n    def __repr__(self) -> str:\n        # this is used to print() and log any instance of this class in dictionary format\n        attrs = {x: getattr(self, x) for x in self.__slots__}\n        for attr in self._secret_attrs:\n            if attrs.get(attr) is not None:\n                attrs[attr] = '*****'\n        return str(attrs)\n\n    def binary_image(self, index_info: IndexImageInfo, distribution_scope: str) -> str:\n        \"\"\"Get binary image based on self configuration, index image info and distribution scope.\"\"\"\n        ocp_version = index_info['ocp_version']\n        config_binary_image = get_binary_image_from_config(\n            ocp_version, distribution_scope, self.binary_image_config\n        )\n        if not self._binary_image:\n            if not config_binary_image:\n                raise IIBError(\n                    'IIB does not have a configured binary_image for'\n                    f' distribution_scope : {distribution_scope} and ocp_version: {ocp_version}.'\n                    ' Please specify a binary_image value in the request.'\n                )\n            return config_binary_image\n        if self._binary_image == \"scratch\" and config_binary_image != \"scratch\":\n            raise IIBError(f\"The index image should not be binaryless for {ocp_version}.\")\n        elif self._binary_image != \"scratch\" and config_binary_image == \"scratch\":\n            raise IIBError(f\"The index image must be built as a binaryless for {ocp_version}.\")\n        return self._binary_image\n\n\nclass RequestConfigAddRm(RequestConfig):\n    \"\"\"Request config for add and remove operations.\n\n    :param str overwrite_from_index_token: the token used for overwriting the input\n        ``from_index`` image. This is required for\n        non-privileged users to use ``overwrite_from_index``.\n        The format of the token must be\n        in the format \"user:password\".\n    :param str from_index: the pull specification of the container image\n        containing the index that the index image build\n        will be based from.\n    :param set add_arches: the set of arches to build in addition to the\n        arches ``from_index`` is currently built for;\n        if ``from_index`` is ``None``, then this is used as the list of arches\n        to build the index image for\n    :param list bundles: the list of bundles to create the\n        bundle mapping on the request\n    \"\"\"\n\n    _attrs: List[str] = RequestConfig._attrs + [\n        \"overwrite_from_index_token\",\n        \"from_index\",\n        \"add_arches\",\n        \"bundles\",\n        \"operators\",\n    ]\n    __slots__ = _attrs\n    if TYPE_CHECKING:\n        overwrite_from_index_token: str\n        from_index: str\n        add_arches: Set[str]\n        bundles: List[str]\n        operators: List[str]\n\n\nclass RequestConfigMerge(RequestConfig):\n    \"\"\"Request config for merge operation.\n\n    :param str overwrite_target_index_token:  auth token used to pus index image\n        when overwrite is set.\n    :param str source_from_index: the pull specification of the container image\n        containing the index that will be used\n        as a base of the merged index image.\n    :param str target_index: the pull specification of the container image\n        c",
+      "total_lines": 1303
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "base64",
+        "getpass",
+        "socket",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:Generator",
+        "typing:List",
+        "typing:Optional",
+        "typing:Set",
+        "typing:TYPE_CHECKING",
+        "typing:Tuple",
+        "typing:Union",
+        "contextlib:contextmanager",
+        "functools",
+        "hashlib",
+        "inspect",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "sqlite3",
+        "subprocess",
+        "pathlib:Path",
+        "tenacity:before_sleep_log",
+        "tenacity:retry",
+        "tenacity:retry_if_exception_type",
+        "tenacity:stop_after_attempt",
+        "tenacity:wait_exponential",
+        "tenacity:wait_chain"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/release-engineering/iib/master/README.md",
+      "content_excerpt": "# IIB Image Builder (IIB) Service\n\nA REST API to manage operator index container images (and some bundle images).\n\nIIB is a recursive acronym.  IIB stands for IIB Image Builder.\n\nNote: IIB was originally called \"Index Image Build Service\" but the name has been changed since\n  its scope widened.\n\nPodman 1.9.2+ is required by IIB.\n\n## External Documentation\n\n* [API Documentation](http://release-engineering.github.io/iib)\n* [General Documentation](https://iib.readthedocs.io/en/latest/)\n* [Python Module Documentation](https://iib.readthedocs.io/en/latest/module_documentation/index.html)\n\n# Development\n## Coding Standards\n\nThe codebase conforms to the style enforced by `flake8` with the following exceptions:\n\n* The maximum line length allowed is 100 characters instead of 80 characters\n\nIn addition to `flake8`, docstrings are also enforced by the plugin `flake8-docstrings` with\nthe following exemptions:\n\n* D100: Missing docstring in public module\n* D104: Missing docstring in public package\n* D105: Missing docstring in magic method\n\nThe format of the docstrings should be in the\n[reStructuredText](https://docs.python-guide.org/writing/documentation/#restructuredtext-ref) style\nsuch as:\n\n```python\n\"\"\"\nGet the IIB build request from the REST API.\n\n:param int request_id: the ID of the IIB request\n:return: the request\n:rtype: dict\n:raises IIBError: if the HTTP request fails\n\"\"\"\n```\n\nAdditionally, `black` is used to enforce other coding standards with the following exceptions:\n\n* Single quotes are used instead of double quotes\n\nTo verify that your code meets these standards, you may run"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "request_logger test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_utils.py",
+          "path": "tests/test_workers/test_tasks/test_utils.py",
+          "sha": "ae866b70b76a3347ee85dd0cf53049f1a42700c5",
+          "html_url": "https://github.com/release-engineering/iib/blob/ff7c2b6055bf30420e3ba5781f6f635af34d3def/tests/test_workers/test_tasks/test_utils.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"request_logger(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "utils.py",
+          "path": "iib/workers/tasks/utils.py",
+          "sha": "79b5920481bd466bfbb4095f10823c1c59ae005c",
+          "html_url": "https://github.com/release-engineering/iib/blob/ff7c2b6055bf30420e3ba5781f6f635af34d3def/iib/workers/tasks/utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_utils.py",
+          "path": "tests/test_workers/test_tasks/test_utils.py",
+          "sha": "ae866b70b76a3347ee85dd0cf53049f1a42700c5",
+          "html_url": "https://github.com/release-engineering/iib/blob/ff7c2b6055bf30420e3ba5781f6f635af34d3def/tests/test_workers/test_tasks/test_utils.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "iib/workers/tasks",
+      "count": 17,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "iib/workers/tasks/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "build.py",
+          "path": "iib/workers/tasks/build.py",
+          "type": "file"
+        },
+        {
+          "name": "build_add_deprecations.py",
+          "path": "iib/workers/tasks/build_add_deprecations.py",
+          "type": "file"
+        },
+        {
+          "name": "build_create_empty_index.py",
+          "path": "iib/workers/tasks/build_create_empty_index.py",
+          "type": "file"
+        },
+        {
+          "name": "build_fbc_operations.py",
+          "path": "iib/workers/tasks/build_fbc_operations.py",
+          "type": "file"
+        },
+        {
+          "name": "build_merge_index_image.py",
+          "path": "iib/workers/tasks/build_merge_index_image.py",
+          "type": "file"
+        },
+        {
+          "name": "build_recursive_related_bundles.py",
+          "path": "iib/workers/tasks/build_recursive_related_bundles.py",
+          "type": "file"
+        },
+        {
+          "name": "build_regenerate_bundle.py",
+          "path": "iib/workers/tasks/build_regenerate_bundle.py",
+          "type": "file"
+        },
+        {
+          "name": "celery.py",
+          "path": "iib/workers/tasks/celery.py",
+          "type": "file"
+        },
+        {
+          "name": "fbc_utils.py",
+          "path": "iib/workers/tasks/fbc_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "general.py",
+          "path": "iib/workers/tasks/general.py",
+          "type": "file"
+        },
+        {
+          "name": "git_utils.py",
+          "path": "iib/workers/tasks/git_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "iib_static_types.py",
+          "path": "iib/workers/tasks/iib_static_types.py",
+          "type": "file"
+        },
+        {
+          "name": "konflux_utils.py",
+          "path": "iib/workers/tasks/konflux_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "opm_operations.py",
+          "path": "iib/workers/tasks/opm_operations.py",
+          "type": "file"
+        },
+        {
+          "name": "oras_utils.py",
+          "path": "iib/workers/tasks/oras_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "iib/workers/tasks/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "iib/workers/tasks/__init__.py"
+        },
+        {
+          "name": "build.py",
+          "path": "iib/workers/tasks/build.py"
+        },
+        {
+          "name": "build_add_deprecations.py",
+          "path": "iib/workers/tasks/build_add_deprecations.py"
+        },
+        {
+          "name": "build_create_empty_index.py",
+          "path": "iib/workers/tasks/build_create_empty_index.py"
+        },
+        {
+          "name": "build_fbc_operations.py",
+          "path": "iib/workers/tasks/build_fbc_operations.py"
+        },
+        {
+          "name": "build_merge_index_image.py",
+          "path": "iib/workers/tasks/build_merge_index_image.py"
+        },
+        {
+          "name": "build_recursive_related_bundles.py",
+          "path": "iib/workers/tasks/build_recursive_related_bundles.py"
+        },
+        {
+          "name": "build_regenerate_bundle.py",
+          "path": "iib/workers/tasks/build_regenerate_bundle.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "iib/workers/tasks/utils.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "0f3e52e9518eb9ba455b658118183ae9f5bd5622",
+          "html_url": "https://github.com/release-engineering/iib/commit/0f3e52e9518eb9ba455b658118183ae9f5bd5622",
+          "message": "Adding helper functions for index.db caching\n\nAssisted by: Gemini\n\n[CLOUDDST-28870]",
+          "author": "Jan Lipovský",
+          "date": "2025-09-16T11:39:36Z"
+        },
+        {
+          "sha": "8055e59edd0aea7bb257e226e51bb3385c0eb3e4",
+          "html_url": "https://github.com/release-engineering/iib/commit/8055e59edd0aea7bb257e226e51bb3385c0eb3e4",
+          "message": "Add support for multiple FBC fragments in fbc-operations endpoint\n\nRefers to CLOUDDST-29205\n\nAssisted-by: Cursor\nSigned-off-by: Yashvardhan Nanavati <yashn@bu.edu>",
+          "author": "Yashvardhan Nanavati",
+          "date": "2025-08-27T07:16:48Z"
+        },
+        {
+          "sha": "f155336a0cce44a7055afd3994873cee13d809a0",
+          "html_url": "https://github.com/release-engineering/iib/commit/f155336a0cce44a7055afd3994873cee13d809a0",
+          "message": "Add oras_utils.py module to push and pull artifacts\n\nOras doesn't work well with multiple auths for the same registry\nin config.json. This commit also enhances set_registry_auths to\nfunction such that it is possible to replace entire config.json\nwith provided auth instead of simply appending to the ",
+          "author": "Yashvardhan Nanavati",
+          "date": "2025-08-17T08:26:10Z"
+        },
+        {
+          "sha": "b53036c804462c6b271fa5f52b0aa4948c6e6151",
+          "html_url": "https://github.com/release-engineering/iib/commit/b53036c804462c6b271fa5f52b0aa4948c6e6151",
+          "message": "feat(utils): Sanitize logs of git operations\n\nThis change sanitizes the logs for git clone operations in order to\nprevent leaking secrets on logs.\n\nIt uses an auxiliary function for `run_cmd` named `_sanitize_cmd_log` to\ndo this job.\n\nRefers to CLOUDDST-28864\n\nSigned-off-by: Jonathan Gangi <jgangi@r",
+          "author": "Jonathan Gangi",
+          "date": "2025-08-05T19:46:01Z"
+        },
+        {
+          "sha": "3c7d6060870f76d0df6baff37a10eaafe396766e",
+          "html_url": "https://github.com/release-engineering/iib/commit/3c7d6060870f76d0df6baff37a10eaafe396766e",
+          "message": "Delay retries on podman_pull\n\nThis commit updates the `podman_pull` retry to use the `wait` interval\nconfigured on `iib_retry_multiplier`.\n\nRefers to CLOUDDST-23349\n\nSigned-off-by: Jonathan Gangi <jgangi@redhat.com>",
+          "author": "Jonathan Gangi",
+          "date": "2025-03-13T17:34:35Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "request_logger FIXME Bandit complaining permissive logs",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "iib/workers/tasks/utils.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "0f3e52e9518eb9ba455b658118183ae9f5bd5622",
+        "html_url": "https://github.com/release-engineering/iib/commit/0f3e52e9518eb9ba455b658118183ae9f5bd5622",
+        "message": "Adding helper functions for index.db caching\n\nAssisted by: Gemini\n\n[CLOUDDST-28870]",
+        "author": "Jan Lipovský",
+        "date": "2025-09-16T11:39:36Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "Bandit security scan reports",
+        "Log file permission checks",
+        "Unit tests for logging behavior",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

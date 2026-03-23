@@ -1,0 +1,379 @@
+{
+  "task_id": "782",
+  "repo_owner": "odoo",
+  "repo_name": "odoo",
+  "file_path": "addons/website_slides/models/slide_slide.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:16:01+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:16:13+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:16:18+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "addons/website_slides/models/slide_slide.py",
+    "original_code": "def _compute_website_url(self):\n    # TDE FIXME: clena this link.tracker strange stuff\n    super(Slide, self)._compute_website_url()\n    for slide in self:\n        if slide.id:  # avoid to perform a slug on a not yet saved record in case of an onchange.\n            base_url = slide.channel_id.get_base_url()\n            # link_tracker is not in dependencies, so use it to shorten url only if installed.\n            if self.env.registry.get('link.tracker'):\n                url = self.env['link.tracker'].sudo().create({\n                    'url': '%s/slides/slide/%s' % (base_url, slug(slide)),\n                    'title': slide.name,\n                }).short_url\n            else:\n                url = '%s/slides/slide/%s' % (base_url, slug(slide))\n            slide.website_url = url",
+    "satd_comment": "# TDE FIXME: clena this link.tracker strange stuff",
+    "target_file": {
+      "ok": true,
+      "path": "addons/website_slides/models/slide_slide.py",
+      "sha": "55c1619ea0989660d5b727e8e998246f38e34df1",
+      "download_url": "https://raw.githubusercontent.com/odoo/odoo/19.0/addons/website_slides/models/slide_slide.py",
+      "content_excerpt": "# Part of Odoo. See LICENSE file for full copyright and licensing details.\n\nimport base64\nimport datetime\nimport io\nimport logging\nimport re\nimport requests\n\nfrom dateutil.relativedelta import relativedelta\nfrom markupsafe import Markup\nfrom werkzeug import urls\n\nfrom odoo import api, fields, models, _\nfrom odoo.exceptions import RedirectWarning, UserError, AccessError\nfrom odoo.http import request\nfrom odoo.tools import html2plaintext, sql\nfrom odoo.tools.pdf import PdfFileReader\n\n_logger = logging.getLogger(__name__)\n\n\nclass SlideSlide(models.Model):\n    _name = 'slide.slide'\n    _inherit = [\n        'mail.thread',\n        'image.mixin',\n        'website.seo.metadata',\n        'website.published.mixin',\n        'website.searchable.mixin',\n    ]\n    _description = 'Slides'\n    _mail_post_access = 'read'\n    _order_by_strategy = {\n        'sequence': 'sequence asc, id asc',\n        'most_viewed': 'total_views desc',\n        'most_voted': 'likes desc',\n        'latest': 'date_published desc',\n    }\n    _order = 'sequence asc, is_category asc, id asc'\n    _partner_unfollow_enabled = True\n\n    YOUTUBE_VIDEO_ID_REGEX = r'^(?:(?:https?:)?//)?(?:www\\.|m\\.)?(?:youtu\\.be/|youtube(-nocookie)?\\.com/(?:embed/|v/|shorts/|live/|watch\\?v=|watch\\?.+&v=))((?:\\w|-){11})\\S*$'\n    GOOGLE_DRIVE_DOCUMENT_ID_REGEX = r'(^https:\\/\\/docs.google.com|^https:\\/\\/drive.google.com).*\\/d\\/([^\\/]*)'\n    VIMEO_VIDEO_ID_REGEX = r'\\/\\/(player.)?vimeo.com\\/(?:[a-z]*\\/)*([0-9]{6,11})\\/?([0-9a-z]{6,11})?[?]?.*'\n\n    # description\n    name = fields.Char('Title', required=True, translate=True)\n    image_1920 = fields.Image(compute=\"_compute_image_1920\", store=True, readonly=False)  # image.mixin override\n    active = fields.Boolean(default=True, tracking=100)\n    sequence = fields.Integer('Sequence', default=0)\n    user_id = fields.Many2one('res.users', string='Uploaded by', default=lambda self: self.env.uid)\n    description = fields.Html('Description', translate=True, sanitize_attributes=False, sanitize_overridable=True)\n    channel_id = fields.Many2one('slide.channel', string=\"Course\", required=True, index=True, ondelete='cascade')\n    tag_ids = fields.Many2many('slide.tag', 'rel_slide_tag', 'slide_id', 'tag_id', string='Tags')\n    is_preview = fields.Boolean('Allow Preview', default=False, help=\"The course is accessible by anyone : the users don't need to join the channel to access the content of the course.\")\n    is_new_slide = fields.Boolean('Is New Slide', compute='_compute_is_new_slide')\n    completion_time = fields.Float('Duration', digits=(10, 4), compute='_compute_category_completion_time', recursive=True, readonly=False, store=True)\n    # Categories\n    is_category = fields.Boolean('Is a category', default=False)\n    category_id = fields.Many2one('slide.slide', string=\"Section\", compute=\"_compute_category_id\", store=True, index='btree_not_null')\n    slide_ids = fields.One2many('slide.slide', \"category_id\", string=\"Content\")\n    # subscribers\n    partner_ids = fields.Many2many('res.partner', 'slide_slide_partner', 'slide_id', 'partner_id',\n                                   string='Subscribers', groups='website_slides.group_website_slides_officer', copy=False)\n    slide_partner_ids = fields.One2many('slide.slide.partner', 'slide_id', string='Subscribers information', groups='website_slides.group_website_slides_officer', copy=False)\n    user_membership_id = fields.Many2one(\n        'slide.slide.partner', string=\"Subscriber information\",\n        compute='_compute_user_membership_id', compute_sudo=False,\n        help=\"Subscriber information for the current logged in user\")\n    # current user membership\n    user_vote = fields.Integer('User vote', compute='_compute_user_membership_id', compute_sudo=False)\n    user_has_completed = fields.Boolean('Is Member', compute='_compute_user_membership_id', compute_sudo=False)\n    user_has_completed_category = fields.Boolean('Is Category Completed', compute='_compute_category_completed')\n    # Quiz related fields\n    question_ids = fields.One2many(\"slide.question\", \"slide_id\", string=\"Questions\", copy=True)\n    questions_count = fields.Integer(string=\"Numbers of Questions\", compute='_compute_questions_count')\n    quiz_first_attempt_reward = fields.Integer(\"Reward: first attempt\", default=10)\n    quiz_second_attempt_reward = fields.Integer(\"Reward: second attempt\", default=7)\n    quiz_third_attempt_reward = fields.Integer(\"Reward: third attempt\", default=5,)\n    quiz_fourth_attempt_reward = fields.Integer(\"Reward: every attempt after the third try\", default=2)\n    # content\n    can_self_mark_completed = fields.Boolean('Can Mark Completed', compute='_compute_mark_complete_actions',\n        help='The slide can be marked as completed even without opening it')\n    can_self_mark_uncompleted = fields.Boolean('Can Mark Uncompleted', compute='_compute_mark_complete_actions',\n        help='The slide can be marked as not completed and the progression')\n    slide_category = fields.Selection([\n        ('infographic', 'Image'),\n        ('article', 'Article'),\n        ('document', 'Document'),\n        ('video', 'Video'),\n        ('quiz', \"Quiz\")],\n        string='Category', required=True,\n        default='document')\n    source_type = fields.Selection([\n        ('local_file', 'Upload from Device'),\n        ('external', 'Retrieve from Google Drive')],\n        default='local_file', required=True)\n    # generic\n    url = fields.Char('External URL', help=\"URL of the Google Drive file or URL of the YouTube video\")\n    binary_content = fields.Binary('File', attachment=True)\n    slide_resource_ids = fields.One2many('slide.slide.resource', 'slide_id', string=\"Additional Resource for this slide\", copy=True)\n    slide_resource_downloadable = fields.Boolean('Allow Download', default=False, help=\"Allow the user to download the content of the slide.\")\n    # google\n    google_drive_id = fields.Char('Google Drive ID of the external URL', compute='_compute_google_drive_id')\n    # content - webpage\n    html_content = fields.Html(\n        \"HTML Content\", translate=True,\n        sanitize_attributes=False, sanitize_form=False, sanitize_overridable=True,\n        help=\"Custom HTML content for slides of category 'Article'.\")\n    # content - images\n    image_binary_content = fields.Binary('Image Content', related='binary_content', readonly=False) # Used to filter file input to images only\n    image_google_url = fields.Char('Image Link', related='url', readonly=False,\n        help=\"Link of the image (we currently only support Google Drive as source)\")\n    # content - documents\n    slide_icon_class = fields.Char('Slide Icon fa-class', compute='_compute_slide_icon_class')\n    slide_type = fields.Selection([\n        ('image', 'Image'),\n        ('article', 'Article'),\n        ('quiz', 'Quiz'),\n        ('pdf', 'PDF'),\n        ('sheet', 'Sheet (Excel, Google Sheet, ...)'),\n        ('doc', 'Document (Word, Google Doc, ...)'),\n        ('slides', 'Slides (PowerPoint, Google Slides, ...)'),\n        ('youtube_video', 'YouTube Video'),\n        ('google_drive_video', 'Google Drive Video'),\n        ('vimeo_video', 'Vimeo Video')],\n        string=\"Slide Type\", compute='_compute_slide_type', store=True, readonly=False,\n        help=\"Subtype of the slide category, allows more precision on the actual file type / source type.\")\n    document_google_url = fields.Char('Document Link', related='url', readonly=False,\n        help=\"Link of the document (we currently only support Google Drive as source)\")\n    document_binary_content = fields.Binary('PDF Content', related='binary_content', readonly=False) # Used to filter file input to PDF only\n    # content - videos\n    video_url = fields.Char('Video Link', related='url', readonly=False,\n        help=\"Link of the video (we support YouTube, Google Drive and Vimeo as sources)\")\n    video_source_type = fields.Selection([\n        ('youtube', 'YouTube'),\n        ('google_drive', 'Google Drive'),\n        ('vimeo', 'Vimeo')],\n        string='Video Source', compute=\"_compute_video_source_type\")\n    youtube_id = fields.Char('Video YouTube ID', compute='_compute_youtube_id')\n    vimeo_id = fields.Char('Video Vimeo ID', compute='_compute_vimeo_id')\n    # website\n    website_id = fields.Many2one(related='channel_id.website_id', readonly=True)\n    date_published = fields.Datetime('Publish Date', readonly=True, tracking=False, copy=False)\n    likes = fields.Integer('Likes', compute='_compute_like_info', store=True, compute_sudo=False)\n    dislikes = fields.Integer('Dislikes', compute='_compute_like_info', store=True, compute_sudo=False)\n    embed_code = fields.Html('Embed Code', readonly=True, compute='_compute_embed_code', sanitize=False)\n    embed_code_external = fields.Html('External Embed Code', readonly=True, compute='_compute_embed_code', sanitize=False,\n        help=\"Same as 'Embed Code' but used to embed the content on an external website.\")\n    website_share_url = fields.Char('Share URL', compute='_compute_website_share_url')\n    # views\n    embed_ids = fields.One2many('slide.embed', 'slide_id', string=\"External Slide Embeds\")\n    embed_count = fields.Integer('# of Embeds', compute='_compute_embed_counts')\n    slide_views = fields.Integer('# of Website Views', store=True, compute=\"_compute_slide_views\")\n    public_views = fields.Integer('# of Public Views', copy=False, default=0, readonly=True)\n    total_views = fields.Integer(\"# Total Views\", default=\"0\", compute='_compute_total', store=True)\n    # comments\n    comments_count = fields.Integer('Number of comments', compute=\"_compute_comments_count\")\n    # channel\n    channel_type = fields.Selection(related=\"channel_id.channel_type\", string=\"Channel type\")\n    channel_allow_comment = fields.Boolean(related=\"channel_id.allow_comment\", string=\"Allows comment\")\n    # Statistics in case the slide is a category\n    nbr_document = fields.Integer(\"Number of Documents\", compute='_compute_slides_statistics', store=True)\n    nbr_video = fields.Integer(\"Number of Videos\", compute='_compute_slides_statistics', store=True)\n    nbr_infographic = fields.Integer(\"Number of Images\", compute='_compute_slides_statistics', store=True)\n    nbr_article = fields.Integer(\"Number of Articles\", compute='_compute_slides_statistics', store=True)\n    nbr_quiz = fields.Integer(\"Number of Quizs\", compute=\"_compute_slides_statistics\", store=True)\n    total_slides = fields.Integer(compute='_compute_slides_statistics', store=True)\n    is_published = fields.Boolean(tracking=1)\n    website_published = fields.Boolean(tracking=False)\n\n    _exclusion_html_content_and_url = models.Constraint(\n        'CHECK(html_content IS NULL OR url IS NULL)',\n        'A slide is either filled with a url or HTML content. Not both.',\n    )\n\n    @api.depends('slide_category', 'source_type', 'image_binary_content')\n    def _compute_image_1920(self):\n        for slide in self:\n            if slide.slide_category == 'infographic' and slide.source_type == 'local_file' and slide.image_binary_content:\n                slide.image_1920 = slide.image_binary_content\n            elif not slide.image_1920:\n                slide.image_1920 = False\n\n    @api.depends('date_published', 'is_published')\n    def _compute_is_new_slide(self):\n        for slide in self:\n            slide.is_new_slide = slide.date_published > fields.Datetime.now() - relativedelta(days=7) if slide.is_published else False\n\n    def _get_placeholder_filename(self, field):\n        return self.channel_id._get_placeholder_filename(field)\n\n    @api.depends('channel_id.slide_ids.is_category', 'channel_id.slide_ids.sequence', 'channel_id.slide_ids.slide_ids')\n    def _compute_category_id(self):\n        \"\"\" Will take all the slides of the channel for which the index is higher\n        than the index of this category and lower than the index of the next category.\n\n        Lists are manually sorted because when adding a new browse record order\n        will not be correct as the added slide would actually end up at the\n        first place no matte",
+      "total_lines": 1331
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "base64",
+        "datetime",
+        "io",
+        "logging",
+        "re",
+        "requests",
+        "dateutil.relativedelta:relativedelta",
+        "markupsafe:Markup",
+        "werkzeug:urls",
+        "odoo:api",
+        "odoo:fields",
+        "odoo:models",
+        "odoo:_",
+        "odoo.exceptions:RedirectWarning",
+        "odoo.exceptions:UserError",
+        "odoo.exceptions:AccessError",
+        "odoo.http:request",
+        "odoo.tools:html2plaintext",
+        "odoo.tools:sql",
+        "odoo.tools.pdf:PdfFileReader"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/odoo/odoo/19.0/README.md",
+      "content_excerpt": "# Odoo\n\n[![Build Status](https://runbot.odoo.com/runbot/badge/flat/1/master.svg)](https://runbot.odoo.com/runbot)\n[![Tech Doc](https://img.shields.io/badge/master-docs-875A7B.svg?style=flat&colorA=8F8F8F)](https://www.odoo.com/documentation/master)\n[![Help](https://img.shields.io/badge/master-help-875A7B.svg?style=flat&colorA=8F8F8F)](https://www.odoo.com/forum/help-1)\n[![Nightly Builds](https://img.shields.io/badge/master-nightly-875A7B.svg?style=flat&colorA=8F8F8F)](https://nightly.odoo.com/)\n\nOdoo is a suite of web based open source business apps.\n\nThe main Odoo Apps include an [Open Source CRM](https://www.odoo.com/page/crm),\n[Website Builder](https://www.odoo.com/app/website),\n[eCommerce](https://www.odoo.com/app/ecommerce),\n[Warehouse Management](https://www.odoo.com/app/inventory),\n[Project Management](https://www.odoo.com/app/project),\n[Billing &amp; Accounting](https://www.odoo.com/app/accounting),\n[Point of Sale](https://www.odoo.com/app/point-of-sale-shop),\n[Human Resources](https://www.odoo.com/app/employees),\n[Marketing](https://www.odoo.com/app/social-marketing),\n[Manufacturing](https://www.odoo.com/app/manufacturing),\n[...](https://www.odoo.com/)\n\nOdoo Apps can be used as stand-alone applications, but they also integrate seamlessly so you get\na full-featured [Open Source ERP](https://www.odoo.com) when you install several Apps.\n\n## Getting started with Odoo\n\nFor a standard installation please follow the [Setup instructions](https://www.odoo.com/documentation/master/administration/install/install.html)\nfrom the documentation.\n\nTo learn the software, we recomme"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_compute_website_url test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_performance.py",
+          "path": "addons/website_forum/tests/test_performance.py",
+          "sha": "565cc192bb3393036988a7bf8d54b41a911352a2",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_forum/tests/test_performance.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_compute_website_url(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "res_partner.py",
+          "path": "addons/website_partner/models/res_partner.py",
+          "sha": "c5f7ce0e186f4217d7cf111483b6def01f87095c",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_partner/models/res_partner.py",
+          "score": 1.0
+        },
+        {
+          "name": "forum_forum.py",
+          "path": "addons/website_forum/models/forum_forum.py",
+          "sha": "c2a1e337ec5336140b3c3cc1659e675ca5c11527",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_forum/models/forum_forum.py",
+          "score": 1.0
+        },
+        {
+          "name": "website_blog.py",
+          "path": "addons/website_blog/models/website_blog.py",
+          "sha": "20aa6cefcd00d92b48f675687b2b7235331c5d12",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_blog/models/website_blog.py",
+          "score": 1.0
+        },
+        {
+          "name": "res_partner_grade.py",
+          "path": "addons/website_crm_partner_assign/models/res_partner_grade.py",
+          "sha": "83f10dab4d097be407ec135865fb4d4a9315adab",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_crm_partner_assign/models/res_partner_grade.py",
+          "score": 1.0
+        },
+        {
+          "name": "event_track.py",
+          "path": "addons/website_event_track/models/event_track.py",
+          "sha": "bc9a5c0da788821434de4fa20f9df2a21b82cf23",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_event_track/models/event_track.py",
+          "score": 1.0
+        },
+        {
+          "name": "ir_actions_server.py",
+          "path": "addons/website/models/ir_actions_server.py",
+          "sha": "a884850f5ea2edd361820b9af26493c30283b37b",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website/models/ir_actions_server.py",
+          "score": 1.0
+        },
+        {
+          "name": "slide_slide.py",
+          "path": "addons/website_slides/models/slide_slide.py",
+          "sha": "55c1619ea0989660d5b727e8e998246f38e34df1",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_slides/models/slide_slide.py",
+          "score": 1.0
+        },
+        {
+          "name": "product_template.py",
+          "path": "addons/website_sale/models/product_template.py",
+          "sha": "7bc55a945b1dacf7649a3e5b0b96571fe74e48fe",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/website_sale/models/product_template.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "addons/website_slides/models",
+      "count": 18,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "addons/website_slides/models/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "gamification_challenge.py",
+          "path": "addons/website_slides/models/gamification_challenge.py",
+          "type": "file"
+        },
+        {
+          "name": "gamification_karma_tracking.py",
+          "path": "addons/website_slides/models/gamification_karma_tracking.py",
+          "type": "file"
+        },
+        {
+          "name": "mail_activity.py",
+          "path": "addons/website_slides/models/mail_activity.py",
+          "type": "file"
+        },
+        {
+          "name": "res_config_settings.py",
+          "path": "addons/website_slides/models/res_config_settings.py",
+          "type": "file"
+        },
+        {
+          "name": "res_groups.py",
+          "path": "addons/website_slides/models/res_groups.py",
+          "type": "file"
+        },
+        {
+          "name": "res_partner.py",
+          "path": "addons/website_slides/models/res_partner.py",
+          "type": "file"
+        },
+        {
+          "name": "res_users.py",
+          "path": "addons/website_slides/models/res_users.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_channel.py",
+          "path": "addons/website_slides/models/slide_channel.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_channel_partner.py",
+          "path": "addons/website_slides/models/slide_channel_partner.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_channel_tag.py",
+          "path": "addons/website_slides/models/slide_channel_tag.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_embed.py",
+          "path": "addons/website_slides/models/slide_embed.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_question.py",
+          "path": "addons/website_slides/models/slide_question.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_slide.py",
+          "path": "addons/website_slides/models/slide_slide.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_slide_partner.py",
+          "path": "addons/website_slides/models/slide_slide_partner.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_slide_resource.py",
+          "path": "addons/website_slides/models/slide_slide_resource.py",
+          "type": "file"
+        },
+        {
+          "name": "slide_tag.py",
+          "path": "addons/website_slides/models/slide_tag.py",
+          "type": "file"
+        },
+        {
+          "name": "website.py",
+          "path": "addons/website_slides/models/website.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "addons/website_slides/models/__init__.py"
+        },
+        {
+          "name": "gamification_challenge.py",
+          "path": "addons/website_slides/models/gamification_challenge.py"
+        },
+        {
+          "name": "gamification_karma_tracking.py",
+          "path": "addons/website_slides/models/gamification_karma_tracking.py"
+        },
+        {
+          "name": "mail_activity.py",
+          "path": "addons/website_slides/models/mail_activity.py"
+        },
+        {
+          "name": "res_config_settings.py",
+          "path": "addons/website_slides/models/res_config_settings.py"
+        },
+        {
+          "name": "res_groups.py",
+          "path": "addons/website_slides/models/res_groups.py"
+        },
+        {
+          "name": "res_partner.py",
+          "path": "addons/website_slides/models/res_partner.py"
+        },
+        {
+          "name": "res_users.py",
+          "path": "addons/website_slides/models/res_users.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "addons/website_slides/models/slide_slide.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "99e65de82a2b8930876bd561d608903a0d78a193",
+          "html_url": "https://github.com/odoo/odoo/commit/99e65de82a2b8930876bd561d608903a0d78a193",
+          "message": "[FIX] website_slides: support Google Shared Drive links\n\nStep to reproduce:\n1. Install `website_slides`\n2. Go to eLearning > Courses > select a course > Add Content\n3. Paste a public link that belongs to a file located in a Google `Shared Drive`\n\nIssue:\n- The system shows a warning\n  `Your file coul",
+          "author": "pish-odoo",
+          "date": "2025-12-22T13:29:33Z"
+        },
+        {
+          "sha": "74d5f4cff201ff766442abee77bf2cea2131f341",
+          "html_url": "https://github.com/odoo/odoo/commit/74d5f4cff201ff766442abee77bf2cea2131f341",
+          "message": "[REF] *: update arguments of write and default_get\n\nThis is required to make RPC calls work with keyword arguments. Right\nnow, sometimes you need to call `write(vals)` or `write(values)`\ndepending on the model and on the installed modules.\n\n- `write(self, vals)`\n- `default_get(self, fields)` (api.mo",
+          "author": "Krzysztof Magusiak (krma)",
+          "date": "2025-07-10T09:20:23Z"
+        },
+        {
+          "sha": "e7a61bcfc6e87953c1ceebfb11587aaf187c6e01",
+          "html_url": "https://github.com/odoo/odoo/commit/e7a61bcfc6e87953c1ceebfb11587aaf187c6e01",
+          "message": "[REF] *: replace deprecated attributes on model\n\nPart-of: odoo/odoo#193636\nRelated: odoo/enterprise#77138\nRelated: odoo/upgrade#7066\nSigned-off-by: Krzysztof Magusiak (krma) <krma@odoo.com>",
+          "author": "Krzysztof Magusiak (krma)",
+          "date": "2025-06-26T11:45:27Z"
+        },
+        {
+          "sha": "120555cda0c4711203e7f19d14dfaf6f2c636120",
+          "html_url": "https://github.com/odoo/odoo/commit/120555cda0c4711203e7f19d14dfaf6f2c636120",
+          "message": "[FIX] website_slides: fix broken share link in email\n\nSteps to reproduce\n===================\n1. Add new content to the course and publish it.\n2. A notification email is sent to the course attendees.\n3. Click the 'View Content' button in the email.\nIt leads to a 404 error page.\n\nWith https://github.c",
+          "author": "Mayurrajsinh Rathod",
+          "date": "2025-05-23T09:03:17Z"
+        },
+        {
+          "sha": "cc0602adefb08796d9149c7651b2303b091264c6",
+          "html_url": "https://github.com/odoo/odoo/commit/cc0602adefb08796d9149c7651b2303b091264c6",
+          "message": "[REM] website_slides: remove dead code\n\nJust removing a method not used anymore.\n\ncloses odoo/odoo#214491\n\nSigned-off-by: Thibault Delavallee (tde) <tde@openerp.com>",
+          "author": "Thibault Delavallée",
+          "date": "2025-06-16T11:48:45Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_compute_website_url FIXME clena this link tracker",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "addons/website_slides/models/slide_slide.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "99e65de82a2b8930876bd561d608903a0d78a193",
+        "html_url": "https://github.com/odoo/odoo/commit/99e65de82a2b8930876bd561d608903a0d78a193",
+        "message": "[FIX] website_slides: support Google Shared Drive links\n\nStep to reproduce:\n1. Install `website_slides`\n2. Go to eLearning > Courses > select a course > Add Content\n3. Paste a public link that belongs to a file located in a Google `Shared Drive`\n\nIssue:\n- The system shows a warning\n  `Your file coul",
+        "author": "pish-odoo",
+        "date": "2025-12-22T13:29:33Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

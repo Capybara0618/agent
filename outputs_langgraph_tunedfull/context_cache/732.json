@@ -1,0 +1,335 @@
+{
+  "task_id": "732",
+  "repo_owner": "dwavesystems",
+  "repo_name": "dwave-system",
+  "file_path": "dwave/system/samplers/dwave_sampler.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:02:52+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 7,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:03:01+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:03:06+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "dwave/system/samplers/dwave_sampler.py",
+    "original_code": "def __init__(self, config_file=None, profile=None, endpoint=None, token=None,\n             solver=None, solver_features=None, proxy=None, permissive_ssl=False):\n\n    self.client = Client.from_config(config_file=config_file, profile=profile,\n                                     endpoint=endpoint, token=token, proxy=proxy,\n                                     permissive_ssl=permissive_ssl)\n\n    # TODO: deprecate `solver`` name in favor of name regex in `solver_features`\n    self.solver = self.client.get_solver(name=solver, features=solver_features)\n\n    # need to set up the nodelist and edgelist, properties, parameters\n    self._nodelist = sorted(self.solver.nodes)\n    self._edgelist = sorted(set(tuple(sorted(edge)) for edge in self.solver.edges))\n    self._properties = self.solver.properties.copy()  # shallow copy\n    self._parameters = {param: ['parameters'] for param in self.solver.properties['parameters']}",
+    "satd_comment": "# TODO: deprecate `solver`` name in favor of name regex in `solver_features`",
+    "target_file": {
+      "ok": true,
+      "path": "dwave/system/samplers/dwave_sampler.py",
+      "sha": "b8d17c6c9a8ee649a38d65e864330c9e95848eb6",
+      "download_url": "https://raw.githubusercontent.com/dwavesystems/dwave-system/master/dwave/system/samplers/dwave_sampler.py",
+      "content_excerpt": "# Copyright 2018 D-Wave Systems Inc.\n#\n#    Licensed under the Apache License, Version 2.0 (the \"License\");\n#    you may not use this file except in compliance with the License.\n#    You may obtain a copy of the License at\n#\n#        http://www.apache.org/licenses/LICENSE-2.0\n#\n#    Unless required by applicable law or agreed to in writing, software\n#    distributed under the License is distributed on an \"AS IS\" BASIS,\n#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n#    See the License for the specific language governing permissions and\n#    limitations under the License.\n\n\"\"\"\nA :ref:`dimod <index_dimod>` :term:`sampler` for D-Wave quantum computers.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport copy\nimport collections.abc as abc\nfrom collections import defaultdict\nfrom typing import Optional, Dict, TYPE_CHECKING\n\nimport dimod\nimport dwave_networkx as dnx\nfrom dimod.exceptions import BinaryQuadraticModelStructureError\nfrom dwave.cloud.client import Client\nfrom dwave.cloud.exceptions import (\n    SolverError, SolverAuthenticationError, InvalidAPIResponseError,\n    RequestTimeout, PollingTimeout, ProblemUploadError, ProblemStructureError,\n    SolverNotFoundError,\n)\n\nfrom dwave.system.exceptions import FailoverCondition, RetryCondition\nfrom dwave.system.warnings import WarningHandler, WarningAction\n\nif TYPE_CHECKING:\n    from dwave.cloud.solver import StructuredSolver\n\n__all__ = ['DWaveSampler', 'qpu_graph']\n\n\ndef qpu_graph(topology_type, topology_shape, nodelist, edgelist):\n    \"\"\"Convert node and edge lists to a ``dwave-networkx`` graph.\n\n    Creates a QPU :term:`topology` (Chimera, Pegasus or Zephyr) graph compatible\n    with Ocean software's :ref:`index_dnx`.\n\n    Args:\n        topology_type (string):\n            Type of lattice. Valid strings are ``'chimera'``, ``'pegasus'`` and\n            ``'zephyr'``.\n        topology_shape(iterable of ints):\n            Dimensions of the lattice.\n        nodelist (list of ints):\n            List of nodes in the graph. Node labeling is integer and compatible\n            with the linear labeling scheme for the specified ``topology_type``.\n        edgelist (list of Tuples):\n            List of edges in the graph, with each edge consisting of a pair of\n            nodes.\n\n    See also:\n            :func:`dwave_networkx.chimera_graph`,\n            :func:`dwave_networkx.pegasus_graph`,\n            :func:`dwave_networkx.zephyr_graph` for descriptions of the lattice\n            parameters and indexing.\n    \"\"\"\n\n    if topology_type == 'chimera':\n        if not (1 <= len(topology_shape) <=3):\n            raise ValueError('topology_shape is incompatible with a chimera lattice.')\n        G = dnx.chimera_graph(*topology_shape,\n                              node_list=nodelist,\n                              edge_list=edgelist)\n    elif topology_type == 'pegasus':\n        if len(topology_shape) != 1:\n            raise ValueError('topology_shape is incompatible with a pegasus lattice.')\n        G = dnx.pegasus_graph(topology_shape[0],\n                                  node_list=nodelist,\n                                  edge_list=edgelist)\n    elif topology_type == 'zephyr':\n        if len(topology_shape) not in (1, 2):\n            raise ValueError('topology_shape is incompatible with a zephyr lattice.')\n        G = dnx.zephyr_graph(*topology_shape,\n                                 node_list=nodelist,\n                                 edge_list=edgelist)\n    else:\n        # Alternative could be to create a standard network graph and\n        # issue a warning. Requires new dependency on networkx.\n        raise ValueError('topology_type does not match a known QPU architecure')\n    return G\n\n\ndef _get_solver_id(solver: StructuredSolver) -> str:\n    \"\"\"Return a unique solver string identifier, derived from solver's name or\n    solver's identity (if available).\"\"\"\n\n    # only available in cloud-client>=0.14\n    if hasattr(solver, 'identity'):\n        return str(solver.identity)\n\n    # used until cloud-client==0.14, deprecated since\n    return solver.id\n\n\nclass DWaveSampler(dimod.Sampler, dimod.Structured):\n    r\"\"\"Submits binary quadratic models directly to D-Wave quantum computers.\n\n    Linear and quadratic terms of the :term:`binary quadratic model` (BQM) must\n    map directly to qubit and coupler indices of the selected :term:`QPU`.\n    Typically this mapping (:term:`minor-embedding`) is handled by software\n    (e.g., the :class:`.EmbeddingComposite` class) but for small problems can be\n    manual.\n    You can configure your :term:`solver` selection and usage by setting\n    parameters, hierarchically, in a configuration file, as environment\n    variables, or explicitly as input arguments. For more information, see the\n    :meth:`~dwave.cloud.client.Client.get_solvers` method. By default, online\n    QPUs are returned ordered by highest number of qubits.\n\n    Args:\n        failover (bool, optional, default=False):\n            Signal a failover condition if a sampling error occurs. When\n            ``True``, raises :exc:`~dwave.system.exceptions.FailoverCondition`\n            or :exc:`~dwave.system.exceptions.RetryCondition` on sampleset\n            :meth:`~dimod.SampleSet.resolve` to signal failover.\n            Actual failover (i.e., selection of a new solver) has to be handled\n            by the user. A convenience method :meth:`.trigger_failover` is\n            available for this. Note that hardware graphs vary between QPUs, so\n            triggering failover results in regenerated :attr:`.nodelist`,\n            :attr:`.edgelist`, :attr:`.properties` and :attr:`.parameters`.\n\n            .. versionchanged:: 1.16.0\n\n               In the past, the :meth:`.sample` method was blocking and\n               ``failover=True`` caused a solver failover and sampling retry.\n               However, this failover implementation broke when :meth:`.sample`\n               became non-blocking (asynchronous), Setting ``failover=True`` had\n               no effect.\n\n        retry_interval (number, optional, default=-1):\n            Ignored, but kept for backward compatibility.\n\n            .. versionchanged:: 1.16.0\n\n               Ignored since 1.16.0. See note for ``failover`` parameter above.\n\n        **config:\n            Keyword arguments passed to\n            :meth:`~dwave.cloud.client.Client.from_config`.\n\n    .. versionadded:: 1.29.0\n        Support for context manager protocol.\n\n    Note:\n        Prior to version 1.0.0, :class:`.DWaveSampler` used the ``base`` client,\n        allowing non-QPU solvers to be selected.\n        To reproduce the old behavior, instantiate :class:`.DWaveSampler` with\n        ``client='base'``.\n\n    Note:\n        The recommended way to use :class:`DWaveSampler` is from a\n        `runtime context <https://docs.python.org/3/reference/datamodel.html#with-statement-context-managers>`_:\n\n        >>> with DWaveSampler() as sampler:\n        ...     sampler.sample_ising(...)       # doctest: +SKIP\n\n        Alternatively, call the :meth:`~DWaveSampler.close` method to\n        terminate the sampler resources:\n\n        >>> sampler = DWaveSampler()\n        ...\n        >>> sampler.close()\n\n    Examples:\n        This example submits a two-variable Ising problem mapped directly to two\n        adjacent qubits on a :term:`QPU`. ``qubit_a`` is the first qubit in\n        the QPU's indexed list of qubits and ``qubit_b`` is one of the qubits\n        coupled to it. Other required parameters for communication with the\n        system, such as its URL and an authentication token, are implicitly set\n        in a configuration file or as environment variables, as described in the\n        :ref:`ocean_sapi_access_basic` section. Given sufficient reads (here\n        100), the quantum computer should return the best solution,\n        :math:`{1, -1}` on ``qubit_a`` and ``qubit_b``, respectively, as its\n        first sample (samples are ordered from lowest energy).\n\n        >>> from dwave.system import DWaveSampler\n        ...\n        >>> with DWaveSampler() as sampler:\n        ...     qubit_a = sampler.nodelist[0]\n        ...     qubit_b = next(iter(sampler.adjacency[qubit_a]))\n        ...     sampleset = sampler.sample_ising({qubit_a: -1, qubit_b: 1},\n        ...                                      {},\n        ...                                      num_reads=100)\n        ...     print(sampleset.first.sample[qubit_a] == 1 and sampleset.first.sample[qubit_b] == -1)\n        True\n\n\n        For additional examples, see:\n\n        *   :ref:`Beginner examples <qpu_index_examples_beginner>` of using\n            :class:`.DWaveSampler`.\n        *   :ref:`qpu_basic_config`.\n    \"\"\"\n    def __init__(self, failover=False, retry_interval=-1, **config):\n        # strongly prefer QPU solvers; requires kwarg-level override\n        config.setdefault('client', 'qpu')\n\n        # weakly prefer QPU solver with the highest qubit count,\n        # easily overridden on any config level above defaults (file/env/kwarg)\n        defaults = config.setdefault('defaults', {})\n        if not isinstance(defaults, abc.Mapping):\n            raise TypeError(\"mapping expected for 'defaults'\")\n        defaults.update(solver=dict(order_by='-num_active_qubits'))\n\n        self.failover = failover\n        self.retry_interval = retry_interval\n        self._solver_penalty = defaultdict(int)\n\n        self.client = Client.from_config(**config)\n        self.solver = self._get_solver(penalty=self._solver_penalty)\n\n    def close(self):\n        \"\"\"Close the underlying cloud client to release system resources such as\n        threads.\n\n        The method blocks for all the currently scheduled work (sampling\n        requests) to finish.\n\n        See also:\n            :meth:`~dwave.cloud.client.Client.close`.\n        \"\"\"\n        self.client.close()\n\n    def _get_solver(self, *, refresh: bool = False, penalty: Optional[Dict[str, int]] = None):\n        \"\"\"Get the least penalized solver from the list of solvers filtered and\n        ordered according to user config.\n\n        Note: we need to partially replicate\n        :class:`dwave.cloud.Client.get_solver` logic.\n        \"\"\"\n        if penalty is None:\n            penalty = {}\n\n        # the only solver filters used by `DWaveSampler` are those\n        # propagated to `Client.from_config` on construction\n        filters = copy.deepcopy(self.client.config.solver)\n        order_by = filters.pop('order_by', 'avg_load')\n        solvers = self.client.get_solvers(refresh=refresh, order_by=order_by, **filters)\n\n        # we now just need to de-prioritize penalized solvers\n        solvers.sort(key=lambda solver: penalty.get(_get_solver_id(solver), 0))\n\n        try:\n            return solvers[0]\n        except IndexError:\n            raise SolverNotFoundError(\"Solver with the requested features not available\") from None\n\n    warnings_default = WarningAction.IGNORE\n    \"\"\"Defines default behavior for ``warnings`` keyword arguments of the\n    :meth:`~DWaveSampler.sample_ising`  and :meth:`~DWaveSampler.sample_qubo`\n    methods.\n    \"\"\"\n\n    @property\n    def properties(self):\n        \"\"\"dict: Solver properties as returned by a :term:`SAPI` query.\n\n        Solver properties are dependent on the selected solver and subject to\n        change; for example, new features may add properties. The\n        :ref:`qpu_index_solver_properties` and :ref:`qpu_solver_parameters`\n        sections describe the parameters and properties supported on D-Wave\n        quantum computers.\n\n        Examples:\n\n            >>> from dwave.system import DWaveSampler\n            >>> with DWaveSampler() as sampler:\n            ...     print(sampler.properties['category'])\n            qpu\n\n        \"\"\"\n        try:\n            return self._properties\n        except AttributeError:\n            self._properties = properties = self.solver.properties.copy()\n            return properties\n\n    @property\n    def parameters(self):\n        \"\"\"dict[str, list]: Supported parameters.\n\n        ",
+      "total_lines": 627
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "copy",
+        "collections.abc",
+        "collections:defaultdict",
+        "typing:Optional",
+        "typing:Dict",
+        "typing:TYPE_CHECKING",
+        "dimod",
+        "dwave_networkx",
+        "dimod.exceptions:BinaryQuadraticModelStructureError",
+        "dwave.cloud.client:Client",
+        "dwave.cloud.exceptions:SolverError",
+        "dwave.cloud.exceptions:SolverAuthenticationError",
+        "dwave.cloud.exceptions:InvalidAPIResponseError",
+        "dwave.cloud.exceptions:RequestTimeout",
+        "dwave.cloud.exceptions:PollingTimeout",
+        "dwave.cloud.exceptions:ProblemUploadError",
+        "dwave.cloud.exceptions:ProblemStructureError",
+        "dwave.cloud.exceptions:SolverNotFoundError",
+        "dwave.system.exceptions:FailoverCondition",
+        "dwave.system.exceptions:RetryCondition",
+        "dwave.system.warnings:WarningHandler",
+        "dwave.system.warnings:WarningAction",
+        "dwave.cloud.solver:StructuredSolver"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/dwavesystems/dwave-system/master/README.rst",
+      "content_excerpt": ".. image:: https://img.shields.io/pypi/v/dwave-system.svg\n   :target: https://pypi.org/project/dwave-system\n\n.. image:: https://img.shields.io/pypi/pyversions/dwave-system.svg?style=flat\n    :target: https://pypi.org/project/dwave-system\n    :alt: PyPI - Python Version\n\n.. image:: https://codecov.io/gh/dwavesystems/dwave-system/branch/master/graph/badge.svg\n   :target: https://codecov.io/gh/dwavesystems/dwave-system\n\n.. image:: https://circleci.com/gh/dwavesystems/dwave-system.svg?style=shield\n   :target: https://circleci.com/gh/dwavesystems/dwave-system\n\n\n============\ndwave-system\n============\n\n.. start_system_about\n\n``dwave-system`` is an API for easily incorporating D-Wave quantum computers as\na sampler in the\n`Ocean software stack <https://docs.dwavequantum.com/en/latest/ocean/stack.html>`_,\ndirectly or through the `Leap <https://cloud.dwavesys.com/leap/>`_ service's\ncloud-based hybrid solvers. It includes ``DWaveSampler``, a dimod sampler that\naccepts and passes system parameters such as system identification and\nauthentication down the stack, ``StrideHybridSolver``, for Leap's Stride™ hybrid\nsolver, and others. It also includes several useful composites---layers of pre-\nand post-processing---that can be used with ``DWaveSampler`` to handle\nminor-embedding, optimize chain strength, etc.\n\n.. end_system_about\n\nInstallation\n============\n\n**Installation from PyPI:**\n\n.. code-block:: bash\n\n    pip install dwave-system\n\n.. note::\n    As of ``dwave-system`` 1.28.0, support for ``dwave-drivers`` is removed (it\n    was used for calibration of qubits in chains via ``VirtualGraph"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 7,
+      "items": [
+        {
+          "name": "test_cutoffcomposite.py",
+          "path": "tests/test_cutoffcomposite.py",
+          "sha": "13163d28c56bde6588efdaacb016b267d769546a",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/tests/test_cutoffcomposite.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_leaphybridsolver.py",
+          "path": "tests/test_leaphybridsolver.py",
+          "sha": "7ea494a80620370883ac51b4e33298cedf552b3b",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/tests/test_leaphybridsolver.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_dwavecliquesampler.py",
+          "path": "tests/test_dwavecliquesampler.py",
+          "sha": "160f5e4e906c95250d925c32490e33203467919c",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/tests/test_dwavecliquesampler.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_polycutoffcomposite.py",
+          "path": "tests/test_polycutoffcomposite.py",
+          "sha": "39f8c19a8d9feadd5f9d8cee5e032bd016c7093e",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/tests/test_polycutoffcomposite.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_reverse_composite.py",
+          "path": "tests/test_reverse_composite.py",
+          "sha": "0b8724edde21f2d636c5ed9ff7a0540d8a1cfe53",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/tests/test_reverse_composite.py",
+          "score": 1.0
+        },
+        {
+          "name": "testing.py",
+          "path": "dwave/system/testing.py",
+          "sha": "cbb9321b8ad0a346780ca16449f106baa2857bcf",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/testing.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_dwavesampler.py",
+          "path": "tests/test_dwavesampler.py",
+          "sha": "88b168f36b53debf1177c72c37d9fd6229dcc363",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/tests/test_dwavesampler.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "transforms.py",
+          "path": "dwave/embedding/transforms.py",
+          "sha": "20f6c70afb60dd2e96460d4b112ca1c0151c21f2",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/embedding/transforms.py",
+          "score": 1.0
+        },
+        {
+          "name": "linear_ancilla.py",
+          "path": "dwave/system/composites/linear_ancilla.py",
+          "sha": "620de6af2e929dcc86c126bf626e762182fa4b07",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/composites/linear_ancilla.py",
+          "score": 1.0
+        },
+        {
+          "name": "virtual_graph.py",
+          "path": "dwave/system/composites/virtual_graph.py",
+          "sha": "dfe1476787a2fd821daafd13cd75a49ee267b200",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/composites/virtual_graph.py",
+          "score": 1.0
+        },
+        {
+          "name": "embedding.py",
+          "path": "dwave/system/composites/embedding.py",
+          "sha": "ca56d97ad9515818cff380820904c4eb1254a0bf",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/composites/embedding.py",
+          "score": 1.0
+        },
+        {
+          "name": "warnings.py",
+          "path": "dwave/system/warnings.py",
+          "sha": "93fc3c1430a4db2dda82143a49ec1162b86d1f0e",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/warnings.py",
+          "score": 1.0
+        },
+        {
+          "name": "utils.py",
+          "path": "dwave/embedding/utils.py",
+          "sha": "5b015374ff9251cf1bdf48ffa89805beaadc7f71",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/embedding/utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "testing.py",
+          "path": "dwave/system/testing.py",
+          "sha": "cbb9321b8ad0a346780ca16449f106baa2857bcf",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/testing.py",
+          "score": 1.0
+        },
+        {
+          "name": "clique.py",
+          "path": "dwave/system/samplers/clique.py",
+          "sha": "7b44d6d5b22e8e163ffd42075faf4fe1098915c9",
+          "html_url": "https://github.com/dwavesystems/dwave-system/blob/ec8cbdf52f36f4a7f9ef6249a1325c5ef290a373/dwave/system/samplers/clique.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "dwave/system/samplers",
+      "count": 4,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "dwave/system/samplers/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "clique.py",
+          "path": "dwave/system/samplers/clique.py",
+          "type": "file"
+        },
+        {
+          "name": "dwave_sampler.py",
+          "path": "dwave/system/samplers/dwave_sampler.py",
+          "type": "file"
+        },
+        {
+          "name": "leap_hybrid_sampler.py",
+          "path": "dwave/system/samplers/leap_hybrid_sampler.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 3,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "dwave/system/samplers/__init__.py"
+        },
+        {
+          "name": "clique.py",
+          "path": "dwave/system/samplers/clique.py"
+        },
+        {
+          "name": "leap_hybrid_sampler.py",
+          "path": "dwave/system/samplers/leap_hybrid_sampler.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "dwave/system/samplers/dwave_sampler.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "acb33dcac73a63c0d81a300dbc90191cc1f25046",
+          "html_url": "https://github.com/dwavesystems/dwave-system/commit/acb33dcac73a63c0d81a300dbc90191cc1f25046",
+          "message": "General edit: readme, samplers, others",
+          "author": "Joel Pasvolsky",
+          "date": "2026-02-12T22:49:03Z"
+        },
+        {
+          "sha": "f106b65b1cb5a18249a1664550c44eeb1b248d5e",
+          "html_url": "https://github.com/dwavesystems/dwave-system/commit/f106b65b1cb5a18249a1664550c44eeb1b248d5e",
+          "message": "Merge pull request #589 from JoelPasvolsky/refresh_samplers2\n\nRefresh samplers",
+          "author": "Radomir Stevanovic",
+          "date": "2025-08-28T12:20:57Z"
+        },
+        {
+          "sha": "5a89a167ae387c3b0eb4ca9a83b0733a0f662d2f",
+          "html_url": "https://github.com/dwavesystems/dwave-system/commit/5a89a167ae387c3b0eb4ca9a83b0733a0f662d2f",
+          "message": "Eliminate noise from `SolverNotFoundError` stacktrace",
+          "author": "Radomir Stevanovic",
+          "date": "2025-08-26T13:38:18Z"
+        },
+        {
+          "sha": "09b671944d28ed07d296537a35e334cbd12be97f",
+          "html_url": "https://github.com/dwavesystems/dwave-system/commit/09b671944d28ed07d296537a35e334cbd12be97f",
+          "message": "Use a safe solver id getter (avoid deprecated .id if possible)",
+          "author": "Radomir Stevanovic",
+          "date": "2025-08-26T13:18:01Z"
+        },
+        {
+          "sha": "73f4fb30b63ac52b29496f65791a6a71f3f94db6",
+          "html_url": "https://github.com/dwavesystems/dwave-system/commit/73f4fb30b63ac52b29496f65791a6a71f3f94db6",
+          "message": "Add missing sampler properties and methods, fix indents to standard",
+          "author": "Joel Pasvolsky",
+          "date": "2025-08-19T21:11:33Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO deprecate solver name favor",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "dwave/system/samplers/dwave_sampler.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "acb33dcac73a63c0d81a300dbc90191cc1f25046",
+        "html_url": "https://github.com/dwavesystems/dwave-system/commit/acb33dcac73a63c0d81a300dbc90191cc1f25046",
+        "message": "General edit: readme, samplers, others",
+        "author": "Joel Pasvolsky",
+        "date": "2026-02-12T22:49:03Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 7,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

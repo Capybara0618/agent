@@ -1,0 +1,445 @@
+{
+  "task_id": "912",
+  "repo_owner": "webrtc-uwp",
+  "repo_name": "depot_tools",
+  "file_path": "git_cl.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T20:02:32+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_trigger_try_jobs",
+    "satd_line": 532,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T20:02:41+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T20:02:49+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "git_cl.py",
+    "original_code": "def CMDcomments(parser, args):\n  \"\"\"Shows or posts review comments for any changelist.\"\"\"\n  parser.add_option('-a', '--add-comment', dest='comment',\n                    help='comment to add to an issue')\n  parser.add_option('-i', '--issue', dest='issue',\n                    help='review issue id (defaults to current issue). '\n                         'If given, requires --rietveld or --gerrit')\n  parser.add_option('-j', '--json-file',\n                    help='File to write JSON summary to')\n  auth.add_auth_options(parser)\n  _add_codereview_select_options(parser)\n  options, args = parser.parse_args(args)\n  _process_codereview_select_options(parser, options)\n  auth_config = auth.extract_auth_config_from_options(options)\n\n  issue = None\n  if options.issue:\n    try:\n      issue = int(options.issue)\n    except ValueError:\n      DieWithError('A review issue id is expected to be a number')\n    if not options.forced_codereview:\n      parser.error('--gerrit or --rietveld is required if --issue is specified')\n\n  cl = Changelist(issue=issue,\n                  # TODO(tandrii): remove 'rietveld' default.\n                  codereview=options.forced_codereview or (\n                      'rietveld' if issue else None),\n                  auth_config=auth_config)\n\n  if options.comment:\n    cl.AddComment(options.comment)\n    return 0\n\n  summary = sorted(cl.GetCommentsSummary(), key=lambda c: c.date)\n  for comment in summary:\n    if comment.disapproval:\n      color = Fore.RED\n    elif comment.approval:\n      color = Fore.GREEN\n    elif comment.sender == cl.GetIssueOwner():\n      color = Fore.MAGENTA\n    else:\n      color = Fore.BLUE\n    print('\\n%s%s   %s%s\\n%s' % (\n      color,\n      comment.date.strftime('%Y-%m-%d %H:%M:%S UTC'),\n      comment.sender,\n      Fore.RESET,\n      '\\n'.join('  ' + l for l in comment.message.strip().splitlines())))\n\n  if options.json_file:\n    def pre_serialize(c):\n      dct = c.__dict__.copy()\n      dct['date'] = dct['date'].strftime('%Y-%m-%d %H:%M:%S.%f')\n      return dct\n    with open(options.json_file, 'wb') as f:\n      json.dump(map(pre_serialize, summary), f)\n  return 0",
+    "satd_comment": "# TODO(tandrii): remove 'rietveld' default.",
+    "target_file": {
+      "ok": true,
+      "path": "git_cl.py",
+      "sha": "8f82be47b7999e7476086e47bf55e76e4aae8cae",
+      "download_url": "https://raw.githubusercontent.com/webrtc-uwp/depot_tools/master/git_cl.py",
+      "content_excerpt": "#!/usr/bin/env python\n# Copyright (c) 2013 The Chromium Authors. All rights reserved.\n# Use of this source code is governed by a BSD-style license that can be\n# found in the LICENSE file.\n\n# Copyright (C) 2008 Evan Martin <martine@danga.com>\n\n\"\"\"A git-command for integrating reviews on Gerrit.\"\"\"\n\nfrom __future__ import print_function\n\nfrom distutils.version import LooseVersion\nfrom multiprocessing.pool import ThreadPool\nimport base64\nimport collections\nimport contextlib\nimport datetime\nimport fnmatch\nimport httplib\nimport itertools\nimport json\nimport logging\nimport multiprocessing\nimport optparse\nimport os\nimport re\nimport shutil\nimport stat\nimport sys\nimport tempfile\nimport textwrap\nimport time\nimport urllib\nimport urllib2\nimport urlparse\nimport uuid\nimport webbrowser\nimport zlib\n\ntry:\n  import readline  # pylint: disable=import-error,W0611\nexcept ImportError:\n  pass\n\nfrom third_party import colorama\nfrom third_party import httplib2\nimport auth\nimport checkout\nimport clang_format\nimport dart_format\nimport setup_color\nimport fix_encoding\nimport gclient_utils\nimport gerrit_util\nimport git_cache\nimport git_common\nimport git_footers\nimport metrics\nimport metrics_utils\nimport owners\nimport owners_finder\nimport presubmit_support\nimport scm\nimport split_cl\nimport subcommand\nimport subprocess2\nimport watchlists\n\n__version__ = '2.0'\n\n# Traces for git push will be stored in a traces directory inside the\n# depot_tools checkout.\nDEPOT_TOOLS = os.path.dirname(os.path.abspath(__file__))\nTRACES_DIR = os.path.join(DEPOT_TOOLS, 'traces')\n\n# When collecting traces, Git hashes will be reduced to 6 characters to reduce\n# the size after compression.\nGIT_HASH_RE = re.compile(r'\\b([a-f0-9]{6})[a-f0-9]{34}\\b', flags=re.I)\n# Used to redact the cookies from the gitcookies file.\nGITCOOKIES_REDACT_RE = re.compile(r'1/.*')\n\nTRACES_MESSAGE = (\n'When filing a bug, be sure to include the traces found at:\\n'\n'  %s.zip\\n'\n'Consider including the git config and gitcookies,\\n'\n'which we have packed for you at:\\n'\n'  %s.zip\\n')\n\nCOMMIT_BOT_EMAIL = 'commit-bot@chromium.org'\nPOSTUPSTREAM_HOOK = '.git/hooks/post-cl-land'\nDESCRIPTION_BACKUP_FILE = '~/.git_cl_description_backup'\nREFS_THAT_ALIAS_TO_OTHER_REFS = {\n    'refs/remotes/origin/lkgr': 'refs/remotes/origin/master',\n    'refs/remotes/origin/lkcr': 'refs/remotes/origin/master',\n}\n\n# Valid extensions for files we want to lint.\nDEFAULT_LINT_REGEX = r\"(.*\\.cpp|.*\\.cc|.*\\.h)\"\nDEFAULT_LINT_IGNORE_REGEX = r\"$^\"\n\n# File name for yapf style config files.\nYAPF_CONFIG_FILENAME = '.style.yapf'\n\n# Buildbucket master name prefix.\nMASTER_PREFIX = 'master.'\n\n# Shortcut since it quickly becomes redundant.\nFore = colorama.Fore\n\n# Initialized in main()\nsettings = None\n\n# Used by tests/git_cl_test.py to add extra logging.\n# Inside the weirdly failing test, add this:\n# >>> self.mock(git_cl, '_IS_BEING_TESTED', True)\n# And scroll up to see the stack trace printed.\n_IS_BEING_TESTED = False\n\n\ndef DieWithError(message, change_desc=None):\n  if change_desc:\n    SaveDescriptionBackup(change_desc)\n\n  print(message, file=sys.stderr)\n  sys.exit(1)\n\n\ndef SaveDescriptionBackup(change_desc):\n  backup_path = os.path.expanduser(DESCRIPTION_BACKUP_FILE)\n  print('\\nsaving CL description to %s\\n' % backup_path)\n  backup_file = open(backup_path, 'w')\n  backup_file.write(change_desc.description)\n  backup_file.close()\n\n\ndef GetNoGitPagerEnv():\n  env = os.environ.copy()\n  # 'cat' is a magical git string that disables pagers on all platforms.\n  env['GIT_PAGER'] = 'cat'\n  return env\n\n\ndef RunCommand(args, error_ok=False, error_message=None, shell=False, **kwargs):\n  try:\n    return subprocess2.check_output(args, shell=shell, **kwargs)\n  except subprocess2.CalledProcessError as e:\n    logging.debug('Failed running %s', args)\n    if not error_ok:\n      DieWithError(\n          'Command \"%s\" failed.\\n%s' % (\n            ' '.join(args), error_message or e.stdout or ''))\n    return e.stdout\n\n\ndef RunGit(args, **kwargs):\n  \"\"\"Returns stdout.\"\"\"\n  return RunCommand(['git'] + args, **kwargs)\n\n\ndef RunGitWithCode(args, suppress_stderr=False):\n  \"\"\"Returns return code and stdout.\"\"\"\n  if suppress_stderr:\n    stderr = subprocess2.VOID\n  else:\n    stderr = sys.stderr\n  try:\n    (out, _), code = subprocess2.communicate(['git'] + args,\n                                             env=GetNoGitPagerEnv(),\n                                             stdout=subprocess2.PIPE,\n                                             stderr=stderr)\n    return code, out\n  except subprocess2.CalledProcessError as e:\n    logging.debug('Failed running %s', ['git'] + args)\n    return e.returncode, e.stdout\n\n\ndef RunGitSilent(args):\n  \"\"\"Returns stdout, suppresses stderr and ignores the return code.\"\"\"\n  return RunGitWithCode(args, suppress_stderr=True)[1]\n\n\ndef IsGitVersionAtLeast(min_version):\n  prefix = 'git version '\n  version = RunGit(['--version']).strip()\n  return (version.startswith(prefix) and\n      LooseVersion(version[len(prefix):]) >= LooseVersion(min_version))\n\n\ndef BranchExists(branch):\n  \"\"\"Return True if specified branch exists.\"\"\"\n  code, _ = RunGitWithCode(['rev-parse', '--verify', branch],\n                           suppress_stderr=True)\n  return not code\n\n\ndef time_sleep(seconds):\n  # Use this so that it can be mocked in tests without interfering with python\n  # system machinery.\n  return time.sleep(seconds)\n\n\ndef time_time():\n  # Use this so that it can be mocked in tests without interfering with python\n  # system machinery.\n  return time.time()\n\n\ndef ask_for_data(prompt):\n  try:\n    return raw_input(prompt)\n  except KeyboardInterrupt:\n    # Hide the exception.\n    sys.exit(1)\n\n\ndef confirm_or_exit(prefix='', action='confirm'):\n  \"\"\"Asks user to press enter to continue or press Ctrl+C to abort.\"\"\"\n  if not prefix or prefix.endswith('\\n'):\n    mid = 'Press'\n  elif prefix.endswith('.') or prefix.endswith('?'):\n    mid = ' Press'\n  elif prefix.endswith(' '):\n    mid = 'press'\n  else:\n    mid = ' press'\n  ask_for_data('%s%s Enter to %s, or Ctrl+C to abort' % (prefix, mid, action))\n\n\ndef ask_for_explicit_yes(prompt):\n  \"\"\"Returns whether user typed 'y' or 'yes' to confirm the given prompt\"\"\"\n  result = ask_for_data(prompt + ' [Yes/No]: ').lower()\n  while True:\n    if 'yes'.startswith(result):\n      return True\n    if 'no'.startswith(result):\n      return False\n    result = ask_for_data('Please, type yes or no: ').lower()\n\n\ndef _git_branch_config_key(branch, key):\n  \"\"\"Helper method to return Git config key for a branch.\"\"\"\n  assert branch, 'branch name is required to set git config for it'\n  return 'branch.%s.%s' % (branch, key)\n\n\ndef _git_get_branch_config_value(key, default=None, value_type=str,\n                                 branch=False):\n  \"\"\"Returns git config value of given or current branch if any.\n\n  Returns default in all other cases.\n  \"\"\"\n  assert value_type in (int, str, bool)\n  if branch is False:  # Distinguishing default arg value from None.\n    branch = GetCurrentBranch()\n\n  if not branch:\n    return default\n\n  args = ['config']\n  if value_type == bool:\n    args.append('--bool')\n  # git config also has --int, but apparently git config suffers from integer\n  # overflows (http://crbug.com/640115), so don't use it.\n  args.append(_git_branch_config_key(branch, key))\n  code, out = RunGitWithCode(args)\n  if code == 0:\n    value = out.strip()\n    if value_type == int:\n      return int(value)\n    if value_type == bool:\n      return bool(value.lower() == 'true')\n    return value\n  return default\n\n\ndef _git_set_branch_config_value(key, value, branch=None, **kwargs):\n  \"\"\"Sets the value or unsets if it's None of a git branch config.\n\n  Valid, though not necessarily existing, branch must be provided,\n  otherwise currently checked out branch is used.\n  \"\"\"\n  if not branch:\n    branch = GetCurrentBranch()\n    assert branch, 'a branch name OR currently checked out branch is required'\n  args = ['config']\n  # Check for boolean first, because bool is int, but int is not bool.\n  if value is None:\n    args.append('--unset')\n  elif isinstance(value, bool):\n    args.append('--bool')\n    value = str(value).lower()\n  else:\n    # git config also has --int, but apparently git config suffers from integer\n    # overflows (http://crbug.com/640115), so don't use it.\n    value = str(value)\n  args.append(_git_branch_config_key(branch, key))\n  if value is not None:\n    args.append(value)\n  RunGit(args, **kwargs)\n\n\ndef _get_committer_timestamp(commit):\n  \"\"\"Returns Unix timestamp as integer of a committer in a commit.\n\n  Commit can be whatever git show would recognize, such as HEAD, sha1 or ref.\n  \"\"\"\n  # Git also stores timezone offset, but it only affects visual display,\n  # actual point in time is defined by this timestamp only.\n  return int(RunGit(['show', '-s', '--format=%ct', commit]).strip())\n\n\ndef _git_amend_head(message, committer_timestamp):\n  \"\"\"Amends commit with new message and desired committer_timestamp.\n\n  Sets committer timezone to UTC.\n  \"\"\"\n  env = os.environ.copy()\n  env['GIT_COMMITTER_DATE'] = '%d+0000' % committer_timestamp\n  return RunGit(['commit', '--amend', '-m', message], env=env)\n\n\ndef _get_properties_from_options(options):\n  properties = dict(x.split('=', 1) for x in options.properties)\n  for key, val in properties.iteritems():\n    try:\n      properties[key] = json.loads(val)\n    except ValueError:\n      pass  # If a value couldn't be evaluated, treat it as a string.\n  return properties\n\n\ndef _prefix_master(master):\n  \"\"\"Convert user-specified master name to full master name.\n\n  Buildbucket uses full master name(master.tryserver.chromium.linux) as bucket\n  name, while the developers always use shortened master name\n  (tryserver.chromium.linux) by stripping off the prefix 'master.'. This\n  function does the conversion for buildbucket migration.\n  \"\"\"\n  if master.startswith(MASTER_PREFIX):\n    return master\n  return '%s%s' % (MASTER_PREFIX, master)\n\n\ndef _unprefix_master(bucket):\n  \"\"\"Convert bucket name to shortened master name.\n\n  Buildbucket uses full master name(master.tryserver.chromium.linux) as bucket\n  name, while the developers always use shortened master name\n  (tryserver.chromium.linux) by stripping off the prefix 'master.'. This\n  function does the conversion for buildbucket migration.\n  \"\"\"\n  if bucket.startswith(MASTER_PREFIX):\n    return bucket[len(MASTER_PREFIX):]\n  return bucket\n\n\ndef _buildbucket_retry(operation_name, http, *args, **kwargs):\n  \"\"\"Retries requests to buildbucket service and returns parsed json content.\"\"\"\n  try_count = 0\n  while True:\n    response, content = http.request(*args, **kwargs)\n    try:\n      content_json = json.loads(content)\n    except ValueError:\n      content_json = None\n\n    # Buildbucket could return an error even if status==200.\n    if content_json and content_json.get('error'):\n      error = content_json.get('error')\n      if error.get('code') == 403:\n        raise BuildbucketResponseException(\n            'Access denied: %s' % error.get('message', ''))\n      msg = 'Error in response. Reason: %s. Message: %s.' % (\n          error.get('reason', ''), error.get('message', ''))\n      raise BuildbucketResponseException(msg)\n\n    if response.status == 200:\n      if content_json is None:\n        raise BuildbucketResponseException(\n            'Buildbucket returns invalid json content: %s.\\n'\n            'Please file bugs at http://crbug.com, '\n            'component \"Infra>Platform>BuildBucket\".' %\n            content)\n      return content_json\n    if response.status < 500 or try_count >= 2:\n      raise httplib2.HttpLib2Error(content)\n\n    # status >= 500 means transient failures.\n    logging.debug('Transient errors when %s. Will retry.', operation_name)\n    time_sleep(0.5 + 1.5*try_count)\n    try_count += 1\n  assert False, 'unreachable'\n\n\ndef _get_bucket_map(changelist, options, option_parser):\n  \"\"\"Returns a dict mapping bucket names to builders and tests,\n  for triggering try jobs.\n  \"\"\"\n  # If no bots are listed, we try to get a set of builders and tests base",
+      "total_lines": 5727
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 532,
+      "start_line": 512,
+      "end_line": 552,
+      "matched_line": "      )",
+      "excerpt": "512:         parameters['properties']['dry_run'] = 'true'\n513:       if tests:\n514:         parameters['properties']['testfilter'] = tests\n515: \n516:       tags = [\n517:           'builder:%s' % builder,\n518:           'buildset:%s' % buildset,\n519:           'user_agent:git_cl_try',\n520:       ]\n521:       if master:\n522:         parameters['properties']['master'] = master\n523:         tags.append('master:%s' % master)\n524: \n525:       batch_req_body['builds'].append(\n526:           {\n527:               'bucket': bucket,\n528:               'parameters_json': json.dumps(parameters),\n529:               'client_operation_id': str(uuid.uuid4()),\n530:               'tags': tags,\n531:           }\n532:       )\n533: \n534:   _buildbucket_retry(\n535:       'triggering try jobs',\n536:       http,\n537:       buildbucket_put_url,\n538:       'PUT',\n539:       body=json.dumps(batch_req_body),\n540:       headers={'Content-Type': 'application/json'}\n541:   )\n542:   print_text.append('To see results here, run:        git cl try-results')\n543:   print_text.append('To see results in browser, run:  git cl web')\n544:   print('\\n'.join(print_text))\n545: \n546: \n547: def fetch_try_jobs(auth_config, changelist, buildbucket_host,\n548:                    patchset=None):\n549:   \"\"\"Fetches try jobs from buildbucket.\n550: \n551:   Returns a map from build id to build info as a dictionary.\n552:   \"\"\""
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_trigger_try_jobs",
+      "start_line": 455,
+      "end_line": 544,
+      "source": "def _trigger_try_jobs(auth_config, changelist, buckets, options, patchset):\n  \"\"\"Sends a request to Buildbucket to trigger try jobs for a changelist.\n\n  Args:\n    auth_config: AuthConfig for Buildbucket.\n    changelist: Changelist that the try jobs are associated with.\n    buckets: A nested dict mapping bucket names to builders to tests.\n    options: Command-line options.\n  \"\"\"\n  assert changelist.GetIssue(), 'CL must be uploaded first'\n  codereview_url = changelist.GetCodereviewServer()\n  assert codereview_url, 'CL must be uploaded first'\n  patchset = patchset or changelist.GetMostRecentPatchset()\n  assert patchset, 'CL must be uploaded first'\n\n  codereview_host = urlparse.urlparse(codereview_url).hostname\n  # Cache the buildbucket credentials under the codereview host key, so that\n  # users can use different credentials for different buckets.\n  authenticator = auth.get_authenticator_for_host(codereview_host, auth_config)\n  http = authenticator.authorize(httplib2.Http())\n  http.force_exception_to_status_code = True\n\n  buildbucket_put_url = (\n      'https://{hostname}/_ah/api/buildbucket/v1/builds/batch'.format(\n          hostname=options.buildbucket_host))\n  buildset = 'patch/gerrit/{hostname}/{issue}/{patch}'.format(\n      hostname=codereview_host,\n      issue=changelist.GetIssue(),\n      patch=patchset)\n\n  shared_parameters_properties = changelist.GetTryJobProperties(patchset)\n  shared_parameters_properties['category'] = options.category\n  if options.clobber:\n    shared_parameters_properties['clobber'] = True\n  extra_properties = _get_properties_from_options(options)\n  if extra_properties:\n    shared_parameters_properties.update(extra_properties)\n\n  batch_req_body = {'builds': []}\n  print_text = []\n  print_text.append('Tried jobs on:')\n  for bucket, builders_and_tests in sorted(buckets.iteritems()):\n    print_text.append('Bucket: %s' % bucket)\n    master = None\n    if bucket.startswith(MASTER_PREFIX):\n      master = _unprefix_master(bucket)\n    for builder, tests in sorted(builders_and_tests.iteritems()):\n      print_text.append('  %s: %s' % (builder, tests))\n      parameters = {\n          'builder_name': builder,\n          'changes': [{\n              'author': {'email': changelist.GetIssueOwner()},\n              'revision': options.revision,\n          }],\n          'properties': shared_parameters_properties.copy(),\n      }\n      if 'presubmit' in builder.lower():\n        parameters['properties']['dry_run'] = 'true'\n      if tests:\n        parameters['properties']['testfilter'] = tests\n\n      tags = [\n          'builder:%s' % builder,\n          'buildset:%s' % buildset,\n          'user_agent:git_cl_try',\n      ]\n      if master:\n        parameters['properties']['master'] = master\n        tags.append('master:%s' % master)\n\n      batch_req_body['builds'].append(\n          {\n              'bucket': bucket,\n              'parameters_json': json.dumps(parameters),\n              'client_operation_id': str(uuid.uuid4()),\n              'tags': tags,\n          }\n      )\n\n  _buildbucket_retry(\n      'triggering try jobs',\n      http,\n      buildbucket_put_url,\n      'PUT',\n      body=json.dumps(batch_req_body),\n      headers={'Content-Type': 'application/json'}\n  )\n  print_text.append('To see results here, run:        git cl try-results')\n  print_text.append('To see results in browser, run:  git cl web')\n  print('\\n'.join(print_text))"
+    },
+    "imports": {
+      "imports": [
+        "__future__:print_function",
+        "distutils.version:LooseVersion",
+        "multiprocessing.pool:ThreadPool",
+        "base64",
+        "collections",
+        "contextlib",
+        "datetime",
+        "fnmatch",
+        "httplib",
+        "itertools",
+        "json",
+        "logging",
+        "multiprocessing",
+        "optparse",
+        "os",
+        "re",
+        "shutil",
+        "stat",
+        "sys",
+        "tempfile",
+        "textwrap",
+        "time",
+        "urllib",
+        "urllib2",
+        "urlparse",
+        "uuid",
+        "webbrowser",
+        "zlib",
+        "third_party:colorama",
+        "third_party:httplib2"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": false,
+      "error": "no_module_prefix"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_trigger_try_jobs test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_trigger_try_jobs(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "git_cl.py",
+          "path": "git_cl.py",
+          "sha": "8f82be47b7999e7476086e47bf55e76e4aae8cae",
+          "html_url": "https://github.com/webrtc-uwp/depot_tools/blob/370d193c8e46d8ff67d9581afb639c095cc7ded4/git_cl.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "",
+      "count": 40,
+      "entries": [
+        {
+          "name": ".gitattributes",
+          "path": ".gitattributes",
+          "type": "file"
+        },
+        {
+          "name": ".gitignore",
+          "path": ".gitignore",
+          "type": "file"
+        },
+        {
+          "name": ".style.yapf",
+          "path": ".style.yapf",
+          "type": "file"
+        },
+        {
+          "name": "CROS_OWNERS",
+          "path": "CROS_OWNERS",
+          "type": "file"
+        },
+        {
+          "name": "LICENSE",
+          "path": "LICENSE",
+          "type": "file"
+        },
+        {
+          "name": "OWNERS",
+          "path": "OWNERS",
+          "type": "file"
+        },
+        {
+          "name": "PRESUBMIT.py",
+          "path": "PRESUBMIT.py",
+          "type": "file"
+        },
+        {
+          "name": "README.gclient.md",
+          "path": "README.gclient.md",
+          "type": "file"
+        },
+        {
+          "name": "README.git-cl.md",
+          "path": "README.git-cl.md",
+          "type": "file"
+        },
+        {
+          "name": "README.md",
+          "path": "README.md",
+          "type": "file"
+        },
+        {
+          "name": "README.testing",
+          "path": "README.testing",
+          "type": "file"
+        },
+        {
+          "name": "WATCHLISTS",
+          "path": "WATCHLISTS",
+          "type": "file"
+        },
+        {
+          "name": "annotated_gclient.py",
+          "path": "annotated_gclient.py",
+          "type": "file"
+        },
+        {
+          "name": "appengine_mapper.py",
+          "path": "appengine_mapper.py",
+          "type": "file"
+        },
+        {
+          "name": "auth.py",
+          "path": "auth.py",
+          "type": "file"
+        },
+        {
+          "name": "autoninja",
+          "path": "autoninja",
+          "type": "file"
+        },
+        {
+          "name": "autoninja.bat",
+          "path": "autoninja.bat",
+          "type": "file"
+        },
+        {
+          "name": "autoninja.py",
+          "path": "autoninja.py",
+          "type": "file"
+        },
+        {
+          "name": "bb",
+          "path": "bb",
+          "type": "file"
+        },
+        {
+          "name": "bb.bat",
+          "path": "bb.bat",
+          "type": "file"
+        },
+        {
+          "name": "bootstrap",
+          "path": "bootstrap",
+          "type": "dir"
+        },
+        {
+          "name": "breakpad.py",
+          "path": "breakpad.py",
+          "type": "file"
+        },
+        {
+          "name": "buildbucket.py",
+          "path": "buildbucket.py",
+          "type": "file"
+        },
+        {
+          "name": "cbuildbot",
+          "path": "cbuildbot",
+          "type": "file"
+        },
+        {
+          "name": "checkout.py",
+          "path": "checkout.py",
+          "type": "file"
+        },
+        {
+          "name": "chrome_set_ver",
+          "path": "chrome_set_ver",
+          "type": "file"
+        },
+        {
+          "name": "cipd",
+          "path": "cipd",
+          "type": "file"
+        },
+        {
+          "name": "cipd.bat",
+          "path": "cipd.bat",
+          "type": "file"
+        },
+        {
+          "name": "cipd.ps1",
+          "path": "cipd.ps1",
+          "type": "file"
+        },
+        {
+          "name": "cipd_bin_setup.bat",
+          "path": "cipd_bin_setup.bat",
+          "type": "file"
+        },
+        {
+          "name": "cipd_bin_setup.sh",
+          "path": "cipd_bin_setup.sh",
+          "type": "file"
+        },
+        {
+          "name": "cipd_client_version",
+          "path": "cipd_client_version",
+          "type": "file"
+        },
+        {
+          "name": "cipd_client_version.digests",
+          "path": "cipd_client_version.digests",
+          "type": "file"
+        },
+        {
+          "name": "cipd_manifest.txt",
+          "path": "cipd_manifest.txt",
+          "type": "file"
+        },
+        {
+          "name": "cipd_manifest.versions",
+          "path": "cipd_manifest.versions",
+          "type": "file"
+        },
+        {
+          "name": "cit",
+          "path": "cit",
+          "type": "file"
+        },
+        {
+          "name": "cit.bat",
+          "path": "cit.bat",
+          "type": "file"
+        },
+        {
+          "name": "cit.py",
+          "path": "cit.py",
+          "type": "file"
+        },
+        {
+          "name": "clang-format",
+          "path": "clang-format",
+          "type": "file"
+        },
+        {
+          "name": "clang-format.bat",
+          "path": "clang-format.bat",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": ".gitattributes",
+          "path": ".gitattributes"
+        },
+        {
+          "name": ".gitignore",
+          "path": ".gitignore"
+        },
+        {
+          "name": ".style.yapf",
+          "path": ".style.yapf"
+        },
+        {
+          "name": "CROS_OWNERS",
+          "path": "CROS_OWNERS"
+        },
+        {
+          "name": "LICENSE",
+          "path": "LICENSE"
+        },
+        {
+          "name": "OWNERS",
+          "path": "OWNERS"
+        },
+        {
+          "name": "PRESUBMIT.py",
+          "path": "PRESUBMIT.py"
+        },
+        {
+          "name": "README.gclient.md",
+          "path": "README.gclient.md"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "git_cl.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "e7f0b4c62c551cde2723d1456e007fcb10f53ac2",
+          "html_url": "https://github.com/webrtc-uwp/depot_tools/commit/e7f0b4c62c551cde2723d1456e007fcb10f53ac2",
+          "message": "Revert \"git-cl: Keep git push traces\"\n\nThis reverts commit dc8e23d35612f213aa1ee554196f640cc315e4d5.\n\nReason for revert: Breaking chrome releases crbug.com/960638\n\nOriginal change's description:\n> git-cl: Keep git push traces\n> \n> Keep the last N git push traces.\n> Name them after the time when they",
+          "author": "Michael Moss",
+          "date": "2019-05-08T04:36:24Z"
+        },
+        {
+          "sha": "dc8e23d35612f213aa1ee554196f640cc315e4d5",
+          "html_url": "https://github.com/webrtc-uwp/depot_tools/commit/dc8e23d35612f213aa1ee554196f640cc315e4d5",
+          "message": "git-cl: Keep git push traces\n\nKeep the last N git push traces.\nName them after the time when they were collected, and add a\nREADME file to each one to provide some context to developers.\n\nBug: 955206\nChange-Id: Ib5fcf2f78fb65f6ddd80a93619c14e1ef70c5564\nReviewed-on: https://chromium-review.googlesour",
+          "author": "Edward Lemur",
+          "date": "2019-05-07T00:45:48Z"
+        },
+        {
+          "sha": "80ee78e7fa9f84c3b36cc57e02034dc726d782af",
+          "html_url": "https://github.com/webrtc-uwp/depot_tools/commit/80ee78e7fa9f84c3b36cc57e02034dc726d782af",
+          "message": "Convert print statements to Python 3 style\n\nRan \"2to3 -w -n -f print ./\" and manually added imports.\nRan \"^\\s*print \" and \"\\s+print \" to find batch/shell scripts, comments and the like with embedded code, and updated them manually.\nAlso manually added imports to files, which used print as a function",
+          "author": "Raul Tambre",
+          "date": "2019-05-06T22:41:05Z"
+        },
+        {
+          "sha": "9c0620120980e4c247ff8325ee8bbdcd4d9576e0",
+          "html_url": "https://github.com/webrtc-uwp/depot_tools/commit/9c0620120980e4c247ff8325ee8bbdcd4d9576e0",
+          "message": "Fix multiple confusingly escaped regex strings\n\nPython (prior to 3.8) treats meaningless string escape sequences as if\nthey were a slash followed by the character. That is, '\\w' == '\\\\w'.\nPython 3.8 rejects this, and it's confusing. This change fixes seven of these\nregex strings found in depot_tools",
+          "author": "Bruce Dawson",
+          "date": "2019-05-02T19:20:28Z"
+        },
+        {
+          "sha": "fe1dbe120c9905324026fa503ac1690dc96e16e2",
+          "html_url": "https://github.com/webrtc-uwp/depot_tools/commit/fe1dbe120c9905324026fa503ac1690dc96e16e2",
+          "message": "Fix always false 'is not' comparison with a literal\n\nThe 'is' operator compares references, so a comparison with a string literal will always be false.\n\nFound while using Python 3.8:\n\nC:\\Google\\depot_tools/git_cl.py:1265: SyntaxWarning: \"is not\" with a literal. Did you mean \"!=\"?\n  if remote is not ",
+          "author": "Raul Tambre",
+          "date": "2019-05-02T04:43:57Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_trigger_try_jobs TODO tandrii remove rietveld default",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "git_cl.py",
+      "satd_line": 532,
+      "last_commit": {
+        "sha": "e7f0b4c62c551cde2723d1456e007fcb10f53ac2",
+        "html_url": "https://github.com/webrtc-uwp/depot_tools/commit/e7f0b4c62c551cde2723d1456e007fcb10f53ac2",
+        "message": "Revert \"git-cl: Keep git push traces\"\n\nThis reverts commit dc8e23d35612f213aa1ee554196f640cc315e4d5.\n\nReason for revert: Breaking chrome releases crbug.com/960638\n\nOriginal change's description:\n> git-cl: Keep git push traces\n> \n> Keep the last N git push traces.\n> Name them after the time when they",
+        "author": "Michael Moss",
+        "date": "2019-05-08T04:36:24Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_trigger_try_jobs",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

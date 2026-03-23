@@ -1,0 +1,286 @@
+{
+  "task_id": "82",
+  "repo_owner": "huggingface",
+  "repo_name": "datasets-server",
+  "file_path": "services/admin/src/admin/routes/force_refresh.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T15:29:22+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 11,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T15:29:42+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T15:29:49+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "services/admin/src/admin/routes/force_refresh.py",
+    "original_code": "def create_force_refresh_endpoint(\n    input_type: InputType,\n    job_type: str,\n    hf_endpoint: str,\n    hf_token: Optional[str] = None,\n    external_auth_url: Optional[str] = None,\n    organization: Optional[str] = None,\n) -> Endpoint:\n    async def force_refresh_endpoint(request: Request) -> Response:\n        try:\n            dataset = request.query_params.get(\"dataset\")\n            if not are_valid_parameters([dataset]) or not dataset:\n                raise MissingRequiredParameterError(\"Parameter 'dataset' is required\")\n            if input_type == \"dataset\":\n                config = None\n                split = None\n            elif input_type == \"config\":\n                config = request.query_params.get(\"config\")\n                split = None\n                if not are_valid_parameters([config]):\n                    raise MissingRequiredParameterError(\"Parameter 'config' is required\")\n            else:\n                config = request.query_params.get(\"config\")\n                split = request.query_params.get(\"split\")\n                if not are_valid_parameters([config, split]):\n                    raise MissingRequiredParameterError(\"Parameters 'config' and 'split' are required\")\n            logging.info(f\"/force-refresh{job_type}, dataset={dataset}, config={config}, split={split}\")\n\n            # if auth_check fails, it will raise an exception that will be caught below\n            auth_check(external_auth_url=external_auth_url, request=request, organization=organization)\n            get_dataset_git_revision(dataset=dataset, hf_endpoint=hf_endpoint, hf_token=hf_token)\n            # ^ TODO: pass the revision to the job (meanwhile: checks if the dataset is supported)\n            Queue().upsert_job(job_type=job_type, dataset=dataset, config=config, split=split)\n            return get_json_ok_response(\n                {\"status\": \"ok\"},\n                max_age=0,\n            )\n        except CustomError as e:\n            return get_json_admin_error_response(e, max_age=0)\n        except Exception as e:\n            return get_json_admin_error_response(UnexpectedError(\"Unexpected error.\", e), max_age=0)\n\n    return force_refresh_endpoint",
+    "satd_comment": "# ^ TODO: pass the revision to the job (meanwhile: checks if the dataset is supported)",
+    "target_file": {
+      "ok": true,
+      "path": "services/admin/src/admin/routes/force_refresh.py",
+      "sha": "47e086f98dde5c348a9e74dfaf18540c96224b7f",
+      "download_url": "https://raw.githubusercontent.com/huggingface/dataset-viewer/main/services/admin/src/admin/routes/force_refresh.py",
+      "content_excerpt": "# SPDX-License-Identifier: Apache-2.0\n# Copyright 2022 The HuggingFace Authors.\n\nimport logging\nfrom typing import Optional\n\nfrom libapi.exceptions import (\n    InvalidParameterError,\n    MissingRequiredParameterError,\n    UnexpectedApiError,\n)\nfrom libapi.request import get_request_parameter\nfrom libapi.utils import (\n    Endpoint,\n    are_valid_parameters,\n    get_json_api_error_response,\n    get_json_ok_response,\n)\nfrom libcommon.constants import DEFAULT_DIFFICULTY_MAX, DEFAULT_DIFFICULTY_MIN, MIN_BYTES_FOR_BONUS_DIFFICULTY\nfrom libcommon.dtos import Priority\nfrom libcommon.exceptions import CustomError\nfrom libcommon.operations import get_latest_dataset_revision_if_supported_or_raise\nfrom libcommon.orchestrator import get_num_bytes_from_config_infos\nfrom libcommon.processing_graph import InputType, processing_graph\nfrom libcommon.queue.jobs import Queue\nfrom starlette.requests import Request\nfrom starlette.responses import Response\n\nfrom admin.authentication import auth_check\n\n\ndef create_force_refresh_endpoint(\n    input_type: InputType,\n    job_type: str,\n    bonus_difficulty_if_dataset_is_big: int,\n    blocked_datasets: list[str],\n    hf_endpoint: str,\n    hf_token: Optional[str] = None,\n    external_auth_url: Optional[str] = None,\n    organization: Optional[str] = None,\n    hf_timeout_seconds: Optional[float] = None,\n) -> Endpoint:\n    async def force_refresh_endpoint(request: Request) -> Response:\n        try:\n            dataset = get_request_parameter(request, \"dataset\", required=True)\n            if input_type == \"dataset\":\n                config = None\n                split = None\n            elif input_type == \"config\":\n                config = get_request_parameter(request, \"config\", required=True)\n                split = None\n            else:\n                config = get_request_parameter(request, \"config\", required=True)\n                split = get_request_parameter(request, \"split\", required=True)\n                if not are_valid_parameters([config, split]):\n                    raise MissingRequiredParameterError(\"Parameters 'config' and 'split' are required\")\n            try:\n                priority = Priority(get_request_parameter(request, \"priority\", default=\"low\"))\n            except ValueError:\n                raise InvalidParameterError(\n                    f\"Parameter 'priority' should be one of {', '.join(prio.value for prio in Priority)}.\"\n                )\n\n            difficulty_error_message = \"Parameter 'difficulty' should be an int value between 0 and 100.\"\n            try:\n                total_difficulty = int(\n                    get_request_parameter(\n                        request, \"difficulty\", default=str(processing_graph.get_processing_step(job_type).difficulty)\n                    )\n                )\n                if total_difficulty > DEFAULT_DIFFICULTY_MAX or total_difficulty < DEFAULT_DIFFICULTY_MIN:\n                    raise InvalidParameterError(difficulty_error_message)\n            except ValueError:\n                raise InvalidParameterError(difficulty_error_message)\n\n            if config is not None:\n                num_bytes = get_num_bytes_from_config_infos(dataset=dataset, config=config, split=split)\n                if num_bytes is not None and num_bytes > MIN_BYTES_FOR_BONUS_DIFFICULTY:\n                    total_difficulty += bonus_difficulty_if_dataset_is_big\n\n            logging.info(\n                f\"/force-refresh/{job_type}, {dataset=}, {config=}, {split=}, {priority=}, {total_difficulty=}\"\n            )\n\n            # if auth_check fails, it will raise an exception that will be caught below\n            await auth_check(\n                external_auth_url=external_auth_url,\n                request=request,\n                organization=organization,\n                hf_timeout_seconds=hf_timeout_seconds,\n            )\n            revision = get_latest_dataset_revision_if_supported_or_raise(\n                dataset=dataset,\n                hf_endpoint=hf_endpoint,\n                hf_token=hf_token,\n                hf_timeout_seconds=hf_timeout_seconds,\n                blocked_datasets=blocked_datasets,\n            )\n            Queue().add_job(\n                job_type=job_type,\n                difficulty=total_difficulty,\n                dataset=dataset,\n                revision=revision,\n                config=config,\n                split=split,\n                priority=priority,\n            )\n            return get_json_ok_response(\n                {\"status\": \"ok\"},\n                max_age=0,\n            )\n        except CustomError as e:\n            return get_json_api_error_response(e, max_age=0)\n        except Exception as e:\n            return get_json_api_error_response(UnexpectedApiError(\"Unexpected error.\", e), max_age=0)\n\n    return force_refresh_endpoint\n",
+      "total_lines": 117
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 11,
+      "start_line": 1,
+      "end_line": 31,
+      "matched_line": ")",
+      "excerpt": "1: # SPDX-License-Identifier: Apache-2.0\n2: # Copyright 2022 The HuggingFace Authors.\n3: \n4: import logging\n5: from typing import Optional\n6: \n7: from libapi.exceptions import (\n8:     InvalidParameterError,\n9:     MissingRequiredParameterError,\n10:     UnexpectedApiError,\n11: )\n12: from libapi.request import get_request_parameter\n13: from libapi.utils import (\n14:     Endpoint,\n15:     are_valid_parameters,\n16:     get_json_api_error_response,\n17:     get_json_ok_response,\n18: )\n19: from libcommon.constants import DEFAULT_DIFFICULTY_MAX, DEFAULT_DIFFICULTY_MIN, MIN_BYTES_FOR_BONUS_DIFFICULTY\n20: from libcommon.dtos import Priority\n21: from libcommon.exceptions import CustomError\n22: from libcommon.operations import get_latest_dataset_revision_if_supported_or_raise\n23: from libcommon.orchestrator import get_num_bytes_from_config_infos\n24: from libcommon.processing_graph import InputType, processing_graph\n25: from libcommon.queue.jobs import Queue\n26: from starlette.requests import Request\n27: from starlette.responses import Response\n28: \n29: from admin.authentication import auth_check\n30: \n31: "
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "imports": {
+      "imports": [
+        "logging",
+        "typing:Optional",
+        "libapi.exceptions:InvalidParameterError",
+        "libapi.exceptions:MissingRequiredParameterError",
+        "libapi.exceptions:UnexpectedApiError",
+        "libapi.request:get_request_parameter",
+        "libapi.utils:Endpoint",
+        "libapi.utils:are_valid_parameters",
+        "libapi.utils:get_json_api_error_response",
+        "libapi.utils:get_json_ok_response",
+        "libcommon.constants:DEFAULT_DIFFICULTY_MAX",
+        "libcommon.constants:DEFAULT_DIFFICULTY_MIN",
+        "libcommon.constants:MIN_BYTES_FOR_BONUS_DIFFICULTY",
+        "libcommon.dtos:Priority",
+        "libcommon.exceptions:CustomError",
+        "libcommon.operations:get_latest_dataset_revision_if_supported_or_raise",
+        "libcommon.orchestrator:get_num_bytes_from_config_infos",
+        "libcommon.processing_graph:InputType",
+        "libcommon.processing_graph:processing_graph",
+        "libcommon.queue.jobs:Queue",
+        "starlette.requests:Request",
+        "starlette.responses:Response",
+        "admin.authentication:auth_check"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/huggingface/dataset-viewer/main/README.md",
+      "content_excerpt": "# Dataset viewer\n\nThe dataset page includes a table with the dataset's contents, arranged by pages of 100 rows. You can navigate between pages using the buttons at the bottom of the table, filter, search, look at basic statistics, and more.\n\n<img width=\"1015\" alt=\"screenshot of the dataset viewer, for the dataset 'AI-MO/NuminaMath-CoT' hosted on Hugging Face\" src=\"https://github.com/user-attachments/assets/f4299ba4-8582-4b64-b3f5-eb1feb7b9731\">\n\nThis repository is the backend that provides the dataset viewer with pre-computed data through an API, for all the datasets on the Hub. The frontend viewer component is not part of this repository and is not open-source, as the rest of the Hub.\n\nDocumentation:\n- dataset viewer: https://huggingface.co/docs/hub/datasets-viewer\n- configuration of the datasets: https://huggingface.co/docs/hub/datasets-data-files-configuration\n- backend's API: https://huggingface.co/docs/dataset-viewer\n\n## You saw a bug 🪲 or want a new feature 🎁\n\nIf the dataset viewer is showing an error on your dataset page, please [open a discussion](https://huggingface.co/docs/hub/repositories-pull-requests-discussions) there, it's the most efficient way to fix it. Tag [`@lhoestq`](https://huggingface.co/lhoestq), [`@asoria`](https://huggingface.co/asoria) or [`@albertvillanova`](https://huggingface.co/albertvillanova) in the discussion to reach the team directly.\n\nIf you identify a bigger error and think the dataset viewer has a bug, or if you want to ask for a new feature, please [open a new issue](https://github.com/huggingface/dataset-viewer/issues/new) here.\n\n## "
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "create_force_refresh_endpoint test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"create_force_refresh_endpoint(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "services/admin/src/admin/routes",
+      "count": 11,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "services/admin/src/admin/routes/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "blocked_datasets.py",
+          "path": "services/admin/src/admin/routes/blocked_datasets.py",
+          "type": "file"
+        },
+        {
+          "name": "cache_reports.py",
+          "path": "services/admin/src/admin/routes/cache_reports.py",
+          "type": "file"
+        },
+        {
+          "name": "cache_reports_with_content.py",
+          "path": "services/admin/src/admin/routes/cache_reports_with_content.py",
+          "type": "file"
+        },
+        {
+          "name": "dataset_status.py",
+          "path": "services/admin/src/admin/routes/dataset_status.py",
+          "type": "file"
+        },
+        {
+          "name": "force_refresh.py",
+          "path": "services/admin/src/admin/routes/force_refresh.py",
+          "type": "file"
+        },
+        {
+          "name": "healthcheck.py",
+          "path": "services/admin/src/admin/routes/healthcheck.py",
+          "type": "file"
+        },
+        {
+          "name": "metrics.py",
+          "path": "services/admin/src/admin/routes/metrics.py",
+          "type": "file"
+        },
+        {
+          "name": "num_dataset_infos_by_builder_name.py",
+          "path": "services/admin/src/admin/routes/num_dataset_infos_by_builder_name.py",
+          "type": "file"
+        },
+        {
+          "name": "pending_jobs.py",
+          "path": "services/admin/src/admin/routes/pending_jobs.py",
+          "type": "file"
+        },
+        {
+          "name": "recreate_dataset.py",
+          "path": "services/admin/src/admin/routes/recreate_dataset.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "services/admin/src/admin/routes/__init__.py"
+        },
+        {
+          "name": "blocked_datasets.py",
+          "path": "services/admin/src/admin/routes/blocked_datasets.py"
+        },
+        {
+          "name": "cache_reports.py",
+          "path": "services/admin/src/admin/routes/cache_reports.py"
+        },
+        {
+          "name": "cache_reports_with_content.py",
+          "path": "services/admin/src/admin/routes/cache_reports_with_content.py"
+        },
+        {
+          "name": "dataset_status.py",
+          "path": "services/admin/src/admin/routes/dataset_status.py"
+        },
+        {
+          "name": "healthcheck.py",
+          "path": "services/admin/src/admin/routes/healthcheck.py"
+        },
+        {
+          "name": "metrics.py",
+          "path": "services/admin/src/admin/routes/metrics.py"
+        },
+        {
+          "name": "num_dataset_infos_by_builder_name.py",
+          "path": "services/admin/src/admin/routes/num_dataset_infos_by_builder_name.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "services/admin/src/admin/routes/force_refresh.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "d19ec8711fb64db9ab4a2957af1c0243bb1d31a4",
+          "html_url": "https://github.com/huggingface/dataset-viewer/commit/d19ec8711fb64db9ab4a2957af1c0243bb1d31a4",
+          "message": "[refactoring] split queue.py in 3 modules (#2930)\n\n* extract lock\r\n\r\n* move metrics\r\n\r\n* move queue\r\n\r\n* new_queue -> queue\r\n\r\n* fix\r\n\r\n* fix",
+          "author": "Sylvain Lesage",
+          "date": "2024-06-20T12:39:16Z"
+        },
+        {
+          "sha": "93b439538196532b6dc093ba7b4a53cd2bed3ad4",
+          "html_url": "https://github.com/huggingface/dataset-viewer/commit/93b439538196532b6dc093ba7b4a53cd2bed3ad4",
+          "message": "UI: Add difficulty and failed_runs to admin_ui (#2380)\n\n* add difficulty and failed_runs to admin_ui\r\n\r\n* fix test",
+          "author": "Andrea Francis Soria Jimenez",
+          "date": "2024-02-02T16:54:09Z"
+        },
+        {
+          "sha": "bd7ace6813aeb1a952829474bf4652a62bba5bdf",
+          "html_url": "https://github.com/huggingface/dataset-viewer/commit/bd7ace6813aeb1a952829474bf4652a62bba5bdf",
+          "message": "Align docstrings to hf guidelines (#2351)\n\n* Remove :obj:\r\n\r\n* Align raises and return at the end\r\n\r\n* Align optional types\r\n\r\n* Align attributes\r\n\r\n* align args\r\n\r\n* Align args\r\n\r\n* Align Defaults to None\r\n\r\n* Remove returns None for voids\r\n\r\n* Align return type\r\n\r\n* Align Raises\r\n\r\n* Align comment",
+          "author": "Andrea Francis Soria Jimenez",
+          "date": "2024-01-30T13:36:02Z"
+        },
+        {
+          "sha": "c151c7b7149694a0a5601a2ba0343b96473baee3",
+          "html_url": "https://github.com/huggingface/dataset-viewer/commit/c151c7b7149694a0a5601a2ba0343b96473baee3",
+          "message": "move code from worker to libcommon (#2320)\n\n* create libcommon.dtos and move transform_rows to libcommon\r\n\r\n* move RowsContent to libcommon + dataclass\r\n\r\n* remove redundant code - already in function\r\n\r\n* use RowsContent\r\n\r\n* move get_json_size to libcommon\r\n\r\n* move create_truncated_row_items to l",
+          "author": "Sylvain Lesage",
+          "date": "2024-01-23T12:56:58Z"
+        },
+        {
+          "sha": "c77fbf654cc595e9174af6b00bce7726677c9475",
+          "html_url": "https://github.com/huggingface/dataset-viewer/commit/c77fbf654cc595e9174af6b00bce7726677c9475",
+          "message": "Dont delete dataset cache if webhook is update on another branch (#2254)\n\n* don't delete if update on another branch\r\n\r\n* add get_revison\r\n\r\n* fix style\r\n\r\n* revison -> revision\r\n\r\n---------\r\n\r\nCo-authored-by: Test User <sylvain.lesage@huggingface.co>",
+          "author": "Quentin Lhoest",
+          "date": "2024-01-10T12:21:48Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "create_force_refresh_endpoint TODO pass revision meanwhile checks",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "services/admin/src/admin/routes/force_refresh.py",
+      "satd_line": 11,
+      "last_commit": {
+        "sha": "d19ec8711fb64db9ab4a2957af1c0243bb1d31a4",
+        "html_url": "https://github.com/huggingface/dataset-viewer/commit/d19ec8711fb64db9ab4a2957af1c0243bb1d31a4",
+        "message": "[refactoring] split queue.py in 3 modules (#2930)\n\n* extract lock\r\n\r\n* move metrics\r\n\r\n* move queue\r\n\r\n* new_queue -> queue\r\n\r\n* fix\r\n\r\n* fix",
+        "author": "Sylvain Lesage",
+        "date": "2024-06-20T12:39:16Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

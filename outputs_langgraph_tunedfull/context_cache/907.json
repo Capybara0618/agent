@@ -1,0 +1,454 @@
+{
+  "task_id": "907",
+  "repo_owner": "luci",
+  "repo_name": "luci-py",
+  "file_path": "appengine/swarming/server/service_accounts.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T20:01:05+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T20:01:15+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T20:01:23+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "appengine/swarming/server/service_accounts.py",
+    "original_code": "def get_task_account_token(task_id, scopes):  # pylint: disable=unused-argument\n  \"\"\"Returns an access token for a service account associated with a task.\n\n  Assumes authorization checks have been made already. If the task is not\n  configured to use service account returns ('none', None). If the task is\n  configured to use whatever bot is using when calling Swarming, returns\n  ('bot', None).\n\n  Otherwise returns (<email>, AccessToken with valid token for <email>).\n\n  Args:\n    task_id: ID of the task.\n    scopes: list of requested OAuth scopes.\n\n  Returns:\n    (<service account email> or 'bot' or 'none', AccessToken or None).\n\n  Raises:\n    auth.AccessTokenError if the token can't be generated.\n  \"\"\"\n  # TODO(vadimsh): Grab TaskRequest entity based on 'task_id' and use data\n  # there to generate new access token for task-associated service account.\n  raise NotImplementedError('\"task\" service accounts are not implemented yet')",
+    "satd_comment": "# TODO(vadimsh): Grab TaskRequest entity based on 'task_id' and use data\n# there to generate new access token for task-associated service account.",
+    "target_file": {
+      "ok": true,
+      "path": "appengine/swarming/server/service_accounts.py",
+      "sha": "1d46717a41b36d8443bbd4e4446f2b0eccc7fc16",
+      "download_url": "https://raw.githubusercontent.com/luci/luci-py/main/appengine/swarming/server/service_accounts.py",
+      "content_excerpt": "# Copyright 2017 The LUCI Authors. All rights reserved.\n# Use of this source code is governed under the Apache License, Version 2.0\n# that can be found in the LICENSE file.\n\n\"\"\"Functions to generate OAuth access tokens to use by bots or inside tasks.\"\"\"\n\nimport collections\nimport datetime\nimport logging\nimport os\nimport random\n\nfrom google.appengine.api import app_identity\nfrom google.appengine.api import memcache\n\nfrom components import auth\nfrom components import net\nfrom components import utils\n\nfrom server import pools_config\nfrom server import realms\nfrom server import service_accounts_utils\nfrom server import task_pack\n\n\n# Matches tokenserver.minter.SERVICE_ACCOUNT_TOKEN_ACCESS_TOKEN\nTOKEN_KIND_ACCESS_TOKEN = 1\n# Matches tokenserver.minter.SERVICE_ACCOUNT_TOKEN_ID_TOKEN\nTOKEN_KIND_ID_TOKEN = 2\n\n# Brackets for possible lifetimes of OAuth tokens produced by this module.\nMIN_TOKEN_LIFETIME_SEC = 5 * 60\nMAX_TOKEN_LIFETIME_SEC = 3600 * 60  # this is just hardcoded by Google APIs\n\nAccessToken = collections.namedtuple(\n    'AccessToken',\n    [\n        'access_token',  # actual access or ID token\n        'expiry',  # unix timestamp (in seconds, int) when it expires\n    ])\n\n\nclass PermissionError(Exception):  # pylint: disable=redefined-builtin\n  \"\"\"The service account is not allowed to be used by the caller.\"\"\"\n\n\nclass MisconfigurationError(Exception):\n  \"\"\"Something is not correctly configured.\n\n  The difference from PermissionError is that generally the account is allowed\n  to be used, but some misconfiguration (e.g. IAM permissions) preclude the\n  token server or Swarming from using it.\n\n  Can be transformed into HTTP 400 error and returned to the caller.\n  \"\"\"\n\n\nclass InternalError(Exception):\n  \"\"\"Something unexpectedly misbehaves.\n\n  This generally should not happen. It's fine to return HTTP 500 if it does. The\n  content of the exception is scrubbed of private information that should not be\n  visible to the caller.\n  \"\"\"\n\n\ndef has_token_server():\n  \"\"\"Returns True if Token Server URL is configured.\n\n  Token Server is required to use task-associated service accounts.\n  \"\"\"\n  return bool(auth.get_request_auth_db().token_server_url)\n\n\ndef get_task_account_token(task_id, bot_id, kind, scopes=None, audience=None):\n  \"\"\"Returns an access or ID token for a service account associated with a task.\n\n  Assumes authorization checks have been made already. If the task is not\n  configured to use service account returns ('none', None). If the task is\n  configured to use whatever bot is using when calling Swarming, returns\n  ('bot', None).\n\n  Otherwise returns (<email>, AccessToken with valid token for <email>).\n\n  Args:\n    task_id: ID of the task.\n    bot_id: ID of the bot that executes the task, for logs.\n    kind: either TOKEN_KIND_ACCESS_TOKEN or TOKEN_KIND_ID_TOKEN.\n    scopes: a list of requested OAuth scopes for TOKEN_KIND_ACCESS_TOKEN.\n    audience: a requested audience for TOKEN_KIND_ID_TOKEN.\n\n  Returns:\n    (<service account email> or 'bot' or 'none', AccessToken or None).\n\n  Raises:\n    PermissionError if the token server forbids the usage.\n    MisconfigurationError if the service account is misconfigured.\n    InternalError if the RPC fails unexpectedly.\n  \"\"\"\n  # Asserts 'scopes' are not empty when using TOKEN_KIND_ACCESS_TOKEN, etc.\n  _check_token_args(kind, scopes, audience)\n\n  # Grab corresponding TaskRequest.\n  try:\n    result_summary_key = task_pack.run_result_key_to_result_summary_key(\n        task_pack.unpack_run_result_key(task_id))\n    task_request_key = task_pack.result_summary_key_to_request_key(\n        result_summary_key)\n  except ValueError as exc:\n    logging.error('Unexpectedly bad task_id: %s', exc)\n    raise MisconfigurationError('Bad task_id: %s' % task_id)\n\n  task_request = task_request_key.get()\n  if not task_request:\n    raise MisconfigurationError('No such task request: %s' % task_id)\n\n  # 'none' or 'bot' cases are handled by the bot locally, no token for them.\n  if task_request.service_account in ('none', 'bot'):\n    return task_request.service_account, None\n\n  # The only possible case is a service account email. Double check this.\n  if not service_accounts_utils.is_service_account(\n      task_request.service_account):\n    raise MisconfigurationError(\n        'Not a service account email: %s' % task_request.service_account)\n\n  # The code below works only with realms-aware tasks. All tasks should have\n  # the realm already.\n  if not task_request.realm:\n    raise MisconfigurationError('The task is not using LUCI Realms')\n\n  # Re-check if the service account is still allowed to run in the realm,\n  # because it may have changed since the last check.\n  pool_cfg = pools_config.get_pool_config(task_request.pool)\n  realms.check_tasks_act_as(task_request, pool_cfg, enforce=True)\n\n  # Ask the token server to generate the token.\n  audit_tags = [\n      'swarming:bot_id:%s' % bot_id,\n      'swarming:task_id:%s' % task_id,\n      'swarming:task_name:%s' % task_request.name,\n  ]\n  access_token, expiry = _mint_service_account_token(\n      task_request.service_account, task_request.realm, audit_tags,\n      kind, scopes, audience)\n\n  # Log and return the token.\n  token = AccessToken(\n      access_token, int(utils.datetime_to_timestamp(expiry) / 1e6))\n  _check_and_log_token(\n      'task associated', kind, task_request.service_account, token)\n  return task_request.service_account, token\n\n\ndef get_system_account_token(system_service_account, kind,\n                             scopes=None, audience=None):\n  \"\"\"Returns an access or ID token to use on bots to call internal services.\n\n  \"Internal services\" are (loosely) everything that is needed for correct\n  functioning of the internal guts of the bot (at least Isolate and CIPD).\n\n  Assumes authorization checks have been made already. If the bot is not\n  configured to use service account returns ('none', None). If the bot is\n  configured to use whatever it is using when calling Swarming itself, returns\n  ('bot', None).\n\n  Otherwise returns (<email>, AccessToken with valid token for <email>).\n\n  Args:\n    system_service_account: whatever is specified in bots.cfg for the bot.\n    kind: either TOKEN_KIND_ACCESS_TOKEN or TOKEN_KIND_ID_TOKEN.\n    scopes: a list of requested OAuth scopes for TOKEN_KIND_ACCESS_TOKEN.\n    audience: a requested audience for TOKEN_KIND_ID_TOKEN.\n\n  Returns:\n    (<service account email> or 'bot' or 'none', AccessToken or None).\n\n  Raises:\n    PermissionError if the usage of the account is forbidden.\n    MisconfigurationError if the service account is misconfigured.\n    InternalError if the RPC fails unexpectedly.\n  \"\"\"\n  # Asserts 'scopes' are not empty when using TOKEN_KIND_ACCESS_TOKEN, etc.\n  _check_token_args(kind, scopes, audience)\n\n  if not system_service_account:\n    return 'none', None  # no auth is configured\n\n  if system_service_account == 'bot':\n    return 'bot', None  # the bot should use tokens provided by local hooks\n\n  # TODO(crbug.com/1184230): ID tokens for system account are not implemented.\n  # It is possible to implement them using generateIdToken Cloud IAM call, but\n  # they aren't needed yet.\n  if kind == TOKEN_KIND_ID_TOKEN:\n    raise MisconfigurationError(\n        'ID tokens for system account are not implemented')\n\n  # Attempt to mint a token (or grab an existing one from cache).\n  try:\n    blob, expiry = auth.get_access_token(\n        scopes=scopes,\n        act_as=system_service_account,\n        min_lifetime_sec=MIN_TOKEN_LIFETIME_SEC)\n  except auth.AccessTokenError as exc:\n    if exc.transient:\n      raise InternalError(exc.message)\n    raise MisconfigurationError(exc.message)\n\n  assert isinstance(blob, basestring)\n  assert isinstance(expiry, (int, long, float))\n  token = AccessToken(blob, int(expiry))\n  _check_and_log_token('bot associated', kind, system_service_account, token)\n  return system_service_account, token\n\n\n### Private code\n\n\ndef _check_token_args(kind, scopes, audience):\n  \"\"\"Asserts args match the token kind.\"\"\"\n  if kind == TOKEN_KIND_ACCESS_TOKEN:\n    assert scopes is not None\n    assert audience is None\n  elif kind == TOKEN_KIND_ID_TOKEN:\n    assert scopes is None\n    assert audience is not None\n  else:\n    raise AssertionError('Unknown token kind %s' % (kind,))\n\n\ndef _mint_service_account_token(service_account, realm, audit_tags,\n                                kind, scopes, audience):\n  \"\"\"Does the RPC to the token server to get an access or ID token using realm.\n\n  Args:\n    service_account: a service account email to use.\n    realm: a realm name to use.\n    audit_tags: a list with information tags to send with the RPC, for logging.\n    kind: either TOKEN_KIND_ACCESS_TOKEN or TOKEN_KIND_ID_TOKEN.\n    scopes: a list of requested OAuth scopes for TOKEN_KIND_ACCESS_TOKEN.\n    audience: a requested audience for TOKEN_KIND_ID_TOKEN.\n\n  Raises:\n    PermissionError if the token server forbids the usage.\n    MisconfigurationError if the service account is misconfigured.\n    InternalError if the RPC fails unexpectedly.\n  \"\"\"\n  # extract LUCI project from realm '<project>:<realm>'.\n  luci_project = realm.split(':')[0]\n  assert luci_project\n  resp = _call_token_server(\n      'MintServiceAccountToken',\n      {\n          'tokenKind': kind,\n          'serviceAccount': service_account,\n          'realm': realm,\n          'oauthScope': scopes,\n          'idTokenAudience': audience,\n          'minValidityDuration': MIN_TOKEN_LIFETIME_SEC,\n          'auditTags': _common_audit_tags() + audit_tags,\n      },\n      luci_project)\n  try:\n    token = str(resp['token'])\n    service_version = str(resp['serviceVersion'])\n    expiry = utils.parse_rfc3339_datetime(resp['expiry'])\n  except (KeyError, ValueError) as exc:\n    logging.error('Bad response from the token server (%s):\\n%r', exc, resp)\n    raise InternalError('Bad response from the token server, see server logs')\n  logging.info('The token server replied, its version: %s', service_version)\n  return token, expiry\n\n\ndef _call_token_server(method, request, project_id=None):\n  \"\"\"Sends an RPC to tokenserver.minter.TokenMinter service.\n\n  Args:\n    method: name of the method to call.\n    request: dict with request fields.\n    project_id: if set, act with the authority of this LUCI project.\n\n  Returns:\n    Dict with response fields.\n\n  Raises:\n    PermissionError on HTTP 403 reply.\n    MisconfigurationError if the service account is misconfigured.\n    InternalError if the RPC fails unexpectedly.\n  \"\"\"\n  # Double check token server URL looks sane ('https://....'). This is checked\n  # when it's imported from the config. This check should never fail.\n  ts_url = auth.get_request_auth_db().token_server_url\n  try:\n    utils.validate_root_service_url(ts_url)\n  except ValueError as exc:\n    raise MisconfigurationError(\n        'Invalid token server URL %s: %s' % (ts_url, exc))\n\n  # See TokenMinter in\n  # https://chromium.googlesource.com/infra/luci/luci-go/+/master/tokenserver/api/minter/v1/token_minter.proto\n  # But beware that proto JSON serialization uses camelCase, not snake_case.\n  try:\n    return net.json_request(\n        url='%s/prpc/tokenserver.minter.TokenMinter/%s' % (ts_url, method),\n        method='POST',\n        payload=request,\n        project_id=project_id,\n        scopes=[net.EMAIL_SCOPE])\n  except net.Error as exc:\n    logging.error('Error calling %s (HTTP %s: %s):\\n%s', method,\n                  exc.status_code, exc.message, exc.response)\n    if exc.status_code == 403:\n      raise PermissionError(\n          'HTTP 403 from the token server:\\n%s' % exc.response)\n    if exc.status_code == 400:\n      raise MisconfigurationError(\n          'HTTP 400 from the token server:\\n%s' % exc.response)\n    # Don't put the response body into the error message, it may contain\n    # internal details (that are public to Swarming server, but may not be\n    # public to whoever is calling the Swarming server now).\n    raise InternalError('Failed to call %s, see server logs' % method)\n\n\ndef _common_audit_tags():\n  \"\"\"Returns a list of tags ",
+      "total_lines": 359
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "collections",
+        "datetime",
+        "logging",
+        "os",
+        "random",
+        "google.appengine.api:app_identity",
+        "google.appengine.api:memcache",
+        "components:auth",
+        "components:net",
+        "components:utils",
+        "server:pools_config",
+        "server:realms",
+        "server:service_accounts_utils",
+        "server:task_pack"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/luci/luci-py/main/README.md",
+      "content_excerpt": "# LUCI\n\nLUCI is an ensemble of services that work together to run large scale CI\n(continuous integration) infrastructure to get results in *O(1)*. It is used by\nthe [Chromium project](http://www.chromium.org).\n\nSee [appengine/](appengine) for the services provided.\n\n\n## Overview\n\nA complete CI toolkit:\n\n*   Strict separation between *task distribution* and *file distribution*.\n    *   Swarming distributes tasks across an army (thousands) of Swarming bots.\n    *   Isolate server distributes 10s of thousands of files _per task_.\n*   Federated authentication and ACL.\n*   git based configuration data propagation.\n*   Automatic Google Compute Engine VM recycling.\n*   Windows, OSX and Linux (Ubuntu), used with Android, iOS, ChromeOS.\n*   Written in python 2.7 along [Go](https://go.chromium.org/luci) tools.\n*   Used by the Chromium infrastructure and other teams.\n\n\n## Installing\n\n1.  Install [Google AppEngine\n    SDK](https://cloud.google.com/appengine/downloads).\n2.  git clone https://chromium.googlesource.com/infra/luci/luci-py\n\n\n## Code layout\n\n*   [/appengine/...](appengine) contains\n    [AppEngine](https://cloud.google.com/appengine/docs/python/) server\n    code.\n*   [/client/...](client) contains all client code.\n*   [/infra/config/...](infra/config) contains metadata to run the commit queue.\n\n\n## Versioning\n\n*   Branch `master` constains the latest code.\n*   Branch `stable` contains the stable code.\n\n\n## Contributing\n\n*   Sign the [Google CLA](https://cla.developers.google.com/clas).\n*   See the [coding style](CODING_STYLE.md).\n*   Make sure your `user.email` and `user.name"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "get_task_account_token test",
+      "count": 2,
+      "items": [
+        {
+          "name": "service_accounts_test.py",
+          "path": "appengine/swarming/server/service_accounts_test.py",
+          "sha": "db311411bfafdbf8affcfc1a2be7828750a17413",
+          "html_url": "https://github.com/luci/luci-py/blob/67568c680529900d455ea5c16caf2591a545b5fe/appengine/swarming/server/service_accounts_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "handlers_bot_test.py",
+          "path": "appengine/swarming/handlers_bot_test.py",
+          "sha": "4f74550c774d84b2db9b6688759bc3788d4f901d",
+          "html_url": "https://github.com/luci/luci-py/blob/67568c680529900d455ea5c16caf2591a545b5fe/appengine/swarming/handlers_bot_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"get_task_account_token(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "handlers_bot.py",
+          "path": "appengine/swarming/handlers_bot.py",
+          "sha": "dbfd88a3eff3621fe1cd24c00e50c55d3b4aa838",
+          "html_url": "https://github.com/luci/luci-py/blob/67568c680529900d455ea5c16caf2591a545b5fe/appengine/swarming/handlers_bot.py",
+          "score": 1.0
+        },
+        {
+          "name": "service_accounts.py",
+          "path": "appengine/swarming/server/service_accounts.py",
+          "sha": "1d46717a41b36d8443bbd4e4446f2b0eccc7fc16",
+          "html_url": "https://github.com/luci/luci-py/blob/67568c680529900d455ea5c16caf2591a545b5fe/appengine/swarming/server/service_accounts.py",
+          "score": 1.0
+        },
+        {
+          "name": "service_accounts_test.py",
+          "path": "appengine/swarming/server/service_accounts_test.py",
+          "sha": "db311411bfafdbf8affcfc1a2be7828750a17413",
+          "html_url": "https://github.com/luci/luci-py/blob/67568c680529900d455ea5c16caf2591a545b5fe/appengine/swarming/server/service_accounts_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "appengine/swarming/server",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "appengine/swarming/server/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "acl.py",
+          "path": "appengine/swarming/server/acl.py",
+          "type": "file"
+        },
+        {
+          "name": "acl_test.py",
+          "path": "appengine/swarming/server/acl_test.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_archive.py",
+          "path": "appengine/swarming/server/bot_archive.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_archive_test.py",
+          "path": "appengine/swarming/server/bot_archive_test.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_auth.py",
+          "path": "appengine/swarming/server/bot_auth.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_auth_test.py",
+          "path": "appengine/swarming/server/bot_auth_test.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_code.py",
+          "path": "appengine/swarming/server/bot_code.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_code_test.py",
+          "path": "appengine/swarming/server/bot_code_test.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_groups_config.py",
+          "path": "appengine/swarming/server/bot_groups_config.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_groups_config_test.py",
+          "path": "appengine/swarming/server/bot_groups_config_test.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_management.py",
+          "path": "appengine/swarming/server/bot_management.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_management_test.py",
+          "path": "appengine/swarming/server/bot_management_test.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_session.py",
+          "path": "appengine/swarming/server/bot_session.py",
+          "type": "file"
+        },
+        {
+          "name": "bot_session_test.py",
+          "path": "appengine/swarming/server/bot_session_test.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "appengine/swarming/server/config.py",
+          "type": "file"
+        },
+        {
+          "name": "config_test.py",
+          "path": "appengine/swarming/server/config_test.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "appengine/swarming/server/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "directory_occlusion.py",
+          "path": "appengine/swarming/server/directory_occlusion.py",
+          "type": "file"
+        },
+        {
+          "name": "directory_occlusion_test.py",
+          "path": "appengine/swarming/server/directory_occlusion_test.py",
+          "type": "file"
+        },
+        {
+          "name": "external_scheduler.py",
+          "path": "appengine/swarming/server/external_scheduler.py",
+          "type": "file"
+        },
+        {
+          "name": "external_scheduler_test.py",
+          "path": "appengine/swarming/server/external_scheduler_test.py",
+          "type": "file"
+        },
+        {
+          "name": "hmac_secret.py",
+          "path": "appengine/swarming/server/hmac_secret.py",
+          "type": "file"
+        },
+        {
+          "name": "large.py",
+          "path": "appengine/swarming/server/large.py",
+          "type": "file"
+        },
+        {
+          "name": "named_caches.py",
+          "path": "appengine/swarming/server/named_caches.py",
+          "type": "file"
+        },
+        {
+          "name": "named_caches_test.py",
+          "path": "appengine/swarming/server/named_caches_test.py",
+          "type": "file"
+        },
+        {
+          "name": "pools_config.py",
+          "path": "appengine/swarming/server/pools_config.py",
+          "type": "file"
+        },
+        {
+          "name": "pools_config_test.py",
+          "path": "appengine/swarming/server/pools_config_test.py",
+          "type": "file"
+        },
+        {
+          "name": "rbe.py",
+          "path": "appengine/swarming/server/rbe.py",
+          "type": "file"
+        },
+        {
+          "name": "rbe_test.py",
+          "path": "appengine/swarming/server/rbe_test.py",
+          "type": "file"
+        },
+        {
+          "name": "realms.py",
+          "path": "appengine/swarming/server/realms.py",
+          "type": "file"
+        },
+        {
+          "name": "realms_test.py",
+          "path": "appengine/swarming/server/realms_test.py",
+          "type": "file"
+        },
+        {
+          "name": "resultdb.py",
+          "path": "appengine/swarming/server/resultdb.py",
+          "type": "file"
+        },
+        {
+          "name": "resultdb_test.py",
+          "path": "appengine/swarming/server/resultdb_test.py",
+          "type": "file"
+        },
+        {
+          "name": "service_accounts.py",
+          "path": "appengine/swarming/server/service_accounts.py",
+          "type": "file"
+        },
+        {
+          "name": "service_accounts_test.py",
+          "path": "appengine/swarming/server/service_accounts_test.py",
+          "type": "file"
+        },
+        {
+          "name": "service_accounts_utils.py",
+          "path": "appengine/swarming/server/service_accounts_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "service_accounts_utils_test.py",
+          "path": "appengine/swarming/server/service_accounts_utils_test.py",
+          "type": "file"
+        },
+        {
+          "name": "string_pairs_serializer.py",
+          "path": "appengine/swarming/server/string_pairs_serializer.py",
+          "type": "file"
+        },
+        {
+          "name": "string_pairs_serializer_test.py",
+          "path": "appengine/swarming/server/string_pairs_serializer_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "appengine/swarming/server/__init__.py"
+        },
+        {
+          "name": "acl.py",
+          "path": "appengine/swarming/server/acl.py"
+        },
+        {
+          "name": "acl_test.py",
+          "path": "appengine/swarming/server/acl_test.py"
+        },
+        {
+          "name": "bot_archive.py",
+          "path": "appengine/swarming/server/bot_archive.py"
+        },
+        {
+          "name": "bot_archive_test.py",
+          "path": "appengine/swarming/server/bot_archive_test.py"
+        },
+        {
+          "name": "bot_auth.py",
+          "path": "appengine/swarming/server/bot_auth.py"
+        },
+        {
+          "name": "bot_auth_test.py",
+          "path": "appengine/swarming/server/bot_auth_test.py"
+        },
+        {
+          "name": "bot_code.py",
+          "path": "appengine/swarming/server/bot_code.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "appengine/swarming/server/service_accounts.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "679738de8578b6dd98243e25ed1e7ad9b9995f9d",
+          "html_url": "https://github.com/luci/luci-py/commit/679738de8578b6dd98243e25ed1e7ad9b9995f9d",
+          "message": "[swarming] Upgrade to pylint 2.7 and fix the many linting errors.\n\npylint 1.5 was due to be removed on 2022-07-11, but has now been\nextended until Q4-2022. We need to make Swarming compliant with pylint 2.7 before that time.\n\nBug: 1344829\nChange-Id: I71f05fb6f697548ce4b8f563cd460453268a6199\nReviewed",
+          "author": "Justin Luong",
+          "date": "2022-07-29T01:51:27Z"
+        },
+        {
+          "sha": "45f97b7e6bb612e082bace2ebd57387951005657",
+          "html_url": "https://github.com/luci/luci-py/commit/45f97b7e6bb612e082bace2ebd57387951005657",
+          "message": "[swarming] Remove non-realms service accounts support.\n\nLUCI Token Server no longer supports MintOAuthTokenViaGrant RPC.\n\nR=jwata@google.com, tikuta@chromium.org\nBUG=1066839\n\nChange-Id: I74547a21539402018249e262631c01cf2b541b59\nReviewed-on: https://chromium-review.googlesource.com/c/infra/luci/luci-",
+          "author": "Vadim Shtayura",
+          "date": "2021-12-03T07:57:29Z"
+        },
+        {
+          "sha": "27522844ecec087f60839d74add87a475ea20455",
+          "html_url": "https://github.com/luci/luci-py/commit/27522844ecec087f60839d74add87a475ea20455",
+          "message": "[swarming] Add ID tokens support to get_task_account_token.\n\nThey are actually implemented by MintServiceAccountToken TokenServer's\nRPC, so they are supported only for tasks that use realms.\n\nR=jwata@google.com, tikuta@chromium.org\nBUG=1184230\n\nChange-Id: I4879ffed0f34341656a6ef0c5c85a2c65b6cf0fb\nRe",
+          "author": "Vadim Shtayura",
+          "date": "2021-03-17T00:58:07Z"
+        },
+        {
+          "sha": "1b09d10d09f070ce544d8c178d5d959a2edf938d",
+          "html_url": "https://github.com/luci/luci-py/commit/1b09d10d09f070ce544d8c178d5d959a2edf938d",
+          "message": "[swarming] Change dry_run_task_realm into default_task_realm.\n\nWhile working in integration with Buildbucket I realized I need\na way to enforce *all* permissions, but per individual task. The\nexisting `enforced_realm_permissions` works on per-pool and it is\ntoo coarse. Buildbucket also changes how i",
+          "author": "Vadim Shtayura",
+          "date": "2020-07-27T23:32:41Z"
+        },
+        {
+          "sha": "781d55afaac69264d5d89e4f1d9168cab6eaa22f",
+          "html_url": "https://github.com/luci/luci-py/commit/781d55afaac69264d5d89e4f1d9168cab6eaa22f",
+          "message": "[swarming] Use net.request(project_id=...) when calling Token Server.\n\nThis is a correct abstraction to \"act as a project\". It didn't\nwork before, but should be working now after crbug.com/1099149 has\nbeen fixed.\n\nBUG=1099149\nR=jwata@google.com\n\nChange-Id: I3f661e94d84344d3153cd4361a4fb4e7cfb08aa2\nR",
+          "author": "Vadim Shtayura",
+          "date": "2020-06-30T02:35:43Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "get_task_account_token TODO vadimsh Grab TaskRequest entity",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "appengine/swarming/server/service_accounts.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "679738de8578b6dd98243e25ed1e7ad9b9995f9d",
+        "html_url": "https://github.com/luci/luci-py/commit/679738de8578b6dd98243e25ed1e7ad9b9995f9d",
+        "message": "[swarming] Upgrade to pylint 2.7 and fix the many linting errors.\n\npylint 1.5 was due to be removed on 2022-07-11, but has now been\nextended until Q4-2022. We need to make Swarming compliant with pylint 2.7 before that time.\n\nBug: 1344829\nChange-Id: I71f05fb6f697548ce4b8f563cd460453268a6199\nReviewed",
+        "author": "Justin Luong",
+        "date": "2022-07-29T01:51:27Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

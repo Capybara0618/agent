@@ -1,0 +1,727 @@
+{
+  "task_id": "600",
+  "repo_owner": "getsentry",
+  "repo_name": "sentry",
+  "file_path": "src/sentry/api/endpoints/project_repo_path_parsing.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:26:53+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 10,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:27:14+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:27:18+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/sentry/api/endpoints/project_repo_path_parsing.py",
+    "original_code": "def providers(self):\n    # TODO: use feature flag in the future\n    providers = filter(lambda x: x.has_stacktrace_linking, list(integrations.all()))\n    return map(lambda x: x.key, providers)",
+    "satd_comment": "# TODO: use feature flag in the future",
+    "target_file": {
+      "ok": true,
+      "path": "src/sentry/api/endpoints/project_repo_path_parsing.py",
+      "sha": "c530e5d1105fea70367c1d51bbb799516ce1f3ab",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/master/src/sentry/api/endpoints/project_repo_path_parsing.py",
+      "content_excerpt": "from pathlib import PurePath, PureWindowsPath\nfrom typing import Any\nfrom urllib.parse import urlparse\n\nfrom rest_framework import serializers, status\nfrom rest_framework.request import Request\nfrom rest_framework.response import Response\n\nfrom sentry.api.api_publish_status import ApiPublishStatus\nfrom sentry.api.base import cell_silo_endpoint\nfrom sentry.api.bases.project import ProjectEndpoint, ProjectPermission\nfrom sentry.api.serializers.rest_framework.base import CamelSnakeSerializer\nfrom sentry.integrations.base import IntegrationFeatures\nfrom sentry.integrations.manager import default_manager as integrations\nfrom sentry.integrations.services.integration import RpcIntegration, integration_service\nfrom sentry.integrations.source_code_management.repository import RepositoryIntegration\nfrom sentry.issues.auto_source_code_config.code_mapping import find_roots\nfrom sentry.issues.auto_source_code_config.errors import (\n    UnexpectedPathException,\n    UnsupportedFrameInfo,\n)\nfrom sentry.issues.auto_source_code_config.frame_info import FrameInfo, create_frame_info\nfrom sentry.models.project import Project\nfrom sentry.models.repository import Repository\n\n\nclass PathMappingSerializer(CamelSnakeSerializer[dict[str, str]]):\n    stack_path = serializers.CharField()\n    source_url = serializers.URLField()\n\n    def __init__(self, *args: Any, **kwargs: Any) -> None:\n        super().__init__(*args, **kwargs)\n        self.integration: RpcIntegration | None = None\n        self.repo: Repository | None = None\n\n    @property\n    def providers(self) -> list[str]:\n        return [\n            x.key for x in integrations.all() if x.has_feature(IntegrationFeatures.STACKTRACE_LINK)\n        ]\n\n    @property\n    def org_id(self) -> int:\n        return self.context[\"organization_id\"]\n\n    def validate_source_url(self, source_url: str) -> str:\n        # first check to see if we are even looking at the same file\n        stack_path = self.initial_data[\"stack_path\"]\n\n        stack_file = PureWindowsPath(stack_path).name\n        source_file = PurePath(urlparse(source_url).path).name\n\n        if stack_file != source_file:\n            raise serializers.ValidationError(\n                \"Source code URL points to a different file than the stack trace\"\n            )\n\n        def integration_match(integration: RpcIntegration) -> bool:\n            installation = integration.get_installation(self.org_id)\n            # Check if the installation has the source_url_matches method\n            if isinstance(installation, RepositoryIntegration):\n                return installation.source_url_matches(source_url)\n            # Fallback to a basic check if the method doesn't exist\n            return False\n\n        def repo_match(repo: Repository) -> bool:\n            return repo.url is not None and source_url.startswith(repo.url)\n\n        # now find the matching integration\n        integrations = integration_service.get_integrations(\n            organization_id=self.org_id, providers=self.providers\n        )\n\n        matching_integrations = list(filter(integration_match, integrations))\n        if not matching_integrations:\n            raise serializers.ValidationError(\"Could not find integration\")\n\n        self.integration = matching_integrations[0]\n\n        # now find the matching repo\n        repos = Repository.objects.filter(\n            organization_id=self.org_id, integration_id=self.integration.id, url__isnull=False\n        )\n        matching_repos = list(filter(repo_match, repos))\n        if not matching_repos:\n            raise serializers.ValidationError(\"Could not find repo\")\n\n        # store the repo we found\n        self.repo = matching_repos[0]\n        return source_url\n\n\nclass ProjectRepoPathParsingEndpointLoosePermission(ProjectPermission):\n    \"\"\"\n    Similar to the code_mappings endpoint, loosen permissions to all users\n    \"\"\"\n\n    scope_map = {\n        \"POST\": [\"org:read\", \"project:write\", \"project:admin\"],\n    }\n\n\n@cell_silo_endpoint\nclass ProjectRepoPathParsingEndpoint(ProjectEndpoint):\n    publish_status = {\n        \"POST\": ApiPublishStatus.UNKNOWN,\n    }\n    permission_classes = (ProjectRepoPathParsingEndpointLoosePermission,)\n    \"\"\"\n    Returns the parameters associated with the RepositoryProjectPathConfig\n    we would create based on a particular stack trace and source code URL.\n    Does validation to make sure we have an integration and repo\n    depending on the source code URL\n    \"\"\"\n\n    def post(self, request: Request, project: Project) -> Response:\n        serializer = PathMappingSerializer(\n            context={\"organization_id\": project.organization_id},\n            data=request.data,\n        )\n        if not serializer.is_valid():\n            return self.respond(serializer.errors, status=status.HTTP_400_BAD_REQUEST)\n\n        data = serializer.validated_data\n        source_url = data[\"source_url\"]\n        try:\n            frame_info = get_frame_info_from_request(request)\n        except UnsupportedFrameInfo:\n            return self.respond(\n                {\"detail\": \"Unsupported frame info\"}, status=status.HTTP_400_BAD_REQUEST\n            )\n\n        # validated by `serializer.is_valid()`\n        assert serializer.repo is not None\n        assert serializer.integration is not None\n        repo = serializer.repo\n        integration = serializer.integration\n        installation = integration.get_installation(project.organization_id)\n\n        if not isinstance(installation, RepositoryIntegration):\n            return self.respond(\n                {\"detail\": \"Integration does not support repository operations\"},\n                status=status.HTTP_400_BAD_REQUEST,\n            )\n\n        branch = installation.extract_branch_from_source_url(repo, source_url)\n        source_path = installation.extract_source_path_from_source_url(repo, source_url)\n\n        try:\n            stack_root, source_root = find_roots(frame_info, source_path)\n        except UnexpectedPathException:\n            return self.respond(\n                {\"detail\": \"Could not determine code mapping from provided paths\"},\n                status=status.HTTP_400_BAD_REQUEST,\n            )\n\n        return self.respond(\n            {\n                \"integrationId\": integration.id,\n                \"repositoryId\": repo.id,\n                \"provider\": integration.provider,\n                \"stackRoot\": stack_root,\n                \"sourceRoot\": source_root,\n                \"defaultBranch\": branch,\n            }\n        )\n\n\ndef get_frame_info_from_request(request: Request) -> FrameInfo:\n    frame = {\n        \"abs_path\": request.data.get(\"absPath\"),\n        \"filename\": request.data[\"stackPath\"],\n        \"module\": request.data.get(\"module\"),\n    }\n    return create_frame_info(frame, request.data.get(\"platform\"))\n",
+      "total_lines": 175
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "pathlib:PurePath",
+        "pathlib:PureWindowsPath",
+        "typing:Any",
+        "urllib.parse:urlparse",
+        "rest_framework:serializers",
+        "rest_framework:status",
+        "rest_framework.request:Request",
+        "rest_framework.response:Response",
+        "sentry.api.api_publish_status:ApiPublishStatus",
+        "sentry.api.base:cell_silo_endpoint",
+        "sentry.api.bases.project:ProjectEndpoint",
+        "sentry.api.bases.project:ProjectPermission",
+        "sentry.api.serializers.rest_framework.base:CamelSnakeSerializer",
+        "sentry.integrations.base:IntegrationFeatures",
+        "sentry.integrations.manager:default_manager",
+        "sentry.integrations.services.integration:RpcIntegration",
+        "sentry.integrations.services.integration:integration_service",
+        "sentry.integrations.source_code_management.repository:RepositoryIntegration",
+        "sentry.issues.auto_source_code_config.code_mapping:find_roots",
+        "sentry.issues.auto_source_code_config.errors:UnexpectedPathException",
+        "sentry.issues.auto_source_code_config.errors:UnsupportedFrameInfo",
+        "sentry.issues.auto_source_code_config.frame_info:FrameInfo",
+        "sentry.issues.auto_source_code_config.frame_info:create_frame_info",
+        "sentry.models.project:Project",
+        "sentry.models.repository:Repository"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <p align=\"center\">\n    <a href=\"https://sentry.io/?utm_source=github&utm_medium=logo\" target=\"_blank\">\n      <img src=\"https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png\" alt=\"Sentry\" width=\"280\" height=\"84\" />\n    </a>\n  </p>\n  <p align=\"center\">\n    Users and logs provide clues. Sentry provides answers.\n  </p>\n</p>\n\n# What's Sentry?\n\nSentry is the debugging platform that helps every developer detect, trace, and fix issues. Code breaks, fix it faster.\n\n<p align=\"center\">\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/issue-details.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/seer.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/traces.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/trace-explorer.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/replays.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/logs.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/uptime.png\" width=\"270\" />\n</p>\n\n## Official Sentry SDKs\n\n- [JavaScript](https://github.com/getsentry/sentry-javascript)\n- [Electron]("
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "providers test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_results_consumer.py",
+          "path": "tests/sentry/uptime/consumers/test_results_consumer.py",
+          "sha": "6414dd95661722b42aec638e64a4482613d31557",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/uptime/consumers/test_results_consumer.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_organization_auth_providers.py",
+          "path": "tests/sentry/api/endpoints/test_organization_auth_providers.py",
+          "sha": "9c64049856d0f6efa16b0ab1b71b8b82467c26f0",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/api/endpoints/test_organization_auth_providers.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_user_notification_settings_providers.py",
+          "path": "tests/sentry/notifications/api/endpoints/test_user_notification_settings_providers.py",
+          "sha": "b97a8507ae3bc9642accfc87d8a4188a0efa7a83",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/notifications/api/endpoints/test_user_notification_settings_providers.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_unleash.py",
+          "path": "tests/sentry/flags/providers/test_unleash.py",
+          "sha": "e02a5230995544a92a34b99cbcb173d4592ee518",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/flags/providers/test_unleash.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_saml2.py",
+          "path": "tests/sentry/auth/providers/test_saml2.py",
+          "sha": "d976e1d3361ec6e5ec01c443fa6c68bd9ab149cc",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/auth/providers/test_saml2.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_views.py",
+          "path": "tests/sentry/auth/providers/github/test_views.py",
+          "sha": "b46c519e942c2e4d7127bbeaa6fe532c8ced5f35",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/auth/providers/github/test_views.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_client.py",
+          "path": "tests/sentry/auth/providers/fly/test_client.py",
+          "sha": "3510331368a6c9ea16f6189814e3a2e0e59e8111",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/auth/providers/fly/test_client.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_provider.py",
+          "path": "tests/sentry/auth/providers/google/test_provider.py",
+          "sha": "5dbda8893d007d187d721fc44118a74d58ef00ed",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/tests/sentry/auth/providers/google/test_provider.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"providers(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/sentry/identity/__init__.py",
+          "sha": "4cf95538cfebf5bbefd18b4856b09fc12a78702b",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/identity/__init__.py",
+          "score": 1.0
+        },
+        {
+          "name": "notify.py",
+          "path": "src/sentry/notifications/notify.py",
+          "sha": "30c0b7c8ea2fd4f2b8ece20eb6268222b2b733b1",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/notifications/notify.py",
+          "score": 1.0
+        },
+        {
+          "name": "utils.py",
+          "path": "src/sentry/integrations/coding_agent/utils.py",
+          "sha": "a244c7f7a598618856166db188f6f08a3d35b52e",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/integrations/coding_agent/utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "providers.tsx",
+          "path": "static/app/components/replays/player/__stories__/providers.tsx",
+          "sha": "7099274062d19789d8d8289a5ba8f9bb3059ba9a",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/static/app/components/replays/player/__stories__/providers.tsx",
+          "score": 1.0
+        },
+        {
+          "name": "auth.py",
+          "path": "src/sentry/utils/auth.py",
+          "sha": "8a118866922f35d6b47420501b5a105206a8c492",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/utils/auth.py",
+          "score": 1.0
+        },
+        {
+          "name": "issue.py",
+          "path": "src/sentry/plugins/bases/issue.py",
+          "sha": "15c92825f99c1560358d28c2ef17cb553d02ce75",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/plugins/bases/issue.py",
+          "score": 1.0
+        },
+        {
+          "name": "notificationcontroller.py",
+          "path": "src/sentry/notifications/notificationcontroller.py",
+          "sha": "c25a69ce99c41dd46ba794c9dad4492539ba93d6",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/notifications/notificationcontroller.py",
+          "score": 1.0
+        },
+        {
+          "name": "base.py",
+          "path": "src/sentry/notifications/notifications/base.py",
+          "sha": "04fcdc1cb6a08c4a691d9e9873aed82f72e885f6",
+          "html_url": "https://github.com/getsentry/sentry/blob/db929a770fea7b4dc67c43421b5b8f48beeaf8da/src/sentry/notifications/notifications/base.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/sentry/api/endpoints",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/sentry/api/endpoints/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "accept_organization_invite.py",
+          "path": "src/sentry/api/endpoints/accept_organization_invite.py",
+          "type": "file"
+        },
+        {
+          "name": "accept_project_transfer.py",
+          "path": "src/sentry/api/endpoints/accept_project_transfer.py",
+          "type": "file"
+        },
+        {
+          "name": "admin_project_configs.py",
+          "path": "src/sentry/api/endpoints/admin_project_configs.py",
+          "type": "file"
+        },
+        {
+          "name": "api_application_details.py",
+          "path": "src/sentry/api/endpoints/api_application_details.py",
+          "type": "file"
+        },
+        {
+          "name": "api_application_rotate_secret.py",
+          "path": "src/sentry/api/endpoints/api_application_rotate_secret.py",
+          "type": "file"
+        },
+        {
+          "name": "api_applications.py",
+          "path": "src/sentry/api/endpoints/api_applications.py",
+          "type": "file"
+        },
+        {
+          "name": "api_authorizations.py",
+          "path": "src/sentry/api/endpoints/api_authorizations.py",
+          "type": "file"
+        },
+        {
+          "name": "api_token_details.py",
+          "path": "src/sentry/api/endpoints/api_token_details.py",
+          "type": "file"
+        },
+        {
+          "name": "api_tokens.py",
+          "path": "src/sentry/api/endpoints/api_tokens.py",
+          "type": "file"
+        },
+        {
+          "name": "artifact_bundles.py",
+          "path": "src/sentry/api/endpoints/artifact_bundles.py",
+          "type": "file"
+        },
+        {
+          "name": "artifact_lookup.py",
+          "path": "src/sentry/api/endpoints/artifact_lookup.py",
+          "type": "file"
+        },
+        {
+          "name": "assistant.py",
+          "path": "src/sentry/api/endpoints/assistant.py",
+          "type": "file"
+        },
+        {
+          "name": "auth_config.py",
+          "path": "src/sentry/api/endpoints/auth_config.py",
+          "type": "file"
+        },
+        {
+          "name": "auth_index.py",
+          "path": "src/sentry/api/endpoints/auth_index.py",
+          "type": "file"
+        },
+        {
+          "name": "auth_login.py",
+          "path": "src/sentry/api/endpoints/auth_login.py",
+          "type": "file"
+        },
+        {
+          "name": "auth_validate.py",
+          "path": "src/sentry/api/endpoints/auth_validate.py",
+          "type": "file"
+        },
+        {
+          "name": "broadcast_details.py",
+          "path": "src/sentry/api/endpoints/broadcast_details.py",
+          "type": "file"
+        },
+        {
+          "name": "broadcast_index.py",
+          "path": "src/sentry/api/endpoints/broadcast_index.py",
+          "type": "file"
+        },
+        {
+          "name": "builtin_symbol_sources.py",
+          "path": "src/sentry/api/endpoints/builtin_symbol_sources.py",
+          "type": "file"
+        },
+        {
+          "name": "catchall.py",
+          "path": "src/sentry/api/endpoints/catchall.py",
+          "type": "file"
+        },
+        {
+          "name": "chunk.py",
+          "path": "src/sentry/api/endpoints/chunk.py",
+          "type": "file"
+        },
+        {
+          "name": "data_scrubbing_selector_suggestions.py",
+          "path": "src/sentry/api/endpoints/data_scrubbing_selector_suggestions.py",
+          "type": "file"
+        },
+        {
+          "name": "debug_files.py",
+          "path": "src/sentry/api/endpoints/debug_files.py",
+          "type": "file"
+        },
+        {
+          "name": "dsn_lookup.py",
+          "path": "src/sentry/api/endpoints/dsn_lookup.py",
+          "type": "file"
+        },
+        {
+          "name": "email_capture.py",
+          "path": "src/sentry/api/endpoints/email_capture.py",
+          "type": "file"
+        },
+        {
+          "name": "event_apple_crash_report.py",
+          "path": "src/sentry/api/endpoints/event_apple_crash_report.py",
+          "type": "file"
+        },
+        {
+          "name": "event_attachment_details.py",
+          "path": "src/sentry/api/endpoints/event_attachment_details.py",
+          "type": "file"
+        },
+        {
+          "name": "event_attachments.py",
+          "path": "src/sentry/api/endpoints/event_attachments.py",
+          "type": "file"
+        },
+        {
+          "name": "event_file_committers.py",
+          "path": "src/sentry/api/endpoints/event_file_committers.py",
+          "type": "file"
+        },
+        {
+          "name": "filechange.py",
+          "path": "src/sentry/api/endpoints/filechange.py",
+          "type": "file"
+        },
+        {
+          "name": "frontend_version.py",
+          "path": "src/sentry/api/endpoints/frontend_version.py",
+          "type": "file"
+        },
+        {
+          "name": "index.py",
+          "path": "src/sentry/api/endpoints/index.py",
+          "type": "file"
+        },
+        {
+          "name": "integrations",
+          "path": "src/sentry/api/endpoints/integrations",
+          "type": "dir"
+        },
+        {
+          "name": "internal",
+          "path": "src/sentry/api/endpoints/internal",
+          "type": "dir"
+        },
+        {
+          "name": "internal_ea_features.py",
+          "path": "src/sentry/api/endpoints/internal_ea_features.py",
+          "type": "file"
+        },
+        {
+          "name": "oauth_userinfo.py",
+          "path": "src/sentry/api/endpoints/oauth_userinfo.py",
+          "type": "file"
+        },
+        {
+          "name": "organization_access_request_details.py",
+          "path": "src/sentry/api/endpoints/organization_access_request_details.py",
+          "type": "file"
+        },
+        {
+          "name": "organization_ai_conversation_details.py",
+          "path": "src/sentry/api/endpoints/organization_ai_conversation_details.py",
+          "type": "file"
+        },
+        {
+          "name": "organization_ai_conversations.py",
+          "path": "src/sentry/api/endpoints/organization_ai_conversations.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/sentry/api/endpoints/__init__.py"
+        },
+        {
+          "name": "accept_organization_invite.py",
+          "path": "src/sentry/api/endpoints/accept_organization_invite.py"
+        },
+        {
+          "name": "accept_project_transfer.py",
+          "path": "src/sentry/api/endpoints/accept_project_transfer.py"
+        },
+        {
+          "name": "admin_project_configs.py",
+          "path": "src/sentry/api/endpoints/admin_project_configs.py"
+        },
+        {
+          "name": "api_application_details.py",
+          "path": "src/sentry/api/endpoints/api_application_details.py"
+        },
+        {
+          "name": "api_application_rotate_secret.py",
+          "path": "src/sentry/api/endpoints/api_application_rotate_secret.py"
+        },
+        {
+          "name": "api_applications.py",
+          "path": "src/sentry/api/endpoints/api_applications.py"
+        },
+        {
+          "name": "api_authorizations.py",
+          "path": "src/sentry/api/endpoints/api_authorizations.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/sentry/api/endpoints/project_repo_path_parsing.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "508aea6d9f1abba33fef552fae28d6b6d78d66bf",
+          "html_url": "https://github.com/getsentry/sentry/commit/508aea6d9f1abba33fef552fae28d6b6d78d66bf",
+          "message": "ref(cells): Rename silo decorators (#110458)\n\nregion is deprecated, these are `cell_silo_endpoint` and\n`cell_silo_view` now",
+          "author": "Lyn Nagara",
+          "date": "2026-03-11T21:40:48Z"
+        },
+        {
+          "sha": "1439439dd313c95c0c69b8f49af5ef2f241626ec",
+          "html_url": "https://github.com/getsentry/sentry/commit/1439439dd313c95c0c69b8f49af5ef2f241626ec",
+          "message": "fix(code-mappings): handle malformed source path (#105683)\n\nFixes SENTRY-47GS\n\nPassing a malformed/empty `source_path` when creating a code mapping\ncauses `source_path` to be `\"\"`, which results in an error here (since\n`stack_path` always will end with `\"\"`)\n```\n    elif stack_path.endswith(source_p",
+          "author": "Charlie Luo",
+          "date": "2026-01-05T22:38:59Z"
+        },
+        {
+          "sha": "b1c67c24cccd510f5ab7826a77d8bf93ef4ab539",
+          "html_url": "https://github.com/getsentry/sentry/commit/b1c67c24cccd510f5ab7826a77d8bf93ef4ab539",
+          "message": "fix(repo path parsing): Add handling for exception when parsing repo paths (#100134)\n\nFixes\n[SENTRY-479W](https://sentry.sentry.io/issues/6744362113/?project=1&query=is%3Aunresolved%20unsupportedframeinfo&referrer=issue-stream).\n\nAdds handling for the `UnsupportedFrameInfo` exception which can be\nra",
+          "author": "Shashank Jarmale",
+          "date": "2025-09-23T20:30:58Z"
+        },
+        {
+          "sha": "0989767514c1508ed020c8d71f3e673e3f6bc3d0",
+          "html_url": "https://github.com/getsentry/sentry/commit/0989767514c1508ed020c8d71f3e673e3f6bc3d0",
+          "message": "ref(auto_config): Use factory to create the right instance  (#94880)\n\nThere's two ways of creating frame info instances, thus, decoupling into\ntwo different classes.",
+          "author": "Armen Zambrano G.",
+          "date": "2025-07-11T15:14:43Z"
+        },
+        {
+          "sha": "e0b21445b56cc72a442e0a63c49ad5f0aa84f7e1",
+          "html_url": "https://github.com/getsentry/sentry/commit/e0b21445b56cc72a442e0a63c49ad5f0aa84f7e1",
+          "message": "typing: Stronger typing for ProjectRepoPathParsingEndpoint (#92774)",
+          "author": "Armen Zambrano G.",
+          "date": "2025-06-04T11:38:58Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "providers TODO feature flag future",
+      "count": 10,
+      "items": [
+        {
+          "number": 107441,
+          "title": "feat(scm): Add SCM subscriptions platform publisher",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/107441",
+          "is_pull_request": true
+        },
+        {
+          "number": 109468,
+          "title": "Add GitLab to the SCM platform",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/109468",
+          "is_pull_request": true
+        },
+        {
+          "number": 107860,
+          "title": "feat(onboarding): Add Copy as Markdown button to product empty states",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/107860",
+          "is_pull_request": true
+        },
+        {
+          "number": 104215,
+          "title": "feat(seer): Add new onboarding for Seer",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/104215",
+          "is_pull_request": true
+        },
+        {
+          "number": 107825,
+          "title": "feat(preprod): Snapshots upload API",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/107825",
+          "is_pull_request": true
+        },
+        {
+          "number": 92059,
+          "title": "feat(ourlogs): Add infinite table and auto refresh",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/92059",
+          "is_pull_request": true
+        },
+        {
+          "number": 104636,
+          "title": "feat(code-review): Add Seer onboarding/settings status endpoint",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/104636",
+          "is_pull_request": true
+        },
+        {
+          "number": 93134,
+          "title": "feat(feedback): API endpoint for AI feedback summary",
+          "state": "closed",
+          "html_url": "https://github.com/getsentry/sentry/pull/93134",
+          "is_pull_request": true
+        }
+      ]
+    },
+    "issue_comments": [],
+    "related_pr_files": [
+      {
+        "ok": true,
+        "number": 107441,
+        "count": 8,
+        "files": [
+          {
+            "filename": "src/sentry/conf/server.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 0,
+            "changes": 2
+          },
+          {
+            "filename": "src/sentry/integrations/github/webhook.py",
+            "status": "modified",
+            "additions": 24,
+            "deletions": 0,
+            "changes": 24
+          },
+          {
+            "filename": "src/sentry/integrations/github_enterprise/webhook.py",
+            "status": "modified",
+            "additions": 30,
+            "deletions": 0,
+            "changes": 30
+          },
+          {
+            "filename": "src/sentry/options/defaults.py",
+            "status": "modified",
+            "additions": 9,
+            "deletions": 0,
+            "changes": 9
+          },
+          {
+            "filename": "src/sentry/scm/app.py",
+            "status": "added",
+            "additions": 8,
+            "deletions": 0,
+            "changes": 8
+          },
+          {
+            "filename": "src/sentry/scm/errors.py",
+            "status": "modified",
+            "additions": 6,
+            "deletions": 0,
+            "changes": 6
+          },
+          {
+            "filename": "src/sentry/scm/helpers.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2
+          },
+          {
+            "filename": "src/sentry/scm/private/event_stream.py",
+            "status": "added",
+            "additions": 114,
+            "deletions": 0,
+            "changes": 114
+          }
+        ]
+      },
+      {
+        "ok": true,
+        "number": 109468,
+        "count": 8,
+        "files": [
+          {
+            "filename": "src/sentry/integrations/gitlab/client.py",
+            "status": "modified",
+            "additions": 230,
+            "deletions": 8,
+            "changes": 238
+          },
+          {
+            "filename": "src/sentry/integrations/gitlab/utils.py",
+            "status": "modified",
+            "additions": 31,
+            "deletions": 4,
+            "changes": 35
+          },
+          {
+            "filename": "src/sentry/scm/actions.py",
+            "status": "modified",
+            "additions": 45,
+            "deletions": 5,
+            "changes": 50
+          },
+          {
+            "filename": "src/sentry/scm/private/helpers.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 0,
+            "changes": 4
+          },
+          {
+            "filename": "src/sentry/scm/private/ipc.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2
+          },
+          {
+            "filename": "src/sentry/scm/private/provider.py",
+            "status": "modified",
+            "additions": 25,
+            "deletions": 3,
+            "changes": 28
+          },
+          {
+            "filename": "src/sentry/scm/private/providers/github.py",
+            "status": "modified",
+            "additions": 43,
+            "deletions": 8,
+            "changes": 51
+          },
+          {
+            "filename": "src/sentry/scm/private/providers/gitlab.py",
+            "status": "added",
+            "additions": 649,
+            "deletions": 0,
+            "changes": 649
+          }
+        ]
+      }
+    ],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/sentry/api/endpoints/project_repo_path_parsing.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "508aea6d9f1abba33fef552fae28d6b6d78d66bf",
+        "html_url": "https://github.com/getsentry/sentry/commit/508aea6d9f1abba33fef552fae28d6b6d78d66bf",
+        "message": "ref(cells): Rename silo decorators (#110458)\n\nregion is deprecated, these are `cell_silo_endpoint` and\n`cell_silo_view` now",
+        "author": "Lyn Nagara",
+        "date": "2026-03-11T21:40:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

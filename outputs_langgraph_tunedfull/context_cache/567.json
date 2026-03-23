@@ -1,0 +1,449 @@
+{
+  "task_id": "567",
+  "repo_owner": "google",
+  "repo_name": "praxis",
+  "file_path": "praxis/layers/quantization/linears_test.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:17:17+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_generate_quantization_types_modes",
+    "satd_line": 66,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 2,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:17:29+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:17:35+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "praxis/layers/quantization/linears_test.py",
+    "original_code": "def test_linear_quantized_in_inference_mode(self, quantization_type):\n  p_f = pax_fiddle.Config(linears.Linear, name='_linear_f')\n  p_q = pax_fiddle.Config(\n      qlinears.Linear,\n      name='_linear_q',\n      quantization=QuantizationHParams(quantization_type=quantization_type,\n                                       mode=QuantizationMode.INFERENCE),\n  )\n  for p in [p_f, p_q]:\n    p.input_dims = 4\n    p.output_dims = 2\n\n  inputs = jax.random.normal(jax.random.PRNGKey(0), (3, 4)).astype(\n      jnp.float32\n  )\n  quantized_weight = jax.random.randint(\n      jax.random.PRNGKey(0), (4, 2), minval=-128, maxval=127, dtype=jnp.int8\n  )\n  w_scale = jnp.array([0.5, 2.0], dtype=jnp.float32)\n  weight_rescaled = quantized_weight * w_scale\n\n  # TODO(b/262780000): Remove this if statement when the bug is resolved.\n  if quantization_type == QuantizationType.AQT:\n    w_scale = 1 / w_scale\n\n  linear_f = instantiate(p_f)\n  linear_q = instantiate(p_q)\n\n  prng_key = jax.random.PRNGKey(seed=123)\n  initial_vars_f = linear_f.init(prng_key, inputs)\n  initial_vars_q = linear_q.init(prng_key, inputs)\n  initial_vars_f['params']['w'] = weight_rescaled\n  initial_vars_q['params']['w'] = quantized_weight\n  initial_vars_q['params']['w_quantized_scale'] = w_scale\n  outputs_f = linear_f.apply(initial_vars_f, inputs)\n  outputs_q = linear_q.apply(initial_vars_q, inputs)\n  self.assertAllClose(outputs_f, outputs_q)",
+    "satd_comment": "# TODO(b/262780000): Remove this if statement when the bug is resolved.",
+    "target_file": {
+      "ok": true,
+      "path": "praxis/layers/quantization/linears_test.py",
+      "sha": "9138a055213a65ca063f9ac40949edcf052f237d",
+      "download_url": "https://raw.githubusercontent.com/google/praxis/main/praxis/layers/quantization/linears_test.py",
+      "content_excerpt": "# coding=utf-8\n# Copyright 2022 The Pax Authors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Tests for quantized linears.\"\"\"\n\nimport copy\nimport itertools\nfrom typing import Any, Sequence\n\nfrom absl.testing import absltest\nfrom absl.testing import parameterized\nimport jax\nfrom jax import numpy as jnp\nimport numpy as np\nfrom praxis import base_layer\nfrom praxis import pax_fiddle\nfrom praxis import test_utils\nfrom praxis.layers import linears\nfrom praxis.layers.quantization import linears as qlinears\nfrom praxis.layers.quantization import operations as qoperations\nfrom praxis.layers.quantization import quantization_hparams\nfrom praxis.layers.quantization import utils as qutils\n\n\ninstantiate = base_layer.instantiate\nWeightInit = base_layer.WeightInit\nWeightHParams = base_layer.WeightHParams\nQuantizationParams = quantization_hparams.QuantizationParams\nQuantizationMode = quantization_hparams.QuantizationMode\nQuantizationType = quantization_hparams.QuantizationType\n\nPARAMS = base_layer.PARAMS\nNON_TRAINABLE = base_layer.NON_TRAINABLE\nSUMMARIES = base_layer.SUMMARIES\n\n\ndef _generate_quantization_types_modes() -> Sequence[dict[str, Any]]:\n  keys = ['testcase_name', 'quantization_type', 'mode', 'dtype', 'precision']\n  types = [QuantizationType.PTQ, QuantizationType.FQ, QuantizationType.AQT]\n  modes = [QuantizationMode.INFERENCE, QuantizationMode.TRAINING]\n  dtypes = [jnp.int8, jnp.uint8]\n  precisions = [8, 4]\n\n  cases = []\n  for case in itertools.product(types, modes, dtypes, precisions):\n    name = (\n        case[0].value\n        + '_'\n        + case[1].value\n        + '_'\n        + str(case[2])\n        + '_'\n        + str(case[3])\n    )\n    cases.append([name] + list(case))\n\n  return [dict(zip(keys, case)) for case in cases]\n\n\ndef _generate_quantization_types_symmetric() -> Sequence[dict[str, Any]]:\n  keys = [\n      'testcase_name',\n      'quantization_type',\n      'use_symmetric',\n      'precision',\n      'use_int4_packed_weights',\n      'int4_packed_weights_container_dtype',\n  ]\n  quantization_type = [\n      QuantizationType.PTQ,\n      QuantizationType.FQ,\n      QuantizationType.AQT,\n  ]\n  precision = [4, 8]\n  use_symmetric = [True, False]\n  use_int4_packed_weights = [True, False]\n  int4_packed_weights_container_dtype = [jnp.int32, jnp.int8]\n\n  cases = []\n  for case in itertools.product(\n      quantization_type,\n      use_symmetric,\n      precision,\n      use_int4_packed_weights,\n      int4_packed_weights_container_dtype,\n  ):\n    quant_type = case[0].value\n    is_symmetric = 'symmetric' if case[1] else 'asymmetric'\n    prec = str(case[2])\n    pack = 'pack' if case[3] else 'no_pack'\n    dtype = str(case[4])\n    name = '_'.join([quant_type, is_symmetric, prec, pack, dtype])\n\n    if not (prec == '8' and pack):  # Packing of int8 is not supported.\n      cases.append([name] + list(case))\n\n  return [dict(zip(keys, case)) for case in cases]\n\n\nclass QuantizedLinearTest(test_utils.TestCase):\n\n  def setUp(self):\n    super().setUp()\n    np.random.seed(123456)\n\n  @parameterized.named_parameters(_generate_quantization_types_modes())\n  def test_linear_quantized(self, quantization_type, mode, dtype, precision):\n    p = pax_fiddle.Config(\n        qlinears.Linear,\n        name='_linear',\n        input_dims=8,\n        output_dims=4,\n        quantization=QuantizationParams(\n            quantization_type=quantization_type,\n            mode=mode,\n            weight_params=quantization_hparams.WeightQuantizationParams(\n                dtype=dtype,\n                precision=precision,\n            ),\n        ),\n    )\n    linear = instantiate(p)\n    inputs = jnp.array(\n        [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]],\n        dtype=p.dtype,\n    )\n    with base_layer.JaxContext.new_context():\n      prng_key = jax.random.PRNGKey(seed=123)\n      initial_vars = linear.init(prng_key, inputs)\n      outputs = linear.apply(initial_vars, inputs)\n    self.assertEqual(outputs.shape, (2, 4))\n    if mode == QuantizationMode.INFERENCE:\n      self.assertAllClose(jnp.full((2, 4), 0.0), outputs)\n    else:\n      self.assertRaises(AssertionError, self.assertAllClose,\n                        jnp.full((2, 4), 0.0, dtype=p.dtype), outputs)\n\n  def test_linear_aqt_quantized(self):\n    p_q = pax_fiddle.Config(\n        qlinears.Linear,\n        name='_linear_q',\n        quantization=QuantizationParams(\n            quantization_type=QuantizationType.AQT,\n            mode=QuantizationMode.TRAINING,\n            act_params=quantization_hparams.ActQuantizationParams(precision=3),\n            weight_params=quantization_hparams.WeightQuantizationParams(\n                precision=2,\n                add_scale_eps=False,\n            ),\n        ),\n    )\n    p_q.input_dims = 3\n    p_q.output_dims = 2\n\n    inputs = np.array(\n        [\n            [-7.0, 4.01, 4.01],\n            [-7.0, 0.01, -4.01],\n        ],)\n\n    weight = np.array(\n        [\n            [-1.5, 0.99],\n            [-0.99, 0],\n            [-0.01, 1.5]\n        ],)\n    expected_output = np.array(\n        [\n            [3.5, -3.5],\n            [10.5, -17.5]\n        ])\n\n    linear_q = instantiate(p_q)\n    with base_layer.JaxContext.new_context():\n      prng_key = jax.random.PRNGKey(seed=123)\n      initial_vars_q = linear_q.init(prng_key, inputs)\n      initial_vars_q['params']['w'] = weight\n      outputs_q = linear_q.apply(initial_vars_q, inputs)\n    self.assertAllClose(expected_output, outputs_q)\n\n  def _get_layer_and_inputs(self):\n    p_q = pax_fiddle.Config(\n        qlinears.Linear,\n        name='_linear_q',\n        quantization=QuantizationParams(\n            quantization_type=QuantizationType.AQT,\n            mode=QuantizationMode.TRAINING,\n            act_params=quantization_hparams.ActQuantizationParams(precision=3),\n            weight_params=quantization_hparams.WeightQuantizationParams(\n                precision=2,\n                use_step_count=True,\n            ),\n        ),\n    )\n    p_q.input_dims = 4\n    p_q.output_dims = 4\n\n    inputs = np.random.normal(size=[4, 4, p_q.input_dims]).astype(np.float32)\n\n    linear_q = instantiate(p_q)\n    return linear_q, inputs\n\n  def test_linear_step_count_in_eval(self):\n    linear_q, inputs = self._get_layer_and_inputs()\n    context_params = base_layer.JaxContext.HParams(do_eval=True)\n    with base_layer.JaxContext.new_context(hparams=context_params):\n      prng_key = jax.random.PRNGKey(seed=123)\n      initial_vars_q = linear_q.init(prng_key, inputs)\n      _, updated_variables = linear_q.apply(\n          initial_vars_q, inputs, mutable=[NON_TRAINABLE])\n    # In eval mode step_count is not changed\n    self.assertArraysEqual(updated_variables[NON_TRAINABLE]['step_count'],\n                           np.array([0]))\n\n  def test_linear_step_count_in_train(self):\n    linear_q, inputs = self._get_layer_and_inputs()\n    context_params = base_layer.JaxContext.HParams(do_eval=False)\n    with base_layer.JaxContext.new_context(hparams=context_params):\n      prng_key = jax.random.PRNGKey(seed=123)\n      initial_vars_q = linear_q.init(prng_key, inputs)\n      _, updated_vars = linear_q.apply(\n          initial_vars_q, inputs, mutable=[PARAMS, NON_TRAINABLE, SUMMARIES]\n      )\n    self.assertArraysEqual(\n        updated_vars[NON_TRAINABLE]['step_count'], np.array([1])\n    )\n    self.assertArraysEqual(\n        updated_vars[SUMMARIES]['step_count_scalar'], np.array([0])\n    )\n\n    with base_layer.JaxContext.new_context(hparams=context_params):\n      _, updated_vars = linear_q.apply(\n          updated_vars, inputs, mutable=[PARAMS, NON_TRAINABLE, SUMMARIES]\n      )\n    self.assertArraysEqual(\n        updated_vars[NON_TRAINABLE]['step_count'], np.array([2])\n    )\n    self.assertArraysEqual(\n        updated_vars[SUMMARIES]['step_count_scalar'], np.array([1])\n    )\n\n  def test_linear_calibration(self):\n    p_q = pax_fiddle.Config(\n        qlinears.Linear,\n        name='_linear_q',\n        quantization=QuantizationParams(\n            mode=QuantizationMode.CALIB,\n            quantization_type=QuantizationType.FR,\n        ),\n        input_dims=3,\n        output_dims=3,\n    )\n    linear_q = instantiate(p_q)\n    inputs = jnp.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=jnp.float32)\n\n    context_params = base_layer.JaxContext.HParams(do_eval=False)\n    with base_layer.JaxContext.new_context(hparams=context_params):\n      prng_key = jax.random.PRNGKey(seed=123)\n      initial_vars_q = linear_q.init(prng_key, inputs)\n      self.assertArraysEqual(\n          initial_vars_q[NON_TRAINABLE]['framestat'],\n          jnp.array([0], dtype=jnp.bfloat16),\n      )\n      _, updated_vars = linear_q.apply(\n          initial_vars_q, inputs, mutable=[PARAMS, NON_TRAINABLE, SUMMARIES]\n      )\n      self.assertArraysEqual(\n          updated_vars[NON_TRAINABLE]['framestat'],\n          jnp.array([9], dtype=jnp.bfloat16),\n      )\n\n      # No grad.\n      def loss(params, inputs):\n        return jnp.sum(linear_q.apply(params, inputs)[0])\n\n      grad = jax.grad(loss)(initial_vars_q, inputs)\n      self.assertArraysEqual(\n          grad['params']['w'],\n          jnp.zeros_like(initial_vars_q['params']['w'], dtype=jnp.float32),\n      )\n\n  def test_int4_weight_init(self):\n    p = pax_fiddle.Config(\n        qlinears.Linear,\n        name='linear',\n        input_dims=16,\n        output_dims=32,\n        quantization=QuantizationParams(\n            mode=QuantizationMode.INFERENCE,\n            weight_params=quantization_hparams.WeightQuantizationParams(\n                precision=4,\n                dtype=jnp.int4,\n                use_int4_packed_weights=False,\n            ),\n            act_params=quantization_hparams.ActQuantizationParams(precision=4),\n        ),\n    )\n    linear = instantiate(p)\n    with base_layer.JaxContext.new_context():\n      inputs = jnp.zeros([1, p.input_dims], dtype=jnp.float32)\n      linear_vars = linear.init(jax.random.PRNGKey(123), inputs)\n      self.assertEqual(linear_vars['params']['w'].dtype, jnp.int4)\n      linear.apply(linear_vars, inputs)\n\n  @parameterized.product(\n      input_dim=[64, 256, 1024],\n      apply_jit=[False, True],\n      jit_backend=['cpu', None],\n  )\n  def test_int4_packed_weight_equality(self, input_dim, apply_jit, jit_backend):\n    p_int32_packed = pax_fiddle.Config(\n        qlinears.Linear,\n        name='_linear',\n        input_dims=input_dim,\n        output_dims=128 * 8,\n        quantization=QuantizationParams(\n            quantization_type=QuantizationType.PTQ,\n            mode=QuantizationMode.INFERENCE,\n            weight_params=quantization_hparams.WeightQuantizationParams(\n                precision=4,\n                use_int4_packed_weights=True,\n                dtype=jnp.int8,\n                int4_packed_weights_container_dtype=jnp.int32,\n            ),\n        ),\n    )\n    p_unpacked = p_int32_packed.clone()\n    p_unpacked.quantization.weight_params.use_int4_packed_weights = False\n    p_int8_packed = p_int32_packed.clone()\n    p_int8_packed.quantization.weight_params.int4_packed_weights_container_dtype = (\n        jnp.int8\n    )\n    linear_int32_packed = instantiate(p_int32_packed)\n    linear_int8_packed = instantiate(p_int8_packed)\n    linear_unpacked = instantiate(p_unpacked)\n    inputs = np.random.normal(size=[1, 1, p_int32_packed.input_dims]).astype(\n        np.float32\n    )\n\n    with base_layer.JaxContext.new_context():\n      prng_key = jax.random.PRNGKey(seed=123)\n      w = jax.random.randint(\n          prng_key,\n          shape=[p_int32_packed.input_dims, p_int32_packed.output_dims],\n          minval=qoperations.",
+      "total_lines": 810
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 66,
+      "start_line": 46,
+      "end_line": 86,
+      "matched_line": "    )",
+      "excerpt": "46: SUMMARIES = base_layer.SUMMARIES\n47: \n48: \n49: def _generate_quantization_types_modes() -> Sequence[dict[str, Any]]:\n50:   keys = ['testcase_name', 'quantization_type', 'mode', 'dtype', 'precision']\n51:   types = [QuantizationType.PTQ, QuantizationType.FQ, QuantizationType.AQT]\n52:   modes = [QuantizationMode.INFERENCE, QuantizationMode.TRAINING]\n53:   dtypes = [jnp.int8, jnp.uint8]\n54:   precisions = [8, 4]\n55: \n56:   cases = []\n57:   for case in itertools.product(types, modes, dtypes, precisions):\n58:     name = (\n59:         case[0].value\n60:         + '_'\n61:         + case[1].value\n62:         + '_'\n63:         + str(case[2])\n64:         + '_'\n65:         + str(case[3])\n66:     )\n67:     cases.append([name] + list(case))\n68: \n69:   return [dict(zip(keys, case)) for case in cases]\n70: \n71: \n72: def _generate_quantization_types_symmetric() -> Sequence[dict[str, Any]]:\n73:   keys = [\n74:       'testcase_name',\n75:       'quantization_type',\n76:       'use_symmetric',\n77:       'precision',\n78:       'use_int4_packed_weights',\n79:       'int4_packed_weights_container_dtype',\n80:   ]\n81:   quantization_type = [\n82:       QuantizationType.PTQ,\n83:       QuantizationType.FQ,\n84:       QuantizationType.AQT,\n85:   ]\n86:   precision = [4, 8]"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_generate_quantization_types_modes",
+      "start_line": 49,
+      "end_line": 69,
+      "source": "def _generate_quantization_types_modes() -> Sequence[dict[str, Any]]:\n  keys = ['testcase_name', 'quantization_type', 'mode', 'dtype', 'precision']\n  types = [QuantizationType.PTQ, QuantizationType.FQ, QuantizationType.AQT]\n  modes = [QuantizationMode.INFERENCE, QuantizationMode.TRAINING]\n  dtypes = [jnp.int8, jnp.uint8]\n  precisions = [8, 4]\n\n  cases = []\n  for case in itertools.product(types, modes, dtypes, precisions):\n    name = (\n        case[0].value\n        + '_'\n        + case[1].value\n        + '_'\n        + str(case[2])\n        + '_'\n        + str(case[3])\n    )\n    cases.append([name] + list(case))\n\n  return [dict(zip(keys, case)) for case in cases]"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "itertools",
+        "typing:Any",
+        "typing:Sequence",
+        "absl.testing:absltest",
+        "absl.testing:parameterized",
+        "jax",
+        "jax:numpy",
+        "numpy",
+        "praxis:base_layer",
+        "praxis:pax_fiddle",
+        "praxis:test_utils",
+        "praxis.layers:linears",
+        "praxis.layers.quantization:linears",
+        "praxis.layers.quantization:operations",
+        "praxis.layers.quantization:quantization_hparams",
+        "praxis.layers.quantization:utils"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/google/praxis/main/README.md",
+      "content_excerpt": "# Praxis\n\nWhat is Praxis?\nPraxis is the layer library for [Pax](https://github.com/google/paxml/). While Praxis is optimized for ML at scale, Praxis has a goal to be usable by other JAX-based ML projects.\n\n\nSome examples of layers to be folded into Praxis are in the [praxis/layers/](https://github.com/google/praxis/tree/main/praxis/layers) directory.\n\n\n    Copyright 2022 Google LLC\n\n    Licensed under the Apache License, Version 2.0 (the \"License\");\n    you may not use this file except in compliance with the License.\n    You may obtain a copy of the License at\n\n        https://www.apache.org/licenses/LICENSE-2.0\n\n    Unless required by applicable law or agreed to in writing, software\n    distributed under the License is distributed on an \"AS IS\" BASIS,\n    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n    See the License for the specific language governing permissions and\n    limitations under the License.\n"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_generate_quantization_types_modes test",
+      "count": 2,
+      "items": [
+        {
+          "name": "attentions_test.py",
+          "path": "praxis/layers/quantization/attentions_test.py",
+          "sha": "75f772e2a3c67848322175bd9e31841304791b19",
+          "html_url": "https://github.com/google/praxis/blob/a5b393dcdddb414efd8d87e980d4641823e58a1e/praxis/layers/quantization/attentions_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "linears_test.py",
+          "path": "praxis/layers/quantization/linears_test.py",
+          "sha": "9138a055213a65ca063f9ac40949edcf052f237d",
+          "html_url": "https://github.com/google/praxis/blob/a5b393dcdddb414efd8d87e980d4641823e58a1e/praxis/layers/quantization/linears_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_generate_quantization_types_modes(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "attentions_test.py",
+          "path": "praxis/layers/quantization/attentions_test.py",
+          "sha": "75f772e2a3c67848322175bd9e31841304791b19",
+          "html_url": "https://github.com/google/praxis/blob/a5b393dcdddb414efd8d87e980d4641823e58a1e/praxis/layers/quantization/attentions_test.py",
+          "score": 1.0
+        },
+        {
+          "name": "linears_test.py",
+          "path": "praxis/layers/quantization/linears_test.py",
+          "sha": "9138a055213a65ca063f9ac40949edcf052f237d",
+          "html_url": "https://github.com/google/praxis/blob/a5b393dcdddb414efd8d87e980d4641823e58a1e/praxis/layers/quantization/linears_test.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "praxis/layers/quantization",
+      "count": 38,
+      "entries": [
+        {
+          "name": "BUILD",
+          "path": "praxis/layers/quantization/BUILD",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "praxis/layers/quantization/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "attentions.py",
+          "path": "praxis/layers/quantization/attentions.py",
+          "type": "file"
+        },
+        {
+          "name": "attentions_test.py",
+          "path": "praxis/layers/quantization/attentions_test.py",
+          "type": "file"
+        },
+        {
+          "name": "automl_select.py",
+          "path": "praxis/layers/quantization/automl_select.py",
+          "type": "file"
+        },
+        {
+          "name": "automl_select_test.py",
+          "path": "praxis/layers/quantization/automl_select_test.py",
+          "type": "file"
+        },
+        {
+          "name": "conformers.py",
+          "path": "praxis/layers/quantization/conformers.py",
+          "type": "file"
+        },
+        {
+          "name": "conformers_test.py",
+          "path": "praxis/layers/quantization/conformers_test.py",
+          "type": "file"
+        },
+        {
+          "name": "convolutions.py",
+          "path": "praxis/layers/quantization/convolutions.py",
+          "type": "file"
+        },
+        {
+          "name": "convolutions_test.py",
+          "path": "praxis/layers/quantization/convolutions_test.py",
+          "type": "file"
+        },
+        {
+          "name": "einsum.py",
+          "path": "praxis/layers/quantization/einsum.py",
+          "type": "file"
+        },
+        {
+          "name": "einsum_test.py",
+          "path": "praxis/layers/quantization/einsum_test.py",
+          "type": "file"
+        },
+        {
+          "name": "embedding_softmax.py",
+          "path": "praxis/layers/quantization/embedding_softmax.py",
+          "type": "file"
+        },
+        {
+          "name": "embedding_softmax_test.py",
+          "path": "praxis/layers/quantization/embedding_softmax_test.py",
+          "type": "file"
+        },
+        {
+          "name": "linears.py",
+          "path": "praxis/layers/quantization/linears.py",
+          "type": "file"
+        },
+        {
+          "name": "linears_test.py",
+          "path": "praxis/layers/quantization/linears_test.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_query_attention.py",
+          "path": "praxis/layers/quantization/multi_query_attention.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_query_attention_test.py",
+          "path": "praxis/layers/quantization/multi_query_attention_test.py",
+          "type": "file"
+        },
+        {
+          "name": "ngrammer.py",
+          "path": "praxis/layers/quantization/ngrammer.py",
+          "type": "file"
+        },
+        {
+          "name": "ngrammer_test.py",
+          "path": "praxis/layers/quantization/ngrammer_test.py",
+          "type": "file"
+        },
+        {
+          "name": "operations.py",
+          "path": "praxis/layers/quantization/operations.py",
+          "type": "file"
+        },
+        {
+          "name": "operations_test.py",
+          "path": "praxis/layers/quantization/operations_test.py",
+          "type": "file"
+        },
+        {
+          "name": "optimization.py",
+          "path": "praxis/layers/quantization/optimization.py",
+          "type": "file"
+        },
+        {
+          "name": "optimization_test.py",
+          "path": "praxis/layers/quantization/optimization_test.py",
+          "type": "file"
+        },
+        {
+          "name": "overflow_check.py",
+          "path": "praxis/layers/quantization/overflow_check.py",
+          "type": "file"
+        },
+        {
+          "name": "overflow_check_test.py",
+          "path": "praxis/layers/quantization/overflow_check_test.py",
+          "type": "file"
+        },
+        {
+          "name": "quantization_hparams.py",
+          "path": "praxis/layers/quantization/quantization_hparams.py",
+          "type": "file"
+        },
+        {
+          "name": "quantization_test.py",
+          "path": "praxis/layers/quantization/quantization_test.py",
+          "type": "file"
+        },
+        {
+          "name": "quantize.py",
+          "path": "praxis/layers/quantization/quantize.py",
+          "type": "file"
+        },
+        {
+          "name": "quantize_test.py",
+          "path": "praxis/layers/quantization/quantize_test.py",
+          "type": "file"
+        },
+        {
+          "name": "quantizer.py",
+          "path": "praxis/layers/quantization/quantizer.py",
+          "type": "file"
+        },
+        {
+          "name": "quantizer_test.py",
+          "path": "praxis/layers/quantization/quantizer_test.py",
+          "type": "file"
+        },
+        {
+          "name": "searchable.py",
+          "path": "praxis/layers/quantization/searchable.py",
+          "type": "file"
+        },
+        {
+          "name": "searchable_test.py",
+          "path": "praxis/layers/quantization/searchable_test.py",
+          "type": "file"
+        },
+        {
+          "name": "sparsity",
+          "path": "praxis/layers/quantization/sparsity",
+          "type": "dir"
+        },
+        {
+          "name": "tests",
+          "path": "praxis/layers/quantization/tests",
+          "type": "dir"
+        },
+        {
+          "name": "utils.py",
+          "path": "praxis/layers/quantization/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "utils_test.py",
+          "path": "praxis/layers/quantization/utils_test.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "BUILD",
+          "path": "praxis/layers/quantization/BUILD"
+        },
+        {
+          "name": "__init__.py",
+          "path": "praxis/layers/quantization/__init__.py"
+        },
+        {
+          "name": "attentions.py",
+          "path": "praxis/layers/quantization/attentions.py"
+        },
+        {
+          "name": "attentions_test.py",
+          "path": "praxis/layers/quantization/attentions_test.py"
+        },
+        {
+          "name": "automl_select.py",
+          "path": "praxis/layers/quantization/automl_select.py"
+        },
+        {
+          "name": "automl_select_test.py",
+          "path": "praxis/layers/quantization/automl_select_test.py"
+        },
+        {
+          "name": "conformers.py",
+          "path": "praxis/layers/quantization/conformers.py"
+        },
+        {
+          "name": "conformers_test.py",
+          "path": "praxis/layers/quantization/conformers_test.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "praxis/layers/quantization/linears_test.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "d903d684924b12d3c89309bd12487430b999f0d3",
+          "html_url": "https://github.com/google/praxis/commit/d903d684924b12d3c89309bd12487430b999f0d3",
+          "message": "Replace deprecated `jax.tree_*` functions with `jax.tree.*`\n\nThe top-level `jax.tree_*` aliases have long been deprecated, and will soon be removed. Alternate APIs are in `jax.tree_util`, with shorter aliases in the `jax.tree` submodule, added in JAX version 0.4.25.\n\nPiperOrigin-RevId: 633991844",
+          "author": "Jake VanderPlas",
+          "date": "2024-05-15T17:05:22Z"
+        },
+        {
+          "sha": "ab887914dea4776bf6f052f8ca195ae0291b2d68",
+          "html_url": "https://github.com/google/praxis/commit/ab887914dea4776bf6f052f8ca195ae0291b2d68",
+          "message": "Apply pytype to more unit tests.\n\nPiperOrigin-RevId: 620409331",
+          "author": "Laurent El Shafey",
+          "date": "2024-03-30T03:38:25Z"
+        },
+        {
+          "sha": "0d7a4a4dd8d8ab9ac40210f23ea8b35e413b33e8",
+          "html_url": "https://github.com/google/praxis/commit/0d7a4a4dd8d8ab9ac40210f23ea8b35e413b33e8",
+          "message": "Quantization of Linear layer with LoRA.\n\nPiperOrigin-RevId: 610484826",
+          "author": "Oleg Rybakov",
+          "date": "2024-02-26T20:07:56Z"
+        },
+        {
+          "sha": "1dd2bb08545327374f52181748f85adfe02324e7",
+          "html_url": "https://github.com/google/praxis/commit/1dd2bb08545327374f52181748f85adfe02324e7",
+          "message": "Add calibration.\n\nPiperOrigin-RevId: 608187171",
+          "author": "Jian Li",
+          "date": "2024-02-19T02:02:02Z"
+        },
+        {
+          "sha": "d2d3bb89770de2b3af666981295c23defb38bd2f",
+          "html_url": "https://github.com/google/praxis/commit/d2d3bb89770de2b3af666981295c23defb38bd2f",
+          "message": "Ensure that `int4` types are only used in `load` and `cast` operations on CPU/GPU.\n\nPiperOrigin-RevId: 604141491",
+          "author": "Phoenix Meadowlark",
+          "date": "2024-02-04T21:44:09Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_generate_quantization_types_modes TODO 262780000 Remove this statement",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "praxis/layers/quantization/linears_test.py",
+      "satd_line": 66,
+      "last_commit": {
+        "sha": "d903d684924b12d3c89309bd12487430b999f0d3",
+        "html_url": "https://github.com/google/praxis/commit/d903d684924b12d3c89309bd12487430b999f0d3",
+        "message": "Replace deprecated `jax.tree_*` functions with `jax.tree.*`\n\nThe top-level `jax.tree_*` aliases have long been deprecated, and will soon be removed. Alternate APIs are in `jax.tree_util`, with shorter aliases in the `jax.tree` submodule, added in JAX version 0.4.25.\n\nPiperOrigin-RevId: 633991844",
+        "author": "Jake VanderPlas",
+        "date": "2024-05-15T17:05:22Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "unit test present",
+        "clear SATD comment referencing a bug",
+        "localized code change (single if statement)",
+        "test asserts output closeness"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_generate_quantization_types_modes",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

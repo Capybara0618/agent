@@ -1,0 +1,228 @@
+{
+  "task_id": "646",
+  "repo_owner": "odoo",
+  "repo_name": "odoo",
+  "file_path": "addons/sale_purchase/models/sale_order.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T18:39:51+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T18:40:02+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T18:40:09+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "addons/sale_purchase/models/sale_order.py",
+    "original_code": "def _purchase_service_create(self, quantity=False):\n    \"\"\" On Sales Order confirmation, some lines (services ones) can create a purchase order line and maybe a purchase order.\n        If a line should create a RFQ, it will check for existing PO. If no one is find, the SO line will create one, then adds\n        a new PO line. The created purchase order line will be linked to the SO line.\n        :param quantity: the quantity to force on the PO line, expressed in SO line UoM\n    \"\"\"\n    PurchaseOrder = self.env['purchase.order']\n    supplier_po_map = {}\n    sale_line_purchase_map = {}\n    for line in self:\n        line = line.with_company(line.company_id)\n        # determine vendor of the order (take the first matching company and product)\n        # VFE fixme why isn't the _select_seller function used ???\n        suppliers = line.product_id.seller_ids.filtered(lambda vendor: (not vendor.company_id or vendor.company_id == line.company_id) and (not vendor.product_id or vendor.product_id == line.product_id))\n        if not suppliers:\n            raise UserError(_(\"There is no vendor associated to the product %s. Please define a vendor for this product.\") % (line.product_id.display_name,))\n        supplierinfo = suppliers[0]\n        partner_supplier = supplierinfo.name  # yes, this field is not explicit .... it is a res.partner !\n\n        # determine (or create) PO\n        purchase_order = supplier_po_map.get(partner_supplier.id)\n        if not purchase_order:\n            purchase_order = PurchaseOrder.search([\n                ('partner_id', '=', partner_supplier.id),\n                ('state', '=', 'draft'),\n                ('company_id', '=', line.company_id.id),\n            ], limit=1)\n        if not purchase_order:\n            values = line._purchase_service_prepare_order_values(supplierinfo)\n            purchase_order = PurchaseOrder.create(values)\n        else:  # update origin of existing PO\n            so_name = line.order_id.name\n            origins = []\n            if purchase_order.origin:\n                origins = purchase_order.origin.split(', ') + origins\n            if so_name not in origins:\n                origins += [so_name]\n                purchase_order.write({\n                    'origin': ', '.join(origins)\n                })\n        supplier_po_map[partner_supplier.id] = purchase_order\n\n        # add a PO line to the PO\n        values = line._purchase_service_prepare_line_values(purchase_order, quantity=quantity)\n        purchase_line = line.env['purchase.order.line'].create(values)\n\n        # link the generated purchase to the SO line\n        sale_line_purchase_map.setdefault(line, line.env['purchase.order.line'])\n        sale_line_purchase_map[line] |= purchase_line\n    return sale_line_purchase_map",
+    "satd_comment": "# VFE fixme why isn't the _select_seller function used ???",
+    "target_file": {
+      "ok": true,
+      "path": "addons/sale_purchase/models/sale_order.py",
+      "sha": "dbcc869c082a88c6b63045d377b0d98acc757755",
+      "download_url": "https://raw.githubusercontent.com/odoo/odoo/19.0/addons/sale_purchase/models/sale_order.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# Part of Odoo. See LICENSE file for full copyright and licensing details.\n\nfrom odoo import api, fields, models, _\n\n\nclass SaleOrder(models.Model):\n    _inherit = 'sale.order'\n\n    purchase_order_count = fields.Integer(\n        \"Number of Purchase Order Generated\",\n        compute='_compute_purchase_order_count',\n        groups='purchase.group_purchase_user')\n\n    @api.depends('order_line.purchase_line_ids.order_id')\n    def _compute_purchase_order_count(self):\n        for order in self:\n            order.purchase_order_count = len(order._get_purchase_orders())\n\n    def _action_confirm(self):\n        result = super(SaleOrder, self)._action_confirm()\n        for order in self:\n            order.order_line.sudo()._purchase_service_generation()\n        return result\n\n    def _action_cancel(self):\n        result = super()._action_cancel()\n        # When a sale person cancel a SO, he might not have the rights to write\n        # on PO. But we need the system to create an activity on the PO (so 'write'\n        # access), hence the `sudo`.\n        self.sudo()._activity_cancel_on_purchase()\n        return result\n\n    def action_view_purchase_orders(self):\n        self.ensure_one()\n        purchase_order_ids = self._get_purchase_orders().ids\n        action = {\n            'res_model': 'purchase.order',\n            'type': 'ir.actions.act_window',\n        }\n        if len(purchase_order_ids) == 1:\n            action.update({\n                'view_mode': 'form',\n                'res_id': purchase_order_ids[0],\n            })\n        else:\n            action.update({\n                'name': _(\"Purchase Order generated from %s\", self.name),\n                'domain': [('id', 'in', purchase_order_ids)],\n                'view_mode': 'list,form',\n            })\n        return action\n\n    def _get_purchase_orders(self):\n        return self.order_line.purchase_line_ids.order_id\n\n    def _activity_cancel_on_purchase(self):\n        \"\"\" If some SO are cancelled, we need to put an activity on their generated purchase. If sale lines of\n            different sale orders impact different purchase, we only want one activity to be attached.\n        \"\"\"\n        purchase_to_notify_map = {}  # map PO -> recordset of SOL as {purchase.order: set(sale.orde.liner)}\n\n        purchase_order_lines = self.env['purchase.order.line'].search([\n            ('sale_line_id', 'in', self.mapped('order_line').ids),\n            ('state', '!=', 'cancel'),\n            ('product_id.service_to_purchase', '=', True),\n        ])\n        for purchase_line in purchase_order_lines:\n            purchase_to_notify_map.setdefault(purchase_line.order_id, self.env['sale.order.line'])\n            purchase_to_notify_map[purchase_line.order_id] |= purchase_line.sale_line_id\n\n        for purchase_order, sale_order_lines in purchase_to_notify_map.items():\n            purchase_order._activity_schedule_with_view('mail.mail_activity_data_warning',\n                user_id=purchase_order.user_id.id or self.env.uid,\n                views_or_xmlid='sale_purchase.exception_purchase_on_sale_cancellation',\n                render_context={\n                    'sale_orders': sale_order_lines.mapped('order_id'),\n                    'sale_order_lines': sale_order_lines,\n            })\n",
+      "total_lines": 79
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "odoo:api",
+        "odoo:fields",
+        "odoo:models",
+        "odoo:_"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/odoo/odoo/19.0/README.md",
+      "content_excerpt": "# Odoo\n\n[![Build Status](https://runbot.odoo.com/runbot/badge/flat/1/master.svg)](https://runbot.odoo.com/runbot)\n[![Tech Doc](https://img.shields.io/badge/master-docs-875A7B.svg?style=flat&colorA=8F8F8F)](https://www.odoo.com/documentation/master)\n[![Help](https://img.shields.io/badge/master-help-875A7B.svg?style=flat&colorA=8F8F8F)](https://www.odoo.com/forum/help-1)\n[![Nightly Builds](https://img.shields.io/badge/master-nightly-875A7B.svg?style=flat&colorA=8F8F8F)](https://nightly.odoo.com/)\n\nOdoo is a suite of web based open source business apps.\n\nThe main Odoo Apps include an [Open Source CRM](https://www.odoo.com/page/crm),\n[Website Builder](https://www.odoo.com/app/website),\n[eCommerce](https://www.odoo.com/app/ecommerce),\n[Warehouse Management](https://www.odoo.com/app/inventory),\n[Project Management](https://www.odoo.com/app/project),\n[Billing &amp; Accounting](https://www.odoo.com/app/accounting),\n[Point of Sale](https://www.odoo.com/app/point-of-sale-shop),\n[Human Resources](https://www.odoo.com/app/employees),\n[Marketing](https://www.odoo.com/app/social-marketing),\n[Manufacturing](https://www.odoo.com/app/manufacturing),\n[...](https://www.odoo.com/)\n\nOdoo Apps can be used as stand-alone applications, but they also integrate seamlessly so you get\na full-featured [Open Source ERP](https://www.odoo.com) when you install several Apps.\n\n## Getting started with Odoo\n\nFor a standard installation please follow the [Setup instructions](https://www.odoo.com/documentation/master/administration/install/install.html)\nfrom the documentation.\n\nTo learn the software, we recomme"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "_purchase_service_create test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_purchase_service_create(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "sale_order_line.py",
+          "path": "addons/sale_purchase/models/sale_order_line.py",
+          "sha": "4fff30ce1c1c7c198c7b8a28b78b89d0e2800088",
+          "html_url": "https://github.com/odoo/odoo/blob/1d0db6a2e69d35d7c68d8e1835e5776180c68151/addons/sale_purchase/models/sale_order_line.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "addons/sale_purchase/models",
+      "count": 5,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "addons/sale_purchase/models/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "product_template.py",
+          "path": "addons/sale_purchase/models/product_template.py",
+          "type": "file"
+        },
+        {
+          "name": "purchase_order.py",
+          "path": "addons/sale_purchase/models/purchase_order.py",
+          "type": "file"
+        },
+        {
+          "name": "sale_order.py",
+          "path": "addons/sale_purchase/models/sale_order.py",
+          "type": "file"
+        },
+        {
+          "name": "sale_order_line.py",
+          "path": "addons/sale_purchase/models/sale_order_line.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 4,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "addons/sale_purchase/models/__init__.py"
+        },
+        {
+          "name": "product_template.py",
+          "path": "addons/sale_purchase/models/product_template.py"
+        },
+        {
+          "name": "purchase_order.py",
+          "path": "addons/sale_purchase/models/purchase_order.py"
+        },
+        {
+          "name": "sale_order_line.py",
+          "path": "addons/sale_purchase/models/sale_order_line.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "addons/sale_purchase/models/sale_order.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "2713876dbc70d3984e584a9037a2206dcda4e84a",
+          "html_url": "https://github.com/odoo/odoo/commit/2713876dbc70d3984e584a9037a2206dcda4e84a",
+          "message": "[REF] stock, *: add reference\n\nThe model `procurement.group` is replaced by a more flexible one:\n`stock.reference`. The first one was somehow not well understood and a\nbit limited by its many2one links to other business model (Sales Order,\nPurchase Order, ...). The reference is made of a name and ma",
+          "author": "Arnold Moyaux",
+          "date": "2025-03-20T10:20:11Z"
+        },
+        {
+          "sha": "9144eb051538d5a92d403e1ad9c635ce39e090ec",
+          "html_url": "https://github.com/odoo/odoo/commit/9144eb051538d5a92d403e1ad9c635ce39e090ec",
+          "message": "[REV] *: Restore the model `_name`\n\nFollowing internal discussions, the python typing and inheritance task is\ncanceled. The use of the class name instead of '_name' was done to allow\nnotations such as `partner_id = fields.Many2one[base.ResParter](string='Partner')`.\nSince this notation is canceled, ",
+          "author": "Gorash",
+          "date": "2024-11-12T11:37:02Z"
+        },
+        {
+          "sha": "f10bd8ddcf99c9247dca417fefbc260454d74ea1",
+          "html_url": "https://github.com/odoo/odoo/commit/f10bd8ddcf99c9247dca417fefbc260454d74ea1",
+          "message": "[IMP] *: adapt model class names to correspond to model names (apply script)\n\nPart-of: odoo/odoo#178200\nRelated: odoo/enterprise#69762\nRelated: odoo/documentation#11115\nRelated: odoo/upgrade#6577\nRelated: odoo/design-themes#988\nRelated: odoo/upgrade-util#143",
+          "author": "Gorash",
+          "date": "2024-10-10T09:11:45Z"
+        },
+        {
+          "sha": "706431510110a005618a2acaf6566f2bb61d5114",
+          "html_url": "https://github.com/odoo/odoo/commit/706431510110a005618a2acaf6566f2bb61d5114",
+          "message": "[IMP] all: replace <tree> in <list> (from script)\n\nPart-of: odoo/odoo#159909\nRelated: odoo/enterprise#59787\nRelated: odoo/documentation#8446\nRelated: odoo/upgrade#5884\nSigned-off-by: Christophe Monniez (moc) <moc@odoo.com>",
+          "author": "Gorash",
+          "date": "2024-09-09T22:41:15Z"
+        },
+        {
+          "sha": "7a146e6f0b2d17af1dc496807d0025e1c7ba0c19",
+          "html_url": "https://github.com/odoo/odoo/commit/7a146e6f0b2d17af1dc496807d0025e1c7ba0c19",
+          "message": "[FIX] sale_purchase: change to _action_cancel\n\nAn activity should be posted only when a SO is cancelled, this happens\nafter _action_cancel as action_cancel doesn't always cancel the order.\n\nsale_purchase was forgotten in commit\n7c8f15d4141d4ae130da59d58ee2eaff39e363c4\n\ncloses odoo/odoo#81569\n\nRelate",
+          "author": "Demesmaeker",
+          "date": "2022-05-09T10:43:13Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_purchase_service_create fixme _select_seller function used",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "addons/sale_purchase/models/sale_order.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "2713876dbc70d3984e584a9037a2206dcda4e84a",
+        "html_url": "https://github.com/odoo/odoo/commit/2713876dbc70d3984e584a9037a2206dcda4e84a",
+        "message": "[REF] stock, *: add reference\n\nThe model `procurement.group` is replaced by a more flexible one:\n`stock.reference`. The first one was somehow not well understood and a\nbit limited by its many2one links to other business model (Sales Order,\nPurchase Order, ...). The reference is made of a name and ma",
+        "author": "Arnold Moyaux",
+        "date": "2025-03-20T10:20:11Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "existing purchase order creation tests",
+        "purchase order line linkage to sale order line",
+        "vendor selection correctness",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

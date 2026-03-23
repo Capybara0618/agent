@@ -1,0 +1,92 @@
+{
+  "task_id": "301",
+  "repo_owner": "getsentry",
+  "repo_name": "sentry",
+  "file_path": "src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T16:51:20+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 15,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": false,
+    "review_cached": false
+  },
+  "base_context": {
+    "file_path": "src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+    "original_code": "def get_parallel_metrics_consumer(\n    max_msg_batch_size: int,\n    max_msg_batch_time: float,\n    max_parallel_batch_size: int,\n    max_parallel_batch_time: float,\n    max_batch_size: int,\n    max_batch_time: float,\n    processes: int,\n    input_block_size: int,\n    output_block_size: int,\n    group_id: str,\n    auto_offset_reset: str,\n    indexer_profile: MetricsIngestConfiguration,\n    slicing_router: Optional[SlicingRouter],\n    **options: Mapping[str, Union[str, int]],\n) -> StreamProcessor[KafkaPayload]:\n    processing_factory = MetricsConsumerStrategyFactory(\n        max_msg_batch_size=max_msg_batch_size,\n        max_msg_batch_time=max_msg_batch_time,\n        max_parallel_batch_size=max_parallel_batch_size,\n        max_parallel_batch_time=max_parallel_batch_time,\n        processes=processes,\n        input_block_size=input_block_size,\n        output_block_size=output_block_size,\n        config=indexer_profile,\n        slicing_router=slicing_router,\n    )\n\n    cluster_name: str = settings.KAFKA_TOPICS[indexer_profile.input_topic][\"cluster\"]\n    create_topics(cluster_name, [indexer_profile.input_topic])\n\n    return StreamProcessor(\n        KafkaConsumer(get_config(indexer_profile.input_topic, group_id, auto_offset_reset)),\n        Topic(indexer_profile.input_topic),\n        processing_factory,\n        CommitPolicy(\n            min_commit_frequency_sec=max_batch_time / 1000,\n            # TODO(markus): honor CLI params or remove them\n            min_commit_messages=None,\n        ),\n    )",
+    "satd_comment": "# TODO(markus): honor CLI params or remove them",
+    "target_file": {
+      "ok": true,
+      "path": "src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+      "sha": "7bea100c135d9a716f648e94dec06e59b560e21a",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/master/src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport functools\nimport logging\nfrom collections import deque\nfrom collections.abc import Mapping\nfrom typing import Any, Union, cast\n\nfrom arroyo.backends.kafka import KafkaPayload\nfrom arroyo.dlq import InvalidMessage\nfrom arroyo.processing.strategies import (\n    MessageRejected,\n    ProcessingStrategy,\n    ProcessingStrategyFactory,\n)\nfrom arroyo.processing.strategies import ProcessingStrategy as ProcessingStep\nfrom arroyo.types import Commit, FilteredPayload, Message, Partition\n\nfrom sentry.sentry_metrics.configuration import (\n    MetricsIngestConfiguration,\n    initialize_subprocess_state,\n)\nfrom sentry.sentry_metrics.consumers.indexer.common import BatchMessages, IndexerOutputMessageBatch\nfrom sentry.sentry_metrics.consumers.indexer.multiprocess import SimpleProduceStep\nfrom sentry.sentry_metrics.consumers.indexer.processing import MessageProcessor\nfrom sentry.sentry_metrics.consumers.indexer.routing_producer import (\n    RoutingPayload,\n    RoutingProducerStep,\n)\nfrom sentry.sentry_metrics.consumers.indexer.slicing_router import SlicingRouter\nfrom sentry.utils.arroyo import MultiprocessingPool, run_task_with_multiprocessing\n\nlogger = logging.getLogger(__name__)\n\n\nclass Unbatcher(ProcessingStep[Union[FilteredPayload, IndexerOutputMessageBatch]]):\n    def __init__(\n        self,\n        next_step: ProcessingStep[KafkaPayload | RoutingPayload | InvalidMessage | FilteredPayload],\n    ) -> None:\n        self.__next_step = next_step\n        self.__closed = False\n        self.__messages: deque[Message[KafkaPayload | RoutingPayload | InvalidMessage]] = deque()\n\n    def poll(self) -> None:\n        self.__next_step.poll()\n\n        while self.__messages:\n            msg = self.__messages.popleft()\n            if isinstance(msg.payload, InvalidMessage):\n                raise msg.payload\n            self.__next_step.submit(msg)\n\n    def submit(self, message: Message[FilteredPayload | IndexerOutputMessageBatch]) -> None:\n        assert not self.__closed\n\n        if self.__messages:\n            raise MessageRejected()\n\n        if isinstance(message.payload, FilteredPayload):\n            self.__next_step.submit(cast(Message[KafkaPayload], message))\n            return\n\n        self.__messages.extend(message.payload.data)\n\n        _ = message.payload.cogs_data\n\n    def close(self) -> None:\n        self.__closed = True\n\n    def terminate(self) -> None:\n        self.__closed = True\n\n        logger.debug(\"Terminating %r...\", self.__next_step)\n        self.__next_step.terminate()\n\n    def join(self, timeout: float | None = None) -> None:\n        self.__next_step.close()\n        self.__next_step.join(timeout)\n\n\nclass MetricsConsumerStrategyFactory(ProcessingStrategyFactory[KafkaPayload]):\n    \"\"\"\n    Builds an indexer consumer based on the multi process transform Arroyo step.\n\n    Multi processing happens in batches, the parallel step batches messages, then\n    it dispatches them to a process. This is meant to avoid lock contention that\n    would happen by transferring one message at a time.\n    The parallel transform function is then applied to all messages one by one.\n\n    The indexer must resolve batches of messages. It cannot resolve messages in\n    isolation otherwise the amount of roundtrip to cache would be enormous.\n    So the pipeline works this way:\n    - the indexer batches messages like today.\n    - each batch is a message for the parallel transform step.\n    - the parallel transform step may or may not re-batch messages batcehs\n      together. The load tests show it is still useful.\n    - messages are exploded back into individual ones after the parallel\n      transform step.\n    \"\"\"\n\n    def __init__(\n        self,\n        max_msg_batch_size: int,\n        max_msg_batch_time: float,\n        max_parallel_batch_size: int,\n        max_parallel_batch_time: float,\n        processes: int,\n        input_block_size: int | None,\n        output_block_size: int | None,\n        ingest_profile: str,\n        indexer_db: str,\n    ):\n        from sentry.sentry_metrics.configuration import (\n            IndexerStorage,\n            UseCaseKey,\n            get_ingest_config,\n            initialize_main_process_state,\n        )\n        from sentry.sentry_metrics.consumers.indexer.slicing_router import get_slicing_router\n\n        use_case = UseCaseKey(ingest_profile)\n        db_backend = IndexerStorage(indexer_db)\n        ingest_config = get_ingest_config(use_case, db_backend)\n        initialize_main_process_state(ingest_config)\n        slicing_router = get_slicing_router(ingest_config)\n\n        self.config = ingest_config\n\n        # This is the size of the initial message batching the indexer does\n        self.__max_msg_batch_size = max_msg_batch_size\n        self.__max_msg_batch_time = max_msg_batch_time\n\n        # This is the size of the batches sent to the parallel processes.\n        # These are batches of batches.\n        self.__max_parallel_batch_size = max_parallel_batch_size\n        self.__max_parallel_batch_time = max_parallel_batch_time\n\n        self.__input_block_size = input_block_size\n        self.__output_block_size = output_block_size\n        self.__slicing_router = slicing_router\n        self.__pool = MultiprocessingPool(\n            num_processes=processes,\n            # It is absolutely crucial that we pass a function reference here\n            # where the function lives in a module that does not depend on\n            # Django settings. `sentry.sentry_metrics.configuration` fulfills\n            # that requirement, but if you were to create a wrapper function in\n            # this module, and pass that function here, it would attempt to\n            # pull in a bunch of modules that try to read django settings at\n            # import time\n            initializer=functools.partial(initialize_subprocess_state, self.config),\n        )\n\n    def create_with_partitions(\n        self,\n        commit: Commit,\n        partitions: Mapping[Partition, int],\n    ) -> ProcessingStrategy[KafkaPayload]:\n        producer = get_metrics_producer_strategy(\n            config=self.config,\n            commit=commit,\n            slicing_router=self.__slicing_router,\n        )\n\n        parallel_strategy = run_task_with_multiprocessing(\n            function=MessageProcessor(self.config).process_messages,\n            next_step=Unbatcher(next_step=producer),\n            pool=self.__pool,\n            max_batch_size=self.__max_parallel_batch_size,\n            # This is in seconds\n            max_batch_time=self.__max_parallel_batch_time / 1000,\n            input_block_size=self.__input_block_size,\n            output_block_size=self.__output_block_size,\n        )\n\n        strategy = BatchMessages(\n            parallel_strategy, self.__max_msg_batch_time, self.__max_msg_batch_size\n        )\n\n        return strategy\n\n    def shutdown(self) -> None:\n        self.__pool.close()\n\n\ndef get_metrics_producer_strategy(\n    config: MetricsIngestConfiguration,\n    commit: Commit,\n    slicing_router: SlicingRouter | None,\n) -> Any:\n    if config.is_output_sliced:\n        if slicing_router is None:\n            raise ValueError(\"Slicing router is required for sliced output\")\n        return RoutingProducerStep(\n            commit_function=commit,\n            message_router=slicing_router,\n        )\n    else:\n        return SimpleProduceStep(\n            commit_function=commit,\n            output_topic=config.output_topic,\n        )\n",
+      "total_lines": 202
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 15,
+      "start_line": 1,
+      "end_line": 35,
+      "matched_line": ")",
+      "excerpt": "1: from __future__ import annotations\n2: \n3: import functools\n4: import logging\n5: from collections import deque\n6: from collections.abc import Mapping\n7: from typing import Any, Union, cast\n8: \n9: from arroyo.backends.kafka import KafkaPayload\n10: from arroyo.dlq import InvalidMessage\n11: from arroyo.processing.strategies import (\n12:     MessageRejected,\n13:     ProcessingStrategy,\n14:     ProcessingStrategyFactory,\n15: )\n16: from arroyo.processing.strategies import ProcessingStrategy as ProcessingStep\n17: from arroyo.types import Commit, FilteredPayload, Message, Partition\n18: \n19: from sentry.sentry_metrics.configuration import (\n20:     MetricsIngestConfiguration,\n21:     initialize_subprocess_state,\n22: )\n23: from sentry.sentry_metrics.consumers.indexer.common import BatchMessages, IndexerOutputMessageBatch\n24: from sentry.sentry_metrics.consumers.indexer.multiprocess import SimpleProduceStep\n25: from sentry.sentry_metrics.consumers.indexer.processing import MessageProcessor\n26: from sentry.sentry_metrics.consumers.indexer.routing_producer import (\n27:     RoutingPayload,\n28:     RoutingProducerStep,\n29: )\n30: from sentry.sentry_metrics.consumers.indexer.slicing_router import SlicingRouter\n31: from sentry.utils.arroyo import MultiprocessingPool, run_task_with_multiprocessing\n32: \n33: logger = logging.getLogger(__name__)\n34: \n35: "
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "functools",
+        "logging",
+        "collections:deque",
+        "collections.abc:Mapping",
+        "typing:Any",
+        "typing:Union",
+        "typing:cast",
+        "arroyo.backends.kafka:KafkaPayload",
+        "arroyo.dlq:InvalidMessage",
+        "arroyo.processing.strategies:MessageRejected",
+        "arroyo.processing.strategies:ProcessingStrategy",
+        "arroyo.processing.strategies:ProcessingStrategyFactory",
+        "arroyo.processing.strategies:ProcessingStrategy",
+        "arroyo.types:Commit",
+        "arroyo.types:FilteredPayload",
+        "arroyo.types:Message",
+        "arroyo.types:Partition",
+        "sentry.sentry_metrics.configuration:MetricsIngestConfiguration",
+        "sentry.sentry_metrics.configuration:initialize_subprocess_state",
+        "sentry.sentry_metrics.consumers.indexer.common:BatchMessages",
+        "sentry.sentry_metrics.consumers.indexer.common:IndexerOutputMessageBatch",
+        "sentry.sentry_metrics.consumers.indexer.multiprocess:SimpleProduceStep",
+        "sentry.sentry_metrics.consumers.indexer.processing:MessageProcessor",
+        "sentry.sentry_metrics.consumers.indexer.routing_producer:RoutingPayload",
+        "sentry.sentry_metrics.consumers.indexer.routing_producer:RoutingProducerStep",
+        "sentry.sentry_metrics.consumers.indexer.slicing_router:SlicingRouter",
+        "sentry.utils.arroyo:MultiprocessingPool",
+        "sentry.utils.arroyo:run_task_with_multiprocessing",
+        "sentry.sentry_metrics.configuration:IndexerStorage"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <p align=\"center\">\n    <a href=\"https://sentry.io/?utm_source=github&utm_medium=logo\" target=\"_blank\">\n      <img src=\"https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png\" alt=\"Sentry\" width=\"280\" height=\"84\" />\n    </a>\n  </p>\n  <p align=\"center\">\n    Users and logs provide clues. Sentry provides answers.\n  </p>\n</p>\n\n# What's Sentry?\n\nSentry is the debugging platform that helps every developer detect, trace, and fix issues. Code breaks, fix it faster.\n\n<p align=\"center\">\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/issue-details.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/seer.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/traces.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/trace-explorer.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/replays.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/insights.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/logs.png\" width=\"270\" />\n  <img src=\"https://github.com/getsentry/sentry/raw/master/.github/screenshots/uptime.png\" width=\"270\" />\n</p>\n\n## Official Sentry SDKs\n\n- [JavaScript](https://github.com/getsentry/sentry-javascript)\n- [Electron]("
+    }
+  },
+  "repair_context": {},
+  "review_context": {}
+}

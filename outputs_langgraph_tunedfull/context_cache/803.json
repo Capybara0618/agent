@@ -1,0 +1,370 @@
+{
+  "task_id": "803",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/tune/trainable/trainable.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:21:21+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 40,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:21:29+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:21:35+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "python/ray/tune/trainable/trainable.py",
+    "original_code": "def reset(\n    self, new_config, logger_creator=None, remote_checkpoint_dir=None, storage=None\n):\n    \"\"\"Resets trial for use with new config.\n\n    Subclasses should override reset_config() to actually\n    reset actor behavior for the new config.\"\"\"\n\n    # TODO(justinvyu): remote_checkpoint_dir can be removed.\n    # Save artifacts one last time, if this actor has been swapped to a\n    # different trial.\n    if remote_checkpoint_dir != self.remote_checkpoint_dir:\n        self._maybe_save_artifacts_to_cloud()\n\n    self.config = new_config\n\n    self._storage = storage\n\n    trial_info = new_config.pop(TRIAL_INFO, None)\n    if trial_info:\n        self._trial_info = trial_info\n\n    self._result_logger.flush()\n    self._result_logger.close()\n\n    if logger_creator:\n        logger.debug(\"Logger reset.\")\n        self._create_logger(new_config.copy(), logger_creator)\n    else:\n        logger.debug(\n            \"Did not reset logger. Got: \"\n            f\"trainable.reset(logger_creator={logger_creator}).\"\n        )\n\n    stdout_file = new_config.pop(STDOUT_FILE, None)\n    stderr_file = new_config.pop(STDERR_FILE, None)\n\n    self._close_logfiles()\n    self._open_logfiles(stdout_file, stderr_file)\n\n    success = self.reset_config(new_config)\n    if not success:\n        return False\n\n    # Reset attributes. Will be overwritten by `restore` if a checkpoint\n    # is provided.\n    self._iteration = 0\n    self._time_total = 0.0\n    self._timesteps_total = None\n    self._episodes_total = None\n    self._time_since_restore = 0.0\n    self._timesteps_since_restore = 0\n    self._iterations_since_restore = 0\n    self.remote_checkpoint_dir = remote_checkpoint_dir\n    self._last_artifact_sync_iter = None\n    self._restored = False\n\n    return True",
+    "satd_comment": "# TODO(justinvyu): remote_checkpoint_dir can be removed.\n# Save artifacts one last time, if this actor has been swapped to a\n# different trial.",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/tune/trainable/trainable.py",
+      "sha": "7dd9f5f67425bb08b5fb0d1873566cc00ab4aa6e",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/python/ray/tune/trainable/trainable.py",
+      "content_excerpt": "import copy\nimport logging\nimport os\nimport platform\nimport shutil\nimport sys\nimport tempfile\nimport time\nfrom contextlib import redirect_stderr, redirect_stdout\nfrom datetime import datetime\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Union\n\nimport ray\nimport ray.cloudpickle as ray_pickle\nfrom ray._common.utils import try_to_create_directory\nfrom ray.air._internal.util import exception_cause, skip_exceptions\nfrom ray.air.constants import TIME_THIS_ITER_S, TIMESTAMP, TRAINING_ITERATION\nfrom ray.train._internal.checkpoint_manager import _TrainingResult\nfrom ray.train._internal.storage import StorageContext, _exists_at_fs_path\nfrom ray.train.constants import DEFAULT_STORAGE_PATH, RAY_CHDIR_TO_TRIAL_DIR\nfrom ray.tune.execution.placement_groups import PlacementGroupFactory\nfrom ray.tune.result import (\n    DEBUG_METRICS,\n    DONE,\n    EPISODES_THIS_ITER,\n    EPISODES_TOTAL,\n    HOSTNAME,\n    NODE_IP,\n    PID,\n    RESULT_DUPLICATE,\n    SHOULD_CHECKPOINT,\n    STDERR_FILE,\n    STDOUT_FILE,\n    TIME_TOTAL_S,\n    TIMESTEPS_THIS_ITER,\n    TIMESTEPS_TOTAL,\n    TRIAL_ID,\n    TRIAL_INFO,\n)\nfrom ray.tune.utils import UtilMonitor\nfrom ray.tune.utils.log import disable_ipython\nfrom ray.tune.utils.util import Tee\nfrom ray.util.annotations import DeveloperAPI, PublicAPI\n\nlogger = logging.getLogger(__name__)\n\nSETUP_TIME_THRESHOLD = 10\n\n# File containing dict data returned by user from `Trainable.save_checkpoint`\n_DICT_CHECKPOINT_FILE_NAME = \"_dict_checkpoint.pkl\"\n\n\n@PublicAPI\nclass Trainable:\n    \"\"\"Abstract class for trainable models, functions, etc.\n\n    A call to ``train()`` on a trainable will execute one logical iteration of\n    training. As a rule of thumb, the execution time of one train call should\n    be large enough to avoid overheads (i.e. more than a few seconds), but\n    short enough to report progress periodically (i.e. at most a few minutes).\n\n    Calling ``save()`` should save the training state of a trainable to disk,\n    and ``restore(path)`` should restore a trainable to the given state.\n\n    Generally you only need to implement ``setup``, ``step``,\n    ``save_checkpoint``, and ``load_checkpoint`` when subclassing Trainable.\n\n    Other implementation methods that may be helpful to override are\n    ``log_result``, ``reset_config``, ``cleanup``, and ``_export_model``.\n\n    Tune will convert this class into a Ray actor, which runs on a separate process.\n    By default, Tune will also change the current working directory of this process to\n    its corresponding trial-level log directory ``self.logdir``.\n    This is designed so that different trials that run on the same physical node won't\n    accidentally write to the same location and overstep each other.\n\n    The behavior of changing the working directory can be disabled by setting the\n    `RAY_CHDIR_TO_TRIAL_DIR=0` environment variable. This allows access to files\n    in the original working directory, but relative paths should be used for read only\n    purposes, and you must make sure that the directory is synced on all nodes if\n    running on multiple machines.\n\n    The `TUNE_ORIG_WORKING_DIR` environment variable was the original workaround for\n    accessing paths relative to the original working directory. This environment\n    variable is deprecated, and the `RAY_CHDIR_TO_TRIAL_DIR` environment variable\n    described above should be used instead.\n\n    This class supports checkpointing to and restoring from remote storage.\n    \"\"\"\n\n    def __init__(\n        self,\n        config: Dict[str, Any] = None,\n        storage: Optional[StorageContext] = None,\n    ):\n        \"\"\"Initialize a Trainable.\n\n        Sets up logging and points ``self.logdir`` to a directory in which\n        training outputs should be placed.\n\n        Subclasses should prefer defining ``setup()`` instead of overriding\n        ``__init__()`` directly.\n\n        Args:\n            config: Trainable-specific configuration data. By default\n                will be saved as ``self.config``.\n            storage: StorageContext object that contains persistent storage paths\n        \"\"\"\n\n        self.config = config or {}\n        trial_info = self.config.pop(TRIAL_INFO, None)\n\n        if self.is_actor():\n            disable_ipython()\n\n        self._storage = storage\n        if storage:\n            assert storage.trial_fs_path\n            logger.debug(f\"StorageContext on the TRAINABLE:\\n{storage}\")\n\n        # TODO(justinvyu): Rename/remove logdir.\n        self._logdir = None\n        self._setup_logdir()\n\n        self._stdout_context = self._stdout_fp = self._stdout_stream = None\n        self._stderr_context = self._stderr_fp = self._stderr_stream = None\n        self._stderr_logging_handler = None\n\n        stdout_file = self.config.pop(STDOUT_FILE, None)\n        stderr_file = self.config.pop(STDERR_FILE, None)\n\n        self._iteration = 0\n        self._time_total = 0.0\n        self._timesteps_total = None\n        self._episodes_total = None\n        self._time_since_restore = 0.0\n        self._timesteps_since_restore = 0\n        self._iterations_since_restore = 0\n        self._last_result = None\n        self._restored = False\n        self._trial_info = trial_info\n        self._stdout_file = stdout_file\n        self._stderr_file = stderr_file\n\n        self._start_time = time.time()\n        self._local_ip = ray.util.get_node_ip_address()\n\n        self._open_logfiles(stdout_file, stderr_file)\n\n        self.setup(copy.deepcopy(self.config))\n        setup_time = time.time() - self._start_time\n        if setup_time > SETUP_TIME_THRESHOLD:\n            logger.info(\n                \"Trainable.setup took {:.3f} seconds. If your \"\n                \"trainable is slow to initialize, consider setting \"\n                \"reuse_actors=True to reduce actor creation \"\n                \"overheads.\".format(setup_time)\n            )\n        log_sys_usage = self.config.get(\"log_sys_usage\", False)\n        self._monitor = UtilMonitor(start=log_sys_usage)\n\n    @classmethod\n    def default_resource_request(\n        cls, config: Dict[str, Any]\n    ) -> Optional[PlacementGroupFactory]:\n        \"\"\"Provides a static resource requirement for the given configuration.\n\n        This can be overridden by sub-classes to set the correct trial resource\n        allocation, so the user does not need to.\n\n        .. testcode::\n\n            @classmethod\n            def default_resource_request(cls, config):\n                return PlacementGroupFactory([{\"CPU\": 1}, {\"CPU\": 1}])\n\n\n        Args:\n            config[Dict[str, Any]]: The Trainable's config dict.\n\n        Returns:\n            PlacementGroupFactory: A PlacementGroupFactory consumed by Tune\n                for queueing.\n        \"\"\"\n        return None\n\n    @classmethod\n    def resource_help(cls, config: Dict):\n        \"\"\"Returns a help string for configuring this trainable's resources.\n\n        Args:\n            config: The Trainer's config dict.\n        \"\"\"\n        return \"\"\n\n    def get_current_ip_pid(self):\n        return self._local_ip, os.getpid()\n\n    def get_auto_filled_metrics(\n        self,\n        now: Optional[datetime] = None,\n        time_this_iter: Optional[float] = None,\n        timestamp: Optional[int] = None,\n        debug_metrics_only: bool = False,\n    ) -> dict:\n        \"\"\"Return a dict with metrics auto-filled by the trainable.\n\n        If ``debug_metrics_only`` is True, only metrics that don't\n        require at least one iteration will be returned\n        (``ray.tune.result.DEBUG_METRICS``).\n        \"\"\"\n        if now is None:\n            now = datetime.today()\n        autofilled = {\n            TRIAL_ID: self.trial_id,\n            \"date\": now.strftime(\"%Y-%m-%d_%H-%M-%S\"),\n            \"timestamp\": timestamp if timestamp else int(time.mktime(now.timetuple())),\n            TIME_THIS_ITER_S: time_this_iter,\n            TIME_TOTAL_S: self._time_total,\n            PID: os.getpid(),\n            HOSTNAME: platform.node(),\n            NODE_IP: self._local_ip,\n            \"config\": self.config,\n            \"time_since_restore\": self._time_since_restore,\n            \"iterations_since_restore\": self._iterations_since_restore,\n        }\n        if self._timesteps_since_restore:\n            autofilled[\"timesteps_since_restore\"] = self._timesteps_since_restore\n\n        if debug_metrics_only:\n            autofilled = {k: v for k, v in autofilled.items() if k in DEBUG_METRICS}\n        return autofilled\n\n    def is_actor(self):\n        try:\n            actor_id = ray._private.worker.global_worker.actor_id\n            return actor_id != actor_id.nil()\n        except Exception:\n            # If global_worker is not instantiated, we're not in an actor\n            return False\n\n    def train_buffered(self, buffer_time_s: float, max_buffer_length: int = 1000):\n        \"\"\"Runs multiple iterations of training.\n\n        Calls ``train()`` internally. Collects and combines multiple results.\n        This function will run ``self.train()`` repeatedly until one of\n        the following conditions is met: 1) the maximum buffer length is\n        reached, 2) the maximum buffer time is reached, or 3) a checkpoint\n        was created. Even if the maximum time is reached, it will always\n        block until at least one result is received.\n\n        Args:\n            buffer_time_s: Maximum time to buffer. The next result\n                received after this amount of time has passed will return\n                the whole buffer.\n            max_buffer_length: Maximum number of results to buffer.\n\n        \"\"\"\n        results = []\n\n        now = time.time()\n        send_buffer_at = now + buffer_time_s\n        while now < send_buffer_at or not results:  # At least one result\n            result = self.train()\n            results.append(result)\n            if result.get(DONE, False):\n                # If the trial is done, return\n                break\n            elif result.get(SHOULD_CHECKPOINT, False):\n                # If a checkpoint was created, return\n                break\n            elif result.get(RESULT_DUPLICATE):\n                # If the function API trainable completed, return\n                break\n            elif len(results) >= max_buffer_length:\n                # If the buffer is full, return\n                break\n            now = time.time()\n\n        return results\n\n    def train(self):\n        \"\"\"Runs one logical iteration of training.\n\n        Calls ``step()`` internally. Subclasses should override ``step()``\n        instead to return results.\n        This method automatically fills the following fields in the result:\n\n            `done` (bool): training is terminated. Filled only if not provided.\n\n            `time_this_iter_s` (float): Time in seconds this iteration\n            took to run. This may be overridden in order to override the\n            system-computed time difference.\n\n            `time_total_s` (float): Accumulated time in seconds for this\n            entire experiment.\n\n            `training_iteration` (int): The index of this\n            training iteration, e.g. call to train(). This is incremented\n            after `step()` is called.\n\n            `pid` (str): The pid of the training process.\n\n            `date` (str): A formatted date of when the result was processed.\n\n            `timestamp` (str): A UNIX timestamp of when the result\n            was processed. This may be overridden.\n\n            `hostname` (str): Hostname of the machine hosting the training\n            process.\n\n            `node_ip` (str): Node ip of the machine hosting the training\n            process.\n\n        Returns:\n            A dict that describes training progress.\n        \"\"\"\n        start = time.time()\n        try:\n            result = self.step()\n        except Exception as e:\n            skipped = skip_exceptions(e)\n            raise skipped from exception_cause(skipped)\n\n        assert isinstance(result, dict), \"step() needs to return a dict.\"\n\n        # We do not modify internal state nor update this result if duplicate.\n",
+      "total_lines": 972
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 40,
+      "start_line": 20,
+      "end_line": 60,
+      "matched_line": ")",
+      "excerpt": "20: from ray.train._internal.storage import StorageContext, _exists_at_fs_path\n21: from ray.train.constants import DEFAULT_STORAGE_PATH, RAY_CHDIR_TO_TRIAL_DIR\n22: from ray.tune.execution.placement_groups import PlacementGroupFactory\n23: from ray.tune.result import (\n24:     DEBUG_METRICS,\n25:     DONE,\n26:     EPISODES_THIS_ITER,\n27:     EPISODES_TOTAL,\n28:     HOSTNAME,\n29:     NODE_IP,\n30:     PID,\n31:     RESULT_DUPLICATE,\n32:     SHOULD_CHECKPOINT,\n33:     STDERR_FILE,\n34:     STDOUT_FILE,\n35:     TIME_TOTAL_S,\n36:     TIMESTEPS_THIS_ITER,\n37:     TIMESTEPS_TOTAL,\n38:     TRIAL_ID,\n39:     TRIAL_INFO,\n40: )\n41: from ray.tune.utils import UtilMonitor\n42: from ray.tune.utils.log import disable_ipython\n43: from ray.tune.utils.util import Tee\n44: from ray.util.annotations import DeveloperAPI, PublicAPI\n45: \n46: logger = logging.getLogger(__name__)\n47: \n48: SETUP_TIME_THRESHOLD = 10\n49: \n50: # File containing dict data returned by user from `Trainable.save_checkpoint`\n51: _DICT_CHECKPOINT_FILE_NAME = \"_dict_checkpoint.pkl\"\n52: \n53: \n54: @PublicAPI\n55: class Trainable:\n56:     \"\"\"Abstract class for trainable models, functions, etc.\n57: \n58:     A call to ``train()`` on a trainable will execute one logical iteration of\n59:     training. As a rule of thumb, the execution time of one train call should\n60:     be large enough to avoid overheads (i.e. more than a few seconds), but"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "logging",
+        "os",
+        "platform",
+        "shutil",
+        "sys",
+        "tempfile",
+        "time",
+        "contextlib:redirect_stderr",
+        "contextlib:redirect_stdout",
+        "datetime:datetime",
+        "pathlib:Path",
+        "typing:Any",
+        "typing:Dict",
+        "typing:List",
+        "typing:Optional",
+        "typing:Union",
+        "ray",
+        "ray.cloudpickle",
+        "ray._common.utils:try_to_create_directory",
+        "ray.air._internal.util:exception_cause",
+        "ray.air._internal.util:skip_exceptions",
+        "ray.air.constants:TIME_THIS_ITER_S",
+        "ray.air.constants:TIMESTAMP",
+        "ray.air.constants:TRAINING_ITERATION",
+        "ray.train._internal.checkpoint_manager:_TrainingResult",
+        "ray.train._internal.storage:StorageContext",
+        "ray.train._internal.storage:_exists_at_fs_path",
+        "ray.train.constants:DEFAULT_STORAGE_PATH",
+        "ray.train.constants:RAY_CHDIR_TO_TRIAL_DIR"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/README.rst",
+      "content_excerpt": ".. image:: https://github.com/ray-project/ray/raw/master/doc/source/images/ray_header_logo.png\n\n.. image:: https://readthedocs.org/projects/ray/badge/?version=master\n    :target: http://docs.ray.io/en/master/?badge=master\n\n.. image:: https://img.shields.io/badge/Ray-Join%20Slack-blue\n    :target: https://www.ray.io/join-slack\n\n.. image:: https://img.shields.io/badge/Discuss-Ask%20Questions-blue\n    :target: https://discuss.ray.io/\n\n.. image:: https://img.shields.io/twitter/follow/raydistributed.svg?style=social&logo=twitter\n    :target: https://x.com/raydistributed\n\n.. image:: https://img.shields.io/badge/Get_started_for_free-3C8AE9?logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2F9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAABKElEQVQ4Ea2TvWoCQRRGnWCVWChIIlikC9hpJdikSbGgaONbpAoY8gKBdAGfwkfwKQypLQ1sEGyMYhN1Pd%2B6A8PqwBZeOHt%2FvsvMnd3ZXBRFPQjBZ9K6OY8ZxF%2B0IYw9PW3qz8aY6lk92bZ%2BVqSI3oC9T7%2FyCVnrF1ngj93us%2B540sf5BrCDfw9b6jJ5lx%2FyjtGKBBXc3cnqx0INN4ImbI%2Bl%2BPnI8zWfFEr4chLLrWHCp9OO9j19Kbc91HX0zzzBO8EbLK2Iv4ZvNO3is3h6jb%2BCwO0iL8AaWqB7ILPTxq3kDypqvBuYuwswqo6wgYJbT8XxBPZ8KS1TepkFdC79TAHHce%2F7LbVioi3wEfTpmeKtPRGEeoldSP%2FOeoEftpP4BRbgXrYZefsAI%2BP9JU7ImyEAAAAASUVORK5CYII%3D\n   :target: https://www.anyscale.com/ray-on-anyscale?utm_source=github&utm_medium=ray_readme&utm_campaign=get_started_badge\n\nRay is a unified framework for scaling AI and Python applications. Ray consists of a core distributed runtime and a set of AI libraries for simplifying ML compute:\n\n.. imag"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "reset test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_basic_3.py",
+          "path": "python/ray/tests/test_basic_3.py",
+          "sha": "73b58f7c3ecf80662f1e3985832cf5a1532b22e3",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/tests/test_basic_3.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_actor_cancel.py",
+          "path": "python/ray/tests/test_actor_cancel.py",
+          "sha": "99891bdff5da413e1b572dd80057281e122231c3",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/tests/test_actor_cancel.py",
+          "score": 1.0
+        },
+        {
+          "name": "stats_collector_test.cc",
+          "path": "src/ray/object_manager/plasma/tests/stats_collector_test.cc",
+          "sha": "9c25e7152ffec27428c5ca0993dfcd10f6998067",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/src/ray/object_manager/plasma/tests/stats_collector_test.cc",
+          "score": 1.0
+        },
+        {
+          "name": "test_healthcheck.py",
+          "path": "python/ray/serve/tests/test_healthcheck.py",
+          "sha": "6bf66ee397eccbcb2f1c1dd1fafedda10f4a1745",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/serve/tests/test_healthcheck.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_multi_agent_env.py",
+          "path": "rllib/env/tests/test_multi_agent_env.py",
+          "sha": "a9ded7b21da6c1a0b8c94a61e236833a4477ce8b",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/rllib/env/tests/test_multi_agent_env.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_controller.py",
+          "path": "python/ray/serve/tests/test_controller.py",
+          "sha": "35b957b1401ab58cbd7cf702b3f07afb343cbd3a",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/serve/tests/test_controller.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_env_runner.py",
+          "path": "rllib/env/tests/test_env_runner.py",
+          "sha": "9129d657e999af5281b4e83ca676830d27272833",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/rllib/env/tests/test_env_runner.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_optimize.py",
+          "path": "python/ray/data/tests/test_optimize.py",
+          "sha": "0fdca2ebcd7fb182d6b00ef801d94c9c8d3cb940",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/data/tests/test_optimize.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"reset(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "error.py",
+          "path": "rllib/utils/error.py",
+          "sha": "fb449b9bc52a2ce82681ba6dc9f54f2cc5748dc3",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/rllib/utils/error.py",
+          "score": 1.0
+        },
+        {
+          "name": "columns.py",
+          "path": "rllib/core/columns.py",
+          "sha": "98cb8646913e2b333eab3243308b82419f05d9bc",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/rllib/core/columns.py",
+          "score": 1.0
+        },
+        {
+          "name": "metric.pxi",
+          "path": "python/ray/includes/metric.pxi",
+          "sha": "8cb4aae17538390a1ebad19740c9f72acd1d3ed1",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/includes/metric.pxi",
+          "score": 1.0
+        },
+        {
+          "name": "env_runner.py",
+          "path": "rllib/env/env_runner.py",
+          "sha": "bc855debf98f4815b0e0b329f8efe429e51b5abf",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/rllib/env/env_runner.py",
+          "score": 1.0
+        },
+        {
+          "name": "multi-agent-envs.rst",
+          "path": "doc/source/rllib/multi-agent-envs.rst",
+          "sha": "232f9516c23ea422464bf6315cc81cfd4b617f6b",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/doc/source/rllib/multi-agent-envs.rst",
+          "score": 1.0
+        },
+        {
+          "name": "optional.pxd",
+          "path": "python/ray/includes/optional.pxd",
+          "sha": "a3539824ae73a16df48b1203fbf8b877d00fad42",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/includes/optional.pxd",
+          "score": 1.0
+        },
+        {
+          "name": "utils.py",
+          "path": "python/ray/dag/utils.py",
+          "sha": "2fe1f3adf3d7eb73333731cfa7b83bdc509acd25",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/python/ray/dag/utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "exponential_backoff.h",
+          "path": "src/ray/util/exponential_backoff.h",
+          "sha": "d60826b04711b5d87e3af62606e68f4f4b655fbe",
+          "html_url": "https://github.com/ray-project/ray/blob/ca430cfd5ac41cadbe189ae0efd47f5cce07d6cd/src/ray/util/exponential_backoff.h",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "python/ray/tune/trainable",
+      "count": 6,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/tune/trainable/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "function_trainable.py",
+          "path": "python/ray/tune/trainable/function_trainable.py",
+          "type": "file"
+        },
+        {
+          "name": "metadata.py",
+          "path": "python/ray/tune/trainable/metadata.py",
+          "type": "file"
+        },
+        {
+          "name": "trainable.py",
+          "path": "python/ray/tune/trainable/trainable.py",
+          "type": "file"
+        },
+        {
+          "name": "trainable_fn_utils.py",
+          "path": "python/ray/tune/trainable/trainable_fn_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "util.py",
+          "path": "python/ray/tune/trainable/util.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/tune/trainable/__init__.py"
+        },
+        {
+          "name": "function_trainable.py",
+          "path": "python/ray/tune/trainable/function_trainable.py"
+        },
+        {
+          "name": "metadata.py",
+          "path": "python/ray/tune/trainable/metadata.py"
+        },
+        {
+          "name": "trainable_fn_utils.py",
+          "path": "python/ray/tune/trainable/trainable_fn_utils.py"
+        },
+        {
+          "name": "util.py",
+          "path": "python/ray/tune/trainable/util.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "python/ray/tune/trainable/trainable.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+          "html_url": "https://github.com/ray-project/ray/commit/154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+          "message": "[tune/rllib] Remove deprecated `Logger` interface and `logger_creator` (#61181)\n\n## Summary\n\nCompletes the removal of the `ray.tune.logger.Logger` interface and\n`logger_creator` parameter, which were soft-deprecated in #35162 (May\n2023) targeting Ray 2.7.\n\n### Tune changes\n- Remove `Logger` base cla",
+          "author": "Xinyuan",
+          "date": "2026-03-19T20:49:48Z"
+        },
+        {
+          "sha": "e1e42ce4a398bc348b1457293c768c47d1dbe7d4",
+          "html_url": "https://github.com/ray-project/ray/commit/e1e42ce4a398bc348b1457293c768c47d1dbe7d4",
+          "message": "[tune][typing] type reset_config to return bool (#54581)\n\nCurrently `reset_config` is defined as:\n\n    def reset_config(self, new_config: Dict):\n        return False\n\nBecause of the literal `False` pyright implicitly infers that the method\nalways returns `Literal[False]` during subclassing it will c",
+          "author": "Daniel Sperber",
+          "date": "2025-07-30T16:46:35Z"
+        },
+        {
+          "sha": "c8a1e5b96db17d6a849576b688be7677dc9f8d8e",
+          "html_url": "https://github.com/ray-project/ray/commit/c8a1e5b96db17d6a849576b688be7677dc9f8d8e",
+          "message": "[core] Move some utils to `ray._common.utils` to replace `ray._private.utils` usage in libraries (#53287)\n\n## Why are these changes needed?\n\nTo improve the granularity of tests and independently test Ray Core from\nthe Ray libraries, we want the libraries to use stable APIs from core.\nTo that end, we",
+          "author": "Sagar Sumit",
+          "date": "2025-06-06T15:18:43Z"
+        },
+        {
+          "sha": "64d21bef6272f188064a6d1b376877b8222b1cb1",
+          "html_url": "https://github.com/ray-project/ray/commit/64d21bef6272f188064a6d1b376877b8222b1cb1",
+          "message": "[tune] Update Ray Tune examples and tests off of `ray.train` APIs (#50435)\n\nhttps://github.com/ray-project/ray/pull/49317 initiated the decoupling\nof Ray Train and Ray Tune top-level APIs. This PR updates all of the\ninternal usage in Ray Tune examples and tests to switch from `ray.air`\n(super out-da",
+          "author": "Justin Yu",
+          "date": "2025-02-14T19:47:04Z"
+        },
+        {
+          "sha": "6351f891341a9fe174932ecb99827c4fafa79d20",
+          "html_url": "https://github.com/ray-project/ray/commit/6351f891341a9fe174932ecb99827c4fafa79d20",
+          "message": "[tune] Remove a print statement in internal code (#50466)\n\nRemove a print that accidentally slipped through.\n\nSigned-off-by: Justin Yu <justinvyu@anyscale.com>",
+          "author": "Justin Yu",
+          "date": "2025-02-12T03:36:04Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "reset TODO justinvyu remote_checkpoint_dir removed Save",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "python/ray/tune/trainable/trainable.py",
+      "satd_line": 40,
+      "last_commit": {
+        "sha": "154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+        "html_url": "https://github.com/ray-project/ray/commit/154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+        "message": "[tune/rllib] Remove deprecated `Logger` interface and `logger_creator` (#61181)\n\n## Summary\n\nCompletes the removal of the `ray.tune.logger.Logger` interface and\n`logger_creator` parameter, which were soft-deprecated in #35162 (May\n2023) targeting Ray 2.7.\n\n### Tune changes\n- Remove `Logger` base cla",
+        "author": "Xinyuan",
+        "date": "2026-03-19T20:49:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

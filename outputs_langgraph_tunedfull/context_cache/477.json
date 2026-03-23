@@ -1,0 +1,365 @@
+{
+  "task_id": "477",
+  "repo_owner": "getmoto",
+  "repo_name": "moto",
+  "file_path": "moto/kms/responses.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:48:56+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:49:11+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:49:16+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "moto/kms/responses.py",
+    "original_code": "def decrypt(self):\n    # TODO refuse decode if EncryptionContext is not the same as when it was encrypted / generated\n\n    value = self.parameters.get(\"CiphertextBlob\")\n    try:\n        return json.dumps({\"Plaintext\": base64.b64decode(value).decode(\"utf-8\"), 'KeyId': 'key_id'})\n    except UnicodeDecodeError:\n        # Generate data key will produce random bytes which when decrypted is still returned as base64\n        return json.dumps({\"Plaintext\": value})",
+    "satd_comment": "# TODO refuse decode if EncryptionContext is not the same as when it was encrypted / generated",
+    "target_file": {
+      "ok": true,
+      "path": "moto/kms/responses.py",
+      "sha": "8ec091b2938dac8c96a216e676f247610d9314c7",
+      "download_url": "https://raw.githubusercontent.com/getmoto/moto/master/moto/kms/responses.py",
+      "content_excerpt": "import base64\nimport json\nimport os\nimport re\nfrom typing import Any\n\nfrom moto.core.responses import BaseResponse\nfrom moto.kms.utils import RESERVED_ALIASE_TARGET_KEY_IDS, RESERVED_ALIASES\nfrom moto.utilities.utils import get_partition\n\nfrom .exceptions import (\n    AlreadyExistsException,\n    NotAuthorizedException,\n    NotFoundException,\n    ValidationException,\n)\nfrom .models import KmsBackend, kms_backends\nfrom .policy_validator import validate_policy\n\n\nclass KmsResponse(BaseResponse):\n    def __init__(self) -> None:\n        super().__init__(service_name=\"kms\")\n\n    def _get_param(self, param_name: str, if_none: Any = None) -> Any:\n        params = json.loads(self.body)\n\n        for key in (\"Plaintext\", \"CiphertextBlob\", \"Message\"):\n            if key in params:\n                params[key] = base64.b64decode(params[key].encode(\"utf-8\"))\n\n        return params.get(param_name, if_none)\n\n    @property\n    def kms_backend(self) -> KmsBackend:\n        return kms_backends[self.current_account][self.region]\n\n    def _display_arn(self, key_id: str) -> str:\n        if key_id.startswith(\"arn:\"):\n            return key_id\n\n        if key_id.startswith(\"alias/\"):\n            id_type = \"\"\n        else:\n            id_type = \"key/\"\n\n        return f\"arn:{get_partition(self.region)}:kms:{self.region}:{self.current_account}:{id_type}{key_id}\"\n\n    def _validate_cmk_id(self, key_id: str) -> None:\n        \"\"\"Determine whether a CMK ID exists.\n\n        - raw key ID\n        - key ARN\n        \"\"\"\n        is_arn = key_id.startswith(\"arn:\") and \":key/\" in key_id\n        # https://docs.aws.amazon.com/kms/latest/developerguide/multi-region-keys-overview.html\n        # \"Notice that multi-Region keys have a distinctive key ID that begins with mrk-. You can use the mrk- prefix to\n        # identify MRKs programmatically.\"\n        is_raw_key_id = re.match(\n            r\"^(mrk-)?[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$\",\n            key_id,\n            re.IGNORECASE,\n        )\n\n        if not is_arn and not is_raw_key_id:\n            raise NotFoundException(f\"Invalid keyId {key_id}\")\n\n        cmk_id = self.kms_backend.get_key_id(key_id)\n\n        if cmk_id not in self.kms_backend.keys:\n            raise NotFoundException(f\"Key '{self._display_arn(key_id)}' does not exist\")\n\n    def _validate_alias(self, key_id: str) -> None:\n        \"\"\"Determine whether an alias exists.\n\n        - alias name\n        - alias ARN\n        \"\"\"\n        error = NotFoundException(f\"Alias {self._display_arn(key_id)} is not found.\")\n\n        is_arn = key_id.startswith(\"arn:\") and \":alias/\" in key_id\n        is_name = key_id.startswith(\"alias/\")\n\n        if not is_arn and not is_name:\n            raise error\n\n        alias_name = self.kms_backend.get_alias_name(key_id)\n        cmk_id = self.kms_backend.get_key_id_from_alias(alias_name)\n        if cmk_id is None:\n            raise error\n\n    def _validate_key_id(self, key_id: str) -> None:\n        \"\"\"Determine whether a key ID exists.\n\n        - raw key ID\n        - key ARN\n        - alias name\n        - alias ARN\n        \"\"\"\n        is_alias_arn = key_id.startswith(\"arn:\") and \":alias/\" in key_id\n        is_alias_name = key_id.startswith(\"alias/\")\n\n        if is_alias_arn or is_alias_name:\n            self._validate_alias(key_id)\n            return\n\n        self._validate_cmk_id(key_id)\n\n    def _validate_key_policy(self, key_id: str, action: str) -> None:\n        \"\"\"\n        Validate whether the specified action is allowed, given the key policy\n        \"\"\"\n        key = self.kms_backend.describe_key(self.kms_backend.get_key_id(key_id))\n        validate_policy(key, action)\n\n    def create_key(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_CreateKey.html\"\"\"\n        policy = self._get_param(\"Policy\")\n        key_usage = self._get_param(\"KeyUsage\")\n        key_spec = self._get_param(\"KeySpec\") or self._get_param(\n            \"CustomerMasterKeySpec\"\n        )\n        description = self._get_param(\"Description\")\n        tags = self._get_param(\"Tags\")\n        multi_region = self._get_param(\"MultiRegion\")\n        origin = self._get_param(\"Origin\") or \"AWS_KMS\"\n\n        key = self.kms_backend.create_key(\n            policy, key_usage, key_spec, description, tags, multi_region, origin\n        )\n        return json.dumps(key.to_dict())\n\n    def replicate_key(self) -> str:\n        key_id = self._get_param(\"KeyId\")\n        self._validate_key_id(key_id)\n        replica_region = self._get_param(\"ReplicaRegion\")\n        replica_key = self.kms_backend.replicate_key(key_id, replica_region)\n        return json.dumps(\n            {\n                \"ReplicaKeyMetadata\": replica_key.to_dict()[\"KeyMetadata\"],\n                \"ReplicaPolicy\": replica_key.generate_default_policy(),\n            }\n        )\n\n    def update_key_description(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_UpdateKeyDescription.html\"\"\"\n        key_id = self._get_param(\"KeyId\")\n        description = self._get_param(\"Description\")\n\n        self._validate_cmk_id(key_id)\n\n        self.kms_backend.update_key_description(key_id, description)\n        return json.dumps(None)\n\n    def tag_resource(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_TagResource.html\"\"\"\n        key_id = self._get_param(\"KeyId\")\n        tags = self._get_param(\"Tags\")\n\n        self._validate_cmk_id(key_id)\n\n        self.kms_backend.tag_resource(key_id, tags)\n        return \"{}\"\n\n    def untag_resource(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_UntagResource.html\"\"\"\n        key_id = self._get_param(\"KeyId\")\n        tag_names = self._get_param(\"TagKeys\")\n\n        self._validate_cmk_id(key_id)\n\n        self.kms_backend.untag_resource(key_id, tag_names)\n        return \"{}\"\n\n    def list_resource_tags(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_ListResourceTags.html\"\"\"\n        key_id = self._get_param(\"KeyId\")\n        self._validate_cmk_id(key_id)\n\n        tags: dict[str, Any] = self.kms_backend.list_resource_tags(key_id)\n        tags.update({\"NextMarker\": None, \"Truncated\": False})\n        return json.dumps(tags)\n\n    def describe_key(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html\"\"\"\n        key_id = self._get_param(\"KeyId\")\n\n        self._validate_key_id(key_id)\n        self._validate_key_policy(key_id, \"kms:DescribeKey\")\n\n        key = self.kms_backend.describe_key(self.kms_backend.get_key_id(key_id))\n\n        return json.dumps(key.to_dict())\n\n    def list_keys(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_ListKeys.html\"\"\"\n        keys = self.kms_backend.list_keys()\n\n        return json.dumps(\n            {\n                \"Keys\": [{\"KeyArn\": key.arn, \"KeyId\": key.id} for key in keys],\n                \"NextMarker\": None,\n                \"Truncated\": False,\n            }\n        )\n\n    def create_alias(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_CreateAlias.html\"\"\"\n        return self._set_alias()\n\n    def update_alias(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_UpdateAlias.html\"\"\"\n        return self._set_alias(update=True)\n\n    def _set_alias(self, update: bool = False) -> str:\n        alias_name = self._get_param(\"AliasName\")\n        target_key_id = self._get_param(\"TargetKeyId\")\n\n        if not alias_name.startswith(\"alias/\"):\n            raise ValidationException(\"Invalid identifier\")\n\n        if alias_name in RESERVED_ALIASES:\n            raise NotAuthorizedException()\n\n        if \":\" in alias_name:\n            raise ValidationException(\n                f\"{alias_name} contains invalid characters for an alias\"\n            )\n\n        if not re.match(r\"^[a-zA-Z0-9:/_-]+$\", alias_name):\n            raise ValidationException(\n                f\"1 validation error detected: Value '{alias_name}' at 'aliasName' \"\n                \"failed to satisfy constraint: Member must satisfy regular \"\n                \"expression pattern: ^[a-zA-Z0-9:/_-]+$\"\n            )\n\n        if self.kms_backend.alias_exists(target_key_id):\n            raise ValidationException(\"Aliases must refer to keys. Not aliases\")\n\n        self._validate_cmk_id(target_key_id)\n        if update:\n            self._validate_alias(alias_name)\n            self.kms_backend.update_alias(target_key_id, alias_name)\n        else:\n            if self.kms_backend.alias_exists(alias_name):\n                raise AlreadyExistsException(\n                    f\"An alias with the name arn:aws:kms:{self.region}:{self.current_account}:{alias_name} already exists\"\n                )\n            self.kms_backend.create_alias(target_key_id, alias_name)\n\n        return json.dumps(None)\n\n    def delete_alias(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_DeleteAlias.html\"\"\"\n        alias_name = self._get_param(\"AliasName\")\n\n        if not alias_name.startswith(\"alias/\"):\n            raise ValidationException(\"Invalid identifier\")\n\n        self._validate_alias(alias_name)\n\n        self.kms_backend.delete_alias(alias_name)\n\n        return json.dumps(None)\n\n    def list_aliases(self) -> str:\n        \"\"\"https://docs.aws.amazon.com/kms/latest/APIReference/API_ListAliases.html\"\"\"\n        region = self.region\n        key_id = self._get_param(\"KeyId\")\n        if key_id is not None:\n            self._validate_key_id(key_id)\n            key_id = self.kms_backend.get_key_id(key_id)\n\n        response_aliases = []\n\n        aliases = self.kms_backend.list_aliases(key_id=key_id)\n        for alias in aliases:\n            # TODO: add creation date and last updated in response_aliases\n            response_aliases.append(\n                {\n                    \"AliasArn\": alias.alias_arn,\n                    \"AliasName\": alias.alias_name,\n                    \"TargetKeyId\": alias.target_key_id,\n                }\n            )\n        for reserved_alias, target_key_id in RESERVED_ALIASE_TARGET_KEY_IDS.items():\n            if key_id and target_key_id != key_id:\n                continue\n            existing = [a for a in response_aliases if a[\"AliasName\"] == reserved_alias]\n            if not existing:\n                arn = f\"arn:{get_partition(region)}:kms:{region}:{self.current_account}:{reserved_alias}\"\n                response_aliases.append(\n                    {\n                        \"TargetKeyId\": target_key_id,\n                        \"AliasArn\": arn,\n                        \"AliasName\": reserved_alias,\n                    }\n                )\n\n        return json.dumps({\"Truncated\": False, \"Aliases\": response_aliases})\n\n    def create_grant(self) -> str:\n        key_id = self._get_param(\"KeyId\")\n        grantee_principal = self._get_param(\"GranteePrincipal\")\n        retiring_principal = self._get_param(\"RetiringPrincipal\")\n        operations = self._get_param(\"Operations\")\n        name = self._get_param(\"Name\")\n        constraints = self._get_param(\"Constraints\")\n\n        grant_id, grant_token = self.kms_backend.create_grant(\n            key_id,\n            grantee_principal,\n            operations,\n            name,\n            constraints=constraints,\n            retiring_principal=retiring_principal,\n        )\n        return json.dumps({\"GrantId\": grant_id, \"GrantToken\": grant_token})\n\n    def list_grants(self) -> str:\n        key_id = self._get_param(\"KeyId\")\n        grant_id = self._get_param(\"GrantId\")\n\n        grants = self.kms_backend.list_grants(key_id=key_id, grant_id=grant_id)\n        return json.dumps(\n            {\n                \"Grants\": [gr.to_json() for gr in grants],\n                \"GrantCount\": len(grants),\n                \"Truncated\": False,\n            }\n        )\n\n    def list_retirable_grants(self) -> str:\n        retiring_principal = self._get_param(\"RetiringPrincipal\")\n\n        grants = self.kms_backend.list_retirable_grants",
+      "total_lines": 803
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "base64",
+        "json",
+        "os",
+        "re",
+        "typing:Any",
+        "moto.core.responses:BaseResponse",
+        "moto.kms.utils:RESERVED_ALIASE_TARGET_KEY_IDS",
+        "moto.kms.utils:RESERVED_ALIASES",
+        "moto.utilities.utils:get_partition",
+        "exceptions:AlreadyExistsException",
+        "exceptions:NotAuthorizedException",
+        "exceptions:NotFoundException",
+        "exceptions:ValidationException",
+        "models:KmsBackend",
+        "models:kms_backends",
+        "policy_validator:validate_policy"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/getmoto/moto/master/README.md",
+      "content_excerpt": "# Moto - Mock AWS Services\n\n[![Join the chat at https://gitter.im/awsmoto/Lobby](https://badges.gitter.im/awsmoto/Lobby.svg)](https://gitter.im/awsmoto/Lobby?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)\n\n[![Build Status](https://github.com/getmoto/moto/workflows/TestNDeploy/badge.svg)](https://github.com/getmoto/moto/actions)\n[![Coverage Status](https://codecov.io/gh/getmoto/moto/branch/master/graph/badge.svg)](https://codecov.io/gh/getmoto/moto)\n[![Docs](https://readthedocs.org/projects/pip/badge/?version=stable)](http://docs.getmoto.org)\n[![PyPI](https://img.shields.io/pypi/v/moto.svg)](https://pypi.org/project/moto/)\n[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/moto.svg)](#)\n[![PyPI - Downloads](https://img.shields.io/pypi/dw/moto.svg)](https://pypistats.org/packages/moto)\n[![Code style: Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)\n[![Financial Contributors](https://opencollective.com/moto/tiers/badge.svg)](https://opencollective.com/moto)\n\n\n## Install\n\n```console\n$ pip install 'moto[ec2,s3,all]'\n```\n\n## In a nutshell\n\n\nMoto is a library that allows your tests to easily mock out AWS Services.\n\nImagine you have the following python code that you want to test:\n\n```python\nimport boto3\n\n\nclass MyModel:\n    def __init__(self, name, value):\n        self.name = name\n        self.value = value\n\n    def save(self):\n        s3 = boto3.client(\"s3\", region_name=\"us-east-1\")\n        s3.put_object(Bucket=\"mybucket\", Key=self.nam"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "decrypt test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_utils.py",
+          "path": "tests/test_kms/test_utils.py",
+          "sha": "458abb53cbb63f18bae815d0ecf0a3af4bcedb6f",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_kms_encrypt.py",
+          "path": "tests/test_kms/test_kms_encrypt.py",
+          "sha": "529f57c124f705e6456ef60be760f22b6a239f99",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_kms_encrypt.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_model.py",
+          "path": "tests/test_kms/test_model.py",
+          "sha": "f6532ff657a1f539fcf5d8030313677ad66cceb1",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_model.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_kms_grants.py",
+          "path": "tests/test_kms/test_kms_grants.py",
+          "sha": "db8e881c0d55627b410be9b194c038a0bc4e693d",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_kms_grants.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_kms_mac.py",
+          "path": "tests/test_kms/test_kms_mac.py",
+          "sha": "fcfd09c52ac088a1602144028ab4070c72a3954e",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_kms_mac.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_kms.py",
+          "path": "tests/test_kms/test_kms.py",
+          "sha": "c1ec54d6cd759a129bcdef2f69c77943611d8442",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_kms.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_ec2_integration.py",
+          "path": "tests/test_ec2/test_ec2_integration.py",
+          "sha": "56e543e59bfd2250b8aa2c3100dabc815dfe9c9c",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_ec2/test_ec2_integration.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_integrations.py",
+          "path": "tests/test_rds/test_integrations.py",
+          "sha": "021c3878feddb21e62e69b31aea474a0e29bf7c7",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_rds/test_integrations.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"decrypt(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "CHANGELOG.md",
+          "path": "CHANGELOG.md",
+          "sha": "a3dbf497c45d4f417237c1581b80d4a019579ec4",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/CHANGELOG.md",
+          "score": 1.0
+        },
+        {
+          "name": "models.py",
+          "path": "moto/kms/models.py",
+          "sha": "d2853d58541ba1e27879834f97b1c462c532eb10",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/moto/kms/models.py",
+          "score": 1.0
+        },
+        {
+          "name": "utils.py",
+          "path": "moto/kms/utils.py",
+          "sha": "881d17bbb94fe2e4edcd0a13b10f89da801375aa",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/moto/kms/utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "responses.py",
+          "path": "moto/kms/responses.py",
+          "sha": "8ec091b2938dac8c96a216e676f247610d9314c7",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/moto/kms/responses.py",
+          "score": 1.0
+        },
+        {
+          "name": "models.py",
+          "path": "moto/ssm/models.py",
+          "sha": "0356155e3d9353cedb1c6ee1a17dc78dfaeafe56",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/moto/ssm/models.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_utils.py",
+          "path": "tests/test_kms/test_utils.py",
+          "sha": "458abb53cbb63f18bae815d0ecf0a3af4bcedb6f",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_kms_encrypt.py",
+          "path": "tests/test_kms/test_kms_encrypt.py",
+          "sha": "529f57c124f705e6456ef60be760f22b6a239f99",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_kms_encrypt.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_kms.py",
+          "path": "tests/test_kms/test_kms.py",
+          "sha": "c1ec54d6cd759a129bcdef2f69c77943611d8442",
+          "html_url": "https://github.com/getmoto/moto/blob/b07bcbc3710dee14cb2a09db4cad1aabcb72b841/tests/test_kms/test_kms.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "moto/kms",
+      "count": 7,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "moto/kms/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "moto/kms/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "models.py",
+          "path": "moto/kms/models.py",
+          "type": "file"
+        },
+        {
+          "name": "policy_validator.py",
+          "path": "moto/kms/policy_validator.py",
+          "type": "file"
+        },
+        {
+          "name": "responses.py",
+          "path": "moto/kms/responses.py",
+          "type": "file"
+        },
+        {
+          "name": "urls.py",
+          "path": "moto/kms/urls.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "moto/kms/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 6,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "moto/kms/__init__.py"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "moto/kms/exceptions.py"
+        },
+        {
+          "name": "models.py",
+          "path": "moto/kms/models.py"
+        },
+        {
+          "name": "policy_validator.py",
+          "path": "moto/kms/policy_validator.py"
+        },
+        {
+          "name": "urls.py",
+          "path": "moto/kms/urls.py"
+        },
+        {
+          "name": "utils.py",
+          "path": "moto/kms/utils.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "moto/kms/responses.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ebed4868762686e5c7e2dae49209e4bb6f80a073",
+          "html_url": "https://github.com/getmoto/moto/commit/ebed4868762686e5c7e2dae49209e4bb6f80a073",
+          "message": "[KMS] Support full ARN as TargetKeyId in update_alias (#9841)",
+          "author": "Raajhesh Kannaa Chidambaram",
+          "date": "2026-03-13T20:13:07Z"
+        },
+        {
+          "sha": "abd92db2620efba61a9e019b67f97455552c29c8",
+          "html_url": "https://github.com/getmoto/moto/commit/abd92db2620efba61a9e019b67f97455552c29c8",
+          "message": "KMS: Refactor Aliases into standalone models (#9744)",
+          "author": "Bert Blommers",
+          "date": "2026-02-13T20:38:17Z"
+        },
+        {
+          "sha": "d477e710bf7228f355c0655533600c3e1f2dda9e",
+          "html_url": "https://github.com/getmoto/moto/commit/d477e710bf7228f355c0655533600c3e1f2dda9e",
+          "message": "Admin: Enable Ruff's C4 rules (#9416)",
+          "author": "Bert Blommers",
+          "date": "2025-10-30T21:56:01Z"
+        },
+        {
+          "sha": "9e7a4107a05ed9879369322505fb27aaaaba0a30",
+          "html_url": "https://github.com/getmoto/moto/commit/9e7a4107a05ed9879369322505fb27aaaaba0a30",
+          "message": "Admin: Enable Ruff's UP rules (#9414)",
+          "author": "Bert Blommers",
+          "date": "2025-10-29T23:11:14Z"
+        },
+        {
+          "sha": "e0d4dff20c1d881cca5a3e31ed94aeaa26fa380e",
+          "html_url": "https://github.com/getmoto/moto/commit/e0d4dff20c1d881cca5a3e31ed94aeaa26fa380e",
+          "message": "Core: deprecate and limit use of `XFormedDict` (#9376)",
+          "author": "Brian Pandola",
+          "date": "2025-10-16T17:01:04Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "decrypt TODO refuse decode EncryptionContext same",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "moto/kms/responses.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "ebed4868762686e5c7e2dae49209e4bb6f80a073",
+        "html_url": "https://github.com/getmoto/moto/commit/ebed4868762686e5c7e2dae49209e4bb6f80a073",
+        "message": "[KMS] Support full ARN as TargetKeyId in update_alias (#9841)",
+        "author": "Raajhesh Kannaa Chidambaram",
+        "date": "2026-03-13T20:13:07Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying the intended check",
+        "localized code snippet in decrypt method",
+        "access to parameters dictionary for CiphertextBlob",
+        "presence of kms backend and key validation utilities in file",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

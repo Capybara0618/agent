@@ -1,0 +1,357 @@
+{
+  "task_id": "1",
+  "repo_owner": "famura",
+  "repo_name": "simurlacra",
+  "file_path": "Pyrado/pyrado/algorithms/meta/bayessim.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T12:02:45+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 3,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T12:02:54+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T12:02:58+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "Pyrado/pyrado/algorithms/meta/bayessim.py",
+    "original_code": "def __init__(self, env_sim: Union[SimEnv, EnvWrapper], policy: Policy, downsampling_factor: int = 1, **kwargs):\n    \"\"\"\n    Constructor\n\n    :param env_sim: randomized simulation environment a.k.a. source domain\n    :param policy: policy used for sampling the rollouts in the target domain at the beginning of each iteration.\n                   If `subrtn_policy` is not `None` this policy is also trained at the very last iteration.\n    :param downsampling_factor: downsampling factor for the embedding which is used for pre-processing the data\n                                before passing it to the posterior, 1 means no downsampling\n    :param kwargs: forwarded the superclass constructor\n    \"\"\"\n    # Construct the same embedding as in [1]\n    embedding = BayesSimEmbedding(\n        spec=env_sim.spec,\n        dim_data=RolloutSamplerForSBI.get_dim_data(env_sim.spec),\n        downsampling_factor=downsampling_factor,\n        use_cuda=policy.device != \"cpu\",\n    )\n\n    # Call SBIBase's constructor\n    super().__init__(\n        env_sim=env_sim,\n        policy=policy,\n        subrtn_sbi_class=SNPE_C,  # TODO replace by SNPE-A when available\n        embedding=embedding,\n        num_checkpoints=3,\n        init_checkpoint=0,\n        max_iter=1,  # BayesSim only runs SNPE-A (could be multi-round) once on the initially collected trajectories\n        use_rec_act=True,  # BayesSim requires the trajectories to be recorded beforehand\n        **kwargs,\n    )",
+    "satd_comment": "# TODO replace by SNPE-A when available",
+    "target_file": {
+      "ok": true,
+      "path": "Pyrado/pyrado/algorithms/meta/bayessim.py",
+      "sha": "edba35bdb297ced2dfa0c602072ebd4d713bddf2",
+      "download_url": "https://raw.githubusercontent.com/famura/SimuRLacra/master/Pyrado/pyrado/algorithms/meta/bayessim.py",
+      "content_excerpt": "# Copyright (c) 2020, Fabio Muratore, Honda Research Institute Europe GmbH, and\n# Technical University of Darmstadt.\n# All rights reserved.\n#\n# Redistribution and use in source and binary forms, with or without\n# modification, are permitted provided that the following conditions are met:\n# 1. Redistributions of source code must retain the above copyright\n#    notice, this list of conditions and the following disclaimer.\n# 2. Redistributions in binary form must reproduce the above copyright\n#    notice, this list of conditions and the following disclaimer in the\n#    documentation and/or other materials provided with the distribution.\n# 3. Neither the name of Fabio Muratore, Honda Research Institute Europe GmbH,\n#    or Technical University of Darmstadt, nor the names of its contributors may\n#    be used to endorse or promote products derived from this software without\n#    specific prior written permission.\n#\n# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND\n# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED\n# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\n# DISCLAIMED. IN NO EVENT SHALL FABIO MURATORE, HONDA RESEARCH INSTITUTE EUROPE GMBH,\n# OR TECHNICAL UNIVERSITY OF DARMSTADT BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,\n# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;\n# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER\n# IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)\n# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE\n# POSSIBILITY OF SUCH DAMAGE.\n\nimport os.path as osp\nfrom typing import Optional\n\nimport torch as to\nfrom sbi.inference import SNPE_A\nfrom sbi.inference.base import simulate_for_sbi\n\nimport pyrado\nfrom pyrado.algorithms.meta.sbi_base import SBIBase\nfrom pyrado.algorithms.utils import until_thold_exceeded\nfrom pyrado.sampling.sbi_embeddings import BayesSimEmbedding\nfrom pyrado.utils.input_output import print_cbt\n\n\nclass BayesSim(SBIBase):\n    \"\"\"\n    BayesSim [1] as well as it's online variant [2], both using Sequential Neural Posterior Estimation (SNPE-A) [3]\n\n    For convenience, we provide the possibility to train a policy of the last posterior, i.e. after the inference was\n    done. This is not part of the original BayesSim algorithm [1]. Note that Online BayesSim [2], apart from using an\n    optionally different embedding, alternates between training the policy or the internal model of the policy\n    (see the last paragraph of Section V.B.), thus has a significantly different data generation procedure.\n\n    .. seealso::\n        [1] F. Ramos, R.C. Possas, D. Fox, \"BayesSim: adaptive domain randomization via probabilistic inference for\n            robotics simulators\", RSS, 2019\n        [2] R.C. Possas, L. Barcelos, R. Oliveira, D. Fox, F. Ramos, \"Online BayesSim for Combined Simulator Parameter\n            Inference and Policy Improvement\", IROS, 2020\n        [3] G. Papamakarios, I. Murray. \"Fast epsilon-free inference of simulation models with Bayesian conditional\n            density estimation.\", NIPS, 2016\n    \"\"\"\n\n    name: str = \"bayessim\"\n    iteration_key: str = \"bayessim_iteration\"\n\n    def __init__(\n        self,\n        *args,\n        num_components: int = 5,\n        component_perturbation: float = 1e-3,\n        subrtn_sbi_sampling_hparam: Optional[dict] = None,\n        **kwargs,\n    ):\n        \"\"\"\n        Constructor\n\n        :param num_components: number of components for the mixture of Gaussians density estimator\n        :param component_perturbation: standard deviation applied to all weights and biases when, in the last round of\n                                       SNPE-A, the Mixture of Gaussians is build from a single Gaussian.\n        :param subrtn_sbi_sampling_hparam: keyword arguments forwarded to sbi's `DirectPosterior.sample()` function\n        :param kwargs: forwarded the superclass constructor\n        \"\"\"\n        # Determine weather we are using offline [1] or online [2] BayesSim\n        self._online = False if kwargs.get(\"subrtn_policy\", None) is None else True\n\n        # Original BayesSim [1]\n        if not self._online:\n            # BayesSim only runs SNPE-A (could be multi-round) once on the initially collected trajectories\n            kwargs[\"max_iter\"] = 1\n\n            if not isinstance(kwargs[\"embedding\"], BayesSimEmbedding):\n                raise pyrado.TypeErr(msg=\"The embedding for (the original) BayesSim must be of type BayesSimEmbedding!\")\n            if not kwargs.get(\"use_rec_act\", True):\n                # BayesSim requires the trajectories to be recorded beforehand\n                raise pyrado.ValueErr(given_name=\"use_rec_act\", eq_constraint=\"True\")\n\n        # Online BayesSim [2]\n        if self._online:\n            # The pseudo code (see Algorithm 1 in [2]) shows that only one update step is run before the policy is\n            # called again. This is possible because their controller is kept fixed, but its internal model updates.\n            kwargs[\"subrtn_policy\"].max_iter = 1\n\n        if component_perturbation <= 0:\n            raise pyrado.ValueErr(given=component_perturbation, g_constraint=\"0\")\n\n        # Call SBIBase's constructor\n        super().__init__(\n            *args,\n            num_checkpoints=3,\n            # Both variants of Bayessim does not train the initial policy. See [1] and Algorithm 1 (line 7) in [2].\n            init_checkpoint=0,  # set to -1 to nevertheless train an initial policy\n            posterior_hparam=dict(model=\"mdn_snpe_a\"),  # could be something else but SNPE-A is too special in practice\n            **kwargs,\n        )\n\n        # Set the sampling parameters used by the sbi subroutine\n        self.subrtn_sbi_sampling_hparam = subrtn_sbi_sampling_hparam or dict()\n\n        # Create the algorithm instance used in sbi, i.e. SNPE-A which has a few specialities\n        self._num_components = num_components\n        self._component_perturbation = float(component_perturbation)  # custom to SNPE-A\n        self._initialize_subrtn_sbi(subrtn_sbi_class=SNPE_A, num_components=self._num_components)\n\n    def step(self, snapshot_mode: str = \"latest\", meta_info: dict = None):\n        # Save snapshot to save the correct iteration count\n        self.save_snapshot()\n\n        if self.curr_checkpoint == -1:\n            if self._subrtn_policy is not None and self._train_initial_policy:\n                # Add dummy values of variables that are logger later\n                self.logger.add_value(\"avg log prob\", -pyrado.inf)\n\n                # Train the behavioral policy using the samples obtained from the prior.\n                # Repeat the training if the resulting policy did not exceed the success threshold.\n                domain_params = self._sbi_prior.sample(sample_shape=(self.num_eval_samples,))\n                print_cbt(\"Training the initial policy using domain parameter sets sampled from prior.\", \"c\")\n                wrapped_trn_fcn = until_thold_exceeded(self.thold_succ_subrtn, self.max_subrtn_rep)(\n                    self.train_policy_sim\n                )\n                wrapped_trn_fcn(domain_params, prefix=\"init\", use_rec_init_states=False)  # overrides policy.pt\n\n            self.reached_checkpoint()  # setting counter to 0\n\n        if self.curr_checkpoint == 0:\n            # Check if the rollout files already exist\n            if (\n                osp.isfile(osp.join(self._save_dir, f\"iter_{self.curr_iter}_data_real.pt\"))\n                and osp.isfile(osp.join(self._save_dir, \"data_real.pt\"))\n                and osp.isfile(osp.join(self._save_dir, \"rollouts_real.pkl\"))\n            ):\n                # Rollout files do exist (can be when continuing a previous experiment)\n                self._curr_data_real = pyrado.load(\"data_real.pt\", self._save_dir, prefix=f\"iter_{self.curr_iter}\")\n                print_cbt(f\"Loaded existing rollout data for iteration {self.curr_iter}.\", \"w\")\n\n            else:\n                # If the policy depends on the domain-parameters, reset the policy with the\n                # most likely dp-params from the previous round.\n                pyrado.load(\n                    \"policy.pt\",\n                    self._save_dir,\n                    prefix=f\"iter_{self._curr_iter - 1}\" if self.curr_iter != 0 else \"init\",\n                    obj=self._policy,\n                )\n                if self.curr_iter != 0:\n                    ml_domain_param = pyrado.load(\n                        \"ml_domain_param.pkl\", self.save_dir, prefix=f\"iter_{self._curr_iter - 1}\"\n                    )\n                    self._policy.reset(**dict(domain_param=ml_domain_param))\n\n                # Rollout files do not exist yet (usual case)\n                self._curr_data_real, _ = SBIBase.collect_data_real(\n                    self.save_dir,\n                    self._env_real,\n                    self._policy,\n                    self._embedding,\n                    prefix=f\"iter_{self._curr_iter}\",\n                    num_rollouts=self.num_real_rollouts,\n                    num_segments=self.num_segments,\n                    len_segments=self.len_segments,\n                )\n\n                # Save the target domain data\n                if self._curr_iter == 0:\n                    # Append the first set of data\n                    pyrado.save(self._curr_data_real, \"data_real.pt\", self._save_dir)\n                else:\n                    # Append and save all data\n                    prev_data = pyrado.load(\"data_real.pt\", self._save_dir)\n                    data_real_hist = to.cat([prev_data, self._curr_data_real], dim=0)\n                    pyrado.save(data_real_hist, \"data_real.pt\", self._save_dir)\n\n            # Initialize sbi simulator and prior\n            self._setup_sbi(\n                prior=self._sbi_prior,\n                rollouts_real=pyrado.load(\"rollouts_real.pkl\", self._save_dir, prefix=f\"iter_{self._curr_iter}\"),\n            )\n\n            self.reached_checkpoint()  # setting counter to 1\n\n        if self.curr_checkpoint == 1:\n            # Instantiate the sbi subroutine to retrain from scratch each iteration\n            if self.reset_sbi_routine_each_iter:\n                self._initialize_subrtn_sbi(subrtn_sbi_class=SNPE_A, num_components=self._num_components)\n\n            # Initialize the proposal with the prior\n            proposal = self._sbi_prior\n\n            # Multi-round sbi\n            for idx_r in range(self.num_sbi_rounds):\n                # Sample parameters proposal, and simulate these parameters to obtain the data\n                domain_param, data_sim = simulate_for_sbi(\n                    simulator=self._sbi_simulator,\n                    proposal=proposal,\n                    num_simulations=self.num_sim_per_round,\n                    simulation_batch_size=self.simulation_batch_size,\n                    num_workers=self.num_workers,\n                )\n                self._cnt_samples += self.num_sim_per_round * self._env_sim_sbi.max_steps\n\n                # Append simulations and proposals for sbi\n                self._subrtn_sbi.append_simulations(\n                    domain_param,\n                    data_sim,\n                    proposal=proposal,  # do not pass proposal arg for SNLE or SNRE\n                )\n\n                # Train the posterior\n                density_estimator = self._subrtn_sbi.train(\n                    final_round=idx_r == self.num_sbi_rounds - 1,\n                    component_perturbation=self._component_perturbation,\n                    **self.subrtn_sbi_training_hparam,\n                )\n                posterior = self._subrtn_sbi.build_posterior(\n                    density_estimator=density_estimator, **self.subrtn_sbi_sampling_hparam\n                )\n\n                # Save the posterior of this iteration before tailoring it to the data (when ",
+      "total_lines": 317
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "os.path",
+        "typing:Optional",
+        "torch",
+        "sbi.inference:SNPE_A",
+        "sbi.inference.base:simulate_for_sbi",
+        "pyrado",
+        "pyrado.algorithms.meta.sbi_base:SBIBase",
+        "pyrado.algorithms.utils:until_thold_exceeded",
+        "pyrado.sampling.sbi_embeddings:BayesSimEmbedding",
+        "pyrado.utils.input_output:print_cbt"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/famura/SimuRLacra/master/README.md",
+      "content_excerpt": "<img alt=\"logo\" align=\"left\" height=\"175px\" src=\"assets/logo.png\" style=\"padding-right: 20px\">\n\n**[Overview](#overview)**  \n**[Citing](#citing)**  \n**[Installation](#installation)**  \n**[Checking](#checking)**   \n**[Convenience](#convenience)**   \n**[Troubleshooting](#troubleshooting)**\n\n\n## Overview\n\nSimuRLacra (composed of the two modules Pyrado and RcsPySim) is a Python/C++ framework for reinforcement learning from randomized physics simulations.\nThe focus is on robotics tasks with mostly continuous control.\nIt features __randomizable simulations__ written __in standalone Python__ (no license required) as well as simulations driven by the physics engines __Bullet__ (no license required), __Vortex__ (license required), __or MuJoCo__ (license required).\n\n[![License](https://img.shields.io/badge/License-BSD%203--Clause-green.svg)](https://opensource.org/licenses/BSD-3-Clause)\n[![Documentation](https://img.shields.io/badge/docs-informational)](https://famura.github.io/SimuRLacra/)\n[![codestyle](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)\n[![isort](https://img.shields.io/badge/imports-isort-green)](https://pycqa.github.io/isort/)\n<!-- [![codecov](https://codecov.io/gh/famura/SimuRLacra/branch/master/graph/badge.svg)](https://codecov.io/gh/famura/SimuRLacra) -->\n\n<table>\n<tr>\n  <td>Furuta Pendulum</td>\n  <td>Ball on Beam</td>\n  <td>One-Mass-Oscillator</td>\n  <td>Cart-Pole</td>\n</tr>\n<tr>\n<td><img alt=\"gif\"  height=\"175px\" src=\"assets/gif/qq.gif\"  style=\"padding-right: 0\"/></td>\n<td><img alt=\"gif\"  height=\"175px\" src=\"assets/gif/bo"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 3,
+      "items": [
+        {
+          "name": "test_stopping_criteria.py",
+          "path": "Pyrado/tests/algorithms/test_stopping_criteria.py",
+          "sha": "e0ed3775e02190d8a049770f38479d28aec1c74d",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/tests/algorithms/test_stopping_criteria.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_utils.py",
+          "path": "Pyrado/tests/test_utils.py",
+          "sha": "6a76679102ae7c14aaf36d9d0826394a3bddfd48",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/tests/test_utils.py",
+          "score": 1.0
+        },
+        {
+          "name": "mock_env.py",
+          "path": "Pyrado/tests/environment_wrappers/mock_env.py",
+          "sha": "02bcf73d51357ed64aac0375955e2c28203b1764",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/tests/environment_wrappers/mock_env.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "polar.py",
+          "path": "Pyrado/pyrado/spaces/polar.py",
+          "sha": "abb6b6a91376f5e428828ba9523ddb8e8485fd75",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/pyrado/spaces/polar.py",
+          "score": 1.0
+        },
+        {
+          "name": "nn_layers.py",
+          "path": "Pyrado/pyrado/utils/nn_layers.py",
+          "sha": "e4203e13fc5ca372f1b8eec48be6c6a5fb95c989",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/pyrado/utils/nn_layers.py",
+          "score": 1.0
+        },
+        {
+          "name": "3_algorithm_skeleton.rst",
+          "path": "Pyrado/doc/source/examples/3_algorithm_skeleton.rst",
+          "sha": "f6df360f67a9dfbcb8184bbcfcf51e29aab6914b",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/doc/source/examples/3_algorithm_skeleton.rst",
+          "score": 1.0
+        },
+        {
+          "name": "mp_blending.py",
+          "path": "Pyrado/pyrado/environments/rcspysim/mp_blending.py",
+          "sha": "bdc3c6e91641b21f94bccc450b4a0f46ba192dcc",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/pyrado/environments/rcspysim/mp_blending.py",
+          "score": 1.0
+        },
+        {
+          "name": "ball_in_tube.py",
+          "path": "Pyrado/pyrado/environments/rcspysim/ball_in_tube.py",
+          "sha": "cd03ffe5d1c9a8e42b848c084f609c8bd71daf0c",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/pyrado/environments/rcspysim/ball_in_tube.py",
+          "score": 1.0
+        },
+        {
+          "name": "step_sequence.py",
+          "path": "Pyrado/pyrado/sampling/step_sequence.py",
+          "sha": "836008355f68a3c68d46bef0bedec589aa66816c",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/pyrado/sampling/step_sequence.py",
+          "score": 1.0
+        },
+        {
+          "name": "4_creating_rcspysim_environments.rst",
+          "path": "Pyrado/doc/source/examples/4_creating_rcspysim_environments.rst",
+          "sha": "b12e4804d0d5f79871417505996cf49f157ed28e",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/doc/source/examples/4_creating_rcspysim_environments.rst",
+          "score": 1.0
+        },
+        {
+          "name": "catapult.py",
+          "path": "Pyrado/pyrado/environments/one_step/catapult.py",
+          "sha": "9fcc349cbc58165ca7330321f0a6dbd185eae147",
+          "html_url": "https://github.com/famura/SimuRLacra/blob/36bc88490e7017d3569d70b7526d69b9041051af/Pyrado/pyrado/environments/one_step/catapult.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "Pyrado/pyrado/algorithms/meta",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "Pyrado/pyrado/algorithms/meta/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "adr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/adr.py",
+          "type": "file"
+        },
+        {
+          "name": "arpl.py",
+          "path": "Pyrado/pyrado/algorithms/meta/arpl.py",
+          "type": "file"
+        },
+        {
+          "name": "bayessim.py",
+          "path": "Pyrado/pyrado/algorithms/meta/bayessim.py",
+          "type": "file"
+        },
+        {
+          "name": "bayrn.py",
+          "path": "Pyrado/pyrado/algorithms/meta/bayrn.py",
+          "type": "file"
+        },
+        {
+          "name": "epopt.py",
+          "path": "Pyrado/pyrado/algorithms/meta/epopt.py",
+          "type": "file"
+        },
+        {
+          "name": "iudr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/iudr.py",
+          "type": "file"
+        },
+        {
+          "name": "npdr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/npdr.py",
+          "type": "file"
+        },
+        {
+          "name": "pddr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/pddr.py",
+          "type": "file"
+        },
+        {
+          "name": "sbi_base.py",
+          "path": "Pyrado/pyrado/algorithms/meta/sbi_base.py",
+          "type": "file"
+        },
+        {
+          "name": "simopt.py",
+          "path": "Pyrado/pyrado/algorithms/meta/simopt.py",
+          "type": "file"
+        },
+        {
+          "name": "spdr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/spdr.py",
+          "type": "file"
+        },
+        {
+          "name": "spota.py",
+          "path": "Pyrado/pyrado/algorithms/meta/spota.py",
+          "type": "file"
+        },
+        {
+          "name": "udr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/udr.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "Pyrado/pyrado/algorithms/meta/__init__.py"
+        },
+        {
+          "name": "adr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/adr.py"
+        },
+        {
+          "name": "arpl.py",
+          "path": "Pyrado/pyrado/algorithms/meta/arpl.py"
+        },
+        {
+          "name": "bayrn.py",
+          "path": "Pyrado/pyrado/algorithms/meta/bayrn.py"
+        },
+        {
+          "name": "epopt.py",
+          "path": "Pyrado/pyrado/algorithms/meta/epopt.py"
+        },
+        {
+          "name": "iudr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/iudr.py"
+        },
+        {
+          "name": "npdr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/npdr.py"
+        },
+        {
+          "name": "pddr.py",
+          "path": "Pyrado/pyrado/algorithms/meta/pddr.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "Pyrado/pyrado/algorithms/meta/bayessim.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "2914e551a06376a25d1f9c75b63d11793599dcf9",
+          "html_url": "https://github.com/famura/SimuRLacra/commit/2914e551a06376a25d1f9c75b63d11793599dcf9",
+          "message": "Renaming",
+          "author": "Fabio Muratore",
+          "date": "2021-07-02T13:46:44Z"
+        },
+        {
+          "sha": "bc9f549a149b747e4315a586ec51058636a57667",
+          "html_url": "https://github.com/famura/SimuRLacra/commit/bc9f549a149b747e4315a586ec51058636a57667",
+          "message": "Bundled updates from the lfi branch",
+          "author": "Fabio Muratore",
+          "date": "2021-06-24T14:23:53Z"
+        },
+        {
+          "sha": "e83cb1ee9c862bb75a621c1593217e1ba69299b4",
+          "html_url": "https://github.com/famura/SimuRLacra/commit/e83cb1ee9c862bb75a621c1593217e1ba69299b4",
+          "message": "Changes from lfi branch",
+          "author": "Fabio Muratore",
+          "date": "2021-06-07T15:45:20Z"
+        },
+        {
+          "sha": "a388a05360fe7d70bd42007551dba418579626a2",
+          "html_url": "https://github.com/famura/SimuRLacra/commit/a388a05360fe7d70bd42007551dba418579626a2",
+          "message": "Bundled updates from lfi branch",
+          "author": "Fabio Muratore",
+          "date": "2021-06-06T13:51:51Z"
+        },
+        {
+          "sha": "05cfb7defadf2f78a47a4c850417ff3bd23e3824",
+          "html_url": "https://github.com/famura/SimuRLacra/commit/05cfb7defadf2f78a47a4c850417ff3bd23e3824",
+          "message": "Bundled updates from mini_golf branch",
+          "author": "Fabio Muratore",
+          "date": "2021-06-04T16:32:19Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO replace SNPE when available",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": false,
+      "path": "Pyrado/pyrado/algorithms/meta/bayessim.py",
+      "satd_line": null,
+      "last_commit": null,
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1017)>"
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 3,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

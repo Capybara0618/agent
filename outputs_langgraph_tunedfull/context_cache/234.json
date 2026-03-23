@@ -1,0 +1,283 @@
+{
+  "task_id": "234",
+  "repo_owner": "ploomber",
+  "repo_name": "ploomber",
+  "file_path": "src/ploomber/sources/notebooksource.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T16:28:02+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "remove_injected_cell",
+    "satd_line": 625,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T16:28:13+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T16:28:17+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/ploomber/sources/notebooksource.py",
+    "original_code": "def remove_injected_cell(self):\n    \"\"\"\n    Delete injected cell, overwrite the source file (and any paired files)\n    \"\"\"\n    # TODO: remove metadata\n\n    nb_clean = _cleanup_rendered_nb(self._nb_obj_unrendered)\n\n    fmt, _ = jupytext.guess_format(self._primitive, f'.{self._ext_in}')\n    fmt_ = f'{self._ext_in}:{fmt}'\n\n    # overwrite\n    jupytext.write(nb_clean, self._path, fmt=fmt_)\n\n    # overwrite all paired files\n    for path, fmt_ in iter_paired_notebooks(self._nb_obj_unrendered, fmt_,\n                                            self._path.stem):\n        jupytext.write(nb_clean, fp=path, fmt=fmt_)",
+    "satd_comment": "# TODO: remove metadata",
+    "target_file": {
+      "ok": true,
+      "path": "src/ploomber/sources/notebooksource.py",
+      "sha": "ae9c17e4316c46cb6ca1e05cff8a244ac349cb48",
+      "download_url": "https://raw.githubusercontent.com/ploomber/ploomber/master/src/ploomber/sources/notebooksource.py",
+      "content_excerpt": "\"\"\"\nOn languages and kernels\n------------------------\nNotebookSource represents source code in a Jupyter notebook format (language\nagnostic). Apart from .ipynb, we also support any other extension supported\nby jupytext.\n\nGiven a notebook, we have to know which language it is written in to extract\nupstream/product variables (though this only happens when the option of\nextracting dependencies automatically is on), we also have to determine the\nJupyter kernel to use (this is always needed).\n\nThe unequivocal place to store this information is in the notebook metadata\nsection, but given that we advocate for the use of scripts (converted to\nnotebooks via jupytext), they most likely won't contain metadata (metadata\nsaving is turned off by default in jupytext), so we have to infer this\nourselves.\n\nTo make things more complex, jupytext adds its own metadata section but we are\nignoring that for now.\n\nGiven that there are many places where this information might be stored, we\nhave a few rules to automatically determine language and kernel given a\nscript/notebook.\n\"\"\"\n\nfrom functools import wraps\nimport ast\nfrom pathlib import Path\nimport warnings\nimport logging\nfrom contextlib import redirect_stdout\nfrom io import StringIO\nfrom copy import deepcopy\nfrom papermill.parameterize import parameterize_notebook\nimport click\nimport nbformat\nimport jupytext\nfrom jupytext import cli as jupytext_cli\nfrom jupytext.formats import long_form_one_format, short_form_one_format\nfrom jupytext.config import JupytextConfiguration\nimport parso\n\nfrom ploomber.exceptions import SourceInitializationError\nfrom ploomber.placeholders.placeholder import Placeholder\nfrom ploomber_core.dependencies import requires\nfrom ploomber.sources.abc import Source\nfrom ploomber.sources.nb_utils import find_cell_with_tag, find_cell_with_tags\nfrom ploomber.static_analysis.extractors import extractor_class_for_language\nfrom ploomber.static_analysis.pyflakes import check_notebook\nfrom ploomber.sources import docstring\nfrom ploomber.io import pretty_print\n\n\nclass IgnoreBlackWarning(logging.Filter):\n    def filter(self, record):\n        return \"Black is not installed\" not in record.msg\n\n\nlogging.getLogger(\"papermill.translators\").addFilter(IgnoreBlackWarning())\n\n\ndef _jupytext_fmt(primitive, extension):\n    \"\"\"\n    Determine the jupytext fmt string to use based on the content and extension\n    \"\"\"\n    if extension.startswith(\".\"):\n        extension = extension[1:]\n\n    if extension != \"ipynb\":\n        fmt, _ = jupytext.guess_format(primitive, f\".{extension}\")\n        fmt_final = f\"{extension}:{fmt}\"\n    else:\n        fmt_final = \".ipynb\"\n\n    return fmt_final\n\n\n# TODO: we should unit test that this function is called, as opposed to vanilla\n# .read_text\ndef _read_primitive(path):\n    \"\"\"\n    We read using the UTF-8 instead of the default encoding since notebooks are\n    always stored in UTF-8.\n\n    We can see this in nbformat, which always reads as UTF-8:\n    https://github.com/jupyter/nbformat/blob/df63593b64a15ee1c37b522973c39e8674f93c5b/nbformat/__init__.py#L125\n\n    Scripts are a different story since they may have other encodings, however,\n    modern editors have UTF-8 as default (example: VSCode\n    https://docs.microsoft.com/en-us/powershell/scripting/dev-cross-plat/vscode/understanding-file-encoding?view=powershell-7.2#configuring-vs-code)\n    so it's safer to use UTF-8 than the default encoding.\n\n    jupytext already does this:\n    https://github.com/mwouts/jupytext/issues/896\n    \"\"\"\n    return Path(path).read_text(encoding=\"utf-8\")\n\n\ndef _get_last_cell(nb):\n    \"\"\"\n    Get last cell, ignores cells with empty source (unless the notebook only\n    has one cell and it's empty)\n    \"\"\"\n    # iterate in reverse order\n    for idx in range(-1, -len(nb.cells) - 1, -1):\n        cell = nb.cells[idx]\n\n        # only return it if it has some code\n        if cell[\"source\"].strip():\n            return cell\n\n    # otherwise return the first cell\n    return nb.cells[0]\n\n\ndef _get_cell_suggestion(nb):\n    format_name = (\n        nb.metadata.get(\"jupytext\", {})\n        .get(\"text_representation\", {})\n        .get(\"format_name\")\n    )\n\n    preamble = \"Add a new cell with your code\"\n\n    if format_name == \"light\":\n        message = (\n            f\"{preamble}:\\n\"\n            + \"\"\"\n# + tags=[\"parameters\"]\n# your parameters here...\n# -\n\n# +\n# your code here...\n# -\n\"\"\"\n        )\n\n    elif format_name == \"percent\":\n        message = (\n            f\"{preamble}:\\n\"\n            + \"\"\"\n# %% tags=[\"parameters\"]\n# your parameters here...\n\n# %%\n# your code here...\n\"\"\"\n        )\n    else:\n        message = preamble + \".\"\n\n    return message\n\n\ndef requires_path(func):\n    \"\"\"\n    Checks if NotebookSource instance was initialized from a file, raises\n    an error if not\n    \"\"\"\n\n    @wraps(func)\n    def wrapper(self, *args, **kwargs):\n        if self._path is None:\n            raise ValueError(\n                f\"Cannot use {func.__name__!r} if notebook was \"\n                \"not initialized from a file\"\n            )\n\n        return func(self, *args, **kwargs)\n\n    return wrapper\n\n\nclass NotebookSource(Source):\n    \"\"\"\n    A source object representing a jupyter notebook (or any format supported\n    by jupytext)\n\n    Parameters\n    ----------\n    hot_reload : bool, optional\n        Makes the notebook always read the file before rendering\n\n    kernelspec_name : str, optional\n        Which kernel to use for executing the notebook, it overrides any\n        existing kernelspec metadata in the notebook. If the notebook does\n        not have kernelspec info, this parameter is required. Defaults to None.\n        To see which kernelspecs are available run \"jupyter kernelspec list\"\n\n    check_if_kernel_installed : bool, optional\n        Check if the kernel is installed during initization\n\n    Notes\n    -----\n    The render method prepares the notebook for execution: it adds the\n    parameters and it makes sure kernelspec is defined\n    \"\"\"\n\n    @requires(\n        [\"parso\", \"pyflakes\", \"jupytext\", \"nbformat\", \"papermill\", \"jupyter_client\"]\n    )\n    def __init__(\n        self,\n        primitive,\n        hot_reload=False,\n        ext_in=None,\n        kernelspec_name=None,\n        static_analysis=\"regular\",\n        check_if_kernel_installed=True,\n    ):\n        # any non-py file must first be converted using jupytext, we need\n        # that representation for validation, if input is already a .py file\n        # do not convert. If passed a string, try to guess format using\n        # jupytext. We also need ipynb representation for .develop(),\n        # but do lazy loading in case we don't need both\n        self._primitive = primitive\n        self._check_if_kernel_installed = check_if_kernel_installed\n\n        # this happens if using SourceLoader\n        if isinstance(primitive, Placeholder):\n            self._path = primitive.path\n            self._primitive = str(primitive)\n        elif isinstance(primitive, str):\n            self._path = None\n            self._primitive = primitive\n        elif isinstance(primitive, Path):\n            self._path = primitive\n\n            if primitive.is_dir():\n                raise SourceInitializationError(\n                    f\"Failed to initialize {str(primitive)!r}. \"\n                    \"Expected a file, got a directory.\"\n                    + _suggest_ploomber_scaffold_is_dir()\n                )\n\n            if not primitive.exists():\n                raise SourceInitializationError(\n                    f\"Failed to initialize {str(primitive)!r}. \"\n                    \"File does not exist.\" + _suggest_ploomber_scaffold_missing_file()\n                )\n\n            self._primitive = _read_primitive(primitive)\n        else:\n            raise TypeError(\n                \"Notebooks must be initialized from strings, \"\n                \"Placeholder or pathlib.Path, got {}\".format(type(primitive))\n            )\n\n        static_analysis_vals = {\"disable\", \"regular\", \"strict\"}\n\n        if static_analysis not in static_analysis_vals:\n            raise ValueError(\n                f\"{static_analysis!r} is not a \"\n                \"valid 'static_analysis' value, choose one from: \"\n                f\"{pretty_print.iterable(static_analysis_vals)}\"\n            )\n\n        self.static_analysis = static_analysis\n        self._kernelspec_name = kernelspec_name\n        self._hot_reload = hot_reload\n\n        # TODO: validate ext_in values and extensions\n\n        if self._path is None and hot_reload:\n            raise ValueError(\n                \"hot_reload only works in the notebook was \" \"loaded from a file\"\n            )\n\n        if self._path is not None and ext_in is None:\n            self._ext_in = self._path.suffix[1:]\n        elif self._path is None and ext_in is None:\n            if Path(self._primitive).exists():\n                path = str(self._primitive)\n                raise ValueError(\n                    f\"The file {path!r} you passed looks like \"\n                    \"a path to a file. Perhaps you meant passing a \"\n                    \"pathlib.Path object? Example:\\n\\n\"\n                    \"from pathlib import Path\\n\"\n                    f\"NotebookRunner(Path({path!r}))\"\n                )\n\n            else:\n                raise ValueError(\n                    '\"ext_in\" cannot be None if the notebook is '\n                    \"initialized from a string. Either pass \"\n                    \"a pathlib.Path object with the notebook file \"\n                    \"location or pass the source code as string \"\n                    'and include the \"ext_in\" parameter'\n                )\n\n        elif self._path is not None and ext_in is not None:\n            raise ValueError(\n                '\"ext_in\" must be None if notebook is '\n                \"initialized from a pathlib.Path object\"\n            )\n        elif self._path is None and ext_in is not None:\n            self._ext_in = ext_in\n\n        # try to determine language based on extension, though this test\n        # might be inconclusive if dealing with a ipynb file, though we only\n        # use this to determine the appropriate jupyter kernel when\n        # initializing from a string, when initializing from files, the\n        # extension is used to determine the kernel\n        self._language = determine_language(self._ext_in)\n\n        self._loc = None\n        self._params = None\n\n        self._nb_str_unrendered = None\n        self._nb_obj_unrendered = None\n        self._nb_str_rendered = None\n        self._nb_obj_rendered = None\n\n        # this will raise an error if kernelspec_name is invalid\n        self._read_nb_str_unrendered()\n\n        self._post_init_validation(str(self._primitive))\n\n    @property\n    def primitive(self):\n        if self._hot_reload:\n            self._primitive = _read_primitive(self._path)\n\n        return self._primitive\n\n    def render(self, params):\n        \"\"\"Render notebook (fill parameters using papermill)\"\"\"\n        self._params = json_serializable_params(params)\n        self._render()\n\n    def _render(self):\n        # _read_nb_str_unrendered uses hot_reload, this ensures we always get\n        # the latest version\n        _, nb = self._read_nb_str_unrendered()\n\n        if nb.cells and \"parameters\" in _get_last_cell(nb).metadata.get(\"tags\", []):\n            cell_suggestion = _get_cell_suggestion(nb)\n            kind = \"notebook\" if self._ext_in == \"ipynb\" else \"script\"\n            raise SourceInitializationError(\n                f\"Error processing {str(self._path)!r}: the last cell \"\n                f\"in the {kind} is the parameters cell. {cell_suggestion}\"\n            )\n\n        # this is needed for parameterize_notebook to work\n        for cell in nb.cells:\n            if not hasattr(cell.metadata, \"tags\"):\n                cell.metadata[\"tags\"] = []\n        nb.metadata[\"papermill\"] = dict()\n\n        # NOTE: we use parameterize_notebook instead of execute_notebook\n        # with the prepare_only option because the latter adds a \"papermill\"\n        # section on each cell's m",
+      "total_lines": 1120
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 625,
+      "start_line": 605,
+      "end_line": 645,
+      "matched_line": "        # remove metadata",
+      "excerpt": "605:             )\n606: \n607:         # overwrite\n608:         jupytext.write(self.nb_obj_rendered, self._path, fmt=fmt_)\n609: \n610:         # overwrite all paired files\n611:         for path, fmt_ in iter_paired_notebooks(\n612:             self.nb_obj_rendered, fmt_, self._path.stem\n613:         ):\n614:             # get absolute path for each notebook\n615:             path = Path(self._path.parent / path)\n616:             jupytext.write(self.nb_obj_rendered, fp=path, fmt=fmt_)\n617: \n618:     @requires_path\n619:     def remove_injected_cell(self):\n620:         \"\"\"\n621:         Delete injected cell, overwrite the source file (and any paired files)\n622:         \"\"\"\n623:         nb_clean = _cleanup_rendered_nb(self._nb_obj_unrendered)\n624: \n625:         # remove metadata\n626:         recursive_update(\n627:             nb_clean, dict(metadata=dict(ploomber=dict(injected_manually=None)))\n628:         )\n629: \n630:         fmt_ = _jupytext_fmt(self._primitive, self._ext_in)\n631: \n632:         # overwrite\n633:         jupytext.write(nb_clean, self._path, fmt=fmt_)\n634: \n635:         # overwrite all paired files\n636:         for path, fmt_ in iter_paired_notebooks(\n637:             self._nb_obj_unrendered, fmt_, self._path.stem\n638:         ):\n639:             # get absolute path for each notebook\n640:             path = Path(self._path.parent / path)\n641:             jupytext.write(nb_clean, fp=path, fmt=fmt_)\n642: \n643:     @requires_path\n644:     def format(self, fmt, entry_point):\n645:         \"\"\"Change source format"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "remove_injected_cell",
+      "start_line": 619,
+      "end_line": 641,
+      "source": "    def remove_injected_cell(self):\n        \"\"\"\n        Delete injected cell, overwrite the source file (and any paired files)\n        \"\"\"\n        nb_clean = _cleanup_rendered_nb(self._nb_obj_unrendered)\n\n        # remove metadata\n        recursive_update(\n            nb_clean, dict(metadata=dict(ploomber=dict(injected_manually=None)))\n        )\n\n        fmt_ = _jupytext_fmt(self._primitive, self._ext_in)\n\n        # overwrite\n        jupytext.write(nb_clean, self._path, fmt=fmt_)\n\n        # overwrite all paired files\n        for path, fmt_ in iter_paired_notebooks(\n            self._nb_obj_unrendered, fmt_, self._path.stem\n        ):\n            # get absolute path for each notebook\n            path = Path(self._path.parent / path)\n            jupytext.write(nb_clean, fp=path, fmt=fmt_)"
+    },
+    "imports": {
+      "imports": [
+        "functools:wraps",
+        "ast",
+        "pathlib:Path",
+        "warnings",
+        "logging",
+        "contextlib:redirect_stdout",
+        "io:StringIO",
+        "copy:deepcopy",
+        "papermill.parameterize:parameterize_notebook",
+        "click",
+        "nbformat",
+        "jupytext",
+        "jupytext:cli",
+        "jupytext.formats:long_form_one_format",
+        "jupytext.formats:short_form_one_format",
+        "jupytext.config:JupytextConfiguration",
+        "parso",
+        "ploomber.exceptions:SourceInitializationError",
+        "ploomber.placeholders.placeholder:Placeholder",
+        "ploomber_core.dependencies:requires",
+        "ploomber.sources.abc:Source",
+        "ploomber.sources.nb_utils:find_cell_with_tag",
+        "ploomber.sources.nb_utils:find_cell_with_tags",
+        "ploomber.static_analysis.extractors:extractor_class_for_language",
+        "ploomber.static_analysis.pyflakes:check_notebook",
+        "ploomber.sources:docstring",
+        "ploomber.io:pretty_print",
+        "jupytext",
+        "jupyter_client"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/ploomber/ploomber/master/README.md",
+      "content_excerpt": "<p align=\"center\" width=\"100%\">\n  <img src=\"_static/logo.png\" height=\"250\">\n</p>\n\n[![CI Linux](https://github.com/ploomber/ploomber/actions/workflows/ci-unit-linux.yml/badge.svg)](https://github.com/ploomber/ploomber/actions/workflows/ci-unit-linux.yml/badge.svg)\n[![CI macOS](https://github.com/ploomber/ploomber/actions/workflows/ci-unit-macos.yml/badge.svg)](https://github.com/ploomber/ploomber/actions/workflows/ci-unit-macos.yml/badge.svg)\n[![Documentation Status](https://readthedocs.org/projects/ploomber/badge/?version=latest)](https://docs.ploomber.io/en/latest/?badge=latest)\n[![PyPI](https://badge.fury.io/py/ploomber.svg)](https://badge.fury.io/py/ploomber)\n[![Conda (channel only)](https://img.shields.io/conda/vn/conda-forge/ploomber)](https://anaconda.org/conda-forge/ploomber)\n[![Conda](https://img.shields.io/conda/pn/conda-forge/ploomber)](https://anaconda.org/conda-forge/ploomber)\n[![Coverage](https://coveralls.io/repos/github/ploomber/ploomber/badge.svg?branch=master)](https://coveralls.io/github/ploomber/ploomber?branch=master)\n[![Twitter](https://img.shields.io/twitter/follow/ploomber?label=Follow&style=social)](https://twitter.com/intent/user?screen_name=ploomber)\n[![Downloads](https://pepy.tech/badge/ploomber)](https://pepy.tech/project/ploomber)\n\n> [!TIP]\n> Deploy AI apps for free on [Ploomber Cloud!](https://ploomber.io/?utm_medium=github&utm_source=ploomber)\n\n<p align=\"center\">\n  <a href=\"https://ploomber.io/community\">Join our community</a>\n  |\n  <a href=\"https://share.hsforms.com/1E7Qa_OpcRPi_MV-segFsaAe6c2g\">Newsletter</a>\n  |\n  <a href=\"mailto:contact@pl"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "remove_injected_cell test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"remove_injected_cell(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/ploomber/sources",
+      "count": 9,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/ploomber/sources/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "abc.py",
+          "path": "src/ploomber/sources/abc.py",
+          "type": "file"
+        },
+        {
+          "name": "docstring.py",
+          "path": "src/ploomber/sources/docstring.py",
+          "type": "file"
+        },
+        {
+          "name": "inspect.py",
+          "path": "src/ploomber/sources/inspect.py",
+          "type": "file"
+        },
+        {
+          "name": "interact.py",
+          "path": "src/ploomber/sources/interact.py",
+          "type": "file"
+        },
+        {
+          "name": "nb_utils.py",
+          "path": "src/ploomber/sources/nb_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "notebooksource.py",
+          "path": "src/ploomber/sources/notebooksource.py",
+          "type": "file"
+        },
+        {
+          "name": "pythoncallablesource.py",
+          "path": "src/ploomber/sources/pythoncallablesource.py",
+          "type": "file"
+        },
+        {
+          "name": "sources.py",
+          "path": "src/ploomber/sources/sources.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/ploomber/sources/__init__.py"
+        },
+        {
+          "name": "abc.py",
+          "path": "src/ploomber/sources/abc.py"
+        },
+        {
+          "name": "docstring.py",
+          "path": "src/ploomber/sources/docstring.py"
+        },
+        {
+          "name": "inspect.py",
+          "path": "src/ploomber/sources/inspect.py"
+        },
+        {
+          "name": "interact.py",
+          "path": "src/ploomber/sources/interact.py"
+        },
+        {
+          "name": "nb_utils.py",
+          "path": "src/ploomber/sources/nb_utils.py"
+        },
+        {
+          "name": "pythoncallablesource.py",
+          "path": "src/ploomber/sources/pythoncallablesource.py"
+        },
+        {
+          "name": "sources.py",
+          "path": "src/ploomber/sources/sources.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/ploomber/sources/notebooksource.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "90f0fc838d98e7c67be67e6c1040dffed73a1048",
+          "html_url": "https://github.com/ploomber/ploomber/commit/90f0fc838d98e7c67be67e6c1040dffed73a1048",
+          "message": "add ploomber-extension (#1155)\n\n* lint\r\n\r\n* pin moto\r\n\r\n* sqlalchemy upgrade\r\n\r\n* fix test",
+          "author": "Eduardo Blancas",
+          "date": "2024-02-08T01:22:32Z"
+        },
+        {
+          "sha": "9c67065ac3417aaa2ea7bb7f62cbd2a5b5d2a1c5",
+          "html_url": "https://github.com/ploomber/ploomber/commit/9c67065ac3417aaa2ea7bb7f62cbd2a5b5d2a1c5",
+          "message": "Cleanup tests (#1123)",
+          "author": "Mohit Mehta",
+          "date": "2023-07-27T20:53:39Z"
+        },
+        {
+          "sha": "0bf4bef513a2969a1b631e551c66fe50f0427903",
+          "html_url": "https://github.com/ploomber/ploomber/commit/0bf4bef513a2969a1b631e551c66fe50f0427903",
+          "message": "Removed requires from utils (#1096)\n\n* Removed requires from utils\r\n\r\n* Formatted\r\n\r\n* flake8\r\n\r\n* Pinned package\r\n\r\n* Fomatted and Linted",
+          "author": "Mohit Mehta",
+          "date": "2023-04-17T17:43:05Z"
+        },
+        {
+          "sha": "c4ca4d800bced5dfb34cd14d1a818d95e32124ca",
+          "html_url": "https://github.com/ploomber/ploomber/commit/c4ca4d800bced5dfb34cd14d1a818d95e32124ca",
+          "message": "black formatting (#1094)",
+          "author": "Eduardo Blancas",
+          "date": "2023-04-12T01:30:19Z"
+        },
+        {
+          "sha": "571040c7091e8d2e3f6a62fcf66da0f65dccdf29",
+          "html_url": "https://github.com/ploomber/ploomber/commit/571040c7091e8d2e3f6a62fcf66da0f65dccdf29",
+          "message": "Prioritized cell injection (#1019)\n\n* cell_injection_test\r\n\r\n* cli cell injection with priority\r\n\r\n* cli cell injection with priority\r\n\r\n* --priority args added to nb --inject to set which parameters to inject\r\n\r\n* keyerror fixed\r\n\r\n* nb_inject_test assets location updated\r\n\r\n* warning message fixed",
+          "author": "yafimvo",
+          "date": "2022-11-07T20:09:30Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "remove_injected_cell TODO remove metadata",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/ploomber/sources/notebooksource.py",
+      "satd_line": 625,
+      "last_commit": {
+        "sha": "90f0fc838d98e7c67be67e6c1040dffed73a1048",
+        "html_url": "https://github.com/ploomber/ploomber/commit/90f0fc838d98e7c67be67e6c1040dffed73a1048",
+        "message": "add ploomber-extension (#1155)\n\n* lint\r\n\r\n* pin moto\r\n\r\n* sqlalchemy upgrade\r\n\r\n* fix test",
+        "author": "Eduardo Blancas",
+        "date": "2024-02-08T01:22:32Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "remove_injected_cell",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    }
+  }
+}

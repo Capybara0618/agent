@@ -1,0 +1,412 @@
+{
+  "task_id": "402",
+  "repo_owner": "openstack",
+  "repo_name": "swift",
+  "file_path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T17:26:12+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 8,
+    "call_sites_count": 8,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T17:26:22+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T17:26:33+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+    "original_code": "def POST(self, req):\n    \"\"\"\n    Handles Delete Multiple Objects.\n    \"\"\"\n    def object_key_iter(elem):\n        for obj in elem.iterchildren('Object'):\n            key = obj.find('./Key').text\n            if not key:\n                raise UserKeyMustBeSpecified()\n            version = obj.find('./VersionId')\n            if version is not None:\n                version = version.text\n\n            yield key, version\n\n    max_body_size = min(\n        # FWIW, AWS limits multideletes to 1000 keys, and swift limits\n        # object names to 1024 bytes (by default). Add a factor of two to\n        # allow some slop.\n        2 * self.conf.max_multi_delete_objects * MAX_OBJECT_NAME_LENGTH,\n        # But, don't let operators shoot themselves in the foot\n        10 * 1024 * 1024)\n\n    try:\n        xml = req.xml(max_body_size)\n        if not xml:\n            raise MissingRequestBodyError()\n\n        req.check_md5(xml)\n        elem = fromstring(xml, 'Delete', self.logger)\n\n        quiet = elem.find('./Quiet')\n        if quiet is not None and quiet.text.lower() == 'true':\n            self.quiet = True\n        else:\n            self.quiet = False\n\n        delete_list = list(object_key_iter(elem))\n        if len(delete_list) > self.conf.max_multi_delete_objects:\n            raise MalformedXML()\n    except (XMLSyntaxError, DocumentInvalid):\n        raise MalformedXML()\n    except ErrorResponse:\n        raise\n    except Exception as e:\n        self.logger.error(e)\n        raise\n\n    elem = Element('DeleteResult')\n\n    # check bucket existence\n    try:\n        req.get_response(self.app, 'HEAD')\n    except AccessDenied as error:\n        body = self._gen_error_body(error, elem, delete_list)\n        return HTTPOk(body=body)\n\n    if any(version is not None for _key, version in delete_list):\n        # TODO: support deleting specific versions of objects\n        raise S3NotImplemented()\n\n    def do_delete(base_req, key, version):\n        req = copy.copy(base_req)\n        req.environ = copy.copy(base_req.environ)\n        req.object_name = key\n\n        try:\n            query = req.gen_multipart_manifest_delete_query(self.app)\n            resp = req.get_response(self.app, method='DELETE', query=query,\n                                    headers={'Accept': 'application/json'})\n            # Have to read the response to actually do the SLO delete\n            if query:\n                try:\n                    delete_result = json.loads(resp.body)\n                    if delete_result['Errors']:\n                        # NB: bulk includes 404s in \"Number Not Found\",\n                        # not \"Errors\"\n                        msg_parts = [delete_result['Response Status']]\n                        msg_parts.extend(\n                            '%s: %s' % (obj, status)\n                            for obj, status in delete_result['Errors'])\n                        return key, {'code': 'SLODeleteError',\n                                     'message': '\\n'.join(msg_parts)}\n                    # else, all good\n                except (ValueError, TypeError, KeyError):\n                    # Logs get all the gory details\n                    self.logger.exception(\n                        'Could not parse SLO delete response: %r',\n                        resp.body)\n                    # Client gets something more generic\n                    return key, {'code': 'SLODeleteError',\n                                 'message': 'Unexpected swift response'}\n        except NoSuchKey:\n            pass\n        except ErrorResponse as e:\n            return key, {'code': e.__class__.__name__, 'message': e._msg}\n        return key, None\n\n    with StreamingPile(self.conf.multi_delete_concurrency) as pile:\n        for key, err in pile.asyncstarmap(do_delete, (\n                (req, key, version) for key, version in delete_list)):\n            if err:\n                error = SubElement(elem, 'Error')\n                SubElement(error, 'Key').text = key\n                SubElement(error, 'Code').text = err['code']\n                SubElement(error, 'Message').text = err['message']\n            elif not self.quiet:\n                deleted = SubElement(elem, 'Deleted')\n                SubElement(deleted, 'Key').text = key\n\n    body = tostring(elem)\n\n    return HTTPOk(body=body)",
+    "satd_comment": "# TODO: support deleting specific versions of objects",
+    "target_file": {
+      "ok": true,
+      "path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+      "sha": "e6d00dbd0d847a5a3e299d7a313d2a3abf453b5e",
+      "download_url": "https://raw.githubusercontent.com/openstack/swift/master/swift/common/middleware/s3api/controllers/multi_delete.py",
+      "content_excerpt": "# Copyright (c) 2010-2014 OpenStack Foundation.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#    http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n# implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport copy\nimport json\n\nfrom swift.common.constraints import MAX_OBJECT_NAME_LENGTH\nfrom swift.common.http import HTTP_NO_CONTENT\nfrom swift.common.swob import str_to_wsgi\nfrom swift.common.utils import public, StreamingPile\nfrom swift.common.registry import get_swift_info\n\nfrom swift.common.middleware.s3api.controllers.base import Controller, \\\n    bucket_operation\nfrom swift.common.middleware.s3api.etree import Element, SubElement, \\\n    fromstring, tostring, XMLSyntaxError, DocumentInvalid\nfrom swift.common.middleware.s3api.s3response import HTTPOk, \\\n    S3NotImplemented, NoSuchKey, ErrorResponse, MalformedXML, \\\n    UserKeyMustBeSpecified, AccessDenied, MissingRequestBodyError\n\n\nclass MultiObjectDeleteController(Controller):\n    \"\"\"\n    Handles Delete Multiple Objects, which is logged as a MULTI_OBJECT_DELETE\n    operation in the S3 server log.\n    \"\"\"\n    def _gen_error_body(self, error, elem, delete_list):\n        for key, version in delete_list:\n            error_elem = SubElement(elem, 'Error')\n            SubElement(error_elem, 'Key').text = key\n            if version is not None:\n                SubElement(error_elem, 'VersionId').text = version\n            SubElement(error_elem, 'Code').text = error.__class__.__name__\n            SubElement(error_elem, 'Message').text = error._msg\n\n        return tostring(elem)\n\n    @public\n    @bucket_operation\n    def POST(self, req):\n        \"\"\"\n        Handles Delete Multiple Objects.\n        \"\"\"\n        def object_key_iter(elem):\n            for obj in elem.iterchildren('Object'):\n                key = obj.find('./Key').text\n                if not key:\n                    raise UserKeyMustBeSpecified()\n                version = obj.find('./VersionId')\n                if version is not None:\n                    version = version.text\n\n                yield key, version\n\n        max_body_size = min(\n            # FWIW, AWS limits multideletes to 1000 keys, and swift limits\n            # object names to 1024 bytes (by default). Add a factor of two to\n            # allow some slop.\n            2 * self.conf.max_multi_delete_objects * MAX_OBJECT_NAME_LENGTH,\n            # But, don't let operators shoot themselves in the foot\n            10 * 1024 * 1024)\n\n        try:\n            xml = req.xml(max_body_size)\n            if not xml:\n                raise MissingRequestBodyError()\n\n            req.require_md5(xml)\n            elem = fromstring(xml, 'Delete', self.logger)\n\n            quiet = elem.find('./Quiet')\n            self.quiet = quiet is not None and quiet.text.lower() == 'true'\n\n            delete_list = list(object_key_iter(elem))\n            if len(delete_list) > self.conf.max_multi_delete_objects:\n                raise MalformedXML()\n        except (XMLSyntaxError, DocumentInvalid):\n            raise MalformedXML()\n        except ErrorResponse:\n            raise\n        except Exception as e:\n            self.logger.error(e)\n            raise\n\n        elem = Element('DeleteResult')\n\n        # check bucket existence\n        try:\n            req.get_response(self.app, 'HEAD')\n        except AccessDenied as error:\n            body = self._gen_error_body(error, elem, delete_list)\n            return HTTPOk(body=body)\n\n        if 'object_versioning' not in get_swift_info() and any(\n                version not in ('null', None)\n                for _key, version in delete_list):\n            raise S3NotImplemented()\n\n        def do_delete(base_req, key, version):\n            req = copy.copy(base_req)\n            req.environ = copy.copy(base_req.environ)\n            req.object_name = str_to_wsgi(key)\n            if version:\n                req.params = {'version-id': version, 'symlink': 'get'}\n\n            try:\n                try:\n                    query = req.gen_multipart_manifest_delete_query(\n                        self.app, version=version)\n                except NoSuchKey:\n                    query = {}\n                if version:\n                    query['version-id'] = version\n                    query['symlink'] = 'get'\n\n                resp = req.get_response(self.app, method='DELETE', query=query,\n                                        headers={'Accept': 'application/json'})\n                # If async segment cleanup is available, we expect to get\n                # back a 204; otherwise, the delete is synchronous and we\n                # have to read the response to actually do the SLO delete\n                if query.get('multipart-manifest') and \\\n                        resp.status_int != HTTP_NO_CONTENT:\n                    try:\n                        delete_result = json.loads(resp.body)\n                        if delete_result['Errors']:\n                            # NB: bulk includes 404s in \"Number Not Found\",\n                            # not \"Errors\"\n                            msg_parts = [delete_result['Response Status']]\n                            msg_parts.extend(\n                                '%s: %s' % (obj, status)\n                                for obj, status in delete_result['Errors'])\n                            return key, {'code': 'SLODeleteError',\n                                         'message': '\\n'.join(msg_parts)}\n                        # else, all good\n                    except (ValueError, TypeError, KeyError):\n                        # Logs get all the gory details\n                        self.logger.exception(\n                            'Could not parse SLO delete response (%s): %s',\n                            resp.status, resp.body)\n                        # Client gets something more generic\n                        return key, {'code': 'SLODeleteError',\n                                     'message': 'Unexpected swift response'}\n            except NoSuchKey:\n                pass\n            except ErrorResponse as e:\n                return key, {'code': e.__class__.__name__, 'message': e._msg}\n            except Exception:\n                self.logger.exception(\n                    'Unexpected Error handling DELETE of %r %r' % (\n                        req.container_name, key))\n                return key, {'code': 'Server Error', 'message': 'Server Error'}\n\n            return key, None\n\n        with StreamingPile(self.conf.multi_delete_concurrency) as pile:\n            for key, err in pile.asyncstarmap(do_delete, (\n                    (req, key, version) for key, version in delete_list)):\n                if err:\n                    error = SubElement(elem, 'Error')\n                    SubElement(error, 'Key').text = key\n                    SubElement(error, 'Code').text = err['code']\n                    SubElement(error, 'Message').text = err['message']\n                elif not self.quiet:\n                    deleted = SubElement(elem, 'Deleted')\n                    SubElement(deleted, 'Key').text = key\n\n        body = tostring(elem)\n\n        return HTTPOk(body=body)\n",
+      "total_lines": 181
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "json",
+        "swift.common.constraints:MAX_OBJECT_NAME_LENGTH",
+        "swift.common.http:HTTP_NO_CONTENT",
+        "swift.common.swob:str_to_wsgi",
+        "swift.common.utils:public",
+        "swift.common.utils:StreamingPile",
+        "swift.common.registry:get_swift_info",
+        "swift.common.middleware.s3api.controllers.base:Controller",
+        "swift.common.middleware.s3api.controllers.base:bucket_operation",
+        "swift.common.middleware.s3api.etree:Element",
+        "swift.common.middleware.s3api.etree:SubElement",
+        "swift.common.middleware.s3api.etree:fromstring",
+        "swift.common.middleware.s3api.etree:tostring",
+        "swift.common.middleware.s3api.etree:XMLSyntaxError",
+        "swift.common.middleware.s3api.etree:DocumentInvalid",
+        "swift.common.middleware.s3api.s3response:HTTPOk",
+        "swift.common.middleware.s3api.s3response:S3NotImplemented",
+        "swift.common.middleware.s3api.s3response:NoSuchKey",
+        "swift.common.middleware.s3api.s3response:ErrorResponse",
+        "swift.common.middleware.s3api.s3response:MalformedXML",
+        "swift.common.middleware.s3api.s3response:UserKeyMustBeSpecified",
+        "swift.common.middleware.s3api.s3response:AccessDenied",
+        "swift.common.middleware.s3api.s3response:MissingRequestBodyError"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/swift/master/README.rst",
+      "content_excerpt": "===============\nOpenStack Swift\n===============\n\nOpenStack Swift is a distributed object storage system designed to scale\nfrom a single machine to thousands of servers. Swift is optimized for\nmulti-tenancy and high concurrency. Swift is ideal for backups, web and mobile\ncontent, and any other unstructured data that can grow without bound.\n\nSwift provides a simple, REST-based API fully documented at\nhttps://docs.openstack.org/swift/latest/.\n\nSwift was originally developed as the basis for Rackspace's Cloud Files\nand was open-sourced in 2010 as part of the OpenStack project. It has\nsince grown to include contributions from many companies and has spawned\na thriving ecosystem of 3rd party tools. Swift's contributors are listed\nin the AUTHORS file.\n\nDocs\n----\n\nTo build documentation run::\n\n    pip install -r requirements.txt -r doc/requirements.txt\n    sphinx-build -W -b html doc/source doc/build/html\n\nand then browse to doc/build/html/index.html. These docs are auto-generated\nafter every commit and available online at\nhttps://docs.openstack.org/swift/latest/.\n\nFor Developers\n--------------\n\nGetting Started\n~~~~~~~~~~~~~~~\n\nSwift is part of OpenStack and follows the code contribution, review, and\ntesting processes common to all OpenStack projects.\n\nIf you would like to start contributing, check out these\n`notes <CONTRIBUTING.rst>`__ to help you get started.\n\nThe best place to get started is the\n`\"SAIO - Swift All In One\" <https://docs.openstack.org/swift/latest/development_saio.html>`__.\nThis document will walk you through setting up a development cluster of\nSwift in a VM. The S"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "POST test",
+      "count": 8,
+      "items": [
+        {
+          "name": "test_object_metadata_replication.py",
+          "path": "test/probe/test_object_metadata_replication.py",
+          "sha": "4b5b0d44840f3c4a06f1091ba8abce47bfa35cc0",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/probe/test_object_metadata_replication.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_account.py",
+          "path": "test/functional/test_account.py",
+          "sha": "9a40a14a076af5bde89d500db1082a1334f513a0",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/functional/test_account.py",
+          "score": 1.0
+        },
+        {
+          "name": "swift_test_client.py",
+          "path": "test/functional/swift_test_client.py",
+          "sha": "d59a2b61f8ef7bb218c859b2fcce76aaa24823da",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/functional/swift_test_client.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_object.py",
+          "path": "test/functional/test_object.py",
+          "sha": "33d80522148cb9cffd185805ac4bbb0cc80774ec",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/functional/test_object.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_container.py",
+          "path": "test/functional/test_container.py",
+          "sha": "658e9a6c857891bbc7db464f1fce91972f95c1e4",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/functional/test_container.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_object_handoff.py",
+          "path": "test/probe/test_object_handoff.py",
+          "sha": "e76e86c78a406b75a69195e78c70241b4e9301fe",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/probe/test_object_handoff.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_formpost.py",
+          "path": "test/unit/common/middleware/test_formpost.py",
+          "sha": "f2dc359d0e0dc225e12c961811c168487454bf5f",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/unit/common/middleware/test_formpost.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_dlo.py",
+          "path": "test/functional/test_dlo.py",
+          "sha": "58f2004f9907aa1458fc1331ac4dba8d7b8e5841",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/test/functional/test_dlo.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"POST(\"",
+      "count": 8,
+      "items": [
+        {
+          "name": "server.py",
+          "path": "swift/account/server.py",
+          "sha": "2134056d02ea600fe8d72b6b54e8657631329b5f",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/account/server.py",
+          "score": 1.0
+        },
+        {
+          "name": "ssync_sender.py",
+          "path": "swift/obj/ssync_sender.py",
+          "sha": "6b3d8e77a3a3ed2b6d335741952ea8d51ccf1bb5",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/obj/ssync_sender.py",
+          "score": 1.0
+        },
+        {
+          "name": "symlink.py",
+          "path": "swift/common/middleware/symlink.py",
+          "sha": "8f8d6e4e53664133952d55f2fa64d569848e7a47",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/common/middleware/symlink.py",
+          "score": 1.0
+        },
+        {
+          "name": "s3token.py",
+          "path": "swift/common/middleware/s3api/s3token.py",
+          "sha": "41f87cb375a686a68d5f8a39b6f305d198df1a43",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/common/middleware/s3api/s3token.py",
+          "score": 1.0
+        },
+        {
+          "name": "object_versioning.py",
+          "path": "swift/common/middleware/versioned_writes/object_versioning.py",
+          "sha": "3cc0e37df9a8bfa7c089624d39e7d593b1f70c2a",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/common/middleware/versioned_writes/object_versioning.py",
+          "score": 1.0
+        },
+        {
+          "name": "container.py",
+          "path": "swift/proxy/controllers/container.py",
+          "sha": "7caecb4413cdca7409bd89c240494b7284e2f9e1",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/proxy/controllers/container.py",
+          "score": 1.0
+        },
+        {
+          "name": "obj.py",
+          "path": "swift/common/middleware/s3api/controllers/obj.py",
+          "sha": "6a95fd2351ad7a1ec158a1b1e863161c6b88e086",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/common/middleware/s3api/controllers/obj.py",
+          "score": 1.0
+        },
+        {
+          "name": "acl_handlers.py",
+          "path": "swift/common/middleware/s3api/acl_handlers.py",
+          "sha": "f5b8c587b9b845dac1c60792f790184342fa86d1",
+          "html_url": "https://github.com/openstack/swift/blob/eb1c6890cb263d7754d2223fb6f509a317a07303/swift/common/middleware/s3api/acl_handlers.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "swift/common/middleware/s3api/controllers",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "swift/common/middleware/s3api/controllers/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "acl.py",
+          "path": "swift/common/middleware/s3api/controllers/acl.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "swift/common/middleware/s3api/controllers/base.py",
+          "type": "file"
+        },
+        {
+          "name": "bucket.py",
+          "path": "swift/common/middleware/s3api/controllers/bucket.py",
+          "type": "file"
+        },
+        {
+          "name": "location.py",
+          "path": "swift/common/middleware/s3api/controllers/location.py",
+          "type": "file"
+        },
+        {
+          "name": "logging.py",
+          "path": "swift/common/middleware/s3api/controllers/logging.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_delete.py",
+          "path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_upload.py",
+          "path": "swift/common/middleware/s3api/controllers/multi_upload.py",
+          "type": "file"
+        },
+        {
+          "name": "obj.py",
+          "path": "swift/common/middleware/s3api/controllers/obj.py",
+          "type": "file"
+        },
+        {
+          "name": "object_lock.py",
+          "path": "swift/common/middleware/s3api/controllers/object_lock.py",
+          "type": "file"
+        },
+        {
+          "name": "s3_acl.py",
+          "path": "swift/common/middleware/s3api/controllers/s3_acl.py",
+          "type": "file"
+        },
+        {
+          "name": "service.py",
+          "path": "swift/common/middleware/s3api/controllers/service.py",
+          "type": "file"
+        },
+        {
+          "name": "tagging.py",
+          "path": "swift/common/middleware/s3api/controllers/tagging.py",
+          "type": "file"
+        },
+        {
+          "name": "versioning.py",
+          "path": "swift/common/middleware/s3api/controllers/versioning.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "swift/common/middleware/s3api/controllers/__init__.py"
+        },
+        {
+          "name": "acl.py",
+          "path": "swift/common/middleware/s3api/controllers/acl.py"
+        },
+        {
+          "name": "base.py",
+          "path": "swift/common/middleware/s3api/controllers/base.py"
+        },
+        {
+          "name": "bucket.py",
+          "path": "swift/common/middleware/s3api/controllers/bucket.py"
+        },
+        {
+          "name": "location.py",
+          "path": "swift/common/middleware/s3api/controllers/location.py"
+        },
+        {
+          "name": "logging.py",
+          "path": "swift/common/middleware/s3api/controllers/logging.py"
+        },
+        {
+          "name": "multi_upload.py",
+          "path": "swift/common/middleware/s3api/controllers/multi_upload.py"
+        },
+        {
+          "name": "obj.py",
+          "path": "swift/common/middleware/s3api/controllers/obj.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "cbc3b42d7d8d9280b415f909bce05332689cdf21",
+          "html_url": "https://github.com/openstack/swift/commit/cbc3b42d7d8d9280b415f909bce05332689cdf21",
+          "message": "s3api: verify checksums on DeleteObjects POSTs\n\nIf a checksum header is sent with an S3 API DeleteObjects POST request\nthen it will be verified (unlike a CompleteMultipartUpload POST) [0].\n\nIf a checksum header is not sent with an S3 API DeleteObjects POST\nrequest then a Content-MD5 header is requir",
+          "author": "Alistair Coles",
+          "date": "2025-06-12T13:51:34Z"
+        },
+        {
+          "sha": "a5db202c552e22db6de0a7f3eb6e439e88cb97bc",
+          "html_url": "https://github.com/openstack/swift/commit/a5db202c552e22db6de0a7f3eb6e439e88cb97bc",
+          "message": "s3api: Stop requiring Content-MD5 for multi-deletes\n\n...at least, provided the client sent a X-Amz-Content-SHA256 header.\nApparently Content-MD5 is no longer strictly required by AWS? Or maybe\nit never was, provided the client sent a SHA256 of the content.\n\nThis also allows us to test with newer bot",
+          "author": "Tim Burke",
+          "date": "2025-01-24T22:08:39Z"
+        },
+        {
+          "sha": "fd2dd11562be842db518b751a505c7e8f915ca5f",
+          "html_url": "https://github.com/openstack/swift/commit/fd2dd11562be842db518b751a505c7e8f915ca5f",
+          "message": "s3api: Make the 'Quiet' key value case insensitive\n\nWhen deleting multiple objects, S3 allows to enable\na quiet mode with the 'Quiet' key.\n\nAt AWS S3, the value of this key is case-insensitive.\n- Quiet mode is enabled if the value is 'true'\n  (regardless of case).\n- Otherwise, in all other cases (ev",
+          "author": "Aymeric Ducroquetz",
+          "date": "2022-03-23T16:48:51Z"
+        },
+        {
+          "sha": "dd64a81e652411ab41406096b836087eacb2c1a0",
+          "html_url": "https://github.com/openstack/swift/commit/dd64a81e652411ab41406096b836087eacb2c1a0",
+          "message": "s3api: Fix multi_delete with object names using non-ASCII characters\n\nCo-Authored-By: Florent Vennetier <florent.vennetier@ovhcloud.com>\nChange-Id: I635bc91faa7709f9df9cdf3aec157a21c08923ca",
+          "author": "Aymeric Ducroquetz",
+          "date": "2022-03-01T12:47:07Z"
+        },
+        {
+          "sha": "589ac355f3ddf505983925d80b81c20107ceace0",
+          "html_url": "https://github.com/openstack/swift/commit/589ac355f3ddf505983925d80b81c20107ceace0",
+          "message": "Move *_swift_info functions into a new registry module\n\nThe *_swift_info functions use in module global dicts to provide a\nregistry mechanism for registering and getting swift info.\n\nThis is an abnormal pattern and doesn't quite fit into utils. Further\nwe looking at following this pattern for sensit",
+          "author": "Matthew Oliver",
+          "date": "2022-02-03T05:18:39Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "POST TODO support deleting specific versions",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "cbc3b42d7d8d9280b415f909bce05332689cdf21",
+        "html_url": "https://github.com/openstack/swift/commit/cbc3b42d7d8d9280b415f909bce05332689cdf21",
+        "message": "s3api: verify checksums on DeleteObjects POSTs\n\nIf a checksum header is sent with an S3 API DeleteObjects POST request\nthen it will be verified (unlike a CompleteMultipartUpload POST) [0].\n\nIf a checksum header is not sent with an S3 API DeleteObjects POST\nrequest then a Content-MD5 header is requir",
+        "author": "Alistair Coles",
+        "date": "2025-06-12T13:51:34Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 8,
+      "call_sites_count": 8,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "many_call_sites"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

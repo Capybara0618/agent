@@ -493,6 +493,7 @@ class OpenAIAnalyzer:
             "Missing GitHub files, missing symbols, missing tests, or missing history must be treated as neutral missing evidence, not as automatic reasons to drop. "
             "Score the task on five general dimensions: intent_clarity, change_locality, semantic_risk, context_sufficiency, and verifiability. "
             "Prefer tasks that are clear, local, low-risk, and reviewable. "
+            "Decide whether the task is worth sending into an automatic fixer, not whether it might someday be fixable by a human. "
             "Drop only when the primary evidence itself indicates vague intent, architecture-level change, high behavioral risk, or an external blocking dependency. "
             "Return JSON only."
         )
@@ -505,7 +506,8 @@ class OpenAIAnalyzer:
             "missing_validation_signal, high_behavioral_risk, too_many_call_sites, external_dependency_blocked, repo_history_conflict, or null), "
             "followup_context_requests (array of strings), intent_clarity (float 0-1), change_locality (float 0-1), semantic_risk (float 0-1), "
             "context_sufficiency (float 0-1), verifiability (float 0-1), analyze_score (float 0-1). "
-            "Keep evidence_summary concise and evidence-based. If repository evidence is stale or missing but the task still looks clear and local from SATD comment plus original code, do not drop solely for that reason.\n\n"
+            "Keep evidence_summary concise and evidence-based. If repository evidence is stale or missing but the task still looks clear and local from SATD comment plus original code, do not drop solely for that reason. "
+            "Use needs_more_context for borderline cases that are not strong enough for repairable but also not hard drops.\n\n"
             f"Repository owner: {state['user']}\n"
             f"Repository name: {state['project']}\n"
             f"File path: {state['file_path']}\n"
@@ -591,20 +593,35 @@ class OpenAIAnalyzer:
             "repo_history_conflict",
         }
 
-        if decision == "needs_more_context" and primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.62:
+        if (
+            decision == "needs_more_context"
+            and primary_clear
+            and local_enough
+            and intent_clarity >= 0.65
+            and change_locality >= 0.65
+            and context_sufficiency >= 0.60
+            and semantic_risk <= 0.55
+            and analyze_score >= 0.70
+        ):
             decision = "repairable"
-            repairability_score = max(repairability_score, analyze_score, 0.64)
-            confidence = max(confidence, 0.60)
+            repairability_score = max(repairability_score, analyze_score, 0.70)
+            confidence = max(confidence, 0.64)
             drop_reason = None
             followup_context_requests = []
 
         if decision == "drop" and weak_drop_reason:
-            if primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.66:
+            if (
+                scope_radius in {"line", "function", "class"}
+                and intent_clarity >= 0.72
+                and change_locality >= 0.70
+                and semantic_risk <= 0.50
+                and analyze_score >= 0.72
+            ):
                 decision = "repairable"
-                repairability_score = max(repairability_score, analyze_score, 0.66)
-                confidence = max(confidence, 0.60 if historical_snapshot_mismatch else 0.58)
+                repairability_score = max(repairability_score, analyze_score, 0.72)
+                confidence = max(confidence, 0.66 if historical_snapshot_mismatch else 0.64)
                 drop_reason = None
-            elif analyze_score >= 0.54 and not hard_drop_reason:
+            elif not hard_drop_reason:
                 decision = "needs_more_context"
                 drop_reason = "insufficient_context"
 
@@ -612,17 +629,32 @@ class OpenAIAnalyzer:
             decision == "drop"
             and drop_reason == "architecture_level_change"
             and scope_radius in {"line", "function", "class"}
-            and analyze_score >= 0.58
+            and intent_clarity >= 0.70
+            and change_locality >= 0.68
+            and semantic_risk <= 0.50
+            and analyze_score >= 0.72
         ):
             decision = "repairable"
-            repairability_score = max(repairability_score, analyze_score, 0.62)
-            confidence = max(confidence, 0.57)
+            repairability_score = max(repairability_score, analyze_score, 0.72)
+            confidence = max(confidence, 0.64)
             drop_reason = None
 
-        if decision == "repairable" and primary_clear and local_enough and semantic_risk <= 0.72:
-            repairability_score = max(repairability_score, analyze_score, 0.64)
-            confidence = max(confidence, 0.58)
+        if hard_drop_reason:
+            decision = "drop"
+        elif (
+            analyze_score >= 0.68
+            and intent_clarity >= 0.60
+            and change_locality >= 0.60
+            and semantic_risk <= 0.70
+        ):
+            decision = "repairable"
+            repairability_score = max(repairability_score, analyze_score, 0.68)
+            confidence = max(confidence, 0.60)
             drop_reason = None
+        elif decision != "repairable":
+            decision = "needs_more_context"
+            if not drop_reason or drop_reason not in {"insufficient_context"}:
+                drop_reason = "insufficient_context"
 
         if decision == "repairable":
             repair_strategy = repair_strategy or "Apply a local, behavior-preserving fix within the smallest stable scope."
@@ -683,10 +715,10 @@ class OpenAIAnalyzer:
             and code_lines >= 1
             and has_local_structure
             and scope_local
-            and intent_clarity >= 0.48
-            and change_locality >= 0.50
-            and context_sufficiency >= 0.45
-            and analyze_score >= 0.54
+            and intent_clarity >= 0.55
+            and change_locality >= 0.55
+            and context_sufficiency >= 0.50
+            and analyze_score >= 0.60
         )
 
     def _scope_to_locality(self, scope_radius: str) -> float:
@@ -866,6 +898,7 @@ class OpenAIReviewer:
             "Judge whether the repaired code is a focused, credible response to the SATD, with minimal unnecessary changes and acceptable semantic risk. "
             "Use the analyzer evidence and repair/review context, but do not reject solely because repository evidence is incomplete or stale. "
             "If historical snapshot mismatch is present, rely more on SATD comment and original code semantics. "
+            "Prioritize whether the repair actually solves the SATD's core problem, not just whether the code looks reasonable. "
             "Return JSON only."
         )
         user_prompt = (
@@ -874,7 +907,8 @@ class OpenAIReviewer:
             "issues (array of strings), revision_advice (string), reject_type (string or null), rationale (string).\n"
             "Use these meanings: problem_alignment = whether the repair truly responds to the SATD; minimality = whether the change stays within the smallest necessary scope; "
             "semantic_preservation = whether the repair keeps the original behavior boundaries unless the SATD explicitly asks to change them; internal_consistency = whether the repaired code is self-consistent and fits the context.\n"
-            "Be moderately conservative. Approve strong local repairs, but reject repairs that fail to address the SATD, expand the scope too much, or create plausible semantic drift.\n\n"
+            "Be moderately conservative. Approve strong local repairs, but reject repairs that fail to address the SATD, expand the scope too much, or create plausible semantic drift. "
+            "Problem alignment is the most important dimension: if the repair does not clearly address the SATD, it should not pass.\n\n"
             f"Round: {repair.round_id}\n"
             f"Repository owner: {state['user']}\n"
             f"Repository name: {state['project']}\n"
@@ -912,49 +946,71 @@ class OpenAIReviewer:
             self._weighted_review_score(problem_alignment, minimality, semantic_preservation, internal_consistency),
         )
         issues = [str(item).strip() for item in payload.get("issues", []) if str(item).strip()]
-        approved = bool(payload.get("approved"))
+        model_approved = bool(payload.get("approved"))
         reject_type = payload.get("reject_type")
         rationale = str(payload.get("rationale") or "")
         softened_gate_used = False
+        strong_reject_types = {
+            "unsafe_semantic_change",
+            "high_behavioral_risk",
+            "architecture_level_change",
+            "not_satd_aligned",
+            "over_scoped_change",
+            "content_filter",
+        }
+        hard_reject = False
 
         if problem_alignment < 0.58:
-            approved = False
+            hard_reject = True
             reject_type = reject_type or "not_satd_aligned"
             rationale = rationale + " | hard_gate=problem_not_addressed"
 
         if minimality < 0.42:
-            approved = False
+            hard_reject = True
             reject_type = reject_type or "over_scoped_change"
             rationale = rationale + " | hard_gate=change_too_large"
 
         if semantic_preservation < 0.45:
-            approved = False
+            hard_reject = True
             reject_type = reject_type or "unsafe_semantic_change"
             rationale = rationale + " | hard_gate=semantic_drift_risk"
 
+        meets_core_gate = (
+            review_score >= 0.75
+            and problem_alignment >= 0.75
+            and minimality >= 0.60
+            and semantic_preservation >= 0.60
+        )
+        approved = (
+            meets_core_gate
+            and not hard_reject
+            and reject_type not in strong_reject_types
+        )
+        if model_approved and approved:
+            rationale = rationale + " | model_gate=approved"
+
         credible_local_fix = (
-            analysis.scope_radius in {"line", "function", "class", "file"}
-            and analysis.risk_level != "high"
-            and analysis.analyze_score >= 0.63
-            and repair.confidence >= 0.68
-            and review_score >= 0.72
-            and problem_alignment >= 0.72
-            and minimality >= 0.58
-            and semantic_preservation >= 0.58
+            analysis.scope_radius in {"line", "function"}
+            and analysis.risk_level == "low"
+            and analysis.analyze_score >= 0.70
+            and repair.confidence >= 0.75
+            and review_score >= 0.78
+            and problem_alignment >= 0.80
+            and minimality >= 0.72
+            and semantic_preservation >= 0.70
             and len(issues) == 0
-            and reject_type not in {
-                "unsafe_semantic_change",
-                "high_behavioral_risk",
-                "architecture_level_change",
-                "not_satd_aligned",
-                "over_scoped_change",
-            }
+            and reject_type is None
         )
         if not approved and credible_local_fix:
             approved = True
             reject_type = None
             softened_gate_used = True
             rationale = rationale + " | softened_gate=accepted_as_credible_local_fix"
+
+        if approved and (hard_reject or reject_type in strong_reject_types):
+            approved = False
+            softened_gate_used = False
+            rationale = rationale + " | hardened_reject=review_policy"
 
         if approved and review_score < 0.60 and (problem_alignment < 0.62 or len(issues) >= 2):
             approved = False

@@ -1,0 +1,332 @@
+{
+  "task_id": "828",
+  "repo_owner": "galaxyproject",
+  "repo_name": "galaxy",
+  "file_path": "lib/galaxy/jobs/runners/kubernetes.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T19:29:08+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T19:29:17+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T19:29:22+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lib/galaxy/jobs/runners/kubernetes.py",
+    "original_code": "def __get_k8s_containers(self, job_wrapper):\n    \"\"\"Fills in all required for setting up the docker containers to be used, including setting a pull policy if\n       this has been set.\n    \"\"\"\n    k8s_container = {\n        \"name\": self.__get_k8s_container_name(job_wrapper),\n        \"image\": self._find_container(job_wrapper).container_id,\n        # this form of command overrides the entrypoint and allows multi command\n        # command line execution, separated by ;, which is what Galaxy does\n        # to assemble the command.\n        # TODO possibly shell needs to be set by job_wrapper\n        \"command\": [\"/bin/bash\", \"-c\", job_wrapper.runner_command_line],\n        \"workingDir\": job_wrapper.working_directory,\n        \"volumeMounts\": [{\n            \"mountPath\": self.runner_params['k8s_persistent_volume_claim_mount_path'],\n            \"name\": self._galaxy_vol_name\n        }]\n    }\n\n    resources = self.__get_resources(job_wrapper)\n    if resources:\n        k8s_container['resources'] = resources\n\n    if self._default_pull_policy:\n        k8s_container[\"imagePullPolicy\"] = self._default_pull_policy\n    # if self.__requires_ports(job_wrapper):\n    #    k8s_container['ports'] = self.__get_k8s_containers_ports(job_wrapper)\n\n    return [k8s_container]",
+    "satd_comment": "# TODO possibly shell needs to be set by job_wrapper",
+    "target_file": {
+      "ok": true,
+      "path": "lib/galaxy/jobs/runners/kubernetes.py",
+      "sha": "688e98e3bf7cb18a97d42583e193f4f3bdda5e95",
+      "download_url": "https://raw.githubusercontent.com/galaxyproject/galaxy/dev/lib/galaxy/jobs/runners/kubernetes.py",
+      "content_excerpt": "\"\"\"\nOffload jobs to a Kubernetes cluster.\n\"\"\"\n\nimport json  # for debugging of API objects\nimport logging\nimport math\nimport os\nimport re\nfrom dataclasses import dataclass\nfrom datetime import datetime\nfrom typing import (\n    Any,\n    TYPE_CHECKING,\n    Union,\n)\n\nimport yaml\n\nfrom galaxy import model\nfrom galaxy.jobs.runners import (\n    AsynchronousJobRunner,\n    AsynchronousJobState,\n    JobState,\n)\nfrom galaxy.jobs.runners.util.pykube_util import (\n    deduplicate_entries,\n    DEFAULT_INGRESS_API_VERSION,\n    DEFAULT_JOB_API_VERSION,\n    delete_ingress,\n    delete_job,\n    delete_service,\n    ensure_pykube,\n    find_ingress_object_by_name,\n    find_job_object_by_name,\n    find_pod_object_by_name,\n    find_service_object_by_name,\n    galaxy_instance_id,\n    get_volume_mounts_for_job,\n    HTTPError,\n    Ingress,\n    ingress_object_dict,\n    is_pod_running,\n    is_pod_unschedulable,\n    Job,\n    job_object_dict,\n    parse_pvc_param_line,\n    Pod,\n    produce_k8s_job_prefix,\n    pull_policy,\n    pykube_client_from_dict,\n    reload_job,\n    Service,\n    service_object_dict,\n)\nfrom galaxy.util.bytesize import ByteSize\n\nif TYPE_CHECKING:\n    from galaxy.jobs import MinimalJobWrapper\n\nlog = logging.getLogger(__name__)\n\n__all__ = (\"KubernetesJobRunner\",)\n\n\n@dataclass\nclass RetryableDeleteJobState(JobState):\n    def __init__(self, job_state, k8s_job, max_retries=5, attempts=0):\n        self.__dict__ = job_state.__dict__.copy()\n        self.init_retryable_job(max_retries, attempts)\n        self.k8s_job = k8s_job\n\n    def init_retryable_job(self, max_retries, attempts):\n        self.max_retries: int = max_retries\n        self.attempts: int = attempts\n\n\nclass KubernetesJobRunner(AsynchronousJobRunner[AsynchronousJobState]):\n    \"\"\"\n    Job runner backed by a finite pool of worker threads. FIFO scheduling\n    \"\"\"\n\n    runner_name = \"KubernetesRunner\"\n\n    LABEL_START = re.compile(\"^[A-Za-z0-9]\")\n    LABEL_END = re.compile(\"[A-Za-z0-9]$\")\n    LABEL_REGEX = re.compile(\"[^-A-Za-z0-9_.]\")\n\n    def __init__(self, app, nworkers, **kwargs):\n        # Check if pykube was importable, fail if not\n        ensure_pykube()\n        runner_param_specs = dict(\n            k8s_config_path=dict(map=str, default=None),\n            k8s_use_service_account=dict(map=bool, default=False),\n            k8s_persistent_volume_claims=dict(map=str),\n            k8s_working_volume_claim=dict(map=str),\n            k8s_data_volume_claim=dict(map=str),\n            k8s_namespace=dict(map=str, default=\"default\"),\n            k8s_pod_priority_class=dict(map=str, default=None),\n            k8s_affinity=dict(map=str, default=None),\n            k8s_node_selector=dict(map=str, default=None),\n            k8s_extra_job_envs=dict(map=str, default=None),\n            k8s_tolerations=dict(map=str, default=None),\n            k8s_galaxy_instance_id=dict(map=str),\n            k8s_timeout_seconds_job_deletion=dict(map=int, valid=lambda x: int > 0, default=30),\n            k8s_job_api_version=dict(map=str, default=DEFAULT_JOB_API_VERSION),\n            k8s_job_ttl_secs_after_finished=dict(map=int, valid=lambda x: x is None or int(x) >= 0, default=None),\n            k8s_job_metadata=dict(map=str, default=None),\n            k8s_supplemental_group_id=dict(\n                map=str, valid=lambda s: s == \"$gid\" or isinstance(s, int) or not s or s.isdigit(), default=None\n            ),\n            k8s_pull_policy=dict(map=str, default=\"Default\"),\n            k8s_run_as_user_id=dict(\n                map=str, valid=lambda s: s == \"$uid\" or isinstance(s, int) or not s or s.isdigit(), default=None\n            ),\n            k8s_run_as_group_id=dict(\n                map=str, valid=lambda s: s == \"$gid\" or isinstance(s, int) or not s or s.isdigit(), default=None\n            ),\n            k8s_fs_group_id=dict(\n                map=str, valid=lambda s: s == \"$gid\" or isinstance(s, int) or not s or s.isdigit(), default=None\n            ),\n            k8s_cleanup_job=dict(map=str, valid=lambda s: s in {\"onsuccess\", \"always\", \"never\"}, default=\"always\"),\n            k8s_pod_retries=dict(\n                map=int, valid=lambda x: int(x) >= 0, default=1\n            ),  # note that if the backOffLimit is lower, this paramer will have no effect.\n            k8s_job_spec_back_off_limit=dict(\n                map=int, valid=lambda x: int(x) >= 0, default=0\n            ),  # this means that it will stop retrying after 1 failure.\n            k8s_walltime_limit=dict(map=int, valid=lambda x: int(x) >= 0, default=172800),\n            k8s_unschedulable_walltime_limit=dict(map=int, valid=lambda x: not x or int(x) >= 0, default=None),\n            k8s_interactivetools_use_ssl=dict(map=bool, default=False),\n            k8s_interactivetools_ingress_annotations=dict(map=str),\n            k8s_interactivetools_ingress_class=dict(map=str, default=None),\n            k8s_interactivetools_tls_secret=dict(map=str, default=None),\n            k8s_ingress_api_version=dict(map=str, default=DEFAULT_INGRESS_API_VERSION),\n        )\n\n        if \"runner_param_specs\" not in kwargs:\n            kwargs[\"runner_param_specs\"] = {}\n        kwargs[\"runner_param_specs\"].update(runner_param_specs)\n\n        # Start the job runner parent object\n        super().__init__(app, nworkers, **kwargs)\n\n        self._pykube_api = pykube_client_from_dict(self.runner_params)\n        self._galaxy_instance_id = self.__get_galaxy_instance_id()\n\n        self._default_pull_policy = self.__get_pull_policy()\n\n        self.setup_base_volumes()\n\n    def setup_base_volumes(self):\n        def generate_volumes(pvc_list):\n            return [{\"name\": pvc[\"name\"], \"persistentVolumeClaim\": {\"claimName\": pvc[\"name\"]}} for pvc in pvc_list]\n\n        def get_volume_mounts_for(claim):\n            if self.runner_params.get(claim):\n                volume_mounts = [parse_pvc_param_line(pvc) for pvc in self.runner_params[claim].split(\",\")]\n                # generate default list of volumes for all jobs\n                volumes = generate_volumes(volume_mounts)\n                return volumes, volume_mounts\n            return [], []\n\n        self.runner_params[\"k8s_volumes\"], self.runner_params[\"k8s_volume_mounts\"] = get_volume_mounts_for(\n            \"k8s_persistent_volume_claims\"\n        )\n        # ignore volume mounts for the following two, as they are generated per job\n        self.runner_params[\"k8s_volumes\"].extend(get_volume_mounts_for(\"k8s_data_volume_claim\")[0])\n        self.runner_params[\"k8s_volumes\"].extend(get_volume_mounts_for(\"k8s_working_volume_claim\")[0])\n\n    def queue_job(self, job_wrapper: \"MinimalJobWrapper\") -> None:\n        \"\"\"Create a Galaxy job script and submit it to Kubernetes cluster\"\"\"\n        # prepare the Galaxy job\n        # We currently don't need to include_metadata or include_work_dir_outputs, as working directory is the same\n        # where galaxy will expect results.\n        log.debug(f\"Starting queue_job for Galaxy job {job_wrapper.get_id_tag()}\")\n\n        ajs = AsynchronousJobState(\n            job_wrapper=job_wrapper,\n            job_destination=job_wrapper.job_destination,\n            files_dir=job_wrapper.working_directory,\n        )\n        # Kubernetes doesn't really produce a \"job script\", but job stream files needs to be present\n        ajs.init_job_stream_files()\n        if not self.prepare_job(\n            job_wrapper,\n            include_metadata=False,\n            modify_command_for_container=False,\n            stream_stdout_stderr=True,\n        ):\n            return\n\n        script = self.get_job_file(\n            job_wrapper, exit_code_path=ajs.exit_code_file, shell=job_wrapper.shell, galaxy_virtual_env=None\n        )\n        try:\n            self.write_executable_script(ajs.job_file, script, job_io=job_wrapper.job_io)\n        except Exception:\n            job_wrapper.fail(\"Failure preparing Galaxy job script\", exception=True)\n            log.exception(f\"({job_wrapper.get_id_tag()}) failure writing Galaxy job script\")\n            return\n\n        # Construction of Kubernetes objects follow: https://kubernetes.io/docs/concepts/workloads/controllers/job/\n        if self.__has_guest_ports(job_wrapper):\n            try:\n                self.__configure_port_routing(ajs)\n            except HTTPError:\n                log.exception(\"Kubernetes failed to expose tool ports as services, HTTP exception encountered\")\n                ajs.runner_state = JobState.runner_states.UNKNOWN_ERROR\n                ajs.fail_message = \"Kubernetes failed to export tool ports as services.\"\n                self.mark_as_failed(ajs)\n                return\n\n        k8s_job_prefix = self.__produce_k8s_job_prefix()\n        k8s_job_obj = job_object_dict(self.runner_params, k8s_job_prefix, self.__get_k8s_job_spec(ajs))\n\n        k8s_job = Job(self._pykube_api, k8s_job_obj)\n        try:\n            k8s_job.create()\n        except HTTPError:\n            log.exception(\"Kubernetes failed to create a job, HTTP exception encountered\")\n            ajs.runner_state = JobState.runner_states.UNKNOWN_ERROR\n            ajs.fail_message = \"Kubernetes failed to create a job; HTTP exception encountered.\"\n            self.mark_as_failed(ajs)\n            return\n        if not k8s_job.name:\n            log.exception(f\"Kubernetes failed to create a job, empty name encountered: [{k8s_job.obj}]\")\n            ajs.runner_state = JobState.runner_states.UNKNOWN_ERROR\n            ajs.fail_message = \"Kubernetes failed to create a job; empty name encountered.\"\n            self.mark_as_failed(ajs)\n            return\n        k8s_job_id = k8s_job.name\n\n        # define job attributes in the AsyncronousJobState for follow-up\n        ajs.job_id = k8s_job_id\n        # store runner information for tracking if Galaxy restarts\n        job_wrapper.set_external_id(k8s_job_id)\n        self.monitor_queue.put(ajs)\n\n    def __has_guest_ports(self, job_wrapper):\n        # Check if job has guest ports or interactive tool entry points that would signal that\n        log.debug(\n            f\"Checking if job {job_wrapper.get_id_tag()} is an interactive tool. guest ports: {job_wrapper.guest_ports}. interactive entry points: {job_wrapper.get_job().interactivetool_entry_points}\"\n        )\n        return bool(job_wrapper.guest_ports) or bool(job_wrapper.get_job().interactivetool_entry_points)\n\n    def __configure_port_routing(self, ajs: AsynchronousJobState) -> None:\n        # Configure interactive tool entry points first\n        guest_ports = ajs.job_wrapper.guest_ports\n        ports_dict = {}\n        for guest_port in guest_ports:\n            ports_dict[str(guest_port)] = dict(host=\"manual\", port=guest_port, protocol=\"https\")\n        self.app.interactivetool_manager.configure_entry_points(ajs.job_wrapper.get_job(), ports_dict)\n\n        # Configure additional k8s service and ingress for tools with guest ports\n        k8s_job_prefix = self.__produce_k8s_job_prefix()\n        k8s_job_name = self.__get_k8s_job_name(k8s_job_prefix, ajs.job_wrapper)\n        log.debug(f\"Configuring entry points and deploying service/ingress for job with ID {ajs.job_id}\")\n        k8s_service_obj = service_object_dict(self.runner_params, k8s_job_name, self.__get_k8s_service_spec(ajs))\n\n        k8s_ingress_obj = ingress_object_dict(self.runner_params, k8s_job_name, self.__get_k8s_ingress_spec(ajs))\n        log.debug(f\"Kubernetes service object: {json.dumps(k8s_service_obj, indent=4)}\")\n        log.debug(f\"Kubernetes ingress object: {json.dumps(k8s_ingress_obj, indent=4)}\")\n        # We avoid creating service and ingress if they already exist (e.g. when Galaxy is restarted or resubmitting a job)\n        service = Service(self._pykube_api, k8s_service_obj)\n        service.create()\n        ingress = Ingress(self._pykube_api, k8s_ingress_obj)\n        ingress.version = self.runner_params[\"k8s_ingress_api_version\"]\n        ingress.create()\n\n    def __get_overridable_params(self, job_wrapper, param_key):\n        try:\n            return job_wrapper.job_destination.params[param_key]\n        except KeyE",
+      "total_lines": 1161
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "logging",
+        "math",
+        "os",
+        "re",
+        "dataclasses:dataclass",
+        "datetime:datetime",
+        "typing:Any",
+        "typing:TYPE_CHECKING",
+        "typing:Union",
+        "yaml",
+        "galaxy:model",
+        "galaxy.jobs.runners:AsynchronousJobRunner",
+        "galaxy.jobs.runners:AsynchronousJobState",
+        "galaxy.jobs.runners:JobState",
+        "galaxy.jobs.runners.util.pykube_util:deduplicate_entries",
+        "galaxy.jobs.runners.util.pykube_util:DEFAULT_INGRESS_API_VERSION",
+        "galaxy.jobs.runners.util.pykube_util:DEFAULT_JOB_API_VERSION",
+        "galaxy.jobs.runners.util.pykube_util:delete_ingress",
+        "galaxy.jobs.runners.util.pykube_util:delete_job",
+        "galaxy.jobs.runners.util.pykube_util:delete_service",
+        "galaxy.jobs.runners.util.pykube_util:ensure_pykube",
+        "galaxy.jobs.runners.util.pykube_util:find_ingress_object_by_name",
+        "galaxy.jobs.runners.util.pykube_util:find_job_object_by_name",
+        "galaxy.jobs.runners.util.pykube_util:find_pod_object_by_name",
+        "galaxy.jobs.runners.util.pykube_util:find_service_object_by_name",
+        "galaxy.jobs.runners.util.pykube_util:galaxy_instance_id",
+        "galaxy.jobs.runners.util.pykube_util:get_volume_mounts_for_job",
+        "galaxy.jobs.runners.util.pykube_util:HTTPError",
+        "galaxy.jobs.runners.util.pykube_util:Ingress"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/galaxyproject/galaxy/dev/README.rst",
+      "content_excerpt": ".. figure:: https://galaxyproject.org/images/galaxy-logos/galaxy_project_logo.jpg\n   :alt: Galaxy Logo\n\nThe latest information about Galaxy can be found on the `Galaxy Community Hub <https://galaxyproject.org/>`__.\n\nCommunity support is available at `Galaxy Help <https://help.galaxyproject.org/>`__.\n\n.. image:: https://img.shields.io/badge/chat-gitter-blue.svg\n    :target: https://gitter.im/galaxyproject/Lobby\n    :alt: Chat on gitter\n\n.. image:: https://img.shields.io/badge/chat-irc.freenode.net%23galaxyproject-blue.svg\n    :target: https://webchat.freenode.net/?channels=galaxyproject\n    :alt: Chat on irc\n\n.. image:: https://img.shields.io/badge/release-documentation-blue.svg\n    :target: https://docs.galaxyproject.org/en/master/\n    :alt: Release Documentation\n\n.. image:: https://travis-ci.org/galaxyproject/galaxy.svg?branch=dev\n    :target: https://travis-ci.org/galaxyproject/galaxy\n    :alt: Inspect the test results\n\nGalaxy Quickstart\n=================\n\nGalaxy requires Python 3.10 or higher. To check your Python version, run:\n\n.. code:: console\n\n    $ python -V\n    Python 3.10.12\n\nStart Galaxy:\n\n.. code:: console\n\n    $ sh run.sh\n\nOnce Galaxy completes startup, you should be able to view Galaxy in your\nbrowser at: http://localhost:8080\n\nFor more installation details please see: https://getgalaxy.org/\n\nDocumentation is available at: https://docs.galaxyproject.org/\n\nTutorials on how to use Galaxy, perform scientific analyses with it, develop Galaxy and its tools, and admin a Galaxy server are at: https://training.galaxyproject.org/\n\nTools\n=====\n\nTools can be either insta"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "__get_k8s_containers test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__get_k8s_containers(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "kubernetes.py",
+          "path": "lib/galaxy/jobs/runners/kubernetes.py",
+          "sha": "688e98e3bf7cb18a97d42583e193f4f3bdda5e95",
+          "html_url": "https://github.com/galaxyproject/galaxy/blob/e5e064f3efb5f25339d60b9f83b2e11f61f70dbf/lib/galaxy/jobs/runners/kubernetes.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lib/galaxy/jobs/runners",
+      "count": 18,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "lib/galaxy/jobs/runners/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aws.py",
+          "path": "lib/galaxy/jobs/runners/aws.py",
+          "type": "file"
+        },
+        {
+          "name": "chronos.py",
+          "path": "lib/galaxy/jobs/runners/chronos.py",
+          "type": "file"
+        },
+        {
+          "name": "cli.py",
+          "path": "lib/galaxy/jobs/runners/cli.py",
+          "type": "file"
+        },
+        {
+          "name": "condor.py",
+          "path": "lib/galaxy/jobs/runners/condor.py",
+          "type": "file"
+        },
+        {
+          "name": "drmaa.py",
+          "path": "lib/galaxy/jobs/runners/drmaa.py",
+          "type": "file"
+        },
+        {
+          "name": "gcp_batch.py",
+          "path": "lib/galaxy/jobs/runners/gcp_batch.py",
+          "type": "file"
+        },
+        {
+          "name": "godocker.py",
+          "path": "lib/galaxy/jobs/runners/godocker.py",
+          "type": "file"
+        },
+        {
+          "name": "kubernetes.py",
+          "path": "lib/galaxy/jobs/runners/kubernetes.py",
+          "type": "file"
+        },
+        {
+          "name": "local.py",
+          "path": "lib/galaxy/jobs/runners/local.py",
+          "type": "file"
+        },
+        {
+          "name": "pbs.py",
+          "path": "lib/galaxy/jobs/runners/pbs.py",
+          "type": "file"
+        },
+        {
+          "name": "pulsar.py",
+          "path": "lib/galaxy/jobs/runners/pulsar.py",
+          "type": "file"
+        },
+        {
+          "name": "slurm.py",
+          "path": "lib/galaxy/jobs/runners/slurm.py",
+          "type": "file"
+        },
+        {
+          "name": "state_handler_factory.py",
+          "path": "lib/galaxy/jobs/runners/state_handler_factory.py",
+          "type": "file"
+        },
+        {
+          "name": "state_handlers",
+          "path": "lib/galaxy/jobs/runners/state_handlers",
+          "type": "dir"
+        },
+        {
+          "name": "tasks.py",
+          "path": "lib/galaxy/jobs/runners/tasks.py",
+          "type": "file"
+        },
+        {
+          "name": "univa.py",
+          "path": "lib/galaxy/jobs/runners/univa.py",
+          "type": "file"
+        },
+        {
+          "name": "util",
+          "path": "lib/galaxy/jobs/runners/util",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lib/galaxy/jobs/runners/__init__.py"
+        },
+        {
+          "name": "aws.py",
+          "path": "lib/galaxy/jobs/runners/aws.py"
+        },
+        {
+          "name": "chronos.py",
+          "path": "lib/galaxy/jobs/runners/chronos.py"
+        },
+        {
+          "name": "cli.py",
+          "path": "lib/galaxy/jobs/runners/cli.py"
+        },
+        {
+          "name": "condor.py",
+          "path": "lib/galaxy/jobs/runners/condor.py"
+        },
+        {
+          "name": "drmaa.py",
+          "path": "lib/galaxy/jobs/runners/drmaa.py"
+        },
+        {
+          "name": "gcp_batch.py",
+          "path": "lib/galaxy/jobs/runners/gcp_batch.py"
+        },
+        {
+          "name": "godocker.py",
+          "path": "lib/galaxy/jobs/runners/godocker.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lib/galaxy/jobs/runners/kubernetes.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "d216ec438cef756d5bd28882fee3657cf3a188c4",
+          "html_url": "https://github.com/galaxyproject/galaxy/commit/d216ec438cef756d5bd28882fee3657cf3a188c4",
+          "message": "Improve type annotation of job runners",
+          "author": "Nicola Soranzo",
+          "date": "2025-10-13T22:05:25Z"
+        },
+        {
+          "sha": "4e2112355cf96d0c70d83b10563fd63131a39218",
+          "html_url": "https://github.com/galaxyproject/galaxy/commit/4e2112355cf96d0c70d83b10563fd63131a39218",
+          "message": "Extract functionality from k8s runner for reuse.",
+          "author": "John Chilton",
+          "date": "2025-09-02T19:30:17Z"
+        },
+        {
+          "sha": "7ebb964ab5929e412bbdfe12b7d81462e4429306",
+          "html_url": "https://github.com/galaxyproject/galaxy/commit/7ebb964ab5929e412bbdfe12b7d81462e4429306",
+          "message": "Eliminate copy-paste from Kubernetes runner.",
+          "author": "John Chilton",
+          "date": "2025-09-02T19:27:07Z"
+        },
+        {
+          "sha": "fcf165446850a7e7f68001f46291f5129825f8bd",
+          "html_url": "https://github.com/galaxyproject/galaxy/commit/fcf165446850a7e7f68001f46291f5129825f8bd",
+          "message": "Remove unused kubernetes helper method.",
+          "author": "John Chilton",
+          "date": "2025-09-02T19:12:11Z"
+        },
+        {
+          "sha": "aa13a63352a8b18070c285421902274182df3da7",
+          "html_url": "https://github.com/galaxyproject/galaxy/commit/aa13a63352a8b18070c285421902274182df3da7",
+          "message": "Improve type annotation for job runners and ``InteractiveToolManager``\n\nAlso:\n- Fix bug in `KubernetesJobRunner.check_watched_item()` introduced in\n  commit da100d3b274ed077eb40af70d0ff410dbad2ffb2 .\n- Drop unused `InteractiveToolManager.configure_entry_point()` method.\n- Drop unnecessary `trans` pa",
+          "author": "Nicola Soranzo",
+          "date": "2025-09-07T18:56:12Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__get_k8s_containers TODO possibly shell needs job_wrapper",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lib/galaxy/jobs/runners/kubernetes.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "d216ec438cef756d5bd28882fee3657cf3a188c4",
+        "html_url": "https://github.com/galaxyproject/galaxy/commit/d216ec438cef756d5bd28882fee3657cf3a188c4",
+        "message": "Improve type annotation of job runners",
+        "author": "Nicola Soranzo",
+        "date": "2025-10-13T22:05:25Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

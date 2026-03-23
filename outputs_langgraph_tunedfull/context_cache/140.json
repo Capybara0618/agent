@@ -1,0 +1,447 @@
+{
+  "task_id": "140",
+  "repo_owner": "mozilla",
+  "repo_name": "kitsune",
+  "file_path": "kitsune/wiki/facets.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-22T15:50:44+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 5,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-22T15:50:55+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-22T15:51:01+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "kitsune/wiki/facets.py",
+    "original_code": "# TODO: Remove the new_topics argument when we remove old topics.\ndef topics_for(products, parent=False, new_topics=False):\n    \"\"\"Returns a list of topics that apply to passed in products and topics.\n\n    :arg products: a list of Product instances\n    :arg parent: (optional) limit to topics with the given parent\n    \"\"\"\n    statsd.incr('wiki.facets.topics_for.db')\n\n    docs = Document.objects.filter(\n        locale=settings.WIKI_DEFAULT_LANGUAGE,\n        is_archived=False,\n        current_revision__isnull=False,\n        category__in=settings.IA_DEFAULT_CATEGORIES)\n\n    for product in products:\n        docs = docs.filter(products=product)\n\n    if new_topics:\n        for product in products:\n            qs = NewTopic.objects.filter(product=product)\n    else:\n        qs = Topic.objects\n\n    qs = (qs.filter(visible=True, document__in=docs)\n            .annotate(num_docs=Count('document'))\n            .distinct())\n\n    if parent or parent is None:\n        qs = qs.filter(parent=parent)\n\n    return qs",
+    "satd_comment": "# TODO: Remove the new_topics argument when we remove old topics.",
+    "target_file": {
+      "ok": true,
+      "path": "kitsune/wiki/facets.py",
+      "sha": "5eb0d83e4a8ce5bf234a8210d322a3900484c61b",
+      "download_url": "https://raw.githubusercontent.com/mozilla/kitsune/main/kitsune/wiki/facets.py",
+      "content_excerpt": "import hashlib\nfrom datetime import timedelta\n\nfrom django.conf import settings\nfrom django.contrib.postgres.aggregates import StringAgg\nfrom django.core.cache import cache\nfrom django.db.models import Case, Count, OuterRef, Q, Subquery, When\nfrom django.db.models.functions import Now\n\nfrom kitsune.products.models import Topic\nfrom kitsune.wiki.models import Document, HelpfulVote\n\n\ndef topics_for(user, product, parent=False):\n    \"\"\"Returns a list of topics that apply to passed in product.\n\n    :arg product: a Product instance\n    :arg parent: (optional) limit to topics with the given parent\n    \"\"\"\n\n    docs = Document.objects.visible(\n        user,\n        locale=settings.WIKI_DEFAULT_LANGUAGE,\n        is_archived=False,\n        current_revision__isnull=False,\n        products=product,\n        category__in=settings.IA_DEFAULT_CATEGORIES,\n    )\n\n    qs = Topic.active.filter(products=product)\n    qs = qs.filter(visible=True, document__in=docs).annotate(num_docs=Count(\"document\")).distinct()\n\n    if parent or parent is None:\n        qs = qs.filter(parent=parent)\n\n    return qs\n\n\ndef documents_for(user, locale, topics=None, products=None, current_document=None):\n    \"\"\"Returns a tuple of lists of articles that apply to topics and products.\n\n    The first item in the tuple is the list of articles for the locale\n    specified. The second item is the list of fallback articles in en-US\n    that aren't localized to the specified locale. If the specified locale\n    is en-US, the second item will be None.\n\n    :arg user: the user making this request\n    :arg locale: the locale\n    :arg topics: (optional) a list of Topic instances\n    :arg products: (optional) a list of Product instances\n    :arg current_document: (optional) a Document instance to exclude from the results\n\n    The articles are returned as a list of dicts with the following keys:\n        id\n        document_title\n        url\n        document_parent_id\n    \"\"\"\n    documents = _documents_for(user, locale, topics, products)\n\n    if exclude_current_document := isinstance(current_document, Document):\n        if documents and current_document.locale == locale:\n            documents = [d for d in documents if d[\"id\"] != current_document.id]\n\n    # For locales that aren't en-US, get the en-US documents\n    # to fill in for untranslated articles.\n    if locale != settings.WIKI_DEFAULT_LANGUAGE:\n        # Start by getting all of the English documents for the given products and topics.\n        en_documents = _documents_for(\n            user,\n            locale=settings.WIKI_DEFAULT_LANGUAGE,\n            products=products,\n            topics=topics,\n        )\n        # Exclude the English versions of the translated documents we've already found.\n        exclude_en_document_ids = {\n            d[\"document_parent_id\"] for d in documents if \"document_parent_id\" in d\n        }\n        if exclude_current_document:\n            # Exclude the current document if it's in English, or its parent if it's not.\n            exclude_en_document_ids.add(\n                current_document.parent.id if current_document.parent else current_document.id\n            )\n        fallback_documents = [d for d in en_documents if d[\"id\"] not in exclude_en_document_ids]\n    else:\n        fallback_documents = None\n\n    return documents, fallback_documents\n\n\ndef _documents_for(user, locale, topics=None, products=None):\n    \"\"\"Returns a list of articles that apply to passed in locale, topics and products.\"\"\"\n    cache_key = _cache_key(locale, topics, products)\n\n    if not user.is_authenticated:\n        # For anonymous users, first check the cache.\n        documents_cache_key = f\"documents_for_v2:{cache_key}\"\n        documents = cache.get(documents_cache_key)\n        if documents is not None:\n            return documents\n\n    qs = Document.objects.visible(\n        user,\n        locale=locale,\n        is_archived=False,\n        current_revision__isnull=False,\n        category__in=settings.IA_DEFAULT_CATEGORIES,\n    )\n    # speed up query by removing any ordering, since we're doing it in python:\n    qs = qs.select_related(\"current_revision\", \"parent\").order_by()\n\n    if topics:\n        topic_ids = [t.id for t in topics]\n        # For parent documents: include if they have the requested topics\n        # For translations: include ONLY if their parent has the requested topics,\n        # completely ignoring any topics directly assigned to the translation\n        qs = qs.filter(\n            # Either this is a parent document with matching topics\n            (Q(parent__isnull=True) & Q(topics__in=topic_ids))\n            # OR this is a translation and its parent has matching topics\n            | (Q(parent__isnull=False) & Q(parent__topics__in=topic_ids))\n        )\n\n    for product in products or []:\n        # we need to filter against parent products for localized articles\n        qs = qs.filter(Q(products=product) | Q(parent__products=product))\n\n    qs = qs.distinct()\n\n    votes_cache_key = f\"votes_for:{cache_key}\"\n    votes_dict = cache.get(votes_cache_key)\n    if votes_dict is None:\n        # NOTE: It's important to use \"created__range\" rather than \"created__gt\"\n        #       with Postgres, otherwise it won't use the index on the \"created\"\n        #       field, and the \"HelpfulVote\" query will be massively slower.\n        votes_query = (\n            HelpfulVote.objects.filter(\n                revision_id__in=qs.values_list(\"current_revision_id\", flat=True),\n                created__range=(Now() - timedelta(days=30), Now()),\n                helpful=True,\n            )\n            .values(\"revision_id\")\n            .annotate(count=Count(\"*\"))\n            .values(\"revision_id\", \"count\")\n        )\n        votes_dict = {row[\"revision_id\"]: row[\"count\"] for row in votes_query}\n        # the votes query is rather expensive, and only used for ordering,\n        # so we can cache it rather aggressively\n        cache.set(votes_cache_key, votes_dict, timeout=settings.CACHE_LONG_TIMEOUT)\n\n    # Annotate each of the documents with its string of product titles. This must\n    # be a sub-query in order to free itself from the product filter(s) above.\n    qs = qs.annotate(\n        product_titles=Subquery(\n            Document.objects.filter(pk=OuterRef(\"pk\"))\n            .annotate(\n                product_titles=Case(\n                    When(\n                        parent__isnull=False,\n                        then=StringAgg(\n                            \"parent__products__title\",\n                            delimiter=\", \",\n                            ordering=\"parent__products__title\",\n                        ),\n                    ),\n                    default=StringAgg(\n                        \"products__title\", delimiter=\", \", ordering=\"products__title\"\n                    ),\n                ),\n            )\n            .values(\"product_titles\")\n        )\n    )\n\n    doc_dicts = []\n    for d in qs:\n        doc_dicts.append(\n            {\n                \"id\": d.id,\n                \"document_title\": d.title,\n                \"url\": d.get_absolute_url(),\n                \"document_parent_id\": d.parent_id,\n                \"created\": d.current_revision.created,\n                \"product_titles\": d.product_titles,\n                \"document_summary\": d.current_revision.summary,\n                \"display_order\": d.original.display_order,\n                \"helpful_votes\": votes_dict.get(d.current_revision_id, 0),\n            }\n        )\n\n    # sort the results by ascending display_order and descending votes\n    doc_dicts.sort(key=lambda x: (x[\"display_order\"], -x[\"helpful_votes\"]))\n\n    if not user.is_authenticated:\n        cache.set(documents_cache_key, doc_dicts)\n\n    return doc_dicts\n\n\ndef _cache_key(locale, topics, products):\n    m = hashlib.md5()\n    key = \"{locale}:{topics}:{products}:new\".format(\n        locale=locale,\n        topics=\",\".join(sorted([t.slug for t in topics or []])),\n        products=\",\".join(sorted([p.slug for p in products or []])),\n    )\n\n    m.update(key.encode())\n    return m.hexdigest()\n",
+      "total_lines": 209
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "imports": {
+      "imports": [
+        "hashlib",
+        "datetime:timedelta",
+        "django.conf:settings",
+        "django.contrib.postgres.aggregates:StringAgg",
+        "django.core.cache:cache",
+        "django.db.models:Case",
+        "django.db.models:Count",
+        "django.db.models:OuterRef",
+        "django.db.models:Q",
+        "django.db.models:Subquery",
+        "django.db.models:When",
+        "django.db.models.functions:Now",
+        "kitsune.products.models:Topic",
+        "kitsune.wiki.models:Document",
+        "kitsune.wiki.models:HelpfulVote"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/mozilla/kitsune/main/README.md",
+      "content_excerpt": "# Kitsune\n\n![Status Sustain](https://img.shields.io/badge/Status-Sustain-green)\n\nKitsune is the platform that powers [SuMo (support.mozilla.org)](https://support.mozilla.org)\n\n## Usage\n\nIt is a [Django](http://www.djangoproject.com/) application. There is [documentation](https://mozilla.github.io/kitsune/) online.\n\n## Releasing a new version\n\n-   Create a [signed tag](https://git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work) for the new version.\n\n    We are using [semantic versioning](https://semver.org/).\n\n    Given a version number MAJOR.MINOR.PATCH, increment the:\n\n        MAJOR version when you make incompatible API changes\n        MINOR version when you add functionality in a backward compatible manner\n        PATCH version when you make backward compatible bug fixes\n\n    Example:\n\n    `git tag -s 1.0.1 -m \"Bump version: 1.0.0 to 1.0.1`\n\n-   Draft a new release in GitHub for the new tag. Document the **highlights** of the release and also use the option to automatically document the release through the commit history.\n\n-   Trigger the release for the specified tag in the deploy repository.\n\n> [!TIP]\n> You can access the staging site at <https://support.allizom.org/>.\n\n## Code of Conduct\n\nBy participating in this project, you're agreeing to uphold the [Mozilla Community Participation Guidelines](https://www.mozilla.org/en-US/about/governance/policies/participation/). If you need to report a problem, please see our [Code of Conduct](./CODE_OF_CONDUCT.md) guide.\n\n## Contribute\n\nSee our [contribution guide](https://mozilla.github.io/kitsune/contributors), or dive into [s"
+    }
+  },
+  "repair_context": {
+    "related_tests": {
+      "ok": true,
+      "query": "topics_for test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_facets.py",
+          "path": "kitsune/wiki/tests/test_facets.py",
+          "sha": "29bfd344cfa130a722dfeb4bd0cb9208e2f5ff0d",
+          "html_url": "https://github.com/mozilla/kitsune/blob/1cd6347507b597b4b02f78d873a9ae144df6a485/kitsune/wiki/tests/test_facets.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"topics_for(\"",
+      "count": 5,
+      "items": [
+        {
+          "name": "views.py",
+          "path": "kitsune/wiki/views.py",
+          "sha": "a45256fdd8c9b64176b413870703f5646703210b",
+          "html_url": "https://github.com/mozilla/kitsune/blob/1cd6347507b597b4b02f78d873a9ae144df6a485/kitsune/wiki/views.py",
+          "score": 1.0
+        },
+        {
+          "name": "facets.py",
+          "path": "kitsune/wiki/facets.py",
+          "sha": "5eb0d83e4a8ce5bf234a8210d322a3900484c61b",
+          "html_url": "https://github.com/mozilla/kitsune/blob/1cd6347507b597b4b02f78d873a9ae144df6a485/kitsune/wiki/facets.py",
+          "score": 1.0
+        },
+        {
+          "name": "views.py",
+          "path": "kitsune/products/views.py",
+          "sha": "0deeefc147059d71068fd80563426c31928d2fc3",
+          "html_url": "https://github.com/mozilla/kitsune/blob/1cd6347507b597b4b02f78d873a9ae144df6a485/kitsune/products/views.py",
+          "score": 1.0
+        },
+        {
+          "name": "views.py",
+          "path": "kitsune/questions/views.py",
+          "sha": "fbb749ed42936efbf78b0976ec399e846e971908",
+          "html_url": "https://github.com/mozilla/kitsune/blob/1cd6347507b597b4b02f78d873a9ae144df6a485/kitsune/questions/views.py",
+          "score": 1.0
+        },
+        {
+          "name": "test_facets.py",
+          "path": "kitsune/wiki/tests/test_facets.py",
+          "sha": "29bfd344cfa130a722dfeb4bd0cb9208e2f5ff0d",
+          "html_url": "https://github.com/mozilla/kitsune/blob/1cd6347507b597b4b02f78d873a9ae144df6a485/kitsune/wiki/tests/test_facets.py",
+          "score": 1.0
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "kitsune/wiki",
+      "count": 37,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "kitsune/wiki/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "admin.py",
+          "path": "kitsune/wiki/admin.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "kitsune/wiki/api.py",
+          "type": "file"
+        },
+        {
+          "name": "apps.py",
+          "path": "kitsune/wiki/apps.py",
+          "type": "file"
+        },
+        {
+          "name": "badges.py",
+          "path": "kitsune/wiki/badges.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "kitsune/wiki/config.py",
+          "type": "file"
+        },
+        {
+          "name": "content_managers.py",
+          "path": "kitsune/wiki/content_managers.py",
+          "type": "file"
+        },
+        {
+          "name": "data",
+          "path": "kitsune/wiki/data",
+          "type": "dir"
+        },
+        {
+          "name": "decorators.py",
+          "path": "kitsune/wiki/decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "diff.py",
+          "path": "kitsune/wiki/diff.py",
+          "type": "file"
+        },
+        {
+          "name": "events.py",
+          "path": "kitsune/wiki/events.py",
+          "type": "file"
+        },
+        {
+          "name": "facets.py",
+          "path": "kitsune/wiki/facets.py",
+          "type": "file"
+        },
+        {
+          "name": "forms.py",
+          "path": "kitsune/wiki/forms.py",
+          "type": "file"
+        },
+        {
+          "name": "handlers.py",
+          "path": "kitsune/wiki/handlers.py",
+          "type": "file"
+        },
+        {
+          "name": "jinja2",
+          "path": "kitsune/wiki/jinja2",
+          "type": "dir"
+        },
+        {
+          "name": "l10n",
+          "path": "kitsune/wiki/l10n",
+          "type": "dir"
+        },
+        {
+          "name": "locale_views.py",
+          "path": "kitsune/wiki/locale_views.py",
+          "type": "file"
+        },
+        {
+          "name": "management",
+          "path": "kitsune/wiki/management",
+          "type": "dir"
+        },
+        {
+          "name": "managers.py",
+          "path": "kitsune/wiki/managers.py",
+          "type": "file"
+        },
+        {
+          "name": "migrations",
+          "path": "kitsune/wiki/migrations",
+          "type": "dir"
+        },
+        {
+          "name": "models.py",
+          "path": "kitsune/wiki/models.py",
+          "type": "file"
+        },
+        {
+          "name": "parser.py",
+          "path": "kitsune/wiki/parser.py",
+          "type": "file"
+        },
+        {
+          "name": "permissions.py",
+          "path": "kitsune/wiki/permissions.py",
+          "type": "file"
+        },
+        {
+          "name": "sampledata.py",
+          "path": "kitsune/wiki/sampledata.py",
+          "type": "file"
+        },
+        {
+          "name": "services.py",
+          "path": "kitsune/wiki/services.py",
+          "type": "file"
+        },
+        {
+          "name": "showfor.py",
+          "path": "kitsune/wiki/showfor.py",
+          "type": "file"
+        },
+        {
+          "name": "signals.py",
+          "path": "kitsune/wiki/signals.py",
+          "type": "file"
+        },
+        {
+          "name": "strategies.py",
+          "path": "kitsune/wiki/strategies.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks.py",
+          "path": "kitsune/wiki/tasks.py",
+          "type": "file"
+        },
+        {
+          "name": "templatetags",
+          "path": "kitsune/wiki/templatetags",
+          "type": "dir"
+        },
+        {
+          "name": "tests",
+          "path": "kitsune/wiki/tests",
+          "type": "dir"
+        },
+        {
+          "name": "topic_strings.py",
+          "path": "kitsune/wiki/topic_strings.py",
+          "type": "file"
+        },
+        {
+          "name": "urls.py",
+          "path": "kitsune/wiki/urls.py",
+          "type": "file"
+        },
+        {
+          "name": "urls_api.py",
+          "path": "kitsune/wiki/urls_api.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "kitsune/wiki/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "views.py",
+          "path": "kitsune/wiki/views.py",
+          "type": "file"
+        },
+        {
+          "name": "widgets.py",
+          "path": "kitsune/wiki/widgets.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 8,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "kitsune/wiki/__init__.py"
+        },
+        {
+          "name": "admin.py",
+          "path": "kitsune/wiki/admin.py"
+        },
+        {
+          "name": "api.py",
+          "path": "kitsune/wiki/api.py"
+        },
+        {
+          "name": "apps.py",
+          "path": "kitsune/wiki/apps.py"
+        },
+        {
+          "name": "badges.py",
+          "path": "kitsune/wiki/badges.py"
+        },
+        {
+          "name": "config.py",
+          "path": "kitsune/wiki/config.py"
+        },
+        {
+          "name": "content_managers.py",
+          "path": "kitsune/wiki/content_managers.py"
+        },
+        {
+          "name": "decorators.py",
+          "path": "kitsune/wiki/decorators.py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "kitsune/wiki/facets.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "6ca43cf22fb70ab3943f38cd03ed7d24fbcf03ab",
+          "html_url": "https://github.com/mozilla/kitsune/commit/6ca43cf22fb70ab3943f38cd03ed7d24fbcf03ab",
+          "message": "Ruff fixes",
+          "author": "Tasos Katsoulas",
+          "date": "2025-07-10T09:54:44Z"
+        },
+        {
+          "sha": "d7ba74f9a35f1ac838b710e8b90f184c7c8aed70",
+          "html_url": "https://github.com/mozilla/kitsune/commit/d7ba74f9a35f1ac838b710e8b90f184c7c8aed70",
+          "message": "Fix topic inheritance for translated documents (#6633)\n\n* Fix topic referencing parent for translated documents\n\nThis commit addresses issues with topic handling for translated documents:\nImproves query filtering in facets.py to include translated documents\nbased on their parent's topics, providing ",
+          "author": "smith",
+          "date": "2025-04-25T12:56:43Z"
+        },
+        {
+          "sha": "18a5c3bcefde37752550ddc9e4e6e167775a307d",
+          "html_url": "https://github.com/mozilla/kitsune/commit/18a5c3bcefde37752550ddc9e4e6e167775a307d",
+          "message": "Switch topic queries to m2m.",
+          "author": "Tasos Katsoulas",
+          "date": "2024-08-05T10:28:20Z"
+        },
+        {
+          "sha": "25b007afc18f040dce413c5fd1df25d1462dddf9",
+          "html_url": "https://github.com/mozilla/kitsune/commit/25b007afc18f040dce413c5fd1df25d1462dddf9",
+          "message": "Do not override the deafult manager\n\n* Introduce active manager for Topic and Product",
+          "author": "Tasos Katsoulas",
+          "date": "2024-07-04T10:07:03Z"
+        },
+        {
+          "sha": "b6894e1aff46f373c622d5d8e22c26d33ede1ee6",
+          "html_url": "https://github.com/mozilla/kitsune/commit/b6894e1aff46f373c622d5d8e22c26d33ede1ee6",
+          "message": "Return all articles for a list of topics",
+          "author": "Tasos Katsoulas",
+          "date": "2024-05-17T09:00:32Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "topics_for TODO Remove new_topics argument when",
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "kitsune/wiki/facets.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "6ca43cf22fb70ab3943f38cd03ed7d24fbcf03ab",
+        "html_url": "https://github.com/mozilla/kitsune/commit/6ca43cf22fb70ab3943f38cd03ed7d24fbcf03ab",
+        "message": "Ruff fixes",
+        "author": "Tasos Katsoulas",
+        "date": "2025-07-10T09:54:44Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 5,
+      "commits_count": 5,
+      "github_evidence_strength": "medium"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    }
+  }
+}

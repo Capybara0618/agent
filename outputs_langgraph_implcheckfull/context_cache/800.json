@@ -1,0 +1,395 @@
+{
+  "task_id": "800",
+  "repo_owner": "openstack",
+  "repo_name": "watcher",
+  "file_path": "watcher/applier/actions/migration.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T16:11:49+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 2,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 2,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T16:12:23+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T16:12:29+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "watcher/applier/actions/migration.py",
+    "original_code": "def abort(self):\n    # TODO(adisky): implement abort for migration\n    LOG.warning(\"Abort for migration not implemented\")",
+    "original_signature": "def abort(self):",
+    "satd_comment": "# TODO(adisky): implement abort for migration",
+    "target_file": {
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "sha": "14283a6fc7a3555e5031e16da703df700b2118ba",
+      "download_url": "https://raw.githubusercontent.com/openstack/watcher/master/watcher/applier/actions/migration.py",
+      "content_excerpt": "# Copyright (c) 2015 b<>com\n#\n# Authors: Jean-Emile DARTOIS <jean-emile.dartois@b-com.com>\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n# implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n\nfrom oslo_log import log\nfrom watcher._i18n import _\nfrom watcher.applier.actions import base\nfrom watcher.common import exception\nfrom watcher.common import nova_helper\n\nLOG = log.getLogger(__name__)\n\n\nclass Migrate(base.BaseAction):\n    \"\"\"Migrates a server to a destination nova-compute host\n\n    This action will allow you to migrate a server to another compute\n    destination host.\n    Migration type 'live' can only be used for migrating active VMs.\n    Migration type 'cold' can be used for migrating non-active VMs\n    as well active VMs, which will be shut down while migrating.\n\n    The action schema is::\n\n        schema = Schema({\n         'resource_id': str,  # should be a UUID\n         'migration_type': str,  # choices -> \"live\", \"cold\"\n         'destination_node': str,\n         'source_node': str,\n        })\n\n    The `resource_id` is the UUID of the server to migrate.\n    The `source_node` and `destination_node` parameters are respectively the\n    source and the destination compute hostname.\n\n    .. note::\n\n        Nova API version must be 2.56 or above if `destination_node` parameter\n        is given.\n\n    \"\"\"\n\n    # input parameters constants\n    MIGRATION_TYPE = 'migration_type'\n    LIVE_MIGRATION = 'live'\n    COLD_MIGRATION = 'cold'\n    DESTINATION_NODE = 'destination_node'\n    SOURCE_NODE = 'source_node'\n\n    @property\n    def schema(self):\n        return {\n            'type': 'object',\n            'properties': {\n                'destination_node': {\n                    \"anyof\": [\n                        {'type': 'string', \"minLength\": 1},\n                        {'type': 'None'}\n                        ]\n                },\n                'migration_type': {\n                    'type': 'string',\n                    \"enum\": [\"live\", \"cold\"]\n                },\n                'resource_id': {\n                    'type': 'string',\n                    \"minlength\": 1,\n                    \"pattern\": (\"^([a-fA-F0-9]){8}-([a-fA-F0-9]){4}-\"\n                                \"([a-fA-F0-9]){4}-([a-fA-F0-9]){4}-\"\n                                \"([a-fA-F0-9]){12}$\")\n                },\n                'resource_name': {\n                    'type': 'string',\n                    \"minlength\": 1\n                },\n                'source_node': {\n                    'type': 'string',\n                    \"minLength\": 1\n                    }\n            },\n            'required': ['migration_type', 'resource_id', 'source_node'],\n            'additionalProperties': False,\n        }\n\n    @property\n    def instance_uuid(self):\n        return self.resource_id\n\n    @property\n    def migration_type(self):\n        return self.input_parameters.get(self.MIGRATION_TYPE)\n\n    @property\n    def destination_node(self):\n        return self.input_parameters.get(self.DESTINATION_NODE)\n\n    @property\n    def source_node(self):\n        return self.input_parameters.get(self.SOURCE_NODE)\n\n    def _live_migrate_instance(self, nova, destination):\n        result = None\n        try:\n            result = nova.live_migrate_instance(instance_id=self.instance_uuid,\n                                                dest_hostname=destination)\n        except exception.NovaClientError as e:\n            LOG.debug(\"Nova client exception occurred while live \"\n                      \"migrating instance \"\n                      \"%(instance)s.Exception: %(exception)s\",\n                      {'instance': self.instance_uuid, 'exception': e})\n\n        except Exception as e:\n            LOG.exception(e)\n            LOG.critical(\"Unexpected error occurred. Migration failed for \"\n                         \"instance %s. Leaving instance on previous \"\n                         \"host.\", self.instance_uuid)\n\n        return result\n\n    def _cold_migrate_instance(self, nova, destination):\n        result = None\n        try:\n            result = nova.watcher_non_live_migrate_instance(\n                instance_id=self.instance_uuid,\n                dest_hostname=destination)\n        except Exception as exc:\n            LOG.exception(exc)\n            LOG.critical(\"Unexpected error occurred. Migration failed for \"\n                         \"instance %s. Leaving instance on previous \"\n                         \"host.\", self.instance_uuid)\n        return result\n\n    def _abort_cold_migrate(self, nova):\n        # TODO(adisky): currently watcher uses its own version of cold migrate\n        # implement cold migrate using nova dependent on the blueprint\n        # https://blueprints.launchpad.net/nova/+spec/cold-migration-with-target\n        # Abort operation for cold migrate is dependent on blueprint\n        # https://blueprints.launchpad.net/nova/+spec/abort-cold-migration\n        LOG.warning(\"Abort operation for cold migration is not implemented\")\n\n    def _abort_live_migrate(self, nova, source, destination):\n        return nova.abort_live_migrate(instance_id=self.instance_uuid,\n                                       source=source, destination=destination)\n\n    def migrate(self, destination=None):\n        nova = nova_helper.NovaHelper(osc=self.osc)\n        if destination is None:\n            LOG.debug(\"Migrating instance %s, destination node will be \"\n                      \"determined by nova-scheduler\", self.instance_uuid)\n        else:\n            LOG.debug(\"Migrate instance %s to %s\", self.instance_uuid,\n                      destination)\n        try:\n            nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.InstanceNotFound(name=self.instance_uuid)\n\n        if self.migration_type == self.LIVE_MIGRATION:\n            return self._live_migrate_instance(nova, destination)\n        elif self.migration_type == self.COLD_MIGRATION:\n            return self._cold_migrate_instance(nova, destination)\n        else:\n            raise exception.Invalid(\n                message=(_(\"Migration of type '%(migration_type)s' is not \"\n                           \"supported.\") %\n                         {'migration_type': self.migration_type}))\n\n    def execute(self):\n        return self.migrate(destination=self.destination_node)\n\n    def revert(self):\n        return self.migrate(destination=self.source_node)\n\n    def abort(self):\n        nova = nova_helper.NovaHelper(osc=self.osc)\n        try:\n            nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.InstanceNotFound(name=self.instance_uuid)\n\n        if self.migration_type == self.COLD_MIGRATION:\n            return self._abort_cold_migrate(nova)\n        elif self.migration_type == self.LIVE_MIGRATION:\n            return self._abort_live_migrate(\n                nova, source=self.source_node,\n                destination=self.destination_node)\n\n    def pre_condition(self):\n        \"\"\"Check migration preconditions\n\n        Skipping conditions:\n        - Instance does not exist\n        - Instance is not running on the source_node\n        Failing conditions:\n        - Destination node (if specified) does not exist or is disabled\n        - Instance status is not ACTIVE for live migration\n        \"\"\"\n        nova = nova_helper.NovaHelper(osc=self.osc)\n\n        # Check that the instance exists\n        try:\n            instance = nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.ActionSkipped(\n                _(\"Instance %s not found\") % self.instance_uuid)\n\n        # Check that the instance is running on source_node\n        instance_host = instance.host\n        if instance_host != self.source_node:\n            raise exception.ActionSkipped(\n                _(\"Instance %(instance)s is not running on source node \"\n                  \"%(source)s (currently on %(current)s)\") %\n                {'instance': self.instance_uuid,\n                 'source': self.source_node,\n                 'current': instance_host})\n\n        # Check destination node if specified\n        if self.destination_node:\n            try:\n                # Find the compute node and check if service is enabled\n                dest_node = nova.get_compute_node_by_hostname(\n                    self.destination_node)\n\n                # Check if compute service is enabled\n                if dest_node.status != 'enabled':\n                    raise exception.ActionExecutionFailure(\n                        _(\"Destination node %s is not in enabled state\") %\n                        self.destination_node)\n            except exception.ComputeNodeNotFound:\n                raise exception.ActionExecutionFailure(\n                    _(\"Destination node %s not found\") %\n                    self.destination_node)\n\n        # Check instance status based on migration type\n        instance_status = instance.status\n        if self.migration_type == self.LIVE_MIGRATION:\n            if instance_status != 'ACTIVE':\n                raise exception.ActionExecutionFailure(\n                    _(\"Live migration requires instance %(instance)s to be \"\n                      \"in ACTIVE status (current status: %(status)s)\") %\n                    {'instance': self.instance_uuid,\n                     'status': instance_status})\n\n    def post_condition(self):\n        # TODO(jed): check extra parameters (network response, etc.)\n        pass\n\n    def get_description(self):\n        \"\"\"Description of the action\"\"\"\n        return \"Moving a VM instance from source_node to destination_node\"\n",
+      "total_lines": 265
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 189,
+      "end_line": 201,
+      "excerpt": "    def abort(self):\n        nova = nova_helper.NovaHelper(osc=self.osc)\n        try:\n            nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.InstanceNotFound(name=self.instance_uuid)\n\n        if self.migration_type == self.COLD_MIGRATION:\n            return self._abort_cold_migrate(nova)\n        elif self.migration_type == self.LIVE_MIGRATION:\n            return self._abort_live_migrate(\n                nova, source=self.source_node,\n                destination=self.destination_node)",
+      "symbol_name": "abort",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "sha": "14283a6fc7a3555e5031e16da703df700b2118ba",
+      "download_url": "https://raw.githubusercontent.com/openstack/watcher/master/watcher/applier/actions/migration.py"
+    },
+    "imports": {
+      "imports": [
+        "oslo_log:log",
+        "watcher._i18n:_",
+        "watcher.applier.actions:base",
+        "watcher.common:exception",
+        "watcher.common:nova_helper"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/watcher/master/README.rst",
+      "content_excerpt": "=======\nWatcher\n=======\n\n.. image:: https://governance.openstack.org/tc/badges/watcher.svg\n\n.. Change things from this point on\n\n..\n      Except where otherwise noted, this document is licensed under Creative\n      Commons Attribution 3.0 License.  You can view the license at:\n\n          https://creativecommons.org/licenses/by/3.0/\n\nOpenStack Watcher provides a flexible and scalable resource optimization\nservice for multi-tenant OpenStack-based clouds.\nWatcher provides a robust framework to realize a wide range of cloud\noptimization goals, including the reduction of data center\noperating costs, increased system performance via intelligent virtual machine\nmigration, increased energy efficiency and more!\n\n* Free software: Apache license\n* Wiki: https://wiki.openstack.org/wiki/Watcher\n* Source: https://opendev.org/openstack/watcher\n* Bugs: https://bugs.launchpad.net/watcher\n* Documentation: https://docs.openstack.org/watcher/latest/\n* Release notes: https://docs.openstack.org/releasenotes/watcher/\n* Design specifications: https://specs.openstack.org/openstack/watcher-specs/\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "abort test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_migration.py",
+          "path": "watcher/tests/unit/applier/actions/test_migration.py",
+          "sha": "202f15c4c2536ab8aedc87091776c76c42d15ed8",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/tests/unit/applier/actions/test_migration.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 372,
+          "end_line": 396,
+          "excerpt": "372:     def test_revert_cold_migration(self):\n373:         self.m_helper.find_instance.return_value = self.INSTANCE_UUID\n374: \n375:         self.action_cold.revert()\n376: \n377:         self.m_helper_cls.assert_called_once_with(osc=self.m_osc)\n378:         self.m_helper.watcher_non_live_migrate_instance.\\\n379:             assert_called_once_with(\n380:                 instance_id=self.INSTANCE_UUID,\n381:                 dest_hostname=\"compute1-hostname\"\n382:             )\n383: \n384:     def test_abort_live_migrate(self):\n385:         migration = mock.MagicMock()\n386:         migration.id = \"2\"\n387:         migrations = [migration]\n388:         self.m_helper.get_running_migration.return_value = migrations\n389:         self.m_helper.find_instance.return_value = self.INSTANCE_UUID\n390:         try:\n391:             self.action.abort()\n392:         except Exception as exc:\n393:             self.fail(exc)\n394: \n395:         self.m_helper.abort_live_migrate.assert_called_once_with(\n396:             instance_id=self.INSTANCE_UUID, source=\"compute1-hostname\",",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_nova_helper.py",
+          "path": "watcher/tests/unit/common/test_nova_helper.py",
+          "sha": "bbdba4f2e4a90fb67374e4deeefd0973adcb6ba3",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/tests/unit/common/test_nova_helper.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 538,
+          "end_line": 562,
+          "excerpt": "538:     def test_watcher_non_live_migrate_instance_not_found(\n539:             self, mock_cinder):\n540:         nova_util = nova_helper.NovaHelper()\n541:         err = sdk_exc.NotFoundException()\n542:         self.mock_connection.compute.get_server.side_effect = err\n543: \n544:         is_success = nova_util.watcher_non_live_migrate_instance(\n545:             self.instance_uuid,\n546:             self.destination_node)\n547: \n548:         self.assertFalse(is_success)\n549: \n550:     def test_abort_live_migrate_instance(self, mock_cinder):\n551:         nova_util = nova_helper.NovaHelper()\n552:         kwargs = {\n553:             \"id\": self.instance_uuid,\n554:             \"compute_host\": self.source_node,\n555:             \"task_state\": None\n556:         }\n557:         server = self.create_openstacksdk_server(**kwargs)\n558:         migration = self.create_openstacksdk_migration(id=2)\n559:         self.fake_nova_migration_list(\n560:             self.mock_connection, fake_list=migration\n561:         )\n562: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"abort(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "base.py",
+          "path": "watcher/applier/workflow_engine/base.py",
+          "sha": "c4df9afb15f3bc0e331edadba39827fd8c7e7144",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/workflow_engine/base.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 319,
+          "end_line": 322,
+          "excerpt": "    def abort(self, *args, **kwargs):\n        # NOTE(dviroel): only ONGOING actions are called\n        # to abort the operation.\n        return self.do_abort(*args, **kwargs)",
+          "symbol_name": "abort",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "default.py",
+          "path": "watcher/applier/workflow_engine/default.py",
+          "sha": "df726d9813f3d6963039ebe13a1d89756dacbfc4",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/workflow_engine/default.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 179,
+          "end_line": 203,
+          "excerpt": "179:             LOG.info(\"Failed actionplan rollback option is turned off, and \"\n180:                      \"the following action will be skipped: %s\", self.name)\n181:             return\n182: \n183:         LOG.warning(\"Revert action: %s\", self.name)\n184:         try:\n185:             # TODO(jed): do we need to update the states in case of failure?\n186:             self.action.revert()\n187:         except Exception as e:\n188:             LOG.exception(e)\n189:             LOG.critical(\"Oops! We need a disaster recover plan.\")\n190: \n191:     def do_abort(self, *args, **kwargs):\n192:         LOG.warning(\"Aborting action: %s\", self.name)\n193:         try:\n194:             result = self.action.abort()\n195:             if result:\n196:                 # Aborted the action.\n197:                 return self.engine.notify(self._db_action,\n198:                                           objects.action.State.CANCELLED)\n199:             else:\n200:                 return self.engine.notify(self._db_action,\n201:                                           objects.action.State.SUCCEEDED)\n202:         except Exception as e:\n203:             LOG.exception(e)",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "sleep.py",
+          "path": "watcher/applier/actions/sleep.py",
+          "sha": "70f2f44f441f3ac454860dc8f0ab77974b24bf58",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/sleep.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 78,
+          "end_line": 80,
+          "excerpt": "    def abort(self):\n        LOG.debug(\"Abort action sleep\")\n        return True",
+          "symbol_name": "abort",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "migration.py",
+          "path": "watcher/applier/actions/migration.py",
+          "sha": "14283a6fc7a3555e5031e16da703df700b2118ba",
+          "html_url": "https://github.com/openstack/watcher/blob/13fb52e50841cc883e372e5847409e7cc3c349b2/watcher/applier/actions/migration.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 189,
+          "end_line": 201,
+          "excerpt": "    def abort(self):\n        nova = nova_helper.NovaHelper(osc=self.osc)\n        try:\n            nova.find_instance(self.instance_uuid)\n        except exception.ComputeResourceNotFound:\n            raise exception.InstanceNotFound(name=self.instance_uuid)\n\n        if self.migration_type == self.COLD_MIGRATION:\n            return self._abort_cold_migrate(nova)\n        elif self.migration_type == self.LIVE_MIGRATION:\n            return self._abort_live_migrate(\n                nova, source=self.source_node,\n                destination=self.destination_node)",
+          "symbol_name": "abort",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "watcher/applier/actions",
+      "count": 11,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "watcher/applier/actions/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "watcher/applier/actions/base.py",
+          "type": "file"
+        },
+        {
+          "name": "change_node_power_state.py",
+          "path": "watcher/applier/actions/change_node_power_state.py",
+          "type": "file"
+        },
+        {
+          "name": "change_nova_service_state.py",
+          "path": "watcher/applier/actions/change_nova_service_state.py",
+          "type": "file"
+        },
+        {
+          "name": "factory.py",
+          "path": "watcher/applier/actions/factory.py",
+          "type": "file"
+        },
+        {
+          "name": "migration.py",
+          "path": "watcher/applier/actions/migration.py",
+          "type": "file"
+        },
+        {
+          "name": "nop.py",
+          "path": "watcher/applier/actions/nop.py",
+          "type": "file"
+        },
+        {
+          "name": "resize.py",
+          "path": "watcher/applier/actions/resize.py",
+          "type": "file"
+        },
+        {
+          "name": "sleep.py",
+          "path": "watcher/applier/actions/sleep.py",
+          "type": "file"
+        },
+        {
+          "name": "stop.py",
+          "path": "watcher/applier/actions/stop.py",
+          "type": "file"
+        },
+        {
+          "name": "volume_migration.py",
+          "path": "watcher/applier/actions/volume_migration.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "watcher/applier/actions/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "base.py",
+          "path": "watcher/applier/actions/base.py",
+          "match_reason": "anchor_text",
+          "start_line": 21,
+          "end_line": 45,
+          "excerpt": "21: \n22: from watcher.common import clients\n23: from watcher.common.loader import loadable\n24: \n25: \n26: class BaseAction(loadable.Loadable, metaclass=abc.ABCMeta):\n27:     # NOTE(jed): by convention we decided\n28:     # that the attribute \"resource_id\" is the unique id of\n29:     # the resource to which the Action applies to allow us to use it in the\n30:     # watcher dashboard and will be nested in input_parameters\n31:     RESOURCE_ID = 'resource_id'\n32: \n33:     # Add action class name to the list, if implementing abort.\n34:     ABORT_TRUE = ['Sleep', 'Nop']\n35: \n36:     def __init__(self, config, osc=None):\n37:         \"\"\"Constructor\n38: \n39:         :param config: A mapping containing the configuration of this action\n40:         :type config: dict\n41:         :param osc: an OpenStackClients instance, defaults to None\n42:         :type osc: :py:class:`~.OpenStackClients` instance, optional\n43:         \"\"\"\n44:         super().__init__(config)\n45:         self._input_parameters = {}"
+        },
+        {
+          "name": "change_node_power_state.py",
+          "path": "watcher/applier/actions/change_node_power_state.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (c) 2017 ZTE\n2: #\n3: # Authors: Li Canwei\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: # http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or"
+        },
+        {
+          "name": "change_nova_service_state.py",
+          "path": "watcher/applier/actions/change_nova_service_state.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (c) 2015 b<>com\n2: #\n3: # Authors: Jean-Emile DARTOIS <jean-emile.dartois@b-com.com>\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: # http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or"
+        },
+        {
+          "name": "factory.py",
+          "path": "watcher/applier/actions/factory.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (c) 2016 b<>com\n2: #\n3: # Licensed under the Apache License, Version 2.0 (the \"License\");\n4: # you may not use this file except in compliance with the License.\n5: # You may obtain a copy of the License at\n6: #\n7: # http://www.apache.org/licenses/LICENSE-2.0\n8: #\n9: # Unless required by applicable law or agreed to in writing, software\n10: # distributed under the License is distributed on an \"AS IS\" BASIS,\n11: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n12: # implied.\n13: # See the License for the specific language governing permissions and"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "40472f49b3299751090d6c42b474f1d98fb9afda",
+          "html_url": "https://github.com/openstack/watcher/commit/40472f49b3299751090d6c42b474f1d98fb9afda",
+          "message": "Fix exception handling for find_instance calls\n\nThe nova_helper.find_instance method raises ComputeResourceNotFound\nwhen an instance is not found (via the @handle_nova_error decorator),\nbut several callers were checking for None return values instead of\ncatching the exception. This caused uncaught e",
+          "author": "jgilaber",
+          "date": "2026-02-26T14:26:26Z"
+        },
+        {
+          "sha": "bf6c7e2e27b8c48941652e63d8f65e23e6f6a146",
+          "html_url": "https://github.com/openstack/watcher/commit/bf6c7e2e27b8c48941652e63d8f65e23e6f6a146",
+          "message": "Use wrapper classes for novaclient objects\n\nUpdated NovaHelper methods to return wrapped objects:\n- Hypervisor: get_compute_node_list, get_compute_node_by_name,\nget_compute_node_by_hostname, get_compute_node_by_uuid\n- Server: get_instance_list, get_instance_by_uuid, find_instance\n- Flavor: get_flavo",
+          "author": "jgilaber",
+          "date": "2026-01-09T15:52:42Z"
+        },
+        {
+          "sha": "c14f9098a608fb013a710dc9c4ca77fab96d148f",
+          "html_url": "https://github.com/openstack/watcher/commit/c14f9098a608fb013a710dc9c4ca77fab96d148f",
+          "message": "Skip migrate actions in pre_condition phase\n\nThis patch is implementing detection of certain conditions and moving\nthe action to SKIPPED status so that, execution is not started. We will\ncheck that:\n\n- The instance exists\n- The instance is running in the source_node\n\nOn other contitions the action w",
+          "author": "Alfredo Moralejo",
+          "date": "2025-10-28T08:28:17Z"
+        },
+        {
+          "sha": "a1fdc7a1edf9203153b8c2ba29f55d1ae04311b8",
+          "html_url": "https://github.com/openstack/watcher/commit/a1fdc7a1edf9203153b8c2ba29f55d1ae04311b8",
+          "message": "Apply pyupgrade\n\nThis change was generated with the following command\npyupgrade --keep-percent-format --keep-runtime-typing --py3-only $(git ls-files | grep .py)\nthen formated with pre-commit and autopep8\n\nChange-Id: Iefb974d448ab91a01b07656cc5f6590307020f3a\nSigned-off-by: Sean Mooney <work@seanmoon",
+          "author": "Sean Mooney",
+          "date": "2025-09-17T06:26:10Z"
+        },
+        {
+          "sha": "3f6c7e406af2e79c33e0c589a008bc94029dfa4f",
+          "html_url": "https://github.com/openstack/watcher/commit/3f6c7e406af2e79c33e0c589a008bc94029dfa4f",
+          "message": "Drop nova command reference from the code\n\nIn DevStack environment, nova service-list command does not\nexist. Distro suggests to install python-novaclient from package.\n\nIn Strategies documentation, we generate the docs from following\ncode.[1]\n```\n       * - ``migration``\n         - .. watcher-term:",
+          "author": "Chandan Kumar (raukadah)",
+          "date": "2025-04-22T12:46:44Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "abort TODO adisky implement abort migration",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "watcher/applier/actions/migration.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "40472f49b3299751090d6c42b474f1d98fb9afda",
+        "html_url": "https://github.com/openstack/watcher/commit/40472f49b3299751090d6c42b474f1d98fb9afda",
+        "message": "Fix exception handling for find_instance calls\n\nThe nova_helper.find_instance method raises ComputeResourceNotFound\nwhen an instance is not found (via the @handle_nova_error decorator),\nbut several callers were checking for None return values instead of\ncatching the exception. This caused uncaught e",
+        "author": "jgilaber",
+        "date": "2026-02-26T14:26:26Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "defined abort method with TODO comment",
+        "existing private abort methods for cold and live migration",
+        "migration type constants and usage",
+        "exception handling patterns in migration methods",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

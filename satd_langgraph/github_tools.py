@@ -20,6 +20,9 @@ SEARCH_LIMIT = 8
 COMMENT_LIMIT = 6
 COMMIT_LIMIT = 5
 TREE_LIMIT = 40
+SNIPPET_WINDOW = 12
+SNIPPET_CHAR_LIMIT = 2200
+EXPANDED_ITEM_LIMIT = 4
 
 
 class GitHubToolbox:
@@ -94,14 +97,15 @@ class GitHubToolbox:
         }
 
     def extract_enclosing_symbol(self, file_content: str, satd_comment: str) -> dict[str, Any]:
-        satd_window = self.extract_satd_window(file_content, satd_comment, window=0)
+        clean_content = self._sanitize_source_text(file_content)
+        satd_window = self.extract_satd_window(clean_content, satd_comment, window=0)
         satd_line = satd_window.get("satd_line") if satd_window.get("found") else None
         if satd_line is None:
             return {"found": False, "error": "satd_comment_not_found"}
 
         try:
-            tree = ast.parse(file_content)
-        except SyntaxError as exc:
+            tree = ast.parse(clean_content)
+        except (SyntaxError, ValueError) as exc:
             return {"found": False, "error": f"syntax_error: {exc}"}
 
         best_match: ast.AST | None = None
@@ -123,7 +127,7 @@ class GitHubToolbox:
         if best_match is None:
             return {"found": False, "error": "no_enclosing_symbol"}
 
-        source_lines = file_content.splitlines()
+        source_lines = clean_content.splitlines()
         start = getattr(best_match, "lineno")
         end = getattr(best_match, "end_lineno")
         return {
@@ -136,11 +140,12 @@ class GitHubToolbox:
         }
 
     def extract_imports(self, file_content: str) -> dict[str, Any]:
-        if not file_content.strip():
+        clean_content = self._sanitize_source_text(file_content)
+        if not clean_content.strip():
             return {"imports": []}
         try:
-            tree = ast.parse(file_content)
-        except SyntaxError as exc:
+            tree = ast.parse(clean_content)
+        except (SyntaxError, ValueError) as exc:
             return {"imports": [], "error": f"syntax_error: {exc}"}
 
         imports: list[str] = []
@@ -189,6 +194,19 @@ class GitHubToolbox:
             "note": "line-level blame is approximated with the latest path commit",
             "error": commits.get("error"),
         }
+
+    def fetch_code_snippet(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        anchor_text: str = "",
+        symbol_name: str = "",
+        prefer_assert: bool = False,
+        window: int = SNIPPET_WINDOW,
+        max_chars: int = SNIPPET_CHAR_LIMIT,
+    ) -> dict[str, Any]:
+        return self._fetch_code_snippet(owner, repo, path, anchor_text, symbol_name, prefer_assert, window, max_chars)
 
     @functools.lru_cache(maxsize=256)
     def _fetch_repo_readme(self, owner: str, repo: str) -> dict[str, Any]:
@@ -272,8 +290,16 @@ class GitHubToolbox:
         if not token:
             return {"ok": True, "query": "", "count": 0, "items": []}
         basename = os.path.basename(token).replace(".py", "")
+        symbol_name = basename if basename and basename != token else ""
         raw = self._search_code(owner, repo, f'{basename} test', per_page)
-        items = [item for item in raw.get("items", []) if self._is_test_path(item.get("path", ""))]
+        items = self._expand_search_items(
+            owner,
+            repo,
+            [item for item in raw.get("items", []) if self._is_test_path(item.get("path", ""))],
+            anchor_text=basename,
+            symbol_name=symbol_name,
+            prefer_assert=True,
+        )
         return {"ok": raw.get("ok", False), "query": raw.get("query"), "count": len(items), "items": items}
 
     @functools.lru_cache(maxsize=256)
@@ -282,7 +308,7 @@ class GitHubToolbox:
         if not token:
             return {"ok": True, "query": "", "count": 0, "items": []}
         raw = self._search_code(owner, repo, f'"{token}("', per_page)
-        items = raw.get("items", [])
+        items = self._expand_search_items(owner, repo, raw.get("items", []), anchor_text=f"{token}(", symbol_name=token)
         return {"ok": raw.get("ok", False), "query": raw.get("query"), "count": len(items), "items": items}
 
     @functools.lru_cache(maxsize=256)
@@ -362,6 +388,7 @@ class GitHubToolbox:
                         "additions": item.get("additions"),
                         "deletions": item.get("deletions"),
                         "changes": item.get("changes"),
+                        "patch_excerpt": (item.get("patch") or "")[:SNIPPET_CHAR_LIMIT],
                     }
                 )
             return {"ok": True, "number": pr_number, "count": len(files), "files": files}
@@ -408,6 +435,41 @@ class GitHubToolbox:
         except Exception as exc:
             return {"ok": False, "prefix": cleaned_prefix, "error": str(exc), "entries": []}
 
+    @functools.lru_cache(maxsize=1024)
+    def _fetch_code_snippet(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        anchor_text: str,
+        symbol_name: str,
+        prefer_assert: bool,
+        window: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        payload = self._fetch_repo_file(owner, repo, path)
+        if not payload.get("ok"):
+            return {"ok": False, "path": path, "error": payload.get("error")}
+
+        content = self._sanitize_source_text(payload.get("full_content") or "")
+        snippet = self._extract_best_snippet(
+            content,
+            anchor_text=anchor_text,
+            symbol_name=symbol_name,
+            prefer_assert=prefer_assert,
+            window=window,
+            max_chars=max_chars,
+        )
+        snippet.update(
+            {
+                "ok": True,
+                "path": payload.get("path"),
+                "sha": payload.get("sha"),
+                "download_url": payload.get("download_url"),
+            }
+        )
+        return snippet
+
     def _github_json(self, url: str) -> Any:
         request = urllib.request.Request(url, headers=self._headers())
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -423,9 +485,164 @@ class GitHubToolbox:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return headers
 
+    def _sanitize_source_text(self, text: str) -> str:
+        if not text:
+            return ""
+        return text.replace("\x00", "")
+
     def _decode_content(self, payload: dict[str, Any]) -> str:
         content = payload.get("content", "")
-        return base64.b64decode(content).decode("utf-8", errors="replace") if content else ""
+        if not content:
+            return ""
+        decoded = base64.b64decode(content).decode("utf-8", errors="replace")
+        return self._sanitize_source_text(decoded)
+
+    def _expand_search_items(
+        self,
+        owner: str,
+        repo: str,
+        items: list[dict[str, Any]],
+        anchor_text: str,
+        symbol_name: str = "",
+        prefer_assert: bool = False,
+    ) -> list[dict[str, Any]]:
+        enriched = []
+        seen_paths: set[str] = set()
+        for item in items:
+            path = item.get("path") or ""
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            snippet = self._fetch_code_snippet(
+                owner,
+                repo,
+                path,
+                anchor_text=anchor_text,
+                symbol_name=symbol_name,
+                prefer_assert=prefer_assert,
+                window=SNIPPET_WINDOW,
+                max_chars=SNIPPET_CHAR_LIMIT,
+            )
+            enriched.append(
+                {
+                    **item,
+                    "snippet_ok": snippet.get("ok", False),
+                    "match_reason": snippet.get("match_reason"),
+                    "start_line": snippet.get("start_line"),
+                    "end_line": snippet.get("end_line"),
+                    "excerpt": snippet.get("excerpt"),
+                    "symbol_name": snippet.get("symbol_name"),
+                    "symbol_type": snippet.get("symbol_type"),
+                }
+            )
+            if len(enriched) >= EXPANDED_ITEM_LIMIT:
+                break
+        return enriched
+
+    def _extract_best_snippet(
+        self,
+        content: str,
+        anchor_text: str,
+        symbol_name: str,
+        prefer_assert: bool,
+        window: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        content = self._sanitize_source_text(content)
+        lines = content.splitlines()
+        if not lines:
+            return {"match_reason": "empty_file", "start_line": None, "end_line": None, "excerpt": "", "symbol_name": None, "symbol_type": None}
+
+        symbol_snippet = self._extract_symbol_snippet(content, symbol_name)
+        if symbol_snippet:
+            symbol_snippet["excerpt"] = (symbol_snippet.get("excerpt") or "")[:max_chars]
+            return symbol_snippet
+
+        anchor_line = self._find_anchor_line(lines, anchor_text)
+        if anchor_line is not None:
+            return self._snippet_from_line(lines, anchor_line, window, "anchor_text", max_chars)
+
+        if prefer_assert:
+            assert_line = self._find_anchor_line(lines, "assert")
+            if assert_line is not None:
+                return self._snippet_from_line(lines, assert_line, window, "assert_window", max_chars)
+
+        return self._snippet_from_line(lines, 1, min(window, 20), "file_start", max_chars)
+
+    def _extract_symbol_snippet(self, content: str, symbol_name: str) -> dict[str, Any] | None:
+        token = (symbol_name or "").strip()
+        if not token:
+            return None
+        content = self._sanitize_source_text(content)
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError):
+            return None
+
+        best: ast.AST | None = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and getattr(node, "name", "") == token:
+                start = getattr(node, "lineno", None)
+                end = getattr(node, "end_lineno", None)
+                if start is None or end is None:
+                    continue
+                if best is None:
+                    best = node
+                    continue
+                current_span = getattr(best, "end_lineno") - getattr(best, "lineno")
+                node_span = end - start
+                if node_span < current_span:
+                    best = node
+
+        if best is None:
+            return None
+
+        source_lines = content.splitlines()
+        start = getattr(best, "lineno")
+        end = getattr(best, "end_lineno")
+        return {
+            "match_reason": "symbol_match",
+            "start_line": start,
+            "end_line": end,
+            "excerpt": "\n".join(source_lines[start - 1 : end]),
+            "symbol_name": getattr(best, "name", None),
+            "symbol_type": type(best).__name__,
+        }
+
+    def _find_anchor_line(self, lines: list[str], anchor_text: str) -> int | None:
+        target = self._normalize_search_text(anchor_text)
+        if not target:
+            return None
+        for index, line in enumerate(lines, start=1):
+            candidate = self._normalize_search_text(line)
+            if candidate and (target in candidate or candidate in target):
+                return index
+        return None
+
+    def _normalize_search_text(self, text: str) -> str:
+        normalized = (text or "").strip().lower()
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    def _snippet_from_line(
+        self,
+        lines: list[str],
+        line_number: int,
+        window: int,
+        match_reason: str,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        start_line = max(1, line_number - window)
+        end_line = min(len(lines), line_number + window)
+        excerpt = "\n".join(f"{idx}: {lines[idx - 1]}" for idx in range(start_line, end_line + 1))
+        return {
+            "match_reason": match_reason,
+            "start_line": start_line,
+            "end_line": end_line,
+            "excerpt": excerpt[:max_chars],
+            "symbol_name": None,
+            "symbol_type": None,
+        }
 
     def _locate_satd_line(self, lines: list[str], satd_comment: str) -> int | None:
         target = self._normalize_comment_text(satd_comment)

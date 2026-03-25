@@ -1,0 +1,519 @@
+{
+  "task_id": "737",
+  "repo_owner": "zclassiccommunity",
+  "repo_name": "electrum-zclassic",
+  "file_path": "lib/bitcoin.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T15:26:56+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 2,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T15:27:24+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T15:27:30+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lib/bitcoin.py",
+    "original_code": "def set_mainnet(cls):\n    cls.TESTNET = False\n    cls.WIF_PREFIX = 0x80\n    cls.ADDRTYPE_P2PKH = bytes.fromhex('1CB8')\n    cls.ADDRTYPE_P2SH = bytes.fromhex('1CBD')\n    cls.HEADERS_URL = ''  # TODO headers bootstrap\n    cls.GENESIS = '00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08'\n    cls.DEFAULT_PORTS = {'t': '50001', 's': '50002'}\n    cls.DEFAULT_SERVERS = read_json_dict('servers.json')\n    XPRV_HEADERS['standard'] = 0x0488ade4\n    XPUB_HEADERS['standard'] = 0x0488b21e",
+    "original_signature": "def set_mainnet(cls):",
+    "satd_comment": "# TODO headers bootstrap",
+    "target_file": {
+      "ok": true,
+      "path": "lib/bitcoin.py",
+      "sha": "5b7b5ce4fbef8c7605e5c3de7fca492323cd45c4",
+      "download_url": "https://raw.githubusercontent.com/ZclassicCommunity/electrum-zclassic/master/lib/bitcoin.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n#\n# Electrum - lightweight ZClassic client\n# Copyright (C) 2011 thomasv@gitorious\n#\n# Permission is hereby granted, free of charge, to any person\n# obtaining a copy of this software and associated documentation files\n# (the \"Software\"), to deal in the Software without restriction,\n# including without limitation the rights to use, copy, modify, merge,\n# publish, distribute, sublicense, and/or sell copies of the Software,\n# and to permit persons to whom the Software is furnished to do so,\n# subject to the following conditions:\n#\n# The above copyright notice and this permission notice shall be\n# included in all copies or substantial portions of the Software.\n#\n# THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,\n# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF\n# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND\n# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS\n# BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN\n# ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN\n# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\n# SOFTWARE.\n\nimport hashlib\nimport base64\nimport hmac\nimport os\nimport json\n\nimport ecdsa\nimport pyaes\n\nfrom .util import bfh, bh2u, to_string, BitcoinException\nfrom . import version\nfrom .util import print_error, InvalidPassword, assert_bytes, to_bytes, inv_dict\nfrom . import constants\n\n\n################################## transactions\n\nCOINBASE_MATURITY = 100\nCOIN = 100000000\n\n# supported types of transaction outputs\nTYPE_ADDRESS = 0\nTYPE_PUBKEY  = 1\nTYPE_SCRIPT  = 2\n\n# AES encryption\ntry:\n    from Cryptodome.Cipher import AES\nexcept:\n    AES = None\n\n\nclass InvalidPadding(Exception):\n    pass\n\n\ndef append_PKCS7_padding(data):\n    assert_bytes(data)\n    padlen = 16 - (len(data) % 16)\n    return data + bytes([padlen]) * padlen\n\n\ndef strip_PKCS7_padding(data):\n    assert_bytes(data)\n    if len(data) % 16 != 0 or len(data) == 0:\n        raise InvalidPadding(\"invalid length\")\n    padlen = data[-1]\n    if padlen > 16:\n        raise InvalidPadding(\"invalid padding byte (large)\")\n    for i in data[-padlen:]:\n        if i != padlen:\n            raise InvalidPadding(\"invalid padding byte (inconsistent)\")\n    return data[0:-padlen]\n\n\ndef aes_encrypt_with_iv(key, iv, data):\n    assert_bytes(key, iv, data)\n    data = append_PKCS7_padding(data)\n    if AES:\n        e = AES.new(key, AES.MODE_CBC, iv).encrypt(data)\n    else:\n        aes_cbc = pyaes.AESModeOfOperationCBC(key, iv=iv)\n        aes = pyaes.Encrypter(aes_cbc, padding=pyaes.PADDING_NONE)\n        e = aes.feed(data) + aes.feed()  # empty aes.feed() flushes buffer\n    return e\n\n\ndef aes_decrypt_with_iv(key, iv, data):\n    assert_bytes(key, iv, data)\n    if AES:\n        cipher = AES.new(key, AES.MODE_CBC, iv)\n        data = cipher.decrypt(data)\n    else:\n        aes_cbc = pyaes.AESModeOfOperationCBC(key, iv=iv)\n        aes = pyaes.Decrypter(aes_cbc, padding=pyaes.PADDING_NONE)\n        data = aes.feed(data) + aes.feed()  # empty aes.feed() flushes buffer\n    try:\n        return strip_PKCS7_padding(data)\n    except InvalidPadding:\n        raise InvalidPassword()\n\n\ndef EncodeAES(secret, s):\n    assert_bytes(s)\n    iv = bytes(os.urandom(16))\n    ct = aes_encrypt_with_iv(secret, iv, s)\n    e = iv + ct\n    return base64.b64encode(e)\n\ndef DecodeAES(secret, e):\n    e = bytes(base64.b64decode(e))\n    iv, e = e[:16], e[16:]\n    s = aes_decrypt_with_iv(secret, iv, e)\n    return s\n\ndef pw_encode(s, password):\n    if password:\n        secret = Hash(password)\n        return EncodeAES(secret, to_bytes(s, \"utf8\")).decode('utf8')\n    else:\n        return s\n\ndef pw_decode(s, password):\n    if password is not None:\n        secret = Hash(password)\n        try:\n            d = to_string(DecodeAES(secret, s), \"utf8\")\n        except Exception:\n            raise InvalidPassword()\n        return d\n    else:\n        return s\n\n\ndef rev_hex(s):\n    return bh2u(bfh(s)[::-1])\n\n\ndef int_to_hex(i, length=1):\n    if not isinstance(i, int):\n        raise TypeError('{} instead of int'.format(i))\n    if i < 0:\n        # two's complement\n        i = pow(256, length) + i\n    s = hex(i)[2:].rstrip('L')\n    s = \"0\"*(2*length - len(s)) + s\n    return rev_hex(s)\n\n\ndef var_int(i):\n    # https://en.bitcoin.it/wiki/Protocol_specification#Variable_length_integer\n    if i<0xfd:\n        return int_to_hex(i)\n    elif i<=0xffff:\n        return \"fd\"+int_to_hex(i,2)\n    elif i<=0xffffffff:\n        return \"fe\"+int_to_hex(i,4)\n    else:\n        return \"ff\"+int_to_hex(i,8)\n\n\ndef op_push(i):\n    if i<0x4c:  # OP_PUSHDATA1\n        return int_to_hex(i)\n    elif i<=0xff:\n        return '4c' + int_to_hex(i)\n    elif i<=0xffff:\n        return '4d' + int_to_hex(i,2)\n    else:\n        return '4e' + int_to_hex(i,4)\n\ndef push_script(x):\n    return op_push(len(x)//2) + x\n\ndef sha256(x):\n    x = to_bytes(x, 'utf8')\n    return bytes(hashlib.sha256(x).digest())\n\n\ndef Hash(x):\n    x = to_bytes(x, 'utf8')\n    out = bytes(sha256(sha256(x)))\n    return out\n\n\nhash_encode = lambda x: bh2u(x[::-1])\nhash_decode = lambda x: bfh(x)[::-1]\nhmac_sha_512 = lambda x, y: hmac.new(x, y, hashlib.sha512).digest()\n\n\ndef is_new_seed(x, prefix=version.SEED_PREFIX):\n    from . import mnemonic\n    x = mnemonic.normalize_text(x)\n    s = bh2u(hmac_sha_512(b\"Seed version\", x.encode('utf8')))\n    return s.startswith(prefix)\n\n\ndef is_old_seed(seed):\n    from . import old_mnemonic, mnemonic\n    seed = mnemonic.normalize_text(seed)\n    words = seed.split()\n    try:\n        # checks here are deliberately left weak for legacy reasons, see #3149\n        old_mnemonic.mn_decode(words)\n        uses_electrum_words = True\n    except Exception:\n        uses_electrum_words = False\n    try:\n        seed = bfh(seed)\n        is_hex = (len(seed) == 16 or len(seed) == 32)\n    except Exception:\n        is_hex = False\n    return is_hex or (uses_electrum_words and (len(words) == 12 or len(words) == 24))\n\n\ndef seed_type(x):\n    if is_old_seed(x):\n        return 'old'\n    elif is_new_seed(x):\n        return 'standard'\n    return ''\n\nis_seed = lambda x: bool(seed_type(x))\n\n# pywallet openssl private key implementation\n\ndef i2o_ECPublicKey(pubkey, compressed=False):\n    # public keys are 65 bytes long (520 bits)\n    # 0x04 + 32-byte X-coordinate + 32-byte Y-coordinate\n    # 0x00 = point at infinity, 0x02 and 0x03 = compressed, 0x04 = uncompressed\n    # compressed keys: <sign> <x> where <sign> is 0x02 if y is even and 0x03 if y is odd\n    if compressed:\n        if pubkey.point.y() & 1:\n            key = '03' + '%064x' % pubkey.point.x()\n        else:\n            key = '02' + '%064x' % pubkey.point.x()\n    else:\n        key = '04' + \\\n              '%064x' % pubkey.point.x() + \\\n              '%064x' % pubkey.point.y()\n\n    return bfh(key)\n# end pywallet openssl private key implementation\n\n\n############ functions from pywallet #####################\ndef hash_160(public_key):\n    try:\n        md = hashlib.new('ripemd160')\n        md.update(sha256(public_key))\n        return md.digest()\n    except BaseException:\n        from . import ripemd\n        md = ripemd.new(sha256(public_key))\n        return md.digest()\n\n\ndef hash160_to_b58_address(h160, addrtype):\n    s = addrtype\n    s += h160\n    return base_encode(s+Hash(s)[0:4], base=58)\n\n\ndef b58_address_to_hash160(addr):\n    addr = to_bytes(addr, 'ascii')\n    _bytes = base_decode(addr, 26, base=58)\n    return _bytes[0:2], _bytes[2:22]\n\n\ndef hash160_to_p2pkh(h160, *, net=None):\n    if net is None:\n        net = constants.net\n    return hash160_to_b58_address(h160, net.ADDRTYPE_P2PKH)\n\ndef hash160_to_p2sh(h160, *, net=None):\n    if net is None:\n        net = constants.net\n    return hash160_to_b58_address(h160, net.ADDRTYPE_P2SH)\n\ndef public_key_to_p2pkh(public_key):\n    return hash160_to_p2pkh(hash_160(public_key))\n\ndef pubkey_to_address(txin_type, pubkey):\n    if txin_type == 'p2pkh':\n        return public_key_to_p2pkh(bfh(pubkey))\n    else:\n        raise NotImplementedError(txin_type)\n\ndef redeem_script_to_address(txin_type, redeem_script):\n    if txin_type == 'p2sh':\n        return hash160_to_p2sh(hash_160(bfh(redeem_script)))\n    else:\n        raise NotImplementedError(txin_type)\n\n\ndef script_to_address(script, *, net=None):\n    from .transaction import get_address_from_output_script\n    t, addr = get_address_from_output_script(bfh(script), net=net)\n    assert t == TYPE_ADDRESS\n    return addr\n\ndef address_to_script(addr, *, net=None):\n    if net is None:\n        net = constants.net\n    addrtype, hash_160 = b58_address_to_hash160(addr)\n    if addrtype == net.ADDRTYPE_P2PKH:\n        script = '76a9'                                      # op_dup, op_hash_160\n        script += push_script(bh2u(hash_160))\n        script += '88ac'                                     # op_equalverify, op_checksig\n    elif addrtype == net.ADDRTYPE_P2SH:\n        script = 'a9'                                        # op_hash_160\n        script += push_script(bh2u(hash_160))\n        script += '87'                                       # op_equal\n    else:\n        raise BitcoinException('unknown address type: {}'.format(addrtype))\n    return script\n\ndef address_to_scripthash(addr):\n    script = address_to_script(addr)\n    return script_to_scripthash(script)\n\ndef script_to_scripthash(script):\n    h = sha256(bytes.fromhex(script))[0:32]\n    return bh2u(bytes(reversed(h)))\n\ndef public_key_to_p2pk_script(pubkey):\n    script = push_script(pubkey)\n    script += 'ac'                                           # op_checksig\n    return script\n\n__b58chars = b'123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'\nassert len(__b58chars) == 58\n\n__b43chars = b'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$*+-./:'\nassert len(__b43chars) == 43\n\n\ndef base_encode(v, base):\n    \"\"\" encode v, which is a string of bytes, to base58.\"\"\"\n    assert_bytes(v)\n    if base not in (58, 43):\n        raise ValueError('not supported base: {}'.format(base))\n    chars = __b58chars\n    if base == 43:\n        chars = __b43chars\n    long_value = 0\n    for (i, c) in enumerate(v[::-1]):\n        long_value += (256**i) * c\n    result = bytearray()\n    while long_value >= base:\n        div, mod = divmod(long_value, base)\n        result.append(chars[mod])\n        long_value = div\n    result.append(chars[long_value])\n    # ZClassic does a little leading-zero-compression:\n    # leading 0-bytes in the input become leading-1s\n    nPad = 0\n    for c in v:\n        if c == 0x00:\n            nPad += 1\n        else:\n            break\n    result.extend([chars[0]] * nPad)\n    result.reverse()\n    return result.decode('ascii')\n\n\ndef base_decode(v, length, base):\n    \"\"\" decode v into a string of len bytes.\"\"\"\n    # assert_bytes(v)\n    v = to_bytes(v, 'ascii')\n    if base not in (58, 43):\n        raise ValueError('not supported base: {}'.format(base))\n    chars = __b58chars\n    if base == 43:\n        chars = __b43chars\n    long_value = 0\n    for (i, c) in enumerate(v[::-1]):\n        digit = chars.find(bytes([c]))\n        if digit == -1:\n            raise ValueError('Forbidden character {} for base {}'.format(c, base))\n        long_value += digit * (base**i)\n    result = bytearray()\n    while long_value >= 256:\n        div, mod = divmod(long_value, 256)\n        result.append(mod)\n        long_value = div\n    result.append(long_value)\n    nPad = 0\n    for c in v:\n        if c == chars[0]:\n            nPad += 1\n        else:\n            break\n    result.extend(b'\\x00' * nPad)\n    if length is not None and len(result) != length:\n        return None\n    result.reverse()\n    return bytes(result)\n\n\nclass InvalidChecksum(Exception):\n    pass\n\n\ndef EncodeBase58Check(vchIn):\n    hash = Hash(vchIn)\n    return base_encode(vchIn + hash[0:4], base=58)\n\n\ndef DecodeBase58Check(psz):\n    vchRet = base_decode(psz, None, base=58)\n    key = vchRet[0:-4]\n    csum = vchRet[-4:]\n    hash = Hash(key)\n    cs32 = hash[0:4]\n    if cs32 != csum:\n        raise InvalidChecksum('expected {",
+      "total_lines": 981
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "anchor_text",
+      "start_line": 1,
+      "end_line": 14,
+      "excerpt": "1: # -*- coding: utf-8 -*-\n2: #\n3: # Electrum - lightweight ZClassic client\n4: # Copyright (C) 2011 thomasv@gitorious\n5: #\n6: # Permission is hereby granted, free of charge, to any person\n7: # obtaining a copy of this software and associated documentation files\n8: # (the \"Software\"), to deal in the Software without restriction,\n9: # including without limitation the rights to use, copy, modify, merge,\n10: # publish, distribute, sublicense, and/or sell copies of the Software,\n11: # and to permit persons to whom the Software is furnished to do so,\n12: # subject to the following conditions:\n13: #\n14: # The above copyright notice and this permission notice shall be",
+      "symbol_name": null,
+      "symbol_type": null,
+      "ok": true,
+      "path": "lib/bitcoin.py",
+      "sha": "5b7b5ce4fbef8c7605e5c3de7fca492323cd45c4",
+      "download_url": "https://raw.githubusercontent.com/ZclassicCommunity/electrum-zclassic/master/lib/bitcoin.py"
+    },
+    "imports": {
+      "imports": [
+        "hashlib",
+        "base64",
+        "hmac",
+        "os",
+        "json",
+        "ecdsa",
+        "pyaes",
+        "util:bfh",
+        "util:bh2u",
+        "util:to_string",
+        "util:BitcoinException",
+        ":version",
+        "util:print_error",
+        "util:InvalidPassword",
+        "util:assert_bytes",
+        "util:to_bytes",
+        "util:inv_dict",
+        ":constants",
+        "ecdsa.ecdsa:curve_secp256k1",
+        "ecdsa.ecdsa:generator_secp256k1",
+        "ecdsa.curves:SECP256k1",
+        "ecdsa.ellipticcurve:Point",
+        "ecdsa.util:string_to_number",
+        "ecdsa.util:number_to_string",
+        "Cryptodome.Cipher:AES",
+        ":mnemonic",
+        ":old_mnemonic",
+        ":mnemonic",
+        "transaction:get_address_from_output_script",
+        "ecdsa:util"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ZclassicCommunity/electrum-zclassic/master/README.rst",
+      "content_excerpt": "Electrum-Zclassic - Lightweight Zclassic client\n=====================================\n\n::\n\n  Licence: MIT Licence\n  Author: Thomas Voegtlin\n  Language: Python\n  Homepage: https://github.com/ZclassicCommunity/electrum-zcl\n\n\n.. image:: https://travis-ci.org/ZclassicCommunity/electrum-zcl.svg?branch=master\n    :target: https://travis-ci.org/ZclassicCommunity/electrum-zcl\n    :alt: Build Status\n\n\n\n\n\nGetting started\n===============\n\nElectrum-Zclassic is a pure python application. If you want to use the\nQt interface, install the Qt dependencies::\n\n    sudo apt-get install python3-pyqt5\n\nIf you downloaded the official package (tar.gz), you can run\nElectrum-Zclassic from its root directory, without installing it on your\nsystem; all the python dependencies are included in the 'packages'\ndirectory. To run Electrum-Zclassic from its root directory, just do::\n\n    ./electrum-zclassic\n\nYou can also install Electrum-Zclassic on your system, by running this command::\n\n    sudo apt-get install python3-setuptools\n    pip3 install .[full]\n\nThis will download and install the Python dependencies used by\nElectrum-Zclassic, instead of using the 'packages' directory.\nThe 'full' extra contains some optional dependencies that we think\nare often useful but they are not strictly needed.\n\nIf you cloned the git repository, you need to compile extra files\nbefore you can run Electrum-Zclassic. Read the next section, \"Development\nVersion\".\n\n\n\nDevelopment version\n===================\n\nCheck out the code from GitHub::\n\n    git clone git://github.com/ZclassicCommunity/electrum-zclassic.git\n    cd electrum-zcl"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "set_mainnet test",
+      "count": 1,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lib/tests/__init__.py",
+          "sha": "c6e8240fc5706edd891d0d150170f111685a79e1",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/blob/854b91c9bc3cf93e814596a417b474c584c7f589/lib/tests/__init__.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 4,
+          "end_line": 16,
+          "excerpt": "4: \n5: \n6: class TestCaseForTestnet(unittest.TestCase):\n7: \n8:     @classmethod\n9:     def setUpClass(cls):\n10:         super().setUpClass()\n11:         constants.set_testnet()\n12: \n13:     @classmethod\n14:     def tearDownClass(cls):\n15:         super().tearDownClass()\n16:         constants.set_mainnet()",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"set_mainnet(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "constants.py",
+          "path": "lib/constants.py",
+          "sha": "d8d90bc9f9c87d3c73283ff3bb32edd9dff43202",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/blob/854b91c9bc3cf93e814596a417b474c584c7f589/lib/constants.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 91,
+          "end_line": 93,
+          "excerpt": "def set_mainnet():\n    global net\n    net = BitcoinMainnet",
+          "symbol_name": "set_mainnet",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "__init__.py",
+          "path": "lib/tests/__init__.py",
+          "sha": "c6e8240fc5706edd891d0d150170f111685a79e1",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/blob/854b91c9bc3cf93e814596a417b474c584c7f589/lib/tests/__init__.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 4,
+          "end_line": 16,
+          "excerpt": "4: \n5: \n6: class TestCaseForTestnet(unittest.TestCase):\n7: \n8:     @classmethod\n9:     def setUpClass(cls):\n10:         super().setUpClass()\n11:         constants.set_testnet()\n12: \n13:     @classmethod\n14:     def tearDownClass(cls):\n15:         super().tearDownClass()\n16:         constants.set_mainnet()",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lib",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "lib/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base_wizard.py",
+          "path": "lib/base_wizard.py",
+          "type": "file"
+        },
+        {
+          "name": "bitcoin.py",
+          "path": "lib/bitcoin.py",
+          "type": "file"
+        },
+        {
+          "name": "blockchain.py",
+          "path": "lib/blockchain.py",
+          "type": "file"
+        },
+        {
+          "name": "coinchooser.py",
+          "path": "lib/coinchooser.py",
+          "type": "file"
+        },
+        {
+          "name": "commands.py",
+          "path": "lib/commands.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "lib/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "contacts.py",
+          "path": "lib/contacts.py",
+          "type": "file"
+        },
+        {
+          "name": "currencies.json",
+          "path": "lib/currencies.json",
+          "type": "file"
+        },
+        {
+          "name": "daemon.py",
+          "path": "lib/daemon.py",
+          "type": "file"
+        },
+        {
+          "name": "dnssec.py",
+          "path": "lib/dnssec.py",
+          "type": "file"
+        },
+        {
+          "name": "exchange_rate.py",
+          "path": "lib/exchange_rate.py",
+          "type": "file"
+        },
+        {
+          "name": "i18n.py",
+          "path": "lib/i18n.py",
+          "type": "file"
+        },
+        {
+          "name": "interface.py",
+          "path": "lib/interface.py",
+          "type": "file"
+        },
+        {
+          "name": "jsonrpc.py",
+          "path": "lib/jsonrpc.py",
+          "type": "file"
+        },
+        {
+          "name": "keystore.py",
+          "path": "lib/keystore.py",
+          "type": "file"
+        },
+        {
+          "name": "mnemonic.py",
+          "path": "lib/mnemonic.py",
+          "type": "file"
+        },
+        {
+          "name": "msqr.py",
+          "path": "lib/msqr.py",
+          "type": "file"
+        },
+        {
+          "name": "network.py",
+          "path": "lib/network.py",
+          "type": "file"
+        },
+        {
+          "name": "old_mnemonic.py",
+          "path": "lib/old_mnemonic.py",
+          "type": "file"
+        },
+        {
+          "name": "paymentrequest.proto",
+          "path": "lib/paymentrequest.proto",
+          "type": "file"
+        },
+        {
+          "name": "paymentrequest.py",
+          "path": "lib/paymentrequest.py",
+          "type": "file"
+        },
+        {
+          "name": "paymentrequest_pb2.py",
+          "path": "lib/paymentrequest_pb2.py",
+          "type": "file"
+        },
+        {
+          "name": "pem.py",
+          "path": "lib/pem.py",
+          "type": "file"
+        },
+        {
+          "name": "plot.py",
+          "path": "lib/plot.py",
+          "type": "file"
+        },
+        {
+          "name": "plugins.py",
+          "path": "lib/plugins.py",
+          "type": "file"
+        },
+        {
+          "name": "qrscanner.py",
+          "path": "lib/qrscanner.py",
+          "type": "file"
+        },
+        {
+          "name": "ripemd.py",
+          "path": "lib/ripemd.py",
+          "type": "file"
+        },
+        {
+          "name": "rsakey.py",
+          "path": "lib/rsakey.py",
+          "type": "file"
+        },
+        {
+          "name": "servers.json",
+          "path": "lib/servers.json",
+          "type": "file"
+        },
+        {
+          "name": "servers_regtest.json",
+          "path": "lib/servers_regtest.json",
+          "type": "file"
+        },
+        {
+          "name": "servers_testnet.json",
+          "path": "lib/servers_testnet.json",
+          "type": "file"
+        },
+        {
+          "name": "simple_config.py",
+          "path": "lib/simple_config.py",
+          "type": "file"
+        },
+        {
+          "name": "storage.py",
+          "path": "lib/storage.py",
+          "type": "file"
+        },
+        {
+          "name": "synchronizer.py",
+          "path": "lib/synchronizer.py",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "lib/tests",
+          "type": "dir"
+        },
+        {
+          "name": "transaction.py",
+          "path": "lib/transaction.py",
+          "type": "file"
+        },
+        {
+          "name": "util.py",
+          "path": "lib/util.py",
+          "type": "file"
+        },
+        {
+          "name": "verifier.py",
+          "path": "lib/verifier.py",
+          "type": "file"
+        },
+        {
+          "name": "version.py",
+          "path": "lib/version.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lib/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from .version import ELECTRUM_VERSION\n2: from .util import format_satoshis, print_msg, print_error, set_verbosity\n3: from .wallet import Synchronizer, Wallet\n4: from .storage import WalletStorage\n5: from .coinchooser import COIN_CHOOSERS\n6: from .network import Network, pick_random_server\n7: from .interface import Connection, Interface\n8: from .simple_config import SimpleConfig, get_config, set_config\n9: from . import bitcoin\n10: from . import transaction\n11: from . import daemon\n12: from .transaction import Transaction\n13: from .plugins import BasePlugin"
+        },
+        {
+          "name": "base_wizard.py",
+          "path": "lib/base_wizard.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: #\n3: # Electrum - lightweight ZClassic client\n4: # Copyright (C) 2016 Thomas Voegtlin\n5: #\n6: # Permission is hereby granted, free of charge, to any person\n7: # obtaining a copy of this software and associated documentation files\n8: # (the \"Software\"), to deal in the Software without restriction,\n9: # including without limitation the rights to use, copy, modify, merge,\n10: # publish, distribute, sublicense, and/or sell copies of the Software,\n11: # and to permit persons to whom the Software is furnished to do so,\n12: # subject to the following conditions:\n13: #"
+        },
+        {
+          "name": "blockchain.py",
+          "path": "lib/blockchain.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Electrum - lightweight ZClassic client\n2: # Copyright (C) 2012 thomasv@ecdsa.org\n3: #\n4: # Permission is hereby granted, free of charge, to any person\n5: # obtaining a copy of this software and associated documentation files\n6: # (the \"Software\"), to deal in the Software without restriction,\n7: # including without limitation the rights to use, copy, modify, merge,\n8: # publish, distribute, sublicense, and/or sell copies of the Software,\n9: # and to permit persons to whom the Software is furnished to do so,\n10: # subject to the following conditions:\n11: #\n12: # The above copyright notice and this permission notice shall be\n13: # included in all copies or substantial portions of the Software."
+        },
+        {
+          "name": "coinchooser.py",
+          "path": "lib/coinchooser.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: #\n3: # Electrum - lightweight ZClassic client\n4: # Copyright (C) 2015 kyuupichan@gmail\n5: #\n6: # Permission is hereby granted, free of charge, to any person\n7: # obtaining a copy of this software and associated documentation files\n8: # (the \"Software\"), to deal in the Software without restriction,\n9: # including without limitation the rights to use, copy, modify, merge,\n10: # publish, distribute, sublicense, and/or sell copies of the Software,\n11: # and to permit persons to whom the Software is furnished to do so,\n12: # subject to the following conditions:\n13: #"
+        },
+        {
+          "name": "commands.py",
+          "path": "lib/commands.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: #\n3: # Electrum - lightweight ZClassic client\n4: # Copyright (C) 2011 thomasv@gitorious\n5: #\n6: # Permission is hereby granted, free of charge, to any person\n7: # obtaining a copy of this software and associated documentation files\n8: # (the \"Software\"), to deal in the Software without restriction,\n9: # including without limitation the rights to use, copy, modify, merge,\n10: # publish, distribute, sublicense, and/or sell copies of the Software,\n11: # and to permit persons to whom the Software is furnished to do so,\n12: # subject to the following conditions:\n13: #"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lib/bitcoin.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "2faea7b5bd6b05c62e99c1d65c39e686efc64b62",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/commit/2faea7b5bd6b05c62e99c1d65c39e686efc64b62",
+          "message": "Bitcoin to ZClassic",
+          "author": "skellers",
+          "date": "2019-03-16T19:05:28Z"
+        },
+        {
+          "sha": "27b137359543e0727d30ada3ea7209e4602b9501",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/commit/27b137359543e0727d30ada3ea7209e4602b9501",
+          "message": "zcl-ify",
+          "author": "James",
+          "date": "2019-02-28T21:26:15Z"
+        },
+        {
+          "sha": "b75dbe65c946f5e0d6eeeb42347e75d2b9607564",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/commit/b75dbe65c946f5e0d6eeeb42347e75d2b9607564",
+          "message": "add lib changes from electrum 3.1.3\n\n - Add electrum 3.1.3 changes to lib, lib/tests.\n - Get new electrum 3.1.3 lib/constants.py, add Zcash changes.\n - Get original electrum 3.1.3 lib/blockchain.py (will be\n - modified in next commits).\n - Remove debian/ lib-util patch (fixed in 3.1.3 code).\n - Remo",
+          "author": "zebra-lucky",
+          "date": "2018-05-16T18:56:48Z"
+        },
+        {
+          "sha": "a3aa9f40156f54c21d9881facb83860750fb105c",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/commit/a3aa9f40156f54c21d9881facb83860750fb105c",
+          "message": "change headers urls",
+          "author": "zebra-lucky",
+          "date": "2018-04-02T00:37:37Z"
+        },
+        {
+          "sha": "b1776f311da8b4bd56812c71448ef74ebbbff47c",
+          "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/commit/b1776f311da8b4bd56812c71448ef74ebbbff47c",
+          "message": "Zcash changes to setup.py, fix test_bitcoin.py",
+          "author": "zebra-lucky",
+          "date": "2018-03-21T18:10:09Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "set_mainnet TODO headers bootstrap",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lib/bitcoin.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "2faea7b5bd6b05c62e99c1d65c39e686efc64b62",
+        "html_url": "https://github.com/ZclassicCommunity/electrum-zclassic/commit/2faea7b5bd6b05c62e99c1d65c39e686efc64b62",
+        "message": "Bitcoin to ZClassic",
+        "author": "skellers",
+        "date": "2019-03-16T19:05:28Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

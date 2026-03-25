@@ -1,0 +1,350 @@
+{
+  "task_id": "930",
+  "repo_owner": "cms-dev",
+  "repo_name": "cms",
+  "file_path": "cms/grading/Sandbox.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T03:49:44+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 2,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T03:49:59+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T03:50:04+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "cms/grading/Sandbox.py",
+    "original_code": "def allow_writing_only(self, inner_paths):\n    \"\"\"Set permissions in so that the user can write only some paths.\n\n    By default the user can only write to the home directory. This\n    method further restricts permissions so that it can only write\n    to some files inside the home directory.\n\n    inner_paths ([str]): the only paths that the user is allowed to\n        write to; they should be \"inner\" paths (from the perspective\n        of the sandboxed process, not of the host system); they can\n        be absolute or relative (in which case they are interpreted\n        relative to the home directory); paths that point to a file\n        outside the home directory are ignored.\n\n    \"\"\"\n    outer_paths = []\n    for inner_path in inner_paths:\n        abs_inner_path = \\\n            os.path.realpath(os.path.join(self._home_dest, inner_path))\n        # If an inner path is absolute (e.g., /fifo0/u0_to_m) then\n        # it may be outside home and we should ignore it.\n        # FIXME: In Py3 use os.path.commonpath.\n        if not abs_inner_path.startswith(self._home_dest + \"/\"):\n            continue\n        rel_inner_path = os.path.relpath(abs_inner_path, self._home_dest)\n        outer_path = os.path.join(self._home, rel_inner_path)\n        outer_paths.append(outer_path)\n\n    # If one of the specified file do not exists, we touch it to\n    # assign the correct permissions.\n    for path in outer_paths:\n        if not os.path.exists(path):\n            open(path, \"wb\").close()\n\n    # Close everything, then open only the specified.\n    self.allow_writing_none()\n    for path in outer_paths:\n        os.chmod(path, 0o722)",
+    "original_signature": "def allow_writing_only(self, inner_paths):",
+    "satd_comment": "# FIXME: In Py3 use os.path.commonpath.",
+    "target_file": {
+      "ok": true,
+      "path": "cms/grading/Sandbox.py",
+      "sha": "78670069027ec68fa30e6e19182064797fc4a44f",
+      "download_url": "https://raw.githubusercontent.com/cms-dev/cms/main/cms/grading/Sandbox.py",
+      "content_excerpt": "#!/usr/bin/env python3\n\n# Contest Management System - http://cms-dev.github.io/\n# Copyright © 2010-2015 Giovanni Mascellani <mascellani@poisson.phc.unipi.it>\n# Copyright © 2010-2018 Stefano Maggiolo <s.maggiolo@gmail.com>\n# Copyright © 2010-2012 Matteo Boscariol <boscarim@hotmail.com>\n# Copyright © 2014 Luca Wehrstedt <luca.wehrstedt@gmail.com>\n#\n# This program is free software: you can redistribute it and/or modify\n# it under the terms of the GNU Affero General Public License as\n# published by the Free Software Foundation, either version 3 of the\n# License, or (at your option) any later version.\n#\n# This program is distributed in the hope that it will be useful,\n# but WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n# GNU Affero General Public License for more details.\n#\n# You should have received a copy of the GNU Affero General Public License\n# along with this program.  If not, see <http://www.gnu.org/licenses/>.\n\nimport io\nimport logging\nimport os\nimport resource\nimport select\nimport stat\nimport tempfile\nimport time\nimport tarfile\nfrom abc import ABCMeta, abstractmethod\nfrom functools import wraps, partial\nimport typing\n\nimport gevent\nfrom gevent import subprocess\n\nfrom cms import config, rmtree\nfrom cms.db.filecacher import FileCacher\nfrom cmscommon.commands import pretty_print_cmdline\n\n\nlogger = logging.getLogger(__name__)\n\n\nclass SandboxInterfaceException(Exception):\n    pass\n\n\ndef with_log(func):\n    \"\"\"Decorator for presuming that the logs are present.\n\n    \"\"\"\n    @wraps(func)\n    def newfunc(self, *args, **kwargs):\n        \"\"\"If they are not present, get the logs.\n\n        \"\"\"\n        if self.log is None:\n            self.get_log()\n        return func(self, *args, **kwargs)\n\n    return newfunc\n\n\ndef wait_without_std(procs: list[subprocess.Popen]) -> list[int]:\n    \"\"\"Wait for the conclusion of the processes in the list, avoiding\n    starving for input and output.\n\n    procs: a list of processes as returned by Popen.\n\n    return: a list of return codes.\n\n    \"\"\"\n\n    def get_to_consume() -> list:\n        \"\"\"Amongst stdout and stderr of list of processes, find the\n        ones that are alive and not closed (i.e., that may still want\n        to write to).\n\n        return: a list of open streams.\n\n        \"\"\"\n        to_consume = []\n        for process in procs:\n            if process.poll() is None:  # If the process is alive.\n                if process.stdout and not process.stdout.closed:\n                    to_consume.append(process.stdout)\n                if process.stderr and not process.stderr.closed:\n                    to_consume.append(process.stderr)\n        return to_consume\n\n    # Close stdin; just saying stdin=None isn't ok, because the\n    # standard input would be obtained from the application stdin,\n    # that could interfere with the child process behaviour\n    for process in procs:\n        if process.stdin:\n            process.stdin.close()\n\n    # Read stdout and stderr to the end without having to block\n    # because of insufficient buffering (and without allocating too\n    # much memory). Unix specific.\n    to_consume = get_to_consume()\n    while len(to_consume) > 0:\n        to_read = select.select(to_consume, [], [], 1.0)[0]\n        for file_ in to_read:\n            file_.read(8 * 1024)\n        to_consume = get_to_consume()\n\n    return [process.wait() for process in procs]\n\n\nclass Truncator(io.RawIOBase):\n    \"\"\"Wrap a file-like object to simulate truncation.\n\n    This file-like object provides read-only access to a limited prefix\n    of a wrapped file-like object. It provides a truncated version of\n    the file without ever touching the object on the filesystem.\n\n    This class is only able to wrap binary streams as it relies on the\n    readinto method which isn't provided by text (unicode) streams.\n\n    \"\"\"\n    def __init__(self, fobj: io.RawIOBase, size: int):\n        \"\"\"Wrap fobj and give access to its first size bytes.\n\n        fobj: a file-like object to wrap.\n        size: the number of bytes that will be accessible.\n\n        \"\"\"\n        self.fobj = fobj\n        self.size = size\n\n    def close(self):\n        \"\"\"See io.IOBase.close.\"\"\"\n        self.fobj.close()\n\n    @property\n    def closed(self):\n        \"\"\"See io.IOBase.closed.\"\"\"\n        return self.fobj.closed\n\n    def readable(self):\n        \"\"\"See io.IOBase.readable.\"\"\"\n        return True\n\n    def seekable(self):\n        \"\"\"See io.IOBase.seekable.\"\"\"\n        return True\n\n    def readinto(self, b):\n        \"\"\"See io.RawIOBase.readinto.\"\"\"\n        # This is the main \"trick\": we clip (i.e. mask, reduce, slice)\n        # the given buffer so that it doesn't overflow into the area we\n        # want to hide (that is, out of the prefix) and then we forward\n        # it to the wrapped file-like object.\n        b = memoryview(b)[:max(0, self.size - self.fobj.tell())]\n        return self.fobj.readinto(b)\n\n    def seek(self, offset, whence=io.SEEK_SET):\n        \"\"\"See io.IOBase.seek.\"\"\"\n        # We have to catch seeks relative to the end of the file and\n        # adjust them to the new \"imposed\" size.\n        if whence == io.SEEK_END:\n            if self.fobj.seek(0, io.SEEK_END) > self.size:\n                self.fobj.seek(self.size, io.SEEK_SET)\n            return self.fobj.seek(offset, io.SEEK_CUR)\n        else:\n            return self.fobj.seek(offset, whence)\n\n    def tell(self):\n        \"\"\"See io.IOBase.tell.\"\"\"\n        return self.fobj.tell()\n\n    def write(self, _):\n        \"\"\"See io.RawIOBase.write.\"\"\"\n        raise io.UnsupportedOperation('write')\n\n\nclass SandboxBase(metaclass=ABCMeta):\n    \"\"\"A base class for all sandboxes, meant to contain common\n    resources.\n\n    \"\"\"\n\n    EXIT_SANDBOX_ERROR = 'sandbox error'\n    EXIT_OK = 'ok'\n    EXIT_SIGNAL = 'signal'\n    EXIT_TIMEOUT = 'timeout'\n    EXIT_TIMEOUT_WALL = 'wall timeout'\n    EXIT_MEM_LIMIT = 'memory limit exceeded'\n    EXIT_NONZERO_RETURN = 'nonzero return'\n\n    def __init__(\n        self,\n        file_cacher: FileCacher,\n        name: str | None = None,\n        temp_dir: str | None = None,\n    ):\n        \"\"\"Initialization.\n\n        file_cacher: an instance of the FileCacher class\n            (to interact with FS), if the sandbox needs it.\n        name: name of the sandbox, which might appear in the\n            path and in system logs.\n        temp_dir: temporary directory to use; if None, use the\n            default temporary directory specified in the configuration.\n\n        \"\"\"\n        self.file_cacher = file_cacher\n        self.name = name if name is not None else \"unnamed\"\n        self.temp_dir = temp_dir if temp_dir is not None else config.global_.temp_dir\n\n        self.cmd_file: str = \"commands.log\"\n\n        # These are not necessarily used, but are here for API compatibility\n        # TODO: move all other common properties here.\n        self.box_id: int = 0\n        self.fsize: int | None = None\n        self.dirs: list[tuple[str | None, str, str | None]] = []\n        self.preserve_env: bool = False\n        self.inherit_env: list[str] = []\n        self.set_env: dict[str, str] = {}\n        self.verbosity: int = 0\n\n        self.max_processes: int = 1\n\n        # Set common environment variables.\n        # Specifically needed by Python, that searches the home for\n        # packages.\n        self.set_env[\"HOME\"] = \"./\"\n\n    def set_multiprocess(self, multiprocess: bool):\n        \"\"\"Set the sandbox to (dis-)allow multiple threads and processes.\n\n        multiprocess: whether to allow multiple thread/processes or not.\n\n        \"\"\"\n        if multiprocess:\n            # Max processes is set to 1000 to limit the effect of fork bombs.\n            self.max_processes = 1000\n        else:\n            self.max_processes = 1\n\n    def get_stats(self) -> str:\n        \"\"\"Return a human-readable string representing execution time\n        and memory usage.\n\n        return: human-readable stats.\n\n        \"\"\"\n        execution_time = self.get_execution_time()\n        if execution_time is not None:\n            time_str = \"%.3f sec\" % (execution_time)\n        else:\n            time_str = \"(time unknown)\"\n        memory_used = self.get_memory_used()\n        if memory_used is not None:\n            mem_str = \"%.2f MB\" % (memory_used / (1024 * 1024))\n        else:\n            mem_str = \"(memory usage unknown)\"\n        return \"[%s - %s]\" % (time_str, mem_str)\n\n    @abstractmethod\n    def get_root_path(self) -> str:\n        \"\"\"Return the toplevel path of the sandbox.\n\n        return: the root path.\n\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def get_execution_time(self) -> float | None:\n        \"\"\"Return the time spent in the sandbox.\n\n        return: time spent in the sandbox, or None if unknown.\n\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def get_memory_used(self) -> int | None:\n        \"\"\"Return the memory used by the sandbox.\n\n        return: memory used by the sandbox (in bytes), or None if unknown.\n\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def get_killing_signal(self) -> int:\n        \"\"\"Return the signal that killed the sandboxed process.\n\n        return: offending signal, or 0.\n\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def get_exit_status(self) -> str:\n        \"\"\"Get information about how the sandbox terminated.\n\n        return: the main reason why the sandbox terminated.\n\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def get_exit_code(self) -> int:\n        \"\"\"Return the exit code of the sandboxed process.\n\n        return: exitcode, or 0.\n\n        \"\"\"\n        pass\n\n    @abstractmethod\n    def get_human_exit_description(self) -> str:\n        \"\"\"Get the status of the sandbox and return a human-readable\n        string describing it.\n\n        return: human-readable explaination of why the\n                sandbox terminated.\n\n        \"\"\"\n        pass\n\n    def relative_path(self, path: str) -> str:\n        \"\"\"Translate from a relative path inside the sandbox to a\n        system path.\n\n        path: relative path of the file inside the sandbox.\n\n        return: the absolute path.\n\n        \"\"\"\n        return os.path.join(self.get_root_path(), path)\n\n    def create_file(self, path: str, executable: bool = False) -> typing.BinaryIO:\n        \"\"\"Create an empty file in the sandbox and open it in write\n        binary mode.\n\n        path: relative path of the file inside the sandbox.\n        executable: to set permissions.\n\n        return: the file opened in write binary mode.\n\n        \"\"\"\n        if executable:\n            logger.debug(\"Creating executable file %s in sandbox.\", path)\n        else:\n            logger.debug(\"Creating plain file %s in sandbox.\", path)\n        real_path = self.relative_path(path)\n        try:\n            file_fd = os.open(real_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)\n            file_ = open(file_fd, \"wb\")\n        except OSError as e:\n            logger.error(\"Failed create file %s in sandbox. Unable to \"\n                         \"evalulate this submission. This may be due to \"\n                         \"cheating. %s\", real_path, e, exc_info=True)\n            raise\n        mod = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH | stat.S_IWUSR\n        if executable:\n            mod |= stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH\n        os.chmod(real_path, mod)\n        return file_\n\n    def create_file_from_storage(\n        self, path: str, digest: str, executable: bool = False\n    ):\n        \"\"\"Write a file taken from FS in the sandbox.\n\n        path: relative path of the file inside the sandbox.\n        digest: digest of the file in FS.\n        executable: to set permissions.\n\n        \"\"\"\n        with self.create_file(path, executable) as dest_fobj:\n            self.file_cacher.get_file_to_fobj(digest, dest_fobj)\n\n    def create_file_from_string(\n        self, path: str, content: bytes, executable: bool = False\n    ):\n        \"\"\"Write some data to a file in the sandbox.\n\n        path: relative path of the file inside the san",
+      "total_lines": 1521
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 1040,
+      "end_line": 1077,
+      "excerpt": "    def allow_writing_only(self, inner_paths: list[str]):\n        \"\"\"Set permissions in so that the user can write only some paths.\n\n        By default the user can only write to the home directory. This\n        method further restricts permissions so that it can only write\n        to some files inside the home directory.\n\n        inner_paths: the only paths that the user is allowed to\n            write to; they should be \"inner\" paths (from the perspective\n            of the sandboxed process, not of the host system); they can\n            be absolute or relative (in which case they are interpreted\n            relative to the home directory); paths that point to a file\n            outside the home directory are ignored.\n\n        \"\"\"\n        outer_paths = []\n        for inner_path in inner_paths:\n            abs_inner_path = \\\n                os.path.realpath(os.path.join(self._home_dest, inner_path))\n            # If an inner path is absolute (e.g., /fifo0/u0_to_m) then\n            # it may be outside home and we should ignore it.\n            if os.path.commonpath([abs_inner_path,\n                                   self._home_dest]) != self._home_dest:\n                continue\n            rel_inner_path = os.path.relpath(abs_inner_path, self._home_dest)\n            outer_path = os.path.join(self._home, rel_inner_path)\n            outer_paths.append(outer_path)\n\n        # If one of the specified file do not exists, we touch it to\n        # assign the correct permissions.\n        for path in outer_paths:\n            if not os.path.exists(path):\n                open(path, \"wb\").close()\n\n        # Close everything, then open only the specified.\n        self.allow_writing_none()\n        for path in outer_paths:\n            os.chmod(path, 0o722)",
+      "symbol_name": "allow_writing_only",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "cms/grading/Sandbox.py",
+      "sha": "78670069027ec68fa30e6e19182064797fc4a44f",
+      "download_url": "https://raw.githubusercontent.com/cms-dev/cms/main/cms/grading/Sandbox.py"
+    },
+    "imports": {
+      "imports": [
+        "io",
+        "logging",
+        "os",
+        "resource",
+        "select",
+        "stat",
+        "tempfile",
+        "time",
+        "tarfile",
+        "abc:ABCMeta",
+        "abc:abstractmethod",
+        "functools:wraps",
+        "functools:partial",
+        "typing",
+        "gevent",
+        "gevent:subprocess",
+        "cms:config",
+        "cms:rmtree",
+        "cms.db.filecacher:FileCacher",
+        "cmscommon.commands:pretty_print_cmdline"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/cms-dev/cms/main/README.md",
+      "content_excerpt": "Contest Management System\n=========================\n\nHomepage: <http://cms-dev.github.io/>\n\n[![Build Status](https://github.com/cms-dev/cms/actions/workflows/main.yml/badge.svg)](https://github.com/cms-dev/cms/actions)\n[![Codecov](https://codecov.io/gh/cms-dev/cms/branch/main/graph/badge.svg)](https://codecov.io/gh/cms-dev/cms)\n[![Get support on Telegram](https://img.shields.io/badge/Questions%3F-Join%20the%20Telegram%20group!-%2326A5E4?style=flat&logo=telegram)](https://t.me/contestms)\n[![Translation status](https://hosted.weblate.org/widget/cms/svg-badge.svg)](https://hosted.weblate.org/engage/cms/)\n\n[🌍 Help translate CMS in your language using Weblate!](https://hosted.weblate.org/engage/cms/)\n\nIntroduction\n------------\n\nCMS, or Contest Management System, is a distributed system for running\nand (to some extent) organizing a programming contest.\n\nCMS has been designed to be general and to handle many different types\nof contests, tasks, scorings, etc. Nonetheless, CMS has been\nexplicitly build to be used in the 2012 International Olympiad in\nInformatics, held in September 2012 in Italy.\n\n\nDownload\n--------\n\n**For end-users it's best to download the latest stable version of CMS,\nwhich can be found already packaged at <http://cms-dev.github.io/>.**\n\nThis git repository, which contains the development version in its\nmain branch, is intended for developers and everyone interested in\ncontributing or just curious to see how the code works and wanting to\nhack on it.\n\n\nSupport\n-------\n\nTo learn how to install and use CMS, please read the **documentation**,\navailable at <https://cms"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "allow_writing_only test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"allow_writing_only(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "Sandbox.py",
+          "path": "cms/grading/Sandbox.py",
+          "sha": "78670069027ec68fa30e6e19182064797fc4a44f",
+          "html_url": "https://github.com/cms-dev/cms/blob/b98e44b562f7c611967cea4748ddf008ad49e018/cms/grading/Sandbox.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 1040,
+          "end_line": 1077,
+          "excerpt": "    def allow_writing_only(self, inner_paths: list[str]):\n        \"\"\"Set permissions in so that the user can write only some paths.\n\n        By default the user can only write to the home directory. This\n        method further restricts permissions so that it can only write\n        to some files inside the home directory.\n\n        inner_paths: the only paths that the user is allowed to\n            write to; they should be \"inner\" paths (from the perspective\n            of the sandboxed process, not of the host system); they can\n            be absolute or relative (in which case they are interpreted\n            relative to the home directory); paths that point to a file\n            outside the home directory are ignored.\n\n        \"\"\"\n        outer_paths = []\n        for inner_path in inner_paths:\n            abs_inner_path = \\\n                os.path.realpath(os.path.join(self._home_dest, inner_path))\n            # If an inner path is absolute (e.g., /fifo0/u0_to_m) then\n            # it may be outside home and we should ignore it.\n            if os.path.commonpath([abs_inner_path,\n                                   self._home_dest]) != self._home_dest:\n                continue\n            rel_inner_path = os.path.relpath(abs_inner_path, self._home_dest)\n            outer_path = os.path.join(self._home, rel_inner_path)\n            outer_paths.append(outer_path)\n\n        # If one of the specified file do not exists, we touch it to\n        # assign the correct permissions.\n        for path in outer_paths:\n            if not os.path.exists(path):\n                open(path, \"wb\").close()\n\n        # Close everything, then open only the specified.\n        self.allow_writing_none()\n        for path in outer_paths:\n            os.chmod(path, 0o722)",
+          "symbol_name": "allow_writing_only",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "evaluation.py",
+          "path": "cms/grading/steps/evaluation.py",
+          "sha": "adbe507b326aa209f76befb04658cbac8e2ffdf8",
+          "html_url": "https://github.com/cms-dev/cms/blob/b98e44b562f7c611967cea4748ddf008ad49e018/cms/grading/steps/evaluation.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 203,
+          "end_line": 227,
+          "excerpt": "203:     # config.sandbox.max_file_size is in KiB\n204:     sandbox.fsize = config.sandbox.max_file_size * 1024\n205: \n206:     sandbox.stdin_file = stdin_redirect\n207:     sandbox.stdout_file = stdout_redirect\n208:     sandbox.stderr_file = \"stderr.txt\"\n209: \n210:     for src, (dest, options) in dirs_map.items():\n211:         sandbox.add_mapped_directory(src, dest=dest, options=options)\n212:     for name in [sandbox.stderr_file, sandbox.stdout_file]:\n213:         if name is not None:\n214:             writable_files.append(name)\n215:     sandbox.allow_writing_only(writable_files)\n216: \n217:     sandbox.set_multiprocess(multiprocess)\n218: \n219:     # Actually run the evaluation command.\n220:     logger.debug(\"Starting execution step.\")\n221:     return sandbox.execute_without_std(command, wait=wait)\n222: \n223: \n224: def evaluation_step_after_run(\n225:     sandbox: Sandbox,\n226: ) -> tuple[bool, bool | None, StatsDict | None]:\n227:     \"\"\"Final part of an evaluation step, collecting the results after the run.",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "cms/grading",
+      "count": 11,
+      "entries": [
+        {
+          "name": "Job.py",
+          "path": "cms/grading/Job.py",
+          "type": "file"
+        },
+        {
+          "name": "ParameterTypes.py",
+          "path": "cms/grading/ParameterTypes.py",
+          "type": "file"
+        },
+        {
+          "name": "Sandbox.py",
+          "path": "cms/grading/Sandbox.py",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "cms/grading/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "language.py",
+          "path": "cms/grading/language.py",
+          "type": "file"
+        },
+        {
+          "name": "languagemanager.py",
+          "path": "cms/grading/languagemanager.py",
+          "type": "file"
+        },
+        {
+          "name": "languages",
+          "path": "cms/grading/languages",
+          "type": "dir"
+        },
+        {
+          "name": "scoretypes",
+          "path": "cms/grading/scoretypes",
+          "type": "dir"
+        },
+        {
+          "name": "scoring.py",
+          "path": "cms/grading/scoring.py",
+          "type": "file"
+        },
+        {
+          "name": "steps",
+          "path": "cms/grading/steps",
+          "type": "dir"
+        },
+        {
+          "name": "tasktypes",
+          "path": "cms/grading/tasktypes",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "Job.py",
+          "path": "cms/grading/Job.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python3\n2: \n3: # Contest Management System - http://cms-dev.github.io/\n4: # Copyright © 2012 Giovanni Mascellani <mascellani@poisson.phc.unipi.it>\n5: # Copyright © 2013-2018 Luca Wehrstedt <luca.wehrstedt@gmail.com>\n6: # Copyright © 2013 Bernard Blackham <bernard@largestprime.net>\n7: # Copyright © 2013-2018 Stefano Maggiolo <s.maggiolo@gmail.com>\n8: #\n9: # This program is free software: you can redistribute it and/or modify\n10: # it under the terms of the GNU Affero General Public License as\n11: # published by the Free Software Foundation, either version 3 of the\n12: # License, or (at your option) any later version.\n13: #"
+        },
+        {
+          "name": "ParameterTypes.py",
+          "path": "cms/grading/ParameterTypes.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python3\n2: \n3: # Contest Management System - http://cms-dev.github.io/\n4: # Copyright © 2010-2012 Giovanni Mascellani <mascellani@poisson.phc.unipi.it>\n5: # Copyright © 2010-2018 Stefano Maggiolo <s.maggiolo@gmail.com>\n6: # Copyright © 2010-2012 Matteo Boscariol <boscarim@hotmail.com>\n7: #\n8: # This program is free software: you can redistribute it and/or modify\n9: # it under the terms of the GNU Affero General Public License as\n10: # published by the Free Software Foundation, either version 3 of the\n11: # License, or (at your option) any later version.\n12: #\n13: # This program is distributed in the hope that it will be useful,"
+        },
+        {
+          "name": "__init__.py",
+          "path": "cms/grading/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python3\n2: \n3: # Contest Management System - http://cms-dev.github.io/\n4: # Copyright © 2010-2015 Giovanni Mascellani <mascellani@poisson.phc.unipi.it>\n5: # Copyright © 2010-2018 Stefano Maggiolo <s.maggiolo@gmail.com>\n6: # Copyright © 2010-2012 Matteo Boscariol <boscarim@hotmail.com>\n7: # Copyright © 2013 Bernard Blackham <bernard@largestprime.net>\n8: # Copyright © 2013-2014 Luca Wehrstedt <luca.wehrstedt@gmail.com>\n9: # Copyright © 2014 Fabian Gundlach <320pointsguy@gmail.com>\n10: # Copyright © 2016 Myungwoo Chun <mc.tamaki@gmail.com>\n11: # Copyright © 2016 Amir Keivan Mohtashami <akmohtashami97@gmail.com>\n12: #\n13: # This program is free software: you can redistribute it and/or modify"
+        },
+        {
+          "name": "language.py",
+          "path": "cms/grading/language.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python3\n2: \n3: # Contest Management System - http://cms-dev.github.io/\n4: # Copyright © 2016-2017 Stefano Maggiolo <s.maggiolo@gmail.com>\n5: #\n6: # This program is free software: you can redistribute it and/or modify\n7: # it under the terms of the GNU Affero General Public License as\n8: # published by the Free Software Foundation, either version 3 of the\n9: # License, or (at your option) any later version.\n10: #\n11: # This program is distributed in the hope that it will be useful,\n12: # but WITHOUT ANY WARRANTY; without even the implied warranty of\n13: # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the"
+        },
+        {
+          "name": "languagemanager.py",
+          "path": "cms/grading/languagemanager.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python3\n2: \n3: # Contest Management System - http://cms-dev.github.io/\n4: # Copyright © 2016-2017 Stefano Maggiolo <s.maggiolo@gmail.com>\n5: #\n6: # This program is free software: you can redistribute it and/or modify\n7: # it under the terms of the GNU Affero General Public License as\n8: # published by the Free Software Foundation, either version 3 of the\n9: # License, or (at your option) any later version.\n10: #\n11: # This program is distributed in the hope that it will be useful,\n12: # but WITHOUT ANY WARRANTY; without even the implied warranty of\n13: # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "cms/grading/Sandbox.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "f942b027fe4340b1c02e9d9aa6489e41359610ae",
+          "html_url": "https://github.com/cms-dev/cms/commit/f942b027fe4340b1c02e9d9aa6489e41359610ae",
+          "message": "Sandbox: Mount a temporary directory on /dev/shm (#1484)",
+          "author": "p. randla",
+          "date": "2025-08-22T12:34:18Z"
+        },
+        {
+          "sha": "a7dca91f26da8170b00460b7096afbd335d1ee22",
+          "html_url": "https://github.com/cms-dev/cms/commit/a7dca91f26da8170b00460b7096afbd335d1ee22",
+          "message": "Use isolate's cg-oom-killed to detect \"memory limit exceeded\" conditions (#1471)\n\n* Add separate \"memory limit exceeded\" message\n\n* make test suite check for memory limit exceeded\n\n* fix \"memory limit exceeded\" behavior in php\n\nPHP has a memory_limit setting that limits the amount of memory the\ninte",
+          "author": "p. randla",
+          "date": "2025-08-04T20:31:14Z"
+        },
+        {
+          "sha": "800a0fc5b1871458cd554723ebea6375501ef698",
+          "html_url": "https://github.com/cms-dev/cms/commit/800a0fc5b1871458cd554723ebea6375501ef698",
+          "message": "Reorganize config into sections, parse it with custom parser (#1481)\n\n* wrote a custom parser that turns the output from tomllib into a strongly-typed dataclass-based config object\n* reorganized the config file format into sections, which are used in both CMS code and in the config file\n* exposed so",
+          "author": "p. randla",
+          "date": "2025-08-04T19:46:15Z"
+        },
+        {
+          "sha": "a22f39c67bcbceb19901784db7dabd42e3433f60",
+          "html_url": "https://github.com/cms-dev/cms/commit/a22f39c67bcbceb19901784db7dabd42e3433f60",
+          "message": "\"Rerun and archive sandbox\" button in AWS (#1456)\n\n\n\nCo-authored-by: Gregor Eesmaa <gregoreesmaa1@gmail.com>",
+          "author": "p. randla",
+          "date": "2025-07-11T14:52:20Z"
+        },
+        {
+          "sha": "05a3b8d0a131c844e6557bc6a2dd56a735afc067",
+          "html_url": "https://github.com/cms-dev/cms/commit/05a3b8d0a131c844e6557bc6a2dd56a735afc067",
+          "message": "add type hints (#1343)\n\n* add type hints: part 1\n\nConverting old docstring-based type hints to PEP 484 type hints. This\ncommit includes all of cms/ except for cms/server/, and all of cmscommon/.\n\n* python 3.11 compatibility (use typing.TypeVar instead of new syntax)\n\n* add type hints part 2\n\nAdded t",
+          "author": "p. randla",
+          "date": "2025-06-07T16:37:56Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "allow_writing_only FIXME path commonpath",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "cms/grading/Sandbox.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "f942b027fe4340b1c02e9d9aa6489e41359610ae",
+        "html_url": "https://github.com/cms-dev/cms/commit/f942b027fe4340b1c02e9d9aa6489e41359610ae",
+        "message": "Sandbox: Mount a temporary directory on /dev/shm (#1484)",
+        "author": "p. randla",
+        "date": "2025-08-22T12:34:18Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

@@ -1,0 +1,464 @@
+{
+  "task_id": "728",
+  "repo_owner": "containerbuildsystem",
+  "repo_name": "osbs-client",
+  "file_path": "osbs/api.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T15:19:00+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 1,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 2,
+    "retrieved_history_snippets_count": 2,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T15:19:23+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T15:19:32+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "osbs/api.py",
+    "original_code": "def create_source_container_build(\n    self,\n    sources_for_koji_build_nvr=None,\n    outer_template=None,\n    arrangement_version=None,\n    scratch=None,\n    signing_intent=None,\n    user=None,\n    platform=None,\n    koji_task_id=None,\n    reactor_config_override=None,\n    target=None,\n):\n    \"\"\"\n    Take input args, create build request and submit the source image build\n\n    :return: instance of BuildRequest\n    \"\"\"\n    build_request = self.get_source_container_build_request(\n        outer_template=outer_template or ORCHESTRATOR_SOURCES_OUTER_TEMPLATE,\n        arrangement_version=arrangement_version\n    )\n\n    if not sources_for_koji_build_nvr:\n        raise OsbsValidationException(\n            \"required argument 'sources_for_koji_build_nvr' can't be None\"\n        )\n\n    name, _, _ = sources_for_koji_build_nvr.split('-', 3)\n\n    build_request.set_params(\n        arrangement_version=arrangement_version,\n        component=name,  # TODO check this\n        build_image=self.build_conf.get_build_image(),\n        build_imagestream=self.build_conf.get_build_imagestream(),\n        build_from=self.build_conf.get_build_from(),\n        builder_build_json_dir=self.build_conf.get_builder_build_json_store(),\n        koji_target=target,\n        koji_task_id=koji_task_id,\n        orchestrator_deadline=self.build_conf.get_orchestor_deadline(),\n        platform=platform,\n        reactor_config_map=self.build_conf.get_reactor_config_map(),\n        reactor_config_override=reactor_config_override,\n        scratch=self.build_conf.get_scratch(scratch),\n        signing_intent=signing_intent,\n        sources_for_koji_build_nvr=sources_for_koji_build_nvr,\n        user=user,\n        worker_deadline=self.build_conf.get_worker_deadline(),\n    )\n    build_request.set_openshift_required_version(\n        self.os_conf.get_openshift_required_version()\n    )\n\n    builds_for_koji_task = []\n    if koji_task_id:\n        # try to find build for koji_task which isn't canceled and use that one\n        builds_for_koji_task = self._get_not_cancelled_builds_for_koji_task(koji_task_id)\n\n    builds_count = len(builds_for_koji_task)\n    if builds_count == 1:\n        logger.info(\"found running build for koji task: %s\",\n                    builds_for_koji_task[0].get_build_name())\n        response =\\\n            BuildResponse(self.os.get_build(builds_for_koji_task[0].get_build_name()).json(),\n                          self)\n    elif builds_count > 1:\n        raise OsbsException(\"Multiple builds %s for koji task id %s\" %\n                            (builds_count, koji_task_id))\n    else:\n        logger.info(\"creating source container image build\")\n        response = self._create_build_directly(build_request)\n\n    logger.debug(response.json)\n    return response",
+    "original_signature": "def create_source_container_build(",
+    "satd_comment": "# TODO check this",
+    "target_file": {
+      "ok": true,
+      "path": "osbs/api.py",
+      "sha": "186bf534b59f64c38760bfd2933710952fb84104",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/osbs-client/master/osbs/api.py",
+      "content_excerpt": "\"\"\"\nCopyright (c) 2015-2022 Red Hat, Inc\nAll rights reserved.\n\nThis software may be modified and distributed under the terms\nof the BSD license. See the LICENSE file for details.\n\"\"\"\nfrom __future__ import print_function, unicode_literals, absolute_import\n\nfrom collections import namedtuple\nimport logging\nimport sys\nimport warnings\nimport yaml\nfrom functools import wraps\nfrom typing import Any, Dict\nfrom string import Template\n\nfrom osbs.build.user_params import (\n    BuildUserParams,\n    SourceContainerUserParams\n)\nfrom osbs.constants import (RELEASE_LABEL_FORMAT, VERSION_LABEL_FORBIDDEN_CHARS,\n                            ISOLATED_RELEASE_FORMAT)\nfrom osbs.tekton import Openshift, PipelineRun\nfrom osbs.exceptions import (OsbsException, OsbsValidationException, OsbsResponseException)\nfrom osbs.utils.labels import Labels\n# import utils in this way, so that we can mock standalone functions with flexmock\nfrom osbs import utils\n\n\ndef _load_pipeline_from_template(pipeline_run_path, substitutions):\n    \"\"\"Load pipeline run from template and apply substitutions\"\"\"\n    with open(pipeline_run_path) as f:\n        yaml_data = f.read()\n    template = Template(yaml_data)\n    return yaml.safe_load(template.safe_substitute(substitutions))\n\n\n# Decorator for API methods.\ndef osbsapi(func):\n    @wraps(func)\n    def catch_exceptions(*args, **kwargs):\n        if kwargs.pop(\"namespace\", None):\n            warnings.warn(\"OSBS.%s: the 'namespace' argument is no longer supported\" %\n                          func.__name__)\n        try:\n            return func(*args, **kwargs)\n        except OsbsException:\n            # Re-raise OsbsExceptions\n            raise\n        except Exception as ex:\n            # Propogate flexmock errors immediately (used in test cases)\n            if getattr(ex, '__module__', None) == 'flexmock':\n                raise\n\n            # Convert anything else to OsbsException\n\n            # Python 3 has implicit exception chaining and enhanced\n            # reporting, so you get the original traceback as well as\n            # the one originating here.\n            # For Python 2, let's do that explicitly.\n            raise OsbsException(cause=ex, traceback=sys.exc_info()[2])\n\n    return catch_exceptions\n\n\n_REQUIRED_PARAM = object()\n\nlogger = logging.getLogger(__name__)\n\nLogEntry = namedtuple('LogEntry', ['platform', 'line'])\n\n\nclass OSBS(object):\n\n    _GIT_LABEL_KEYS = ('git-repo-name', 'git-branch', 'git-full-repo')\n    _OLD_LABEL_KEYS = ('git-repo-name', 'git-branch')\n\n    @osbsapi\n    def __init__(self, openshift_configuration):\n        \"\"\" \"\"\"\n        self.os_conf = openshift_configuration\n        self.os = Openshift(openshift_api_url=self.os_conf.get_openshift_base_uri(),\n                            openshift_oauth_url=self.os_conf.get_openshift_oauth_api_uri(),\n                            k8s_api_url=self.os_conf.get_k8s_api_uri(),\n                            verbose=self.os_conf.get_verbosity(),\n                            username=self.os_conf.get_username(),\n                            password=self.os_conf.get_password(),\n                            use_kerberos=self.os_conf.get_use_kerberos(),\n                            client_cert=self.os_conf.get_client_cert(),\n                            client_key=self.os_conf.get_client_key(),\n                            kerberos_keytab=self.os_conf.get_kerberos_keytab(),\n                            kerberos_principal=self.os_conf.get_kerberos_principal(),\n                            kerberos_ccache=self.os_conf.get_kerberos_ccache(),\n                            use_auth=self.os_conf.get_use_auth(),\n                            verify_ssl=self.os_conf.get_verify_ssl(),\n                            token=self.os_conf.get_oauth2_token(),\n                            namespace=self.os_conf.get_namespace())\n        self._bm = None\n\n    def _check_labels(self, repo_info):\n        labels = repo_info.labels\n\n        required_missing = False\n        req_labels = {}\n        # required labels which needs to have explicit value (not from env variable)\n        explicit_labels = [Labels.LABEL_TYPE_NAME,\n                           Labels.LABEL_TYPE_COMPONENT]\n        # version label isn't used here, but is required label in Dockerfile\n        # and is used and required for atomic reactor\n        # if we don't catch error here, it will fail in atomic reactor later\n        for label in [Labels.LABEL_TYPE_NAME,\n                      Labels.LABEL_TYPE_COMPONENT,\n                      Labels.LABEL_TYPE_VERSION]:\n            try:\n                _, req_labels[label] = labels.get_name_and_value(label)\n\n                if label in explicit_labels and not req_labels[label]:\n                    required_missing = True\n                    logger.error(\"required label doesn't have explicit value in Dockerfile : %s\",\n                                 labels.get_name(label))\n            except KeyError:\n                required_missing = True\n                logger.error(\"required label missing from Dockerfile : %s\",\n                             labels.get_name(label))\n\n        try:\n            _, release_value = labels.get_name_and_value(Labels.LABEL_TYPE_RELEASE)\n            if release_value and not RELEASE_LABEL_FORMAT.match(release_value):\n                logger.error(\"release label '%s' doesn't match regex : %s\", release_value,\n                             RELEASE_LABEL_FORMAT.pattern)\n                raise OsbsValidationException(\"release label doesn't have proper format\")\n        except KeyError:\n            pass\n\n        try:\n            _, version_value = labels.get_name_and_value(Labels.LABEL_TYPE_VERSION)\n        # version doesn't exist\n        except KeyError:\n            pass\n        else:\n            if version_value:\n                wrong_chars = \\\n                    [denied for denied in VERSION_LABEL_FORBIDDEN_CHARS if denied in version_value]\n\n                if wrong_chars:\n                    msg = \"version label '{}' contains not allowed chars : '{}'\".\\\n                        format(version_value, wrong_chars)\n                    logger.error(msg)\n                    raise OsbsValidationException(msg)\n\n        if required_missing:\n            raise OsbsValidationException(\"required label missing from Dockerfile\")\n\n        # Verify the name label meets requirements.\n        # It is made up of slash-separated name components.\n        #\n        # When pulling an image, the first component of the name\n        # pulled is interpreted as a registry name if it contains a\n        # '.' character, and otherwise the configured registries are\n        # queried in turn.\n        #\n        # Due to this, a name with '.' in its initial component will\n        # be awkward to pull from a registry because the registry name\n        # will have to be explicitly supplied, e.g. \"docker pull\n        # foo.bar/baz\" will fail because the \"foo.bar\" registry cannot\n        # be contacted.\n        #\n        # Avoid this awkwardness by forbidding '.' in the initial\n        # component of the image name.\n        name_components = req_labels[Labels.LABEL_TYPE_NAME].split('/', 1)\n        if '.' in name_components[0]:\n            raise OsbsValidationException(\"initial image name component \"\n                                          \"must not contain '.'\")\n\n        return req_labels\n\n    # Gives flexmock something to mock\n    def get_user_params(self, component=None, req_labels=None, **kwargs):\n        req_labels = req_labels or {}\n        user_component = component or req_labels[Labels.LABEL_TYPE_COMPONENT]\n        return BuildUserParams.make_params(build_conf=self.os_conf,\n                                           component=user_component,\n                                           name_label=req_labels[Labels.LABEL_TYPE_NAME],\n                                           **kwargs)\n\n    def _checks_for_isolated(self, user_params):\n        if user_params.isolated:\n            if not user_params.release:\n                raise OsbsValidationException(\n                    'The release parameter is required for isolated builds.')\n\n            if not ISOLATED_RELEASE_FORMAT.match(user_params.release):\n                raise OsbsValidationException(\n                    'For isolated builds, the release value must be in the format: {}'\n                    .format(ISOLATED_RELEASE_FORMAT.pattern))\n\n    def _checks_for_flatpak(self, flatpak, repo_info):\n        if flatpak and not repo_info.configuration.is_flatpak:\n            raise OsbsException(\n                \"Flatpak build, \"\n                \"but repository doesn't have a container.yaml with a flatpak: section\")\n\n        if not flatpak and repo_info.configuration.is_flatpak:\n            raise OsbsException(\n                \"Not a flatpak build, \"\n                \"but repository has a container.yaml with a flatpak: section\")\n\n    def _get_pipeline_template_substitutions(\n            self, *, buildtime_limit: int = 0, user_params, pipeline_run_name) -> Dict[str, str]:\n        \"\"\"Return map of substitutions used by pipeline run template\n        to construct pipeline run data\n\n        These substitutions can be used in pipeline run template\n\n        Substitutions:\n          $osbs_configmap_name - name of configmap defined by user\n          $osbs_namespace - namespace where pipeline runs\n          $osbs_pipeline_run_name - name of pipeline run\n          $osbs_user_params_json - user params in json format\n        \"\"\"\n        return {\n            'osbs_buildtime_limit': f'{buildtime_limit}s',\n            'osbs_configmap_name': user_params.reactor_config_map,\n            'osbs_namespace': self.os_conf.get_namespace(),\n            'osbs_pipeline_run_name': pipeline_run_name,\n            'osbs_user_params_json': user_params.to_json(),\n        }\n\n    def _get_binary_container_pipeline_name(self, user_params):\n        pipeline_run_postfix = utils.generate_random_postfix()\n        pipeline_run_name = user_params.name\n\n        if user_params.isolated:\n            pipeline_run_name = f'isolated-{pipeline_run_postfix}'\n\n        elif user_params.scratch:\n            pipeline_run_name = f'scratch-{pipeline_run_postfix}'\n        return pipeline_run_name\n\n    def _get_binary_container_pipeline_data(self, *, buildtime_limit, user_params,\n                                            pipeline_run_name):\n        pipeline_run_path = self.os_conf.get_pipeline_run_path()\n\n        substitutions = self._get_pipeline_template_substitutions(\n            buildtime_limit=buildtime_limit,\n            user_params=user_params,\n            pipeline_run_name=pipeline_run_name\n        )\n        pipeline_run_data = _load_pipeline_from_template(pipeline_run_path, substitutions)\n\n        return pipeline_run_data\n\n    @osbsapi\n    def create_binary_container_build(self, **kwargs):\n        return self.create_binary_container_pipeline_run(**kwargs)\n\n    @osbsapi\n    def create_binary_container_pipeline_run(self,\n                                             git_uri=_REQUIRED_PARAM, git_ref=_REQUIRED_PARAM,\n                                             git_branch=_REQUIRED_PARAM,\n                                             component=None,\n                                             flatpak=None,\n                                             git_commit_depth=None,\n                                             isolated=None,\n                                             koji_task_id=None,\n                                             target=None,\n                                             operator_csv_modifications_url=None,\n                                             **kwargs):\n\n        required_params = {\"git_uri\": git_uri, \"git_ref\": git_ref, \"git_branch\": git_branch}\n        missing_params = []\n        for param_name, param_arg in required_params.items():\n            if param_arg is _REQUIRED_PARAM or not param_arg:\n                missing_params.append(param_name)\n        if missing_params:\n            raise OsbsException('required parameter {} missing'.format(\", ",
+      "total_lines": 479
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 352,
+      "end_line": 353,
+      "excerpt": "    def create_source_container_build(self, **kwargs):\n        return self.create_source_container_pipeline_run(**kwargs)",
+      "symbol_name": "create_source_container_build",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "osbs/api.py",
+      "sha": "186bf534b59f64c38760bfd2933710952fb84104",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/osbs-client/master/osbs/api.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:print_function",
+        "__future__:unicode_literals",
+        "__future__:absolute_import",
+        "collections:namedtuple",
+        "logging",
+        "sys",
+        "warnings",
+        "yaml",
+        "functools:wraps",
+        "typing:Any",
+        "typing:Dict",
+        "string:Template",
+        "osbs.build.user_params:BuildUserParams",
+        "osbs.build.user_params:SourceContainerUserParams",
+        "osbs.constants:RELEASE_LABEL_FORMAT",
+        "osbs.constants:VERSION_LABEL_FORBIDDEN_CHARS",
+        "osbs.constants:ISOLATED_RELEASE_FORMAT",
+        "osbs.tekton:Openshift",
+        "osbs.tekton:PipelineRun",
+        "osbs.exceptions:OsbsException",
+        "osbs.exceptions:OsbsValidationException",
+        "osbs.exceptions:OsbsResponseException",
+        "osbs.utils.labels:Labels",
+        "osbs:utils"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/osbs-client/master/README.md",
+      "content_excerpt": "# OSBS\n\n[![unittests status badge]][unittests status link]\n[![coveralls status badge]][coveralls status link]\n[![lgtm python badge]][lgtm python link]\n[![lgtm alerts badge]][lgtm alerts link]\n[![linters status badge]][linters status link]\n\nPython module and command line client for OpenShift Build Service.\n\nIt is able to query OpenShift v3 for various stuff related to building images.\nIt can initiate builds, list builds, get info about builds, get build logs and\nso on. All of this can be done by the OSBS site administrator from command line\nand from python. Regular users submitting builds can interact with this system\nusing Koji, as described in the guide linked below.\n\n## Getting Started\n\nWe have a [development setup guide][] on how to set up a whole build system for\nlocal development.\n\n## Deploying OpenShift Build System\n\nWe have an [osbs instance setup guide][] detailing how you can set up your own\ninstance.\n\n## Contributing\n\nIf you would like to help out, that's great! Please read the [contributing\nguide][] .\n\n[coveralls status badge]: https://coveralls.io/repos/containerbuildsystem/osbs-client/badge.svg?branch=master\n[coveralls status link]: https://coveralls.io/r/containerbuildsystem/osbs-client?branch=master\n[lgtm python badge]: https://img.shields.io/lgtm/grade/python/g/containerbuildsystem/osbs-client.svg?logo=lgtm&logoWidth=18\n[lgtm python link]: https://lgtm.com/projects/g/containerbuildsystem/osbs-client/context:python\n[lgtm alerts badge]: https://img.shields.io/lgtm/alerts/g/containerbuildsystem/osbs-client.svg?logo=lgtm&logoWidth=18\n[lgtm alerts link]: https://"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "create_source_container_build test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_api.py",
+          "path": "tests/test_api.py",
+          "sha": "4eedf5c0f7eeb2bb9cb7db88bbe59161dbca7fcc",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/blob/eda77aa1da23ac97e0f4827e3bddceb9ac37ab60/tests/test_api.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 850,
+          "end_line": 874,
+          "excerpt": "850:         (flexmock(sys.modules['osbs.build.user_params'])\n851:             .should_receive('utcnow').once()\n852:             .and_return(datetime.datetime.strptime(timestr, '%Y%m%d%H%M%S')))\n853: \n854:         (flexmock(random)\n855:             .should_receive('randrange')\n856:             .with_args(10**(len(rand) - 1), 10**len(rand))\n857:             .and_return(int(rand)))\n858: \n859:         image_tag = f'{TEST_USER}/{TEST_COMPONENT}:{TEST_TARGET}-{rand}-{timestr}'\n860: \n861:         self.mock_start_pipeline()\n862:         pipeline_run = osbs.create_source_container_build(\n863:             target=TEST_TARGET,\n864:             signing_intent=signing_intent,\n865:             koji_task_id=koji_task_id,\n866:             scratch=scratch,\n867:             sources_for_koji_build_id=sources_for_koji_build_id,\n868:             **REQUIRED_SOURCE_CONTAINER_BUILD_ARGS\n869:         )\n870:         assert isinstance(pipeline_run, PipelineRun)\n871: \n872:         assert pipeline_run.input_data['metadata']['name'] == pipeline_run_name\n873: \n874:         for ws in pipeline_run.input_data['spec']['workspaces']:",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"create_source_container_build(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "api.py",
+          "path": "osbs/api.py",
+          "sha": "186bf534b59f64c38760bfd2933710952fb84104",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/blob/eda77aa1da23ac97e0f4827e3bddceb9ac37ab60/osbs/api.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 352,
+          "end_line": 353,
+          "excerpt": "    def create_source_container_build(self, **kwargs):\n        return self.create_source_container_pipeline_run(**kwargs)",
+          "symbol_name": "create_source_container_build",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "test_api.py",
+          "path": "tests/test_api.py",
+          "sha": "4eedf5c0f7eeb2bb9cb7db88bbe59161dbca7fcc",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/blob/eda77aa1da23ac97e0f4827e3bddceb9ac37ab60/tests/test_api.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 850,
+          "end_line": 874,
+          "excerpt": "850:         (flexmock(sys.modules['osbs.build.user_params'])\n851:             .should_receive('utcnow').once()\n852:             .and_return(datetime.datetime.strptime(timestr, '%Y%m%d%H%M%S')))\n853: \n854:         (flexmock(random)\n855:             .should_receive('randrange')\n856:             .with_args(10**(len(rand) - 1), 10**len(rand))\n857:             .and_return(int(rand)))\n858: \n859:         image_tag = f'{TEST_USER}/{TEST_COMPONENT}:{TEST_TARGET}-{rand}-{timestr}'\n860: \n861:         self.mock_start_pipeline()\n862:         pipeline_run = osbs.create_source_container_build(\n863:             target=TEST_TARGET,\n864:             signing_intent=signing_intent,\n865:             koji_task_id=koji_task_id,\n866:             scratch=scratch,\n867:             sources_for_koji_build_id=sources_for_koji_build_id,\n868:             **REQUIRED_SOURCE_CONTAINER_BUILD_ARGS\n869:         )\n870:         assert isinstance(pipeline_run, PipelineRun)\n871: \n872:         assert pipeline_run.input_data['metadata']['name'] == pipeline_run_name\n873: \n874:         for ws in pipeline_run.input_data['spec']['workspaces']:",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "osbs",
+      "count": 14,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "osbs/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "osbs/api.py",
+          "type": "file"
+        },
+        {
+          "name": "build",
+          "path": "osbs/build",
+          "type": "dir"
+        },
+        {
+          "name": "cli",
+          "path": "osbs/cli",
+          "type": "dir"
+        },
+        {
+          "name": "conf.py",
+          "path": "osbs/conf.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "osbs/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "osbs/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "kerberos_ccache.py",
+          "path": "osbs/kerberos_ccache.py",
+          "type": "file"
+        },
+        {
+          "name": "osbs_http.py",
+          "path": "osbs/osbs_http.py",
+          "type": "file"
+        },
+        {
+          "name": "repo_utils.py",
+          "path": "osbs/repo_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "schemas",
+          "path": "osbs/schemas",
+          "type": "dir"
+        },
+        {
+          "name": "tekton.py",
+          "path": "osbs/tekton.py",
+          "type": "file"
+        },
+        {
+          "name": "utils",
+          "path": "osbs/utils",
+          "type": "dir"
+        },
+        {
+          "name": "version.py",
+          "path": "osbs/version.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "osbs/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, absolute_import, unicode_literals\n9: \n10: import logging\n11: \n12: from osbs.constants import USER_WARNING_LEVEL, USER_WARNING_LEVEL_NAME\n13: from osbs.utils import user_warning_log_handler"
+        },
+        {
+          "name": "conf.py",
+          "path": "osbs/conf.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015-2022 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, absolute_import, unicode_literals\n9: \n10: import logging\n11: import os\n12: import os.path\n13: "
+        },
+        {
+          "name": "constants.py",
+          "path": "osbs/constants.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015-2022 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, absolute_import, unicode_literals\n9: \n10: import re\n11: \n12: DEFAULT_GIT_REF = \"master\"\n13: DEFAULT_CONFIGURATION_FILE = \"/etc/osbs.conf\""
+        },
+        {
+          "name": "exceptions.py",
+          "path": "osbs/exceptions.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \n8: \n9: Exceptions raised by OSBS\n10: \"\"\"\n11: from __future__ import print_function, absolute_import, unicode_literals\n12: \n13: import json"
+        },
+        {
+          "name": "kerberos_ccache.py",
+          "path": "osbs/kerberos_ccache.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, absolute_import, unicode_literals\n9: \n10: import re\n11: import os\n12: import logging\n13: import datetime"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "osbs/api.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "b0a61b199e87bdd5a630ee6e29ebd852e28b1060",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/commit/b0a61b199e87bdd5a630ee6e29ebd852e28b1060",
+          "message": "revert opentelemetry commits\n\nSigned-off-by: Robert Cerven <rcerven@redhat.com>",
+          "author": "Robert Cerven",
+          "date": "2023-10-17T15:01:12Z"
+        },
+        {
+          "sha": "89cd65acccd645bc9282533f0eee9dd0652e623d",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/commit/89cd65acccd645bc9282533f0eee9dd0652e623d",
+          "message": "opentelemetry: trace parts of osbs-client calls\n\nexpecially tasks with http requests.\n\nThis will allow us to get traces for all important\nHTTP calls. We are also collecting all args provided\nby the user for the build\n\n* MMENG-3834\n\nSigned-off-by: Harsh Modi <hmodi@redhat.com>",
+          "author": "Harsh Modi",
+          "date": "2023-09-12T13:03:51Z"
+        },
+        {
+          "sha": "12c611bd3d1daa36e09c009654c7fcd03554dcc1",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/commit/12c611bd3d1daa36e09c009654c7fcd03554dcc1",
+          "message": "allow user to configure build time for binary pipeline\n\n* CLOUDBLD-9913\n\nSigned-off-by: Harsh Modi <hmodi@redhat.com>",
+          "author": "Harsh Modi",
+          "date": "2022-11-21T17:15:26Z"
+        },
+        {
+          "sha": "55c3e72ef9c5fb6fa41ebbe8e8295dc0b5681b78",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/commit/55c3e72ef9c5fb6fa41ebbe8e8295dc0b5681b78",
+          "message": "new get_task_results api method\n\n* CLOUDBLD-10926\n\nSigned-off-by: Robert Cerven <rcerven@redhat.com>",
+          "author": "Robert Cerven",
+          "date": "2022-09-09T20:49:08Z"
+        },
+        {
+          "sha": "ed9ae88f147ef780812bd81b1edd5e0934fbb109",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/commit/ed9ae88f147ef780812bd81b1edd5e0934fbb109",
+          "message": "use plugin results from exit task results\n\n* CLOUDBLD-10949\n\nSigned-off-by: Robert Cerven <rcerven@redhat.com>",
+          "author": "Robert Cerven",
+          "date": "2022-09-01T17:43:56Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "create_source_container_build TODO check this",
+      "count": 1,
+      "items": [
+        {
+          "number": 896,
+          "title": "Source containers API",
+          "state": "closed",
+          "html_url": "https://github.com/containerbuildsystem/osbs-client/pull/896",
+          "is_pull_request": true
+        }
+      ]
+    },
+    "history_snippets": {
+      "count": 2,
+      "items": [
+        {
+          "path": "osbs/api.py",
+          "match_reason": "symbol_match",
+          "start_line": 352,
+          "end_line": 353,
+          "excerpt": "    def create_source_container_build(self, **kwargs):\n        return self.create_source_container_pipeline_run(**kwargs)",
+          "patch_excerpt": "@@ -20,7 +20,11 @@\n from contextlib import contextmanager\n from types import GeneratorType\n \n-from osbs.build.build_requestv2 import BuildRequestV2\n+from osbs.build.build_requestv2 import (\n+    BaseBuildRequest,\n+    BuildRequestV2,\n+    SourceBuildRequest,\n+)\n from osbs.build.user_params import load_user_params_from_json\n from osbs.build.plugins_configuration import PluginsConfiguration\n from osbs.build.build_response import BuildResponse\n@@ -33,7 +37,9 @@\n                             BUILD_TYPE_ORCHESTRATOR, BUILD_FINISHED_STATES,\n                             DEFAULT_ARRANGEMENT_VERSION, REACTOR_CONFIG_ARRANGEMENT_VERSION,\n                             ANNOTATION_SOURCE_REPO, ANNOTATION_INSECURE_REPO, FILTER_KEY,\n-                            RELEASE_LABEL_FORMAT)\n+                            RELEASE_LABEL_FORMAT,\n+                            ORCHESTRATOR_SOURCES_OUTER_TEMPLATE,\n+                            )\n from osbs.core import Openshift\n from osbs.exceptions import (OsbsException, OsbsValidationException, OsbsResponseException,\n                              OsbsOrchestratorNotEnabled)\n@@ -188,6 +194,20 @@ def get_pod_for_build(self, build_id):\n             raise OsbsException(\"Only one pod expected but %d returned\" % len(pod_list))\n         return pod_list[0]\n \n+    def _set_build_request_resource_limits(self, build_request):\n+        \"\"\"Apply configured resource limits to build_request\"\"\"\n+        assert isinstance(build_request, BaseBuildRequest)\n+        cpu_limit = self.build_conf.get_cpu_limit()\n+        memory_limit = self.build_conf.get_memory_limit()\n+        storage_limit = self.build_conf.get_storage_limit()\n+        if any(\n+                limit is not None\n+                for limit in (cpu_limit, memory_limit, storage_limit)\n+        ):\n+            build_request.set_resource_limits(cpu=cpu_limit,\n+                                              memory=memory_limit,\n+                                              storage=storage_limit)\n+\n     @osbsapi\n     def get_build_request(self, build_type=None, inner_template=None,\n                           outer_template=None, customize_conf=None,\n@@ -212,17 +232,28 @@ def get_build_request(self, build_t"
+        },
+        {
+          "path": "osbs/constants.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015-2022 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, absolute_import, unicode_literals\n9: \n10: import re\n11: \n12: DEFAULT_GIT_REF = \"master\"\n13: DEFAULT_CONFIGURATION_FILE = \"/etc/osbs.conf\"",
+          "patch_excerpt": "@@ -21,6 +21,7 @@\n ORCHESTRATOR_SOURCES_OUTER_TEMPLATE = \"orchestrator_sources.json\"\n WORKER_INNER_TEMPLATE = \"worker_inner:{arrangement_version}.json\"\n ORCHESTRATOR_INNER_TEMPLATE = \"orchestrator_inner:{arrangement_version}.json\"\n+ORCHESTRATOR_SOURCES_INNER_TEMPLATE = \"orchestrator_sources_inner:{arrangement_version}.json\"\n DEFAULT_ARRANGEMENT_VERSION = 6  # this should be the highest-numbered version\n REACTOR_CONFIG_ARRANGEMENT_VERSION = 6\n WORKER_CUSTOMIZE_CONF = \"worker_customize.json\""
+        }
+      ]
+    },
+    "issue_comments": [],
+    "related_pr_files": [
+      {
+        "ok": true,
+        "number": 896,
+        "count": 6,
+        "files": [
+          {
+            "filename": "inputs/orchestrator_sources_inner:6.json",
+            "status": "added",
+            "additions": 15,
+            "deletions": 0,
+            "changes": 15,
+            "patch_excerpt": "@@ -0,0 +1,15 @@\n+{\n+  \"prebuild_plugins\": [\n+    {\n+      \"name\": \"reactor_config\"\n+    }\n+  ],\n+  \"buildstep_plugins\": [\n+    {\n+      \"name\": \"source_container_build\"\n+    }\n+  ],\n+  \"postbuild_plugins\": [],\n+  \"prepublish_plugins\": [],\n+  \"exit_plugins\": []\n+}"
+          },
+          {
+            "filename": "osbs/api.py",
+            "status": "modified",
+            "additions": 118,
+            "deletions": 12,
+            "changes": 130,
+            "patch_excerpt": "@@ -20,7 +20,11 @@\n from contextlib import contextmanager\n from types import GeneratorType\n \n-from osbs.build.build_requestv2 import BuildRequestV2\n+from osbs.build.build_requestv2 import (\n+    BaseBuildRequest,\n+    BuildRequestV2,\n+    SourceBuildRequest,\n+)\n from osbs.build.user_params import load_user_params_from_json\n from osbs.build.plugins_configuration import PluginsConfiguration\n from osbs.build.build_response import BuildResponse\n@@ -33,7 +37,9 @@\n                             BUILD_TYPE_ORCHESTRATOR, BUILD_FINISHED_STATES,\n                             DEFAULT_ARRANGEMENT_VERSION, REACTOR_CONFIG_ARRANGEMENT_VERSION,\n                             ANNOTATION_SOURCE_REPO, ANNOTATION_INSECURE_REPO, FILTER_KEY,\n-                            RELEASE_LABEL_FORMAT)\n+                            RELEASE_LABEL_FORMAT,\n+                            ORCHESTRATOR_SOURCES_OUTER_TEMPLATE,\n+                            )\n from osbs.core import Openshift\n from osbs.exceptions import (OsbsException, OsbsValidationException, OsbsResponseException,\n                              OsbsOrchestratorNotEnabled)\n@@ -188,6 +194,20 @@ def get_pod_for_build(self, build_id):\n             raise OsbsException(\"Only one pod expected but %d returned\" % len(pod_list))\n         return pod_list[0]\n \n+    def _set_build_request_resource_limits(self, build_request):\n+        \"\"\"Apply configured resource limits to build_request\"\"\"\n+        assert isinstance(build_request, BaseBuildRequest)\n+        cpu_limit = self.build_conf.get_cpu_limit()\n+        memory_limit = self.build_conf.get_memory_limit()\n+        storage_limit = self.build_conf.get_storage_limit()\n+        if any(\n+                limit is not None\n+                for limit in (cpu_limit, memory_limit, storage_limit)\n+        ):\n+            build_request.set_resource_limits(cpu=cpu_limit,\n+                                              memory=memory_limit,\n+                                              storage=storage_limit)\n+\n     @osbsapi\n     def get_build_request(self, build_type=None, inner_template=None,\n                           outer_template=None, customize_conf=None,\n@@ -212,17 +232,28 @@ def get_build_request(self, build_t"
+          },
+          {
+            "filename": "osbs/build/build_requestv2.py",
+            "status": "modified",
+            "additions": 19,
+            "deletions": 0,
+            "changes": 19,
+            "patch_excerpt": "@@ -600,6 +600,25 @@ def __init__(self, build_json_store, outer_template=None):\n     def render(self, validate=True):\n         return super(SourceBuildRequest, self).render(validate=validate)\n \n+    def render_name(self, name, image_tag, platform):\n+        \"\"\"Sets the Build/BuildConfig object name\n+\n+        Source container builds must have unique names, because we are not\n+        using buildConfigs just regular builds\n+\n+        platform is unused for source container images builds\n+        \"\"\"\n+        name = image_tag\n+\n+        _, salt, timestamp = name.rsplit('-', 2)\n+\n+        name = 'sources-{}-{}'.format(salt, timestamp)\n+        if self.scratch:\n+            name = 'scratch-{}'.format(name)\n+\n+        # !IMPORTANT! can't be too long: https://github.com/openshift/origin/issues/733\n+        self.template['metadata']['name'] = name\n+\n     def set_params(self, **kwargs):\n         super(SourceBuildRequest, self).set_params(**kwargs)\n "
+          },
+          {
+            "filename": "osbs/cli/main.py",
+            "status": "modified",
+            "additions": 86,
+            "deletions": 21,
+            "changes": 107,
+            "patch_excerpt": "@@ -300,6 +300,31 @@ def cmd_cancel_build(args, osbs):\n     osbs.cancel_build(args.BUILD_ID[0])\n \n \n+def _print_build_logs(args, osbs, build):\n+    build_id = build.get_build_name()\n+    # we need to wait for kubelet to schedule the build, otherwise it's 500\n+    build = osbs.wait_for_build_to_get_scheduled(build_id)\n+    if not args.no_logs:\n+        build_logs = osbs.get_build_logs(build_id, follow=True, decode=True)\n+        if not isinstance(build_logs, collections.Iterable):\n+            logger.error(\"'%s' is not iterable; can't display logs\", build_logs)\n+            return\n+        print(\"Build submitted (%s), watching logs (feel free to interrupt)\" % build_id)\n+        try:\n+            for line in build_logs:\n+                print('{!r}'.format(line))\n+        except Exception as ex:\n+            logger.error(\"Error during fetching logs for build %s: %s\", build_id, repr(ex))\n+\n+        osbs.wait_for_build_to_finish(build_id)\n+        _display_build_summary(osbs.get_build(build_id))\n+    else:\n+        if args.output == 'json':\n+            print_json_nicely(build.json)\n+        elif args.output == 'text':\n+            print(build_id)\n+\n+\n def cmd_build(args, osbs):\n     if args.worker:\n         create_func = osbs.create_worker_build\n@@ -339,28 +364,22 @@ def cmd_build(args, osbs):\n         print(\"Build skipped\")\n         return\n \n-    build_id = build.get_build_name()\n-    # we need to wait for kubelet to schedule the build, otherwise it's 500\n-    build = osbs.wait_for_build_to_get_scheduled(build_id)\n-    if not args.no_logs:\n-        build_logs = osbs.get_build_logs(build_id, follow=True, decode=True)\n-        if not isinstance(build_logs, collections.Iterable):\n-            logger.error(\"'%s' is not iterable; can't display logs\", build_logs)\n-            return\n-        print(\"Build submitted (%s), watching logs (feel free to interrupt)\" % build_id)\n-        try:\n-            for line in build_logs:\n-                print('{!r}'.format(line))\n-        except Exception as ex:\n-            logger.error(\"Error during fetching logs for build %s: %s\", build_id, repr(ex))\n+    _print_build_logs(args, osbs, build)\n \n-        osbs.wait_for_build_to_finish("
+          },
+          {
+            "filename": "osbs/constants.py",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 0,
+            "changes": 1,
+            "patch_excerpt": "@@ -21,6 +21,7 @@\n ORCHESTRATOR_SOURCES_OUTER_TEMPLATE = \"orchestrator_sources.json\"\n WORKER_INNER_TEMPLATE = \"worker_inner:{arrangement_version}.json\"\n ORCHESTRATOR_INNER_TEMPLATE = \"orchestrator_inner:{arrangement_version}.json\"\n+ORCHESTRATOR_SOURCES_INNER_TEMPLATE = \"orchestrator_sources_inner:{arrangement_version}.json\"\n DEFAULT_ARRANGEMENT_VERSION = 6  # this should be the highest-numbered version\n REACTOR_CONFIG_ARRANGEMENT_VERSION = 6\n WORKER_CUSTOMIZE_CONF = \"worker_customize.json\""
+          },
+          {
+            "filename": "tests/test_api.py",
+            "status": "modified",
+            "additions": 13,
+            "deletions": 0,
+            "changes": 13,
+            "patch_excerpt": "@@ -80,6 +80,11 @@\n     'build_type': BUILD_TYPE_ORCHESTRATOR,\n }\n \n+REQUIRED_SOURCE_CONTAINER_BUILD_ARGS = {\n+    'user': TEST_USER,\n+    'sources_for_koji_build_nvr': 'test-1-123',\n+}\n+\n TEST_MODULES = ['mod_name:mod_stream:mod_version']\n \n \n@@ -3080,3 +3085,11 @@ def test_watch_builds(self, osbs, field_selector):\n         with pytest.raises(ValueError):\n             for changetype, _ in osbs.watch_builds(field_selector):\n                 assert changetype is None\n+\n+    # osbs is a fixture here\n+    def test_create_source_container_build(self, osbs):\n+        response = osbs.create_source_container_build(\n+            target=TEST_TARGET,\n+            **REQUIRED_SOURCE_CONTAINER_BUILD_ARGS\n+        )\n+        assert isinstance(response, BuildResponse)"
+          }
+        ]
+      }
+    ],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "osbs/api.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "b0a61b199e87bdd5a630ee6e29ebd852e28b1060",
+        "html_url": "https://github.com/containerbuildsystem/osbs-client/commit/b0a61b199e87bdd5a630ee6e29ebd852e28b1060",
+        "message": "revert opentelemetry commits\n\nSigned-off-by: Robert Cerven <rcerven@redhat.com>",
+        "author": "Robert Cerven",
+        "date": "2023-10-17T15:01:12Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "history_snippets_count": 2,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

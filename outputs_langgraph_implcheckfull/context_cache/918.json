@@ -1,0 +1,373 @@
+{
+  "task_id": "918",
+  "repo_owner": "siegfried415",
+  "repo_name": "portia-dashboard",
+  "file_path": "slyd/slyd/splash/ferry.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T03:45:07+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T03:45:19+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T03:45:22+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "slyd/slyd/splash/ferry.py",
+    "original_code": "def sendMessage(self, message):\n    message = text(message)\n    try:\n        command, data = json.loads(message)\n    except ValueError:  # XXX: Possibly null terminated string\n        command, data = json.loads(message[:-1])\n    self.protocol.sendMessage({\n        '_command': command,\n        '_data': data\n    })\n    if command == 'mutation':\n        self.protocol.sendMessage(metadata(self.protocol))",
+    "original_signature": "def sendMessage(self, message):",
+    "satd_comment": "# XXX: Possibly null terminated string",
+    "target_file": {
+      "ok": true,
+      "path": "slyd/slyd/splash/ferry.py",
+      "sha": "9bf1e492c11147bf5907840e0a3e74a58f8d36eb",
+      "download_url": "https://raw.githubusercontent.com/siegfried415/portia-dashboard/master/slyd/slyd/splash/ferry.py",
+      "content_excerpt": "from __future__ import absolute_import\nfrom functools import partial\nimport json\nimport os\nimport copy\nimport re\n\nfrom six.moves.urllib_parse import urlparse\n\nfrom autobahn.twisted.resource import WebSocketResource\nfrom autobahn.twisted.websocket import (WebSocketServerFactory,\n                                        WebSocketServerProtocol)\nfrom weakref import WeakKeyDictionary, WeakValueDictionary\nfrom twisted.internet import defer, task\nfrom twisted.python import log\n\nfrom scrapy.settings import Settings\nfrom scrapy.utils.serialize import ScrapyJSONEncoder\nfrom splash import defaults\nfrom splash.browser_tab import BrowserTab, skip_if_closing\nfrom splash.network_manager import SplashQNetworkAccessManager\nfrom splash.qtutils import drop_request\nfrom splash.render_options import RenderOptions\n\nfrom slybot.spider import IblSpider\nfrom slybot.utils import decode\nfrom portia_api.errors import BaseHTTPError\n\nfrom django.conf import settings\nfrom django.db import close_old_connections\n\nfrom storage import create_project_storage\n\nfrom portia_orm.models import Project\nfrom portia_orm.datastore import data_store_context\nfrom portia_orm.utils import short_guid\nfrom portia_api.utils.spiders import load_spider_data\n\nfrom .qtutils import QObject, pyqtSlot, QWebElement\nfrom .cookies import PortiaCookieJar\nfrom .commands import Commands\nfrom .css_utils import process_css, wrap_url\nfrom .utils import _DEFAULT_VIEWPORT, ProjectsDict\nimport six\ntext = six.text_type  # unicode in py2, str in py3\n\nimport txaio\ntxaio.use_twisted()\n\n_DEFAULT_USER_AGENT = ('Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 '\n                       '(KHTML, like Gecko) Chrome/48.0.2564.82 Safari/537.36')\nIGNORED_TYPES = ('video/', 'audio/', 'application/ogg')\nMEDIA_EXTENSIONS = (\n    '.aac', '.avi', '.mid', '.mpeg', '.oga', '.ogv', '.ogx', '.swf',\n    '.wav', '.weba', '.webm', '.xul', '.3gp', '.3g2'\n)\nSTORED_TYPES = ('text/html', 'text/xhtml', 'text/xml', 'text/plain',\n                'text/css', 'image/', 'application/font')\nSTORED_EXTENSIONS = ('.jpg', 'jpeg', '.png', '.webp', '.gif', '.svg', '.css',\n                     '.xml', '.html', '.htm', '.xhtml', '.woff', '.woff2',\n                     '.ttf', '.otf', '.eot')\n\n\ndef _is_xml(accepts):\n    if accepts.startswith('application/'):\n        has_xml = accepts.find('xml')\n        if has_xml > 0:\n            semicolon = accepts.find(';')\n            if semicolon < 0 or has_xml < semicolon:\n                return True\n    return False\n\n\ndef wrap_callback(connection, callback, retries=0, **parsed):\n    result = callback(**parsed)\n    if hasattr(parsed.get('storage'), '_working_tree'):\n        parsed['storage'].commit()\n    return result\n\n\ndef create_ferry_resource(factory):\n    return FerryWebSocketResource(factory)\n\n\nclass PortiaNetworkManager(SplashQNetworkAccessManager):\n    _raw_html = None\n\n    def createRequest(self, operation, request, outgoingData=None):\n        reply = super(PortiaNetworkManager, self).createRequest(\n            operation, request, outgoingData)\n        if getattr(self, 'closed', False):\n            return reply\n        try:\n            url = six.binary_type(request.url().toEncoded())\n            frame_url = six.binary_type(\n                self.tab.web_page.mainFrame().requestedUrl().toEncoded())\n            if url == frame_url:\n                self._raw_html = ''\n                self._url = ''\n                reply.readyRead.connect(self._ready_read)\n        except:\n            log.err()\n        finally:\n            return reply\n\n    def _ready_read(self):\n        reply = self.sender()\n        self._raw_html = (self._raw_html + six.binary_type(\n            reply.peek(reply.bytesAvailable())))\n        self._url = six.text_type(reply.url().toString())\n\n\nclass PortiaBrowserTab(BrowserTab):\n    @property\n    def url(self):\n        \"\"\" Current URL \"\"\"\n        if self._closing:\n            return ''\n        return decode(self.web_page.mainFrame().url().toString())\n\n    @skip_if_closing\n    def evaljs(self, *args, **kwargs):\n        return super(PortiaBrowserTab, self).evaljs(*args, **kwargs)\n\n\nclass FerryWebSocketResource(WebSocketResource):\n    def __init__(self, factory):\n        FerryServerProtocol.assets = factory.assets\n        WebSocketResource.__init__(self, factory)\n\n    def render(self, request):\n        request.requestHeaders.setRawHeaders('X-Auth-Info',\n                                             [json.dumps(request.auth_info)])\n        return WebSocketResource.render(self, request)\n\n\nclass User(object):\n    _by_id = WeakValueDictionary()\n\n    def __init__(self, auth, tab=None, spider=None, spiderspec=None):\n        self.auth = auth\n        self.authorized_projects = auth.get('authorized_projects', None)\n        self.project_map = ProjectsDict(auth)\n        self.tab = tab\n        self.spider = spider\n        self.spiderspec = spiderspec\n        self.tabid = id(self)\n        User._by_id[self.tabid] = self\n\n    @classmethod\n    def findById(cls, tabid):\n        return cls._by_id.get(tabid, None)\n\n    @property\n    def name(self):\n        return self.auth.get('username', '')\n\n    def __getattr__(self, key):\n        try:\n            return self.auth[key]\n        except KeyError:\n            name = self.__class__.__name__\n            raise AttributeError('\"%s\" has no attribute \"%s\"' % (name, key))\n\n\nclass SpiderSpec(object):\n    def __init__(self, project, name, spider, items, extractors):\n        self.project = project\n        self.name = name\n        self._spider = spider\n        self._items = items\n        self._extractors = extractors\n\n    @property\n    def spider(self):\n        return copy.deepcopy(self._spider)\n\n    @property\n    def items(self):\n        return copy.deepcopy(self.items)\n\n    @property\n    def extractors(self):\n        return copy.deepcopy(self._extractors)\n\n    @property\n    def templates(self):\n        return self.spider['templates']\n\n    def __repr__(self):\n        return '{}({})'.format(self.__class__.__name__, str(self))\n\n    def __str__(self):\n        return '{}, {}'.format(self.project, self.name)\n\n\nclass PortiaJSApi(QObject):\n    def __init__(self, protocol):\n        super(PortiaJSApi, self).__init__()\n        self.protocol = protocol\n        self.call = None\n\n    @pyqtSlot(QWebElement)\n    def returnElement(self, element):\n        \"\"\"Hack to return an DOM node as a QWebElement instead of\n        QVariant(QVariantMap) \"\"\"\n        self.element = element\n\n    def getReturnedElement(self):\n        element = self.element\n        self.element = None\n        return element\n\n    @pyqtSlot('QString', 'QString', result='QString')\n    def processCss(self, css, baseuri):\n        return process_css(text(css), self.protocol.user.tabid, text(baseuri))\n\n    @pyqtSlot('QString', 'QString', result='QString')\n    def wrapUrl(self, url, baseuri):\n        return wrap_url(text(url), self.protocol.user.tabid, text(baseuri))\n\n    @pyqtSlot('QString')\n    def log(self, s):\n        print(s)\n\n    @pyqtSlot('QString')\n    def sendMessage(self, message):\n        message = text(message)\n        # Allocation bug somewhere leaves null characters at the end.\n        message = message.strip('\\x00')\n        try:\n            command, data = json.loads(message)\n        except ValueError as e:\n            return log.err(ValueError(\n                \"%s JSON head: %r tail: %r\" % (e.message, message[:100],\n                                               message[-100:])\n            ))\n        self.protocol.sendMessage({\n            '_command': command,\n            '_data': data\n        })\n        if command == 'mutation' and not self.call:\n            self.call = task.deferLater(self.protocol.factory.reactor, 1,\n                                        self.extract)\n\n\n    def extract(self):\n        commands = Commands({}, self.protocol, None)\n        self.protocol.sendMessage(commands.metadata())\n        self.call = None\n\n\ndef is_blacklisted(url):\n    from urlparse import urlparse\n    return urlparse(url).netloc in settings.BLACKLIST_URLS\n\n\ndef blacklist_error(data, socket):\n    meta = data.get('_meta', {})\n    extra_meta = {'id': meta.get('id')}\n    msg = \"Sorry Portia doesn't support this page :(\"\n    extra_meta.update(error=4500, reason=msg)\n    commands = Commands({}, socket, None)\n    socket.sendMessage(commands.metadata(extra_meta))\n\n\nclass FerryServerProtocol(WebSocketServerProtocol):\n\n    _handlers = {\n        'load': 'load_page',\n        'interact': 'interact_page'\n    }\n    assets = './'\n    settings = Settings()\n\n    @property\n    def tab(self):\n        return self.factory[self].tab\n\n    @property\n    def spider(self):\n        return self.factory[self].spider\n\n    @property\n    def spiderspec(self):\n        return self.factory[self].spiderspec\n\n    @property\n    def user(self):\n        return self.factory[self]\n\n    def onConnect(self, request):\n        try:\n            auth_info = json.loads(request.headers['x-auth-info'])\n        except (KeyError, TypeError):\n            return\n        self.session_id = ''\n        self.auth_info = auth_info\n        self.factory[self] = User(auth_info)\n\n    def onOpen(self):\n        if self not in self.factory:\n            self.sendClose(1000, 'Invalid Connection missing required '\n                                 'parameters')\n\n    def onMessage(self, payload, isbinary):\n        close_old_connections()\n        payload = payload.decode('utf-8')\n        data = json.loads(payload)\n        project = data.get('project', data.get('_meta', {}).get('project'))\n        storage = create_project_storage(project, author=self.user)\n        projects = storage.__class__.get_projects(self.user)\n        if project and str(project) not in projects:\n            self.sendMessage({'status': 4004, 'message': 'Project not found'})\n            return\n        deferred = defer.maybeDeferred(\n            wrap_callback, None, self._on_message, storage=storage, data=data)\n        deferred.addCallbacks(self.sendMessage,\n                              partial(self.send_error, data))\n\n    def _on_message(self, storage, data):\n        if '_meta' in data and 'session_id' in data['_meta']:\n            self.session_id = data['_meta']['session_id']\n\n        if is_blacklisted(data.get('url', '')):\n            blacklist_error(data, self)\n            return\n\n        command = data['_command']\n        command = self._handlers.get(command, command)\n        with data_store_context():\n            commands = Commands(data, self, storage)\n            result = getattr(commands, command, lambda: None)()\n        if result:\n            result.setdefault('_command', data.get('_callback', command))\n            if '_meta' in data and 'id' in data['_meta']:\n                result['id'] = data['_meta']['id']\n\n        return result\n\n    def onClose(self, was_clean, code, reason):\n        if self in self.factory:\n            if self.tab is not None:\n                self.tab.close()\n                self.tab.network_manager.closed = True\n            msg_data = {'session': self.session_id,\n                        'session_time': 0,\n                        'user': self.user.name}\n            msg = (u'Websocket Closed: id=%(session)s t=%(session_time)s '\n                   u'user=%(user)s command=' % (msg_data))\n            log.err(msg)\n\n    def sendMessage(self, payload, is_binary=False):\n        if isinstance(payload, dict) and '_command' in payload:\n            super(FerryServerProtocol, self).sendMessage(\n                json.dumps(payload, cls=ScrapyJSONEncoder, sort_keys=True),\n                is_binary\n            )\n\n    def send_error(self, data, failure):\n        e = failure.value\n        command = data.get('_callback', data.get('_command'))\n        id_ = data.get('_meta', {}).get('id')\n        if isinstance(e, BaseHTTPError):\n            code, reason, message = e.status, e.title, e.body\n        elif isinstance(e, KeyError):\n            requested_command = data.get('_command')\n            code = 4000\n            reason = \"Unknown command\"\n            if ",
+      "total_lines": 561
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 353,
+      "end_line": 358,
+      "excerpt": "    def sendMessage(self, payload, is_binary=False):\n        if isinstance(payload, dict) and '_command' in payload:\n            super(FerryServerProtocol, self).sendMessage(\n                json.dumps(payload, cls=ScrapyJSONEncoder, sort_keys=True),\n                is_binary\n            )",
+      "symbol_name": "sendMessage",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "slyd/slyd/splash/ferry.py",
+      "sha": "9bf1e492c11147bf5907840e0a3e74a58f8d36eb",
+      "download_url": "https://raw.githubusercontent.com/siegfried415/portia-dashboard/master/slyd/slyd/splash/ferry.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "functools:partial",
+        "json",
+        "os",
+        "copy",
+        "re",
+        "six.moves.urllib_parse:urlparse",
+        "autobahn.twisted.resource:WebSocketResource",
+        "autobahn.twisted.websocket:WebSocketServerFactory",
+        "autobahn.twisted.websocket:WebSocketServerProtocol",
+        "weakref:WeakKeyDictionary",
+        "weakref:WeakValueDictionary",
+        "twisted.internet:defer",
+        "twisted.internet:task",
+        "twisted.python:log",
+        "scrapy.settings:Settings",
+        "scrapy.utils.serialize:ScrapyJSONEncoder",
+        "splash:defaults",
+        "splash.browser_tab:BrowserTab",
+        "splash.browser_tab:skip_if_closing",
+        "splash.network_manager:SplashQNetworkAccessManager",
+        "splash.qtutils:drop_request",
+        "splash.render_options:RenderOptions",
+        "slybot.spider:IblSpider",
+        "slybot.utils:decode",
+        "portia_api.errors:BaseHTTPError",
+        "django.conf:settings",
+        "django.db:close_old_connections",
+        "storage:create_project_storage",
+        "portia_orm.models:Project"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/siegfried415/portia-dashboard/master/README.md",
+      "content_excerpt": "Portia-dashboard\n======\n\nPortia is a great tool that allows you to visually scrape websites without any programming knowledge required. With Portia you can annotate a web page to identify the data you wish to extract, and Portia will understand based on these annotations how to scrape data from similar pages. \n\nBecause Portia by scrapinghub has no dashboard with it, so user can't get the status of spider and scraped items visually , for solving this problem, I add a simple dashboard to Portia, so everybody can get a free dashboard just like scrapinghub cloud.\n\nSometimes, you will need input user name and password to login, or give a query string to begain a search. Portia can't do this by default. So we add a functionality called \"Action\" to Portia, like Selenium IDE, user interaction with current page such as mouse click, keyboard input can be recorded as Action, and will be playback when crawling is started.\n\n\n# Running Portia\nThe easiest way to run Portia is using Docker.\nYou can run Portia using docker by running:\n\n    docker run -v ~/portia_projects:/app/data/projects:rw -p 9001:9001 siegfried415/portia-dashboard start-dev \n\n\nPortia should now be running on port 9001 and you can access it at ``http://localhost:9001``.\n\n\n# Documentation\n\nWhen the docker started, you can get documentation at ``http://localhost:9001/doc/index.html``.  \n\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "sendMessage test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"sendMessage(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "ferry.py",
+          "path": "slyd/slyd/splash/ferry.py",
+          "sha": "9bf1e492c11147bf5907840e0a3e74a58f8d36eb",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/blob/b1e116ea95afd736caf55df5d16e6da28c124eec/slyd/slyd/splash/ferry.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 353,
+          "end_line": 358,
+          "excerpt": "    def sendMessage(self, payload, is_binary=False):\n        if isinstance(payload, dict) and '_command' in payload:\n            super(FerryServerProtocol, self).sendMessage(\n                json.dumps(payload, cls=ScrapyJSONEncoder, sort_keys=True),\n                is_binary\n            )",
+          "symbol_name": "sendMessage",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "z_inject_this.js",
+          "path": "splash_utils/z_inject_this.js",
+          "sha": "f0d2d593d6c302188da2147ad7c9382a512edc5a",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/blob/b1e116ea95afd736caf55df5d16e6da28c124eec/splash_utils/z_inject_this.js",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 9,
+          "end_line": 33,
+          "excerpt": "9: var StringProto = String.prototype;\n10: var BooleanProto = Boolean.prototype;\n11: \n12: \n13: // Note: Variables here are not leaked to the global scope because the compiler wraps it in a function\n14: \n15: var MAX_DIALOGS = 15;  // Maximum number of dialogs (alert, confirm, prompt) before throwing an exception\n16: \n17: var PortiaPage = function PortiaPage() {\n18:     var that = this;\n19:     this.mirrorClient = new TreeMirrorClient(document, {\n20:         initialize: function(rootId, children, baseURI){\n21:             that.sendMessage('mutation', ['initialize', rootId, children, baseURI]);\n22:         },\n23:         applyChanged: function(removed, addedOrMoved, attributes, text){\n24:             that.sendMessage('mutation', ['applyChanged', removed, addedOrMoved, attributes, text]);\n25:         }\n26:     });\n27: };\n28: \n29: PortiaPage.prototype.sendMutation = function(){\n30:     this.sendMessage('mutation', arraySplice.call(arguments, 0));\n31: };\n32: \n33: PortiaPage.prototype.sendMessage = function(action, message) {",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "cookies.py",
+          "path": "slyd/slyd/splash/cookies.py",
+          "sha": "cf7cfd47008b96d0106c2bff58de4b65012969c1",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/blob/b1e116ea95afd736caf55df5d16e6da28c124eec/slyd/slyd/splash/cookies.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 19,
+          "end_line": 34,
+          "excerpt": "19: \n20:     def put_client_cookies(self, cookie_list):\n21:         \"\"\" Set all cookies without updating the client.\n22:         cookie_list is a list of har cookies\"\"\"\n23:         qt_cookies = [self.har_cookie2qt(c) for c in cookie_list]\n24:         return super(PortiaCookieJar, self).setAllCookies(qt_cookies)\n25: \n26:     def update_client_cookies(self):\n27:         cookies = self.allCookies()\n28:         if self._last_cookies == cookies:\n29:             return\n30:         self._last_cookies = cookies\n31:         self.socket.sendMessage({\n32:             '_command': 'cookies',\n33:             'cookies': cookies2har(cookies)\n34:         })",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "commands.py",
+          "path": "slyd/slyd/splash/commands.py",
+          "sha": "79d0e5dba6d1ac13aa9f0088c436733dba65cd69",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/blob/b1e116ea95afd736caf55df5d16e6da28c124eec/slyd/slyd/splash/commands.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 35,
+          "end_line": 59,
+          "excerpt": "35:         self.data, self.socket, self.storage = data, socket, storage\n36: \n37:     @property\n38:     def tab(self):\n39:         return self.socket.tab\n40: \n41:     def cookies(self):\n42:         cookies_list = self.tab.network_manager.cookiejar.allCookies()\n43:         message = {\n44:             '_command': 'cookies',\n45:             'cookies': cookies2har(cookies_list)\n46:         }\n47:         self.socket.sendMessage(message)\n48: \n49:     def heartbeat(self):\n50:         return\n51: \n52:     def save_html(self, item_checker=None):\n53:         data = self.data\n54:         if item_checker is None:\n55:             item_checker = ItemChecker(self, data['project'], data['spider'],\n56:                                        data['sample'])\n57:         project = Project(self.storage, id=data['project'])\n58:         self.socket.spiderspec.project = project\n59:         spider = project.spiders[data['spider']]",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "slyd/slyd/splash",
+      "count": 8,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "slyd/slyd/splash/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "commands.py",
+          "path": "slyd/slyd/splash/commands.py",
+          "type": "file"
+        },
+        {
+          "name": "cookies.py",
+          "path": "slyd/slyd/splash/cookies.py",
+          "type": "file"
+        },
+        {
+          "name": "css_utils.py",
+          "path": "slyd/slyd/splash/css_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "ferry.py",
+          "path": "slyd/slyd/splash/ferry.py",
+          "type": "file"
+        },
+        {
+          "name": "proxy.py",
+          "path": "slyd/slyd/splash/proxy.py",
+          "type": "file"
+        },
+        {
+          "name": "qtutils.py",
+          "path": "slyd/slyd/splash/qtutils.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "slyd/slyd/splash/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "slyd/slyd/splash/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "commands.py",
+          "path": "slyd/slyd/splash/commands.py",
+          "match_reason": "anchor_text",
+          "start_line": 35,
+          "end_line": 59,
+          "excerpt": "35:         self.data, self.socket, self.storage = data, socket, storage\n36: \n37:     @property\n38:     def tab(self):\n39:         return self.socket.tab\n40: \n41:     def cookies(self):\n42:         cookies_list = self.tab.network_manager.cookiejar.allCookies()\n43:         message = {\n44:             '_command': 'cookies',\n45:             'cookies': cookies2har(cookies_list)\n46:         }\n47:         self.socket.sendMessage(message)\n48: \n49:     def heartbeat(self):\n50:         return\n51: \n52:     def save_html(self, item_checker=None):\n53:         data = self.data\n54:         if item_checker is None:\n55:             item_checker = ItemChecker(self, data['project'], data['spider'],\n56:                                        data['sample'])\n57:         project = Project(self.storage, id=data['project'])\n58:         self.socket.spiderspec.project = project\n59:         spider = project.spiders[data['spider']]"
+        },
+        {
+          "name": "cookies.py",
+          "path": "slyd/slyd/splash/cookies.py",
+          "match_reason": "anchor_text",
+          "start_line": 19,
+          "end_line": 34,
+          "excerpt": "19: \n20:     def put_client_cookies(self, cookie_list):\n21:         \"\"\" Set all cookies without updating the client.\n22:         cookie_list is a list of har cookies\"\"\"\n23:         qt_cookies = [self.har_cookie2qt(c) for c in cookie_list]\n24:         return super(PortiaCookieJar, self).setAllCookies(qt_cookies)\n25: \n26:     def update_client_cookies(self):\n27:         cookies = self.allCookies()\n28:         if self._last_cookies == cookies:\n29:             return\n30:         self._last_cookies = cookies\n31:         self.socket.sendMessage({\n32:             '_command': 'cookies',\n33:             'cookies': cookies2har(cookies)\n34:         })"
+        },
+        {
+          "name": "css_utils.py",
+          "path": "slyd/slyd/splash/css_utils.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import re\n2: import urllib\n3: from scrapy.utils.url import urljoin_rfc\n4: from six.moves.urllib_parse import urlparse\n5: from slybot.utils import decode, encode\n6: \n7: \n8: CSS_IMPORT = re.compile(ur'''@import\\s*[\"']([^\"']+)[\"']''')\n9: CSS_URL = re.compile(ur'''\\burl\\((\"[^\"]+\"|'[^']+'|[^\"')][^)]+)\\)''')\n10: BAD_CSS = re.compile(ur'(-moz-binding|expression\\s*\\(|javascript\\s*:)', re.I)\n11: \n12: \n13: def wrap_url(url, tabid, base=None):"
+        },
+        {
+          "name": "proxy.py",
+          "path": "slyd/slyd/splash/proxy.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import absolute_import\n2: import functools\n3: import requests\n4: \n5: from base64 import b64decode\n6: \n7: from twisted.internet.threads import deferToThread\n8: from twisted.internet.defer import CancelledError\n9: from twisted.web.resource import Resource\n10: from twisted.web.server import NOT_DONE_YET\n11: from twisted.python import log\n12: \n13: from .qtutils import QNetworkRequest, to_py"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "slyd/slyd/splash/ferry.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "654049484020d3b5c5868d4be4c21431397214cf",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/commit/654049484020d3b5c5868d4be4c21431397214cf",
+          "message": "initial commit for portia-dashboard\n\nAuthor:    siegfried415 <wang.yong@neusoft.com>",
+          "author": "siegfried415",
+          "date": "2018-01-20T08:43:33Z"
+        },
+        {
+          "sha": "717b02c0dc03c7a6cfdb37b8b855dcba4dd7ed04",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/commit/717b02c0dc03c7a6cfdb37b8b855dcba4dd7ed04",
+          "message": "Convert splash url to unicode",
+          "author": "Ruairi Fahy",
+          "date": "2017-04-13T10:51:18Z"
+        },
+        {
+          "sha": "86b0be8314cb180c75ae412b1c580aa4e2677120",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/commit/86b0be8314cb180c75ae412b1c580aa4e2677120",
+          "message": "Merge pull request #771 from scrapinghub/block_urls_if_they_fail_to_load\n\nBlock urls if they fail to load",
+          "author": "Ruairi Fahy",
+          "date": "2017-04-05T08:08:34Z"
+        },
+        {
+          "sha": "8f6c97d67c18ee18d7f67f3a252786ea04e98b37",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/commit/8f6c97d67c18ee18d7f67f3a252786ea04e98b37",
+          "message": "Store select responses in HAR log and load proxy requests from the log",
+          "author": "Ruairi Fahy",
+          "date": "2017-03-28T10:29:18Z"
+        },
+        {
+          "sha": "e0d31f6980e4e92d777fec16e9303c3d79b45714",
+          "html_url": "https://github.com/siegfried415/portia-dashboard/commit/e0d31f6980e4e92d777fec16e9303c3d79b45714",
+          "message": "Add logic for keeping track of pages that fail to load in Portia\n\nUsing events about previous blocks and when they occurred choose appropriate\nmessage for user.",
+          "author": "Ruairi Fahy",
+          "date": "2017-03-27T14:05:00Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "sendMessage Possibly null terminated string",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "slyd/slyd/splash/ferry.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "654049484020d3b5c5868d4be4c21431397214cf",
+        "html_url": "https://github.com/siegfried415/portia-dashboard/commit/654049484020d3b5c5868d4be4c21431397214cf",
+        "message": "initial commit for portia-dashboard\n\nAuthor:    siegfried415 <wang.yong@neusoft.com>",
+        "author": "siegfried415",
+        "date": "2018-01-20T08:43:33Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

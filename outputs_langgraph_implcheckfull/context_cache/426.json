@@ -1,0 +1,379 @@
+{
+  "task_id": "426",
+  "repo_owner": "eleutherai",
+  "repo_name": "lm-evaluation-harness",
+  "file_path": "lm_eval/api/registry.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T11:10:40+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 3,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T11:11:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T11:11:12+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lm_eval/api/registry.py",
+    "original_code": "def get_metric(name):\n\n    try:\n        return METRIC_REGISTRY[name]\n    except KeyError:\n        # TODO: change this print to logging?\n        print(\n            f\"Could not find registered metric '{name}' in lm-eval, \\\nsearching in HF Evaluate library...\"\n        )\n        try:\n            metric_object = evaluate.load(name)\n            return metric_object.compute\n        except Exception:\n            eval_logger.error(\n                \"{} not found in the evaluate library!\".format(name),\n                \"Please check https://huggingface.co/evaluate-metric\",\n            )",
+    "original_signature": "def get_metric(name):",
+    "satd_comment": "# TODO: change this print to logging?",
+    "target_file": {
+      "ok": true,
+      "path": "lm_eval/api/registry.py",
+      "sha": "0c66c9ca04ab2509ecb0a74baa766c9e34ff27e5",
+      "download_url": "https://raw.githubusercontent.com/EleutherAI/lm-evaluation-harness/main/lm_eval/api/registry.py",
+      "content_excerpt": "\"\"\"Registry system for lm_eval components.\n\nThis module provides a centralized registration system for models, tasks, metrics,\nfilters, and other components in the lm_eval framework.\n\n## Usage Examples\n\n### Registering a Model\n```python\nfrom lm_eval.api.registry import register_model\nfrom lm_eval.api.model import LM\n\n@register_model(\"my-model\")\nclass MyModel(LM):\n    def __init__(self, **kwargs):\n        ...\n```\n\n### Registering with Lazy Loading\n```python\n# Register without importing the actual implementation\nmodel_registry.register(\"lazy-model\", target=\"my_package.models: LazyModel\")\n```\n\n### Looking up Components\n```python\nfrom lm_eval.api.registry import get_model\n\n# Get a model class\nmodel_cls = get_model(\"gpt-j\")\nmodel = model_cls(**config)\n```\n\"\"\"\n\nfrom __future__ import annotations\n\nimport importlib\nimport importlib.metadata as md\nimport inspect\nimport logging\nimport threading\nfrom collections.abc import Callable\nfrom functools import lru_cache\nfrom types import MappingProxyType\nfrom typing import TYPE_CHECKING, Any, Generic, TypeVar, cast, overload\n\n\neval_logger = logging.getLogger(__name__)\n\n\nif TYPE_CHECKING:\n    from collections.abc import Callable, Iterable\n\n    from lm_eval.api.filter import Filter\n    from lm_eval.api.model import LM\n\n\n__all__ = [\n    # Core registry class\n    \"Registry\",\n    # Registry instances\n    \"model_registry\",\n    \"filter_registry\",\n    \"aggregation_registry\",\n    \"metric_registry\",\n    \"metric_agg_registry\",\n    \"higher_is_better_registry\",\n    \"freeze_all\",\n    # Helper functions\n    \"register_model\",\n    \"get_model\",\n    \"register_metric\",\n    \"get_metric\",\n    \"register_aggregation\",\n    \"get_aggregation\",\n    \"get_metric_aggregation\",\n    \"is_higher_better\",\n    \"register_filter\",\n    \"get_filter\",\n    # Backward compat aliases (point to Registry instances)\n    \"MODEL_REGISTRY\",\n    \"FILTER_REGISTRY\",\n    \"METRIC_REGISTRY\",\n    \"METRIC_AGGREGATION_REGISTRY\",\n    \"AGGREGATION_REGISTRY\",\n    \"HIGHER_IS_BETTER_REGISTRY\",\n    # Default metric configuration\n    \"DEFAULT_METRIC_REGISTRY\",\n]\n\n\nT = TypeVar(\"T\")\nD = TypeVar(\"D\")\nPlaceholder = str | md.EntryPoint\n\n# Sentinel for distinguishing \"no default\" from \"default=None\"\n_MISSING: Any = object()\n\n\n@lru_cache(maxsize=16)\ndef _materialise_placeholder(ph: Placeholder) -> Any:\n    \"\"\"Materialize a lazy placeholder into the actual object.\n\n    This is at module level to avoid memory leaks from lru_cache on instance methods.\n\n    Args:\n        ph: Either a string path \"module:object\" or an EntryPoint instance\n\n    Returns:\n        The loaded object\n\n    Raises:\n        ValueError: If the string format is invalid\n        ImportError: If the module cannot be imported\n        AttributeError: If the object doesn't exist in the module\n    \"\"\"\n    if isinstance(ph, str):\n        mod, _, attr = ph.partition(\":\")\n        if not attr:\n            raise ValueError(f\"Invalid lazy path '{ph}', expected 'module:object'\")\n        return getattr(importlib.import_module(mod), attr)\n    return ph.load()\n\n\ndef _suggest_similar(\n    query: str, options: Iterable[str], max_suggestions: int = 3\n) -> list[str]:\n    \"\"\"Return similar option names using prefix/substring matching.\"\"\"\n    query_lower = query.lower()\n    suggestions = []\n    for opt in options:\n        opt_lower = opt.lower()\n        if query_lower in opt_lower or (\n            len(query_lower) >= 3 and opt_lower.startswith(query_lower[:3])\n        ):\n            suggestions.append(opt)\n            if len(suggestions) >= max_suggestions:\n                break\n    return suggestions\n\n\ndef _build_key_error_msg(name: str, alias: str, keys: Iterable[str]) -> str:\n    \"\"\"Build a helpful KeyError message with suggestions.\"\"\"\n    suggestions = _suggest_similar(alias, keys)\n    available = sorted(keys)\n\n    msg = f\"Unknown {name} '{alias}'.\"\n    if suggestions:\n        msg += f\" Did you mean: {', '.join(suggestions)}?\"\n    msg += f\"\\nAvailable: {', '.join(available[:20])}\"\n    if len(available) > 20:\n        msg += f\"... ({len(available)} total)\"\n    return msg\n\n\nclass Registry(Generic[T]):\n    \"\"\"Thread-safe dict mapping string aliases to objects or lazy placeholders.\n\n    Lazy placeholders (\"module.path:attr\" strings or EntryPoints) are\n    materialized on first access via `get()`. Optional `base_cls` enforces\n    type constraints. Call `freeze()` to make read-only.\n    \"\"\"\n\n    def __init__(\n        self,\n        name: str,\n        *,\n        base_cls: type[T] | None = None,\n    ) -> None:\n        \"\"\"Initialize a new registry.\n\n        Args:\n            name: Human-readable name for error messages (e.g., \"model\", \"metric\")\n            base_cls: Optional base class that all registered objects must inherit from\n        \"\"\"\n        self._name = name\n        self._base_cls = base_cls\n        self._objs: dict[str, T | Placeholder] = {}\n        self._lock = threading.RLock()\n\n    # Registration (decorator or direct call) --------------------------------------\n\n    def register(\n        self,\n        *aliases: str,\n        target: T | Placeholder | None = None,\n    ) -> Callable[[T], T]:\n        \"\"\"Register an object under one or more aliases.\n\n        Can be used as a decorator or called directly for direct registration.\n\n        Args:\n            *aliases: Names to register the object under. If empty, uses object's __name__\n            target: For direct calls only - a value, placeholder string \"module:object\",\n                or EntryPoint to register under the alias\n\n        Returns:\n            Decorator function (or no-op if direct registration)\n\n        Examples:\n            >>> # As decorator\n            >>> @model_registry.register(\"name1\", \"name2\")\n            >>> class MyModel(LM):\n            ...     pass\n            >>>\n            >>> # Direct registration with a lazy placeholder\n            >>> model_registry.register(\"lazy-name\", target=\"mymodule:MyModel\")\n\n        Raises:\n            ValueError: If alias is already registered with a different target\n            TypeError: If an object doesn't inherit from base_cls (when specified)\n        \"\"\"\n\n        def _store(alias: str, target: T | Placeholder) -> None:\n            current = self._objs.get(alias)\n            # collision handling ------------------------------------------\n            if current is not None and current != target:\n                # allow placeholder → real object upgrade\n                if (\n                    isinstance(current, str)\n                    and isinstance(target, type)\n                    and current == f\"{target.__module__}:{target.__name__}\"\n                ):\n                    self._objs[alias] = target\n                    return\n                raise ValueError(\n                    f\"{self._name!r} alias '{alias}' already registered (\"\n                    f\"existing={current}, new={target})\"\n                )\n            # type check for concrete classes ----------------------------------------------\n            if (\n                self._base_cls is not None\n                and isinstance(target, type)\n                and not issubclass(target, self._base_cls)\n            ):\n                raise TypeError(\n                    f\"{target} must inherit from {self._base_cls} to be a {self._name}\"\n                )\n            self._objs[alias] = target\n\n        def decorator(obj: T) -> T:  # type: ignore[valid-type]\n            names = aliases or (getattr(obj, \"__name__\", str(obj)),)\n            with self._lock:\n                for name in names:\n                    _store(name, obj)\n            return obj\n\n        # Direct call with target value\n        if target is not None:\n            if len(aliases) != 1:\n                raise ValueError(\"Exactly one alias required when using 'target='\")\n            with self._lock:\n                _store(aliases[0], target)  # type: ignore[arg-type]\n            # return no-op decorator for accidental use\n            return lambda x: x  # type: ignore[return-value]\n\n        return decorator\n\n    # Lookup & materialisation --------------------------------------------------\n\n    def _materialise(self, ph: Placeholder) -> T:\n        \"\"\"Materialize a placeholder using the module-level cached function.\n\n        Args:\n            ph: Placeholder to materialize\n\n        Returns:\n            The materialized object, cast to type T\n        \"\"\"\n        return cast(\"T\", _materialise_placeholder(ph))\n\n    @overload\n    def get(self, alias: str) -> T: ...\n\n    @overload\n    def get(self, alias: str, default: D) -> T | D: ...\n\n    def get(self, alias: str, default: D | Any = _MISSING) -> T | D:\n        \"\"\"Retrieve an object by alias, materializing if needed.\n\n        Thread-safe lazy loading: if the alias points to a placeholder,\n        it will be loaded and cached before returning.\n\n        Args:\n            alias: The registered name to look up\n            default: Default value to return if alias not found (can be None)\n\n        Returns:\n            The registered object, or default if not found\n\n        Raises:\n            KeyError: If an alias is not found and no default provided\n            TypeError: If a materialized object doesn't match base_cls\n            ImportError/AttributeError: If lazy loading fails\n        \"\"\"\n        try:\n            target = self._objs[alias]\n        except KeyError as exc:\n            if default is not _MISSING:\n                return default\n            raise KeyError(\n                _build_key_error_msg(self._name, alias, self._objs.keys())\n            ) from exc\n\n        if isinstance(target, (str, md.EntryPoint)):\n            with self._lock:\n                # Re‑check under lock (another thread might have resolved it)\n                fresh = self._objs[alias]\n                if isinstance(fresh, (str, md.EntryPoint)):\n                    concrete = self._materialise(fresh)\n                    # Only update if not frozen (MappingProxyType)\n                    if not isinstance(self._objs, MappingProxyType):\n                        self._objs[alias] = concrete\n                else:\n                    concrete = fresh  # another thread did the job\n            target = concrete\n\n        # Late type/validator checks\n        if (\n            self._base_cls is not None\n            and isinstance(target, type)\n            and not issubclass(target, self._base_cls)\n        ):\n            raise TypeError(\n                f\"{target} does not inherit from {self._base_cls} (alias '{alias}')\"\n            ) from None\n        return target\n\n    def __getitem__(self, alias: str) -> T:\n        \"\"\"Allow dict-style access: registry[alias].\"\"\"\n        return self.get(alias)\n\n    def __contains__(self, alias: str) -> bool:\n        \"\"\"Check if alias is registered.\"\"\"\n        return alias in self._objs\n\n    def __iter__(self):\n        \"\"\"Iterate over registered aliases.\"\"\"\n        return iter(self._objs)\n\n    def __len__(self):\n        \"\"\"Return the number of registered aliases.\"\"\"\n        return len(self._objs)\n\n    def __repr__(self) -> str:\n        \"\"\"Return a detailed string representation for debugging.\"\"\"\n        materialized = sum(\n            1 for v in self._objs.values() if not isinstance(v, (str, md.EntryPoint))\n        )\n        return f\"Registry({self._name!r}, entries={len(self)}, materialized={materialized})\"\n\n    def keys(self):\n        \"\"\"Return all registered aliases.\"\"\"\n        return self._objs.keys()\n\n    def values(self):\n        \"\"\"Return all registered objects.\n\n        Note: Objects may be placeholders that haven't been materialized yet.\n        \"\"\"\n        return self._objs.values()\n\n    def items(self):\n        \"\"\"Return (alias, object) pairs.\n\n        Note: Objects may be placeholders that haven't been materialized yet.\n        \"\"\"\n        return self._objs.items()\n\n    # Utilities -------------------------------------------------------------\n\n    def origin(self, alias: str) -> str | None:\n        \"\"\"Get the source location of a registered object.\n\n        Args:\n            alias: ",
+      "total_lines": 719
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 609,
+      "end_line": 640,
+      "excerpt": "def get_metric(name: str, hf_evaluate_metric: bool = False) -> Callable | None:\n    \"\"\"Get a metric function by name.\n\n    Args:\n        name: The metric name\n        hf_evaluate_metric: If True, skip the local registry and use HF evaluate\n\n    Returns:\n        The metric compute function, or None if not found\n    \"\"\"\n    # Auto-import metrics module if registry is empty (lazy initialization)\n    if len(metric_registry) == 0:\n        import lm_eval.api.metrics  # noqa: F401\n\n    if not hf_evaluate_metric:\n        if name in metric_registry:\n            return metric_registry.get(name)\n        else:\n            eval_logger.warning(\n                f\"Could not find registered metric '{name}' in lm-eval, searching in HF Evaluate library...\"\n            )\n\n    try:\n        import evaluate as hf_evaluate\n\n        metric_object = hf_evaluate.load(name)\n        return metric_object.compute\n    except Exception:\n        eval_logger.error(\n            f\"{name} not found in the evaluate library! Please check https://huggingface.co/evaluate-metric\",\n        )\n        return None",
+      "symbol_name": "get_metric",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "lm_eval/api/registry.py",
+      "sha": "0c66c9ca04ab2509ecb0a74baa766c9e34ff27e5",
+      "download_url": "https://raw.githubusercontent.com/EleutherAI/lm-evaluation-harness/main/lm_eval/api/registry.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "importlib",
+        "importlib.metadata",
+        "inspect",
+        "logging",
+        "threading",
+        "collections.abc:Callable",
+        "functools:lru_cache",
+        "types:MappingProxyType",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Generic",
+        "typing:TypeVar",
+        "typing:cast",
+        "typing:overload",
+        "collections.abc:Callable",
+        "collections.abc:Iterable",
+        "lm_eval.api.filter:Filter",
+        "lm_eval.api.model:LM",
+        "lm_eval.api.model:LM",
+        "lm_eval.models",
+        "lm_eval.api.metrics",
+        "evaluate",
+        "lm_eval.api.metrics",
+        "lm_eval.api.metrics",
+        "lm_eval.api.metrics"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/EleutherAI/lm-evaluation-harness/main/README.md",
+      "content_excerpt": "# Language Model Evaluation Harness\n\n[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10256836.svg)](https://doi.org/10.5281/zenodo.10256836)\n\n---\n\n## Latest News 📣\n- [2025/12] **CLI refactored** with subcommands (`run`, `ls`, `validate`) and YAML config file support via `--config`. See the [CLI Reference](./docs/interface.md) and [Configuration Guide](./docs/config_files.md).\n- [2025/12] **Lighter install**: Base package no longer includes `transformers`/`torch`. Install model backends separately: `pip install lm_eval[hf]`, `lm_eval[vllm]`, etc.\n- [2025/07] Added `think_end_token` arg to `hf` (token/str), `vllm` and `sglang` (str) for stripping CoT reasoning traces from models that support it.\n- [2025/03] Added support for steering HF models!\n- [2025/02] Added [SGLang](https://docs.sglang.ai/) support!\n- [2024/09] We are prototyping allowing users of LM Evaluation Harness to create and evaluate on text+image multimodal input, text output tasks, and have just added the `hf-multimodal` and `vllm-vlm` model types and `mmmu` task as a prototype feature. We welcome users to try out this in-progress feature and stress-test it for themselves, and suggest they check out [`lmms-eval`](https://github.com/EvolvingLMMs-Lab/lmms-eval), a wonderful project originally forking off of the lm-evaluation-harness, for a broader range of multimodal tasks, models, and features.\n- [2024/07] [API model](docs/API_guide.md) support has been updated and refactored, introducing support for batched and async requests, and making it significantly easier to customize and use for your own purposes. **"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "get_metric test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_registry.py",
+          "path": "tests/test_registry.py",
+          "sha": "31e756c6de72aef5d0c1b061d5cbc2550ae35742",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/ee7e8f4fe58e13d6760c066474f0d01477317d1d/tests/test_registry.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 25,
+          "excerpt": "1: \"\"\"Tests for the registry system.\"\"\"\n2: \n3: import threading\n4: \n5: import pytest\n6: \n7: from lm_eval.api.registry import (\n8:     Registry,\n9:     aggregation_registry,\n10:     filter_registry,\n11:     get_aggregation,\n12:     get_filter,\n13:     get_metric,\n14:     get_metric_aggregation,\n15:     get_model,\n16:     higher_is_better_registry,\n17:     is_higher_better,\n18:     metric_agg_registry,\n19:     metric_registry,\n20:     model_registry,\n21:     register_aggregation,\n22:     register_filter,\n23:     register_metric,\n24: )\n25: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"get_metric(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "task.py",
+          "path": "lm_eval/api/task.py",
+          "sha": "5eb78c8a47e9596eb1a9ab4f8cf03a89c69e7ab6",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/ee7e8f4fe58e13d6760c066474f0d01477317d1d/lm_eval/api/task.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 530,
+          "end_line": 554,
+          "excerpt": "530:                 )\n531:             current_value.update(value)\n532:         else:\n533:             setattr(self._config, key, value)\n534: \n535:     def override_metric(self, metric_name: str) -> None:\n536:         \"\"\"\n537:         Override the default metrics used for evaluation with custom metrics.\n538: \n539:         Parameters:\n540:         - metric_name (str): The name of the custom metric to override. Should be registered in api.metrics.\n541:         \"\"\"\n542:         (\n543:             self._metric_fn_list,\n544:             self._aggregation_list,\n545:             self._metric_fn_kwargs,\n546:             self._higher_is_better,\n547:         ) = ({}, {}, {}, {})\n548:         self._metric_fn_list[metric_name] = get_metric(metric_name)\n549:         self._aggregation_list[metric_name] = get_metric_aggregation(metric_name)\n550:         self._higher_is_better[metric_name] = is_higher_better(metric_name)\n551:         self._metric_fn_kwargs[metric_name] = {}\n552:         if not isinstance(self, ConfigurableTask):\n553:             self.process_results = lambda x, y: {metric_name: get_metric(metric_name)}\n554:             self.aggregation = lambda: {",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "registry.py",
+          "path": "lm_eval/api/registry.py",
+          "sha": "0c66c9ca04ab2509ecb0a74baa766c9e34ff27e5",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/ee7e8f4fe58e13d6760c066474f0d01477317d1d/lm_eval/api/registry.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 609,
+          "end_line": 640,
+          "excerpt": "def get_metric(name: str, hf_evaluate_metric: bool = False) -> Callable | None:\n    \"\"\"Get a metric function by name.\n\n    Args:\n        name: The metric name\n        hf_evaluate_metric: If True, skip the local registry and use HF evaluate\n\n    Returns:\n        The metric compute function, or None if not found\n    \"\"\"\n    # Auto-import metrics module if registry is empty (lazy initialization)\n    if len(metric_registry) == 0:\n        import lm_eval.api.metrics  # noqa: F401\n\n    if not hf_evaluate_metric:\n        if name in metric_registry:\n            return metric_registry.get(name)\n        else:\n            eval_logger.warning(\n                f\"Could not find registered metric '{name}' in lm-eval, searching in HF Evaluate library...\"\n            )\n\n    try:\n        import evaluate as hf_evaluate\n\n        metric_object = hf_evaluate.load(name)\n        return metric_object.compute\n    except Exception:\n        eval_logger.error(\n            f\"{name} not found in the evaluate library! Please check https://huggingface.co/evaluate-metric\",\n        )\n        return None",
+          "symbol_name": "get_metric",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "test_registry.py",
+          "path": "tests/test_registry.py",
+          "sha": "31e756c6de72aef5d0c1b061d5cbc2550ae35742",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/ee7e8f4fe58e13d6760c066474f0d01477317d1d/tests/test_registry.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 339,
+          "end_line": 363,
+          "excerpt": "339:         def mean_agg(items):\n340:             return sum(items) / len(items)\n341: \n342:         @register_metric(\n343:             metric=\"test_metric_unique\",\n344:             higher_is_better=True,\n345:             aggregation=\"test_metric_agg\",\n346:         )\n347:         def test_metric(items):\n348:             return sum(1 for i in items if i)\n349: \n350:         assert \"test_metric_unique\" in metric_registry\n351:         assert get_metric(\"test_metric_unique\") is test_metric\n352:         assert is_higher_better(\"test_metric_unique\") is True\n353:         assert get_metric_aggregation(\"test_metric_unique\") is mean_agg\n354: \n355:     def test_builtin_metrics_loaded(self):\n356:         \"\"\"Test that built-in metrics are loaded.\"\"\"\n357:         # Import metrics module to trigger registration\n358:         from lm_eval.api import metrics  # noqa: F401\n359: \n360:         # Check some common metrics are registered\n361:         assert \"acc\" in metric_registry\n362:         assert \"mean\" in aggregation_registry\n363: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lm_eval/api",
+      "count": 10,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "lm_eval/api/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "filter.py",
+          "path": "lm_eval/api/filter.py",
+          "type": "file"
+        },
+        {
+          "name": "group.py",
+          "path": "lm_eval/api/group.py",
+          "type": "file"
+        },
+        {
+          "name": "instance.py",
+          "path": "lm_eval/api/instance.py",
+          "type": "file"
+        },
+        {
+          "name": "metrics.py",
+          "path": "lm_eval/api/metrics.py",
+          "type": "file"
+        },
+        {
+          "name": "model.py",
+          "path": "lm_eval/api/model.py",
+          "type": "file"
+        },
+        {
+          "name": "registry.py",
+          "path": "lm_eval/api/registry.py",
+          "type": "file"
+        },
+        {
+          "name": "samplers.py",
+          "path": "lm_eval/api/samplers.py",
+          "type": "file"
+        },
+        {
+          "name": "task.py",
+          "path": "lm_eval/api/task.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "lm_eval/api/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lm_eval/api/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "filter.py",
+          "path": "lm_eval/api/filter.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from abc import ABC, abstractmethod\n2: from dataclasses import dataclass\n3: from typing import Callable, Iterable, List, Union\n4: \n5: from lm_eval.api.instance import Instance\n6: \n7: \n8: class Filter(ABC):\n9:     \"\"\"\n10:     Filter classes operate on a per-task level.\n11:     They take all model outputs (`instance.resps` for all `task.instances`)\n12:     across all instances of a task, and perform operations.\n13:     In a single run, one can configure any number of separate filters or lists of filters."
+        },
+        {
+          "name": "group.py",
+          "path": "lm_eval/api/group.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Group model for organizing tasks into hierarchical collections.\n3: \n4: A Group is a container for Tasks and/or sub-Groups that can compute\n5: aggregated metrics across its members.\n6: \n7: Example:\n8:     >>> group = Group(\"mmlu\")\n9:     >>> group.add(mmlu_anatomy_task)\n10:     >>> group.add(mmlu_biology_task)\n11:     >>> all_tasks = group.get_all_tasks()  # [Task, Task]\n12: \"\"\"\n13: "
+        },
+        {
+          "name": "instance.py",
+          "path": "lm_eval/api/instance.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from dataclasses import dataclass, field\n2: from typing import Literal, Optional, Tuple\n3: \n4: \n5: OutputType = Literal[\n6:     \"loglikelihood\", \"loglikelihood_rolling\", \"generate_until\", \"multiple_choice\"\n7: ]\n8: \n9: \n10: @dataclass\n11: class Instance:\n12:     request_type: OutputType\n13:     doc: dict"
+        },
+        {
+          "name": "metrics.py",
+          "path": "lm_eval/api/metrics.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import logging\n2: import math\n3: import os\n4: import random\n5: import re\n6: import string\n7: from collections.abc import Iterable\n8: from typing import Callable, List, Optional, Sequence, TypeVar\n9: \n10: import numpy as np\n11: import sacrebleu\n12: \n13: from lm_eval.api.registry import register_aggregation, register_metric"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lm_eval/api/registry.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "69741cfd8d63e30fb777f0261a5164efee60a2b9",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/commit/69741cfd8d63e30fb777f0261a5164efee60a2b9",
+          "message": "add docstyle rule; update readme; linting",
+          "author": "Baber",
+          "date": "2025-11-27T15:06:44Z"
+        },
+        {
+          "sha": "31dce05b792c71cfd1a37088ac95ecbcb25b72f1",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/commit/31dce05b792c71cfd1a37088ac95ecbcb25b72f1",
+          "message": "import in getters, so registry is populated",
+          "author": "Baber",
+          "date": "2025-11-25T19:34:03Z"
+        },
+        {
+          "sha": "99e5953b2206e211e66dee59bb0abba64a39d3fb",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/commit/99e5953b2206e211e66dee59bb0abba64a39d3fb",
+          "message": "refactor to lazy loaded registry; add tests",
+          "author": "Baber",
+          "date": "2025-11-25T19:10:56Z"
+        },
+        {
+          "sha": "1ba35e623b9bd9ca48df926f1a028043e159a6f2",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/commit/1ba35e623b9bd9ca48df926f1a028043e159a6f2",
+          "message": "Logging (#2203)\n\n* changed source of eval_logger\n\n* allow eval_logger to be set from args\n\n* removed verbosity arg from non-main methods\n\n* fix logging\n\n* pre-commit\n\n* set verbosity in eval logger\n\n* replace utils.eval_logger\n\n* fix logging in main\n\n* add logging to docs\n\n* add logging message\n\n* n",
+          "author": "Lintang Sutawika",
+          "date": "2025-02-21T01:23:59Z"
+        },
+        {
+          "sha": "f724be699e8adf7ca8004ea0e519dfac83a06f18",
+          "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/commit/f724be699e8adf7ca8004ea0e519dfac83a06f18",
+          "message": "update pre-commit (#2632)\n\n* update pre-commit",
+          "author": "Baber Abbasi",
+          "date": "2025-01-19T01:08:55Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "get_metric TODO change this print logging",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lm_eval/api/registry.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "69741cfd8d63e30fb777f0261a5164efee60a2b9",
+        "html_url": "https://github.com/EleutherAI/lm-evaluation-harness/commit/69741cfd8d63e30fb777f0261a5164efee60a2b9",
+        "message": "add docstyle rule; update readme; linting",
+        "author": "Baber",
+        "date": "2025-11-27T15:06:44Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

@@ -1,0 +1,394 @@
+{
+  "task_id": "155",
+  "repo_owner": "justvanrossum",
+  "repo_name": "fontgoggles",
+  "file_path": "Lib/fontgoggles/mac/mainWindow.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T07:27:55+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 2,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T07:28:08+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T07:28:14+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "Lib/fontgoggles/mac/mainWindow.py",
+    "original_code": "async def _loadFont(self, fontKey, fontItem, sharableFontData, isSelectedFont):\n    fontItem.setIsLoading(True)\n    fontPath, fontNumber = fontKey\n    await self.project.loadFont(fontPath, fontNumber, sharableFontData=sharableFontData)\n    font = self.project.getFont(fontPath, fontNumber)\n    await asyncio.sleep(0)\n    fontItem.setIsLoading(False)\n    # TODO: Perhaps we need some callback after all fonts are loaded to avoid setting\n    # things like features and scripts for every single font we load.\n    self.allFeatureTagsGSUB.update(font.featuresGSUB)\n    self.allFeatureTagsGPOS.update(font.featuresGPOS)\n    self.allScriptsAndLanguages = mergeScriptsAndLanguages(self.allScriptsAndLanguages, font.scripts)\n    self.setFontItemText(fontKey, fontItem, isSelectedFont)\n    self.updateSidebarItems()",
+    "original_signature": "async def _loadFont(self, fontKey, fontItem, sharableFontData, isSelectedFont):",
+    "satd_comment": "# TODO: Perhaps we need some callback after all fonts are loaded to avoid setting\n# things like features and scripts for every single font we load.",
+    "target_file": {
+      "ok": true,
+      "path": "Lib/fontgoggles/mac/mainWindow.py",
+      "sha": "14df414ab0679cda0e56fef85a0512f7b6053fae",
+      "download_url": "https://raw.githubusercontent.com/justvanrossum/fontgoggles/master/Lib/fontgoggles/mac/mainWindow.py",
+      "content_excerpt": "import asyncio\nfrom collections import defaultdict, namedtuple\nimport contextlib\nimport io\nimport logging\nimport os\nimport pathlib\nimport time\nimport traceback\nimport unicodedata2 as unicodedata\nimport AppKit\nimport objc\nfrom vanilla import (ActionButton, CheckBox, EditText, Group, List, PopUpButton, SplitView,\n                     TextBox, TextEditor, VanillaBaseControl, Window, HorizontalLine)\nfrom vanilla.dialogs import getFile\nfrom fontTools.misc.arrayTools import offsetRect\nfrom fontgoggles.font import mergeAxes, mergeScriptsAndLanguages, mergeStylisticSetNames\nfrom fontgoggles.font.baseFont import GlyphsRun\nfrom fontgoggles.mac.aligningScrollView import AligningScrollView\nfrom fontgoggles.mac.featureTagGroup import FeatureTagGroup\nfrom fontgoggles.mac.fileObserver import getFileObserver\nfrom fontgoggles.mac.fontList import FontList, fontItemMinimumSize, fontItemMaximumSize, makeUndoProxy\nfrom fontgoggles.mac.misc import ClassNameIncrementer, makeTextCell\nfrom fontgoggles.mac.sliderGroup import SliderGroup, SliderPlus\nfrom fontgoggles.mac.vanillaTabsOld import Tabs\nfrom fontgoggles.compile.compilerPool import CompilerError\nfrom fontgoggles.misc.decorators import asyncTaskAutoCancel, suppressAndLogException\nfrom fontgoggles.misc.textInfo import TextInfo\nfrom fontgoggles.misc import opentypeTags\n\n\n# When the size of the line view needs to grow, overallocate this amount,\n# to avoid having to resize the font line group too often. In other words,\n# this value specifies some wiggle room: the font list can be a little\n# larger than strictly necessary for fitting all glyphs.\nfontListSizePadding = 120\n\n# Width of the sidebar with direction/alignment/script/language/features controls etc.\nsidebarWidth = 300\n\n\ndirectionPopUpConfig = [\n    (\"Automatic, with BiDi and Segmentation\", None),\n    (\"Automatic, w/o BiDi and Segmentation\", None),\n    (\"Left-to-Right\", \"LTR\"),\n    (\"Right-to-Left\", \"RTL\"),\n    (None, None),  # separator\n    (\"Top-to-Bottom\", \"TTB\"),\n    (\"Bottom-to-Top\", \"BTT\"),\n]\ndirectionOptions = [label for label, direction in directionPopUpConfig]\ndirectionSettings = [direction for label, direction in directionPopUpConfig]\n\nalignmentOptionsHorizontal = [\"Automatic\", \"Left\", \"Right\", \"Center\"]\nalignmentValuesHorizontal = [None, \"left\", \"right\", \"center\"]\n\nalignmentOptionsVertical = [\"Automatic\", \"Top\", \"Bottom\", \"Center\"]\nalignmentValuesVertical = [None, \"top\", \"bottom\", \"center\"]\n\nfeaVarTabLabels = [\"Features\", \"Variations\", \"Options\"]\nfeaVarTabValues = [v.lower() for v in feaVarTabLabels]\n\n\nAxisSliderInfo = namedtuple(\"AxisSliderInfo\", [\"label\", \"minValue\", \"defaultValue\", \"maxValue\", \"hidden\"])\n\n\nclass FGMainWindowController(AppKit.NSWindowController, metaclass=ClassNameIncrementer):\n\n    def __new__(cls, project):\n        return cls.alloc().init()\n\n    def __init__(self, project):\n        self.project = project\n        self.projectProxy = makeUndoProxy(self.project, self._projectFontsChanged)\n        self.observedPaths = {}\n        self._callbackRecursionLock = 0\n        self._previouslySingleSelectedItem = None\n\n        characterListGroup = self.setupCharacterListGroup()\n        glyphListGroup = self.setupGlyphListGroup()\n        fontListGroup = self.setupFontListGroup()\n        sidebarGroup = self.setupSidebarGroup()\n\n        glyphListSize = self.project.uiSettings.glyphListSize\n        paneDescriptors = [\n            dict(view=glyphListGroup, identifier=\"glyphList\", canCollapse=True,\n                 size=glyphListSize, minSize=80, resizeFlexibility=False),\n            dict(view=fontListGroup, identifier=\"fontList\", canCollapse=False,\n                 size=200, minSize=160),\n        ]\n        subSplitView = MySplitView((0, 0, 0, 0), paneDescriptors, dividerStyle=\"thin\")\n        if not self.project.uiSettings.glyphListVisible:\n            subSplitView.togglePane(\"glyphList\")\n        self.subSplitView = subSplitView\n\n        characterListSize = self.project.uiSettings.characterListSize\n        paneDescriptors = [\n            dict(view=characterListGroup, identifier=\"characterList\", canCollapse=True,\n                 size=characterListSize, minSize=98, resizeFlexibility=False),\n            dict(view=subSplitView, identifier=\"subSplit\", canCollapse=False),\n            dict(view=sidebarGroup, identifier=\"formattingOptions\", canCollapse=True,\n                 size=sidebarWidth, minSize=sidebarWidth, maxSize=sidebarWidth,\n                 resizeFlexibility=False),\n        ]\n        mainSplitView = MySplitView((0, 0, 0, 0), paneDescriptors, dividerStyle=\"thin\")\n        if not self.project.uiSettings.characterListVisible:\n            mainSplitView.togglePane(\"characterList\")\n        if not self.project.uiSettings.formattingOptionsVisible:\n            mainSplitView.togglePane(\"formattingOptions\")\n\n        self.w = Window((1400, 700), \"FontGoggles\", minSize=(900, 500), autosaveName=\"FontGogglesWindow\",\n                        fullScreenMode=\"primary\")\n        self.restoreWindowPosition(self.project.uiSettings.windowPosition)\n\n        self.w.mainSplitView = mainSplitView\n        self.w.open()\n\n        # this removes a one pixel border at the top of the list view headers\n        _tweakFrameHeight(self.glyphList._nsObject)\n        _tweakFrameHeight(self.characterList._nsObject)\n\n        self.w._window.setWindowController_(self)\n        self.w._window.makeFirstResponder_(fontListGroup.textEntry.nsTextView)\n        self.setWindow_(self.w._window)\n\n        self.textEntry.set(self.project.textSettings.text)\n        self.textEntryChangedCallback(self.textEntry)\n        self.w.bind(\"close\", self._windowCloseCallback)\n        self.updateFileObservers()\n        self.loadFonts(shouldRestoreSettings=True)\n\n    @objc.python_method\n    @suppressAndLogException\n    def _windowCloseCallback(self, sender):\n        obs = getFileObserver()\n        for path in self.observedPaths:\n            obs.removeObserver(path, self._fileChanged)\n        self.__dict__.clear()\n\n    def windowTitleForDocumentDisplayName_(self, displayName):\n        return f\"FontGoggles — {displayName}\"\n\n    @suppressAndLogException\n    def syncUISettingsWithProject(self):\n        # Called by FGDocument just before save\n        textSettings = self.project.textSettings\n        uiSettings = self.project.uiSettings\n\n        textSettings.text = self.textEntry.get()\n        textSettings.textFilePath = self.textEntry.textFilePath\n        textSettings.textFileIndex = self.textEntry.textFileIndex\n\n        (x, y), (w, h) = self.w._window.frame()\n        uiSettings.windowPosition = [x, y, w, h]\n        uiSettings.fontListItemSize = self.fontList.itemSize\n        uiSettings.fontListShowFontFileName = self.fontList.showFontFileName\n        uiSettings.fontListShowMetrics = self.fontList.showMetrics\n        uiSettings.fontListShowBaseline = self.fontList.showBaseline\n\n        uiSettings.characterListVisible = self.w.mainSplitView.isPaneReallyVisible(\"characterList\")\n        uiSettings.characterListSize = self.w.mainSplitView.paneSize(\"characterList\")\n        uiSettings.glyphListVisible = self.subSplitView.isPaneReallyVisible(\"glyphList\")\n        uiSettings.glyphListSize = self.subSplitView.paneSize(\"glyphList\")\n        uiSettings.compileOutputVisible = self.fontListSplitView.isPaneReallyVisible(\"compileOutput\")\n        uiSettings.compileOutputSize = self.fontListSplitView.paneSize(\"compileOutput\")\n        uiSettings.formattingOptionsVisible = self.w.mainSplitView.isPaneReallyVisible(\"formattingOptions\")\n        uiSettings.feaVarTabSelection = feaVarTabValues[self.feaVarTabs.get()]\n        uiSettings.showHiddenAxes = self.variationsGroup.showHiddenAxes\n\n    @objc.python_method\n    def restoreWindowPosition(self, windowPosition):\n        if not windowPosition:\n            return\n        window = self.w._window\n        x, y, w, h = windowPosition\n        window.setFrame_display_(((x, y), (w, h)), False)\n        sw, sh = window.screen().visibleFrame().size\n        w = min(w, sw)\n        h = min(h, sh)\n        window.setFrame_display_(((x, y), (w, h)), True)\n\n    @objc.python_method\n    def setupCharacterListGroup(self):\n        group = Group((0, 0, 0, 0))\n        columnDescriptions = [\n            dict(title=\"char\", width=30, typingSensitive=True, cell=makeTextCell(\"center\")),\n            dict(title=\"unicode\", width=63, cell=makeTextCell(\"right\")),\n            dict(title=\"unicode name\", width=200, minWidth=200, maxWidth=400, key=\"unicodeName\",\n                 cell=makeTextCell(\"left\", \"truncmiddle\")),\n            dict(title=\"script\", width=50),\n            dict(title=\"dir.\", key=\"dir\", width=36),\n            dict(title=\"bidi lvl.\", key=\"bidiLevel\", width=40, cell=makeTextCell(\"right\")),\n            dict(title=\"index\", width=36, cell=makeTextCell(\"right\")),\n        ]\n        self.characterList = List((0, 0, 0, 0), [],\n                                  columnDescriptions=columnDescriptions,\n                                  allowsSorting=False, drawFocusRing=False, rowHeight=20,\n                                  selectionCallback=self.characterListSelectionChangedCallback)\n        self.characterList._tableView.setAllowsColumnSelection_(True)\n        self.characterList._tableView.setDelegate_(self)\n        self.characterList._nsObject.setBorderType_(AppKit.NSNoBorder)\n        if hasattr(AppKit, \"NSTableViewStylePlain\") and hasattr(self.characterList.getNSTableView(), \"setStyle_\"):\n            self.characterList.getNSTableView().setStyle_(AppKit.NSTableViewStylePlain)\n            self.characterList.getNSTableView().setIntercellSpacing_((3, 2))\n        group.characterList = self.characterList\n        return group\n\n    @objc.python_method\n    def setupGlyphListGroup(self):\n        group = Group((0, 0, 0, 0))\n        columnDescriptions = [\n            # dict(title=\"index\", width=34, cell=makeTextCell(\"right\")),\n            dict(title=\"glyph\", key=\"name\", width=80, minWidth=80, maxWidth=200,\n                 typingSensitive=True, cell=makeTextCell(\"left\", lineBreakMode=\"truncmiddle\")),\n            # \"adv\" is \"ax\" or \"ay\", depending on whether we are in vertical layout mode or not:\n            dict(title=\"adv\", key=\"adv\", width=45, cell=makeTextCell(\"right\")),\n            dict(title=\"∆X\", key=\"dx\", width=45, cell=makeTextCell(\"right\")),\n            dict(title=\"∆Y\", key=\"dy\", width=45, cell=makeTextCell(\"right\")),\n            dict(title=\"cluster\", width=40, cell=makeTextCell(\"right\")),\n            dict(title=\"gid\", width=40, cell=makeTextCell(\"right\")),\n            # dummy filler column so \"glyph\" doesn't get to wide:\n            dict(title=\"\", key=\"_dummy_\", minWidth=0, maxWidth=1400),\n        ]\n        self.glyphList = List((0, 0, 0, 0), [],\n                              columnDescriptions=columnDescriptions,\n                              allowsSorting=False, drawFocusRing=False,\n                              rowHeight=20,\n                              selectionCallback=self.glyphListSelectionChangedCallback)\n        self.glyphList._tableView.setAllowsColumnSelection_(True)\n        self.glyphList._tableView.setDelegate_(self)\n        self.glyphList._nsObject.setBorderType_(AppKit.NSNoBorder)\n        if hasattr(AppKit, \"NSTableViewStylePlain\") and hasattr(self.glyphList.getNSTableView(), \"setStyle_\"):\n            self.glyphList.getNSTableView().setStyle_(AppKit.NSTableViewStylePlain)\n            self.glyphList.getNSTableView().setIntercellSpacing_((3, 2))\n        group.glyphList = self.glyphList\n        return group\n\n    @objc.python_method\n    def setupFontListGroup(self):\n        group = Group((0, 0, 0, 0))\n        textFilePath = self.project.textSettings.textFilePath\n        textFileIndex = self.project.textSettings.textFileIndex\n        if textFilePath and not os.path.exists(textFilePath):\n            print(\"text file not found:\", textFilePath)\n            textFilePath = None\n        self.textEntry = TextEntryGroup((0, 0, 0, 40), textFilePath=textFilePath,\n                                        callback=self.textEntryChangedCallback)\n        ",
+      "total_lines": 1436
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 511,
+      "end_line": 537,
+      "excerpt": "    async def _loadFont(self, fontItemInfo, fontItem):\n        fontItem.setIsLoading(True)\n        try:\n            try:\n                fontItem.clearCompileOutput()\n                await fontItemInfo.load(outputWriter=fontItem.writeCompileOutput)\n                externalFiles = fontItemInfo.font.getExternalFiles()\n                if externalFiles:\n                    self.addExternalFileObservers(externalFiles, fontItemInfo)\n                await asyncio.sleep(0)\n            finally:\n                fontItem.setIsLoading(False)\n        except CompilerError as e:\n            fontItemInfo.unload()  # ensure we start with a clean slate next time\n            fontItem.glyphs = GlyphsRun(0, 1000, False)\n            fontItem.writeCompileOutput(f\"{e!r}\\n\")\n        except asyncio.CancelledError:\n            fontItemInfo.unload()  # ensure we start with a clean slate next time\n            raise\n        except Exception:\n            fontItemInfo.unload()  # ensure we start with a clean slate next time\n            fontItem.glyphs = GlyphsRun(0, 1000, False)\n            fontItem.writeCompileOutput(traceback.format_exc())\n        else:\n            self.setFontItemText(fontItemInfo, fontItem)\n            self.growFontListFromItem(fontItem)\n            fontItem.setFontKey(fontItemInfo.fontKey, fontItemInfo.font.nameInCollection)",
+      "symbol_name": "_loadFont",
+      "symbol_type": "AsyncFunctionDef",
+      "ok": true,
+      "path": "Lib/fontgoggles/mac/mainWindow.py",
+      "sha": "14df414ab0679cda0e56fef85a0512f7b6053fae",
+      "download_url": "https://raw.githubusercontent.com/justvanrossum/fontgoggles/master/Lib/fontgoggles/mac/mainWindow.py"
+    },
+    "imports": {
+      "imports": [
+        "asyncio",
+        "collections:defaultdict",
+        "collections:namedtuple",
+        "contextlib",
+        "io",
+        "logging",
+        "os",
+        "pathlib",
+        "time",
+        "traceback",
+        "unicodedata2",
+        "AppKit",
+        "objc",
+        "vanilla:ActionButton",
+        "vanilla:CheckBox",
+        "vanilla:EditText",
+        "vanilla:Group",
+        "vanilla:List",
+        "vanilla:PopUpButton",
+        "vanilla:SplitView",
+        "vanilla:TextBox",
+        "vanilla:TextEditor",
+        "vanilla:VanillaBaseControl",
+        "vanilla:Window",
+        "vanilla:HorizontalLine",
+        "vanilla.dialogs:getFile",
+        "fontTools.misc.arrayTools:offsetRect",
+        "fontgoggles.font:mergeAxes",
+        "fontgoggles.font:mergeScriptsAndLanguages",
+        "fontgoggles.font:mergeStylisticSetNames"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/justvanrossum/fontgoggles/master/README.md",
+      "content_excerpt": "![FontGoggles Icon](docs/images/icon.png)\n\n# FontGoggles\n\n_Interactive Previewing and Comparing_\n\nFor end-user documentation see [fontgoggles.org](https://fontgoggles.org/).\n\nThe lastest release can be downloaded [here](https://github.com/justvanrossum/fontgoggles/releases/latest).\n\nFontGoggles was funded by [Google Fonts](https://fonts.google.com/).\n\n## Brief description\n\nFontGoggles is a font viewer desktop app for macOS that supports these file formats:\n\n- `.otf`, `.ttf`, `.otc`, `.ttc`, `.woff`, `.woff2`\n- `.ufo`\n- `.designspace`\n- `.ttx`\n\nIt uses HarfBuzz for line layout, so it supports complex scripts. The source formats are partially compiled on the fly, so their line layout and variation behaviour can be realistically previewed.\n\nWhen a font file changes on disk, FontGoggles will automatically reload it and show the updated version.\n\n## Build instructions\n\nIf you want to build and run the app from the source, follow these instructions.\n\n- Make sure you have Python 3.10 or up installed, preferably from python.org, but homebrew may work, too.\n\n- Clone this repository.\n\n- `cd` into the repository folder.\n\n- Setup a virtual environment:\n\n\t`$ python3 -m venv venv --prompt=fontgoggles`\n\n- Activate the environment:\n\n\t`$ source venv/bin/activate`\n\n- Update `pip`:\n\n\t`$ pip install --upgrade pip`\n\n- Install dependencies:\n\n\t`$ pip install -r requirements.txt`\n\n- Install dev dependencies:\n\n\t`$ pip install -r requirements-dev.txt`\n\n- Install our lib:\n\n\t`$ pip install .`\n\n- Or, if you prefer an editable install of our lib:\n\n\t```\n\t$ pip install -e .\n\t$ ./Turbo/build_lib.sh\n\t```\n\n "
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_loadFont test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_project.py",
+          "path": "Tests/test_project.py",
+          "sha": "f18f4592992c0142e50cc1b98192f301d01cc808",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/blob/98984927fbc3ec478d453c49709d03b818db826a/Tests/test_project.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 21,
+          "excerpt": "1: import pathlib\n2: import pytest\n3: from fontgoggles.font import iterFontNumbers\n4: from fontgoggles.project import Project\n5: from testSupport import getFontPath\n6: \n7: \n8: @pytest.mark.asyncio\n9: async def test_project_loadFonts():\n10:     pr = Project()\n11:     fontPath = getFontPath(\"IBMPlexSans-Regular.ttf\")\n12:     pr.addFont(fontPath, 0)\n13:     fii = pr.fonts[0]\n14:     assert fii.font is None\n15:     await pr.loadFonts()\n16:     fii = pr.fonts[0]\n17:     assert fii.font.axes == {}  # simple check to see if we have a font at all\n18: \n19: \n20: @pytest.mark.asyncio\n21: async def test_project_loadFont():",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_loadFont(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "mainWindow.py",
+          "path": "Lib/fontgoggles/mac/mainWindow.py",
+          "sha": "14df414ab0679cda0e56fef85a0512f7b6053fae",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/blob/98984927fbc3ec478d453c49709d03b818db826a/Lib/fontgoggles/mac/mainWindow.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 511,
+          "end_line": 537,
+          "excerpt": "    async def _loadFont(self, fontItemInfo, fontItem):\n        fontItem.setIsLoading(True)\n        try:\n            try:\n                fontItem.clearCompileOutput()\n                await fontItemInfo.load(outputWriter=fontItem.writeCompileOutput)\n                externalFiles = fontItemInfo.font.getExternalFiles()\n                if externalFiles:\n                    self.addExternalFileObservers(externalFiles, fontItemInfo)\n                await asyncio.sleep(0)\n            finally:\n                fontItem.setIsLoading(False)\n        except CompilerError as e:\n            fontItemInfo.unload()  # ensure we start with a clean slate next time\n            fontItem.glyphs = GlyphsRun(0, 1000, False)\n            fontItem.writeCompileOutput(f\"{e!r}\\n\")\n        except asyncio.CancelledError:\n            fontItemInfo.unload()  # ensure we start with a clean slate next time\n            raise\n        except Exception:\n            fontItemInfo.unload()  # ensure we start with a clean slate next time\n            fontItem.glyphs = GlyphsRun(0, 1000, False)\n            fontItem.writeCompileOutput(traceback.format_exc())\n        else:\n            self.setFontItemText(fontItemInfo, fontItem)\n            self.growFontListFromItem(fontItem)\n            fontItem.setFontKey(fontItemInfo.fontKey, fontItemInfo.font.nameInCollection)",
+          "symbol_name": "_loadFont",
+          "symbol_type": "AsyncFunctionDef"
+        },
+        {
+          "name": "test_project.py",
+          "path": "Tests/test_project.py",
+          "sha": "f18f4592992c0142e50cc1b98192f301d01cc808",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/blob/98984927fbc3ec478d453c49709d03b818db826a/Tests/test_project.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 9,
+          "end_line": 33,
+          "excerpt": "9: async def test_project_loadFonts():\n10:     pr = Project()\n11:     fontPath = getFontPath(\"IBMPlexSans-Regular.ttf\")\n12:     pr.addFont(fontPath, 0)\n13:     fii = pr.fonts[0]\n14:     assert fii.font is None\n15:     await pr.loadFonts()\n16:     fii = pr.fonts[0]\n17:     assert fii.font.axes == {}  # simple check to see if we have a font at all\n18: \n19: \n20: @pytest.mark.asyncio\n21: async def test_project_loadFont():\n22:     pr = Project()\n23:     fontPath = getFontPath(\"IBMPlexSans-Regular.ttf\")\n24:     pr.addFont(fontPath, 0)\n25:     await pr.fonts[0].load()\n26:     with pytest.raises(TypeError):\n27:         pr.addFont(\"a string\", 0)\n28:     fii = pr.fonts[0]\n29:     assert fii.font.axes == {}  # simple check to see if we have a font at all\n30: \n31: \n32: @pytest.mark.asyncio\n33: async def test_project_purgeFonts():",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "Lib/fontgoggles/mac",
+      "count": 15,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "Lib/fontgoggles/mac/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aligningScrollView.py",
+          "path": "Lib/fontgoggles/mac/aligningScrollView.py",
+          "type": "file"
+        },
+        {
+          "name": "appDelegate.py",
+          "path": "Lib/fontgoggles/mac/appDelegate.py",
+          "type": "file"
+        },
+        {
+          "name": "document.py",
+          "path": "Lib/fontgoggles/mac/document.py",
+          "type": "file"
+        },
+        {
+          "name": "drawing.py",
+          "path": "Lib/fontgoggles/mac/drawing.py",
+          "type": "file"
+        },
+        {
+          "name": "featureTagGroup.py",
+          "path": "Lib/fontgoggles/mac/featureTagGroup.py",
+          "type": "file"
+        },
+        {
+          "name": "fileObserver.py",
+          "path": "Lib/fontgoggles/mac/fileObserver.py",
+          "type": "file"
+        },
+        {
+          "name": "fontList.py",
+          "path": "Lib/fontgoggles/mac/fontList.py",
+          "type": "file"
+        },
+        {
+          "name": "mainWindow.py",
+          "path": "Lib/fontgoggles/mac/mainWindow.py",
+          "type": "file"
+        },
+        {
+          "name": "makePathFromOutline.py",
+          "path": "Lib/fontgoggles/mac/makePathFromOutline.py",
+          "type": "file"
+        },
+        {
+          "name": "misc.py",
+          "path": "Lib/fontgoggles/mac/misc.py",
+          "type": "file"
+        },
+        {
+          "name": "sliderGroup.py",
+          "path": "Lib/fontgoggles/mac/sliderGroup.py",
+          "type": "file"
+        },
+        {
+          "name": "tagView.py",
+          "path": "Lib/fontgoggles/mac/tagView.py",
+          "type": "file"
+        },
+        {
+          "name": "unicodePicker.py",
+          "path": "Lib/fontgoggles/mac/unicodePicker.py",
+          "type": "file"
+        },
+        {
+          "name": "vanillaTabsOld.py",
+          "path": "Lib/fontgoggles/mac/vanillaTabsOld.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "Lib/fontgoggles/mac/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "aligningScrollView.py",
+          "path": "Lib/fontgoggles/mac/aligningScrollView.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import objc\n2: import AppKit\n3: import vanilla\n4: from objc import super\n5: \n6: from ..misc.properties import hookedProperty\n7: \n8: \n9: class AligningScrollView(vanilla.ScrollView):\n10: \n11:     \"\"\"ScrollView aligning its document view according to the `hAlign` and `vAlign`\n12:     parameters.\n13: "
+        },
+        {
+          "name": "appDelegate.py",
+          "path": "Lib/fontgoggles/mac/appDelegate.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import os\n2: import pathlib\n3: from AppKit import NSDocumentController\n4: from Foundation import NSObject, NSURL\n5: from vanilla.dialogs import getFile\n6: from ..font import sniffFontType, fileTypes\n7: from ..misc.decorators import suppressAndLogException\n8: from .document import FGDocument\n9: \n10: \n11: class FGAppDelegate(NSObject):\n12: \n13:     filesToOpen = None"
+        },
+        {
+          "name": "document.py",
+          "path": "Lib/fontgoggles/mac/document.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import pathlib\n2: import AppKit\n3: from objc import super\n4: \n5: from ..project import Project\n6: from .mainWindow import FGMainWindowController\n7: from ..font import defaultSortSpec, sortedFontPathsAndNumbers\n8: \n9: \n10: class FGDocument(AppKit.NSDocument):\n11: \n12:     def __new__(cls):\n13:         return cls.alloc().init()"
+        },
+        {
+          "name": "drawing.py",
+          "path": "Lib/fontgoggles/mac/drawing.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import contextlib\n2: import AppKit\n3: \n4: \n5: __all__ = [\"scale\", \"translate\", \"savedState\", \"nsRectFromRect\", \"rectFromNSRect\"]\n6: \n7: \n8: def scale(scaleX, scaleY=None):\n9:     t = AppKit.NSAffineTransform.alloc().init()\n10:     if scaleY is None:\n11:         t.scaleBy_(scaleX)\n12:     else:\n13:         t.scaleXBy_yBy_(scaleX, scaleY)"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "Lib/fontgoggles/mac/mainWindow.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "579e65ea6de377c1bd8d3f418dec370130aa8e43",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/commit/579e65ea6de377c1bd8d3f418dec370130aa8e43",
+          "message": "Apply review comments",
+          "author": "Khaled Hosny",
+          "date": "2026-01-10T17:51:02Z"
+        },
+        {
+          "sha": "77f7816ba50ecb3075c782573c163339a064b1da",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/commit/77f7816ba50ecb3075c782573c163339a064b1da",
+          "message": "Allow showing baseline separate from font metrics\n\nI often want to see the baseline to check glyph’s vertical displacement,\nbut showing the rest of the metrics makes the view a bit noisy and\ndistracting.\n\nI tried completely separating showing the baseline from font metrics,\nbut the metrics looked od",
+          "author": "Khaled Hosny",
+          "date": "2026-01-10T12:32:25Z"
+        },
+        {
+          "sha": "3f66f4ad7190843f5012b78779d4ec92f0c15508",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/commit/3f66f4ad7190843f5012b78779d4ec92f0c15508",
+          "message": "This method must *not* be a python_method",
+          "author": "Just van Rossum",
+          "date": "2026-01-10T18:47:30Z"
+        },
+        {
+          "sha": "e8cc65a8eaad7632f9d77750948e56072d944510",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/commit/e8cc65a8eaad7632f9d77750948e56072d944510",
+          "message": "Hook it up to a menu toggle",
+          "author": "Simon Cozens",
+          "date": "2022-03-03T12:26:23Z"
+        },
+        {
+          "sha": "9eb7b22244429c9361743e9a810d48ac40123c19",
+          "html_url": "https://github.com/justvanrossum/fontgoggles/commit/9eb7b22244429c9361743e9a810d48ac40123c19",
+          "message": "Use old version of vanillaTabs to work around broken layout on macOS 10.10",
+          "author": "Just van Rossum",
+          "date": "2024-05-25T15:17:00Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_loadFont TODO Perhaps need some callback",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "Lib/fontgoggles/mac/mainWindow.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "579e65ea6de377c1bd8d3f418dec370130aa8e43",
+        "html_url": "https://github.com/justvanrossum/fontgoggles/commit/579e65ea6de377c1bd8d3f418dec370130aa8e43",
+        "message": "Apply review comments",
+        "author": "Khaled Hosny",
+        "date": "2026-01-10T17:51:02Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

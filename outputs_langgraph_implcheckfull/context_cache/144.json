@@ -1,0 +1,537 @@
+{
+  "task_id": "144",
+  "repo_owner": "lykoss",
+  "repo_name": "lykos",
+  "file_path": "src/wolfgame.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T07:22:14+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T07:22:31+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T07:22:39+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/wolfgame.py",
+    "original_code": "def replace(var, wrapper, message):\n    \"\"\"Swap out a player logged in to your account.\"\"\"\n    if wrapper.source not in channels.Main.users:\n        wrapper.pm(messages[\"invalid_channel\"].format(channels.Main))\n        return\n\n    if wrapper.source in get_players():\n        wrapper.pm(messages[\"already_playing\"].format(\"You\"))\n        return\n\n    if wrapper.source.account is None:\n        wrapper.pm(messages[\"not_logged_in\"])\n        return\n\n    rest = message.split()\n\n    if not rest: # bare call\n        target = None\n\n        for user in var.ALL_PLAYERS:\n            if users.equals(user.account, wrapper.source.account):\n                if user is wrapper.source or user not in get_participants():\n                    continue\n                elif target is None:\n                    target = user\n                else:\n                    wrapper.pm(messages[\"swap_notice\"].format(botconfig.CMD_CHAR))\n                    return\n\n        if target is None:\n            wrapper.pm(messages[\"account_not_playing\"])\n            return\n\n    else:\n        pl = get_participants()\n\n        target, _ = users.complete_match(rest[0], pl)\n\n        if target is None:\n            wrapper.pm(messages[\"target_not_playing\"])\n            return\n\n        if target not in pl:\n            wrapper.pm(messages[\"target_no_longer_playing\" if target.nick in var.DEAD else \"target_not_playing\"]) # FIXME: Need to fix once var.DEAD holds User instances\n            return\n\n        if target.account is None:\n            wrapper.pm(messages[\"target_not_logged_in\"])\n            return\n\n    if users.equals(target.account, wrapper.source.account) and target is not wrapper.source:\n        rename_player(var, wrapper.source, target.nick)\n        target.swap(wrapper.source)\n        if var.PHASE in var.GAME_PHASES:\n            return_to_village(var, target, show_message=False)\n\n        if not var.DEVOICE_DURING_NIGHT or var.PHASE != \"night\":\n            channels.Main.mode((\"-v\", target), (\"+v\", wrapper.source))\n\n        channels.Main.send(messages[\"player_swap\"].format(wrapper.source, target))\n        if var.PHASE in var.GAME_PHASES:\n            myrole.func(var, wrapper, \"\")",
+    "original_signature": "def replace(var, wrapper, message):",
+    "satd_comment": "# FIXME: Need to fix once var.DEAD holds User instances",
+    "target_file": {
+      "ok": true,
+      "path": "src/wolfgame.py",
+      "sha": "ad94c5a975958d7579490b8baab63f4488291e1f",
+      "download_url": "https://raw.githubusercontent.com/lykoss/lykos/master/src/wolfgame.py",
+      "content_excerpt": "# Copyright (c) 2011, Jimmy Cao All rights reserved.\n#\n# Redistribution and use in source and binary forms, with or without\n# modification, are permitted provided that the following conditions are met:\n#\n# Redistributions of source code must retain the above copyright notice, this\n# list of conditions and the following disclaimer.  Redistributions in binary\n# form must reproduce the above copyright notice, this list of conditions and\n# the following disclaimer in the documentation and/or other materials provided\n# with the distribution.  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS\n# AND CONTRIBUTORS \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING,\n# BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR\n# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER\n# OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,\n# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,\n# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;\n# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,\n# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR\n# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF\n# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n\nfrom __future__ import annotations\n\nimport itertools\nimport json\nimport logging\nimport os\nimport re\nimport signal\nimport socket\nimport subprocess\nimport sys\nimport urllib.request\nimport urllib.error\n\nfrom collections import Counter, defaultdict\nfrom datetime import datetime\nfrom typing import Optional\n\nimport src\nfrom src import db, config, locks, dispatcher, channels, users, hooks, handler, trans, reaper, context, relay, votes\nfrom src.channels import Channel\nfrom src.users import User\nfrom src.random import random\n\nfrom src.events import Event, EventListener, event_listener\nfrom src.transport.irc import get_ircd\nfrom src.decorators import command, hook, COMMANDS\nfrom src.dispatcher import MessageDispatcher\nfrom src.gamestate import GameState, PregameState\nfrom src.gamemodes import GameMode\nfrom src.messages import messages, LocalMode\nfrom src.warnings import expire_tempbans\nfrom src.context import IRCContext\nfrom src.status import add_dying, kill_players\nfrom src.votes import chk_decision\nfrom src.trans import chk_win, chk_nightdone, reset, stop_game\nfrom src.cats import Hidden, role_order\n\nfrom src.functions import (\n    get_players, get_all_players, get_participants,\n    get_main_role, get_reveal_role, get_all_roles,\n    match_role, match_mode\n   )\n\n# dummy line just to make the src import not unused; having src in scope is useful for !eval and !exec\nassert src is not None\n\ndef connect_callback():\n    db.init_vars()\n    SIGUSR1 = getattr(signal, \"SIGUSR1\", None)\n    SIGUSR2 = getattr(signal, \"SIGUSR2\", None)\n\n    def sighandler(signum, frame):\n        wrapper = dispatcher.MessageDispatcher(users.FakeUser.from_nick(\"<console>\"), channels.Main)\n        if signum == signal.SIGINT:\n            # Exit immediately if Ctrl-C is pressed twice\n            signal.signal(signal.SIGINT, signal.SIG_DFL)\n\n        if signum in (signal.SIGINT, signal.SIGTERM):\n            forced_exit.func(wrapper, \"\")\n        elif signum == SIGUSR1:\n            restart_program.func(wrapper, \"\")\n        elif signum == SIGUSR2:\n            logging.getLogger(\"general\").info(\"Scheduling aftergame restart\")\n            aftergame.func(wrapper, \"frestart\")\n\n    signal.signal(signal.SIGINT, sighandler)\n    signal.signal(signal.SIGTERM, sighandler)\n\n    if SIGUSR1:\n        signal.signal(SIGUSR1, sighandler)\n\n    if SIGUSR2:\n        signal.signal(SIGUSR2, sighandler)\n\n    def who_end(event, request):\n        if request is channels.Main:\n            # Devoice all on connect\n            mode = hooks.Features[\"PREFIX\"][\"+\"]\n            pending = []\n            for user in channels.Main.modes.get(mode, ()):\n                pending.append((\"-\" + mode, user))\n            accumulator.send(pending)\n            next(accumulator, None)\n\n            # Expire tempbans\n            expire_tempbans()\n\n            players = db.get_pre_restart_state()\n            if players:\n                channels.Main.send(*players, first=\"PING! \")\n                channels.Main.send(messages[\"game_restart_cancel\"])\n\n            reset(channels.Main.game_state)\n\n            who_end_listener.remove(\"who_end\")\n\n    def end_listmode(event, chan: Channel, mode: str):\n        if chan is channels.Main and mode == get_ircd().quiet_mode:\n            pending = []\n            for quiet in chan.modes.get(mode, ()):\n                if re.search(r\"^{0}.+!\\*@\\*$\".format(get_ircd().quiet_prefix), quiet):\n                    pending.append((\"-\" + mode, quiet))\n            accumulator.send(pending)\n            next(accumulator, None)\n\n            end_listmode_listener.remove(\"end_listmode\")\n\n    def mode_change(event, actor, target):\n        if target is channels.Main: # we may or may not be opped; assume we are\n            accumulator.send((\"-m\",))\n            next(accumulator, None)\n\n            mode_change_listener.remove(\"mode_change\")\n\n    who_end_listener = EventListener(who_end)\n    who_end_listener.install(\"who_end\")\n    end_listmode_listener = EventListener(end_listmode)\n    end_listmode_listener.install(\"end_listmode\")\n    mode_change_listener = EventListener(mode_change)\n    mode_change_listener.install(\"mode_change\")\n\n    def accumulate_cmodes(count):\n        modes = []\n        for i in range(count):\n            item = yield\n            modes.extend(item)\n            yield i\n\n        if modes:\n            channels.Main.mode(*modes)\n\n    accumulator = accumulate_cmodes(3)\n    accumulator.send(None)\n\n@command(\"sync\", flag=\"m\", pm=True)\ndef fsync(wrapper: MessageDispatcher, message: str):\n    \"\"\"Makes the bot apply the currently appropriate channel modes.\"\"\"\n    sync_modes()\n\n@event_listener(\"sync_modes\")\ndef on_sync_modes(evt):\n    sync_modes()\n\ndef sync_modes():\n    game_state = channels.Main.game_state\n    voices = [None]\n    mode = hooks.Features[\"PREFIX\"][\"+\"]\n    pl = get_players(game_state) if game_state else []\n\n    for user in channels.Main.users:\n        if game_state and not config.Main.get(\"gameplay.nightchat\") and game_state.current_phase == \"night\":\n            if mode in user.channels[channels.Main]:\n                voices.append((\"-\" + mode, user))\n        elif user in pl and mode not in user.channels[channels.Main]:\n            voices.append((\"+\" + mode, user))\n        elif user not in pl and mode in user.channels[channels.Main]:\n            voices.append((\"-\" + mode, user))\n\n    if game_state and game_state.in_game:\n        voices[0] = \"+m\"\n    else:\n        voices[0] = \"-m\"\n\n    channels.Main.mode(*voices)\n\n@command(\"refreshdb\", flag=\"m\", pm=True)\ndef refreshdb(wrapper: MessageDispatcher, message: str):\n    \"\"\"Updates our tracking vars to the current db state.\"\"\"\n    db.expire_stasis()\n    db.init_vars()\n    expire_tempbans()\n    wrapper.reply(\"Done.\")\n\n@command(\"fdie\", flag=\"F\", pm=True)\ndef forced_exit(wrapper: MessageDispatcher, message: str):\n    \"\"\"Forces the bot to close.\"\"\"\n\n    var = wrapper.game_state\n\n    args = message.split()\n\n    # Force in debug mode by default\n    force = config.Main.get(\"debug.enabled\")\n\n    if args and args[0] == \"-dirty\":\n        # use as a last resort\n        os.abort()\n    elif args and args[0] == \"-force\":\n        force = True\n        message = \" \".join(args[1:])\n\n    if var:\n        if var.current_phase == \"join\" or force or wrapper.source.nick == \"<console>\":\n            stop_game(var, log=False)\n        elif var.in_game:\n            wrapper.pm(messages[\"stop_bot_ingame_safeguard\"].format(what=\"stop\", cmd=\"fdie\"))\n            return\n\n    msg = \"{0} quit from {1}\"\n\n    if message.strip():\n        msg += \" ({2})\"\n\n    hooks.quit(wrapper, msg.format(\"Scheduled\" if forced_exit.aftergame else \"Forced\",\n               wrapper.source, message.strip()))\n\ndef _restart_program(mode=None):\n    logging.getLogger(\"general\").info(\"RESTARTING\")\n\n    python = sys.executable\n\n    # FIXME: should maintain the same --config option\n    args = []\n    if (mode != \"normal\" and config.Main.get(\"debug.enabled\")) or mode == \"debug\":\n        args.append(\"--debug\")\n    os.execl(python, python, sys.argv[0], *args)\n\n@command(\"frestart\", flag=\"D\", pm=True)\ndef restart_program(wrapper: MessageDispatcher, message: str):\n    \"\"\"Restarts the bot.\"\"\"\n\n    var = wrapper.game_state\n\n    args = message.split()\n\n    # Force in debug mode by default\n    force = config.Main.get(\"debug.enabled\")\n\n    if args and args[0] == \"-force\":\n        force = True\n        message = \" \".join(args[1:])\n\n    if var:\n        if not var.in_game or force:\n            db.set_pre_restart_state(p.nick for p in get_players(var))\n            stop_game(var, log=False)\n        else:\n            wrapper.pm(messages[\"stop_bot_ingame_safeguard\"].format(what=\"restart\", cmd=\"frestart\"))\n            return\n\n    msg = \"{0} restart from {1}\".format(\n        \"Scheduled\" if restart_program.aftergame else \"Forced\", wrapper.source)\n\n    message = message.strip()\n    mode = None\n\n    if message:\n        args = message.split()\n        first_arg = args[0].lower()\n\n        if first_arg.endswith(\"mode\") and first_arg != \"mode\":\n            mode = first_arg.replace(\"mode\", \"\")\n\n            valid_modes = (\"normal\", \"debug\")\n\n            if mode not in valid_modes:\n                wrapper.pm(messages[\"invalid_restart_mode\"].format(mode, valid_modes))\n                return\n\n            msg += \" in {0} mode\".format(mode)\n            message = \" \".join(args[1:])\n\n    if message:\n        msg += \" ({0})\".format(message.strip())\n\n    hooks.quit(wrapper, msg.format(wrapper.source, message.strip()))\n\n    def restart_buffer(evt, user, reason):\n        # restart the bot once our quit message goes though to ensure entire IRC queue is sent\n        if user is users.Bot:\n            _restart_program(mode)\n\n    EventListener(restart_buffer).install(\"server_quit\")\n\n    # This is checked in the on_error handler. Some IRCds, such as InspIRCd, don't send the bot\n    # its own QUIT message, so we need to use ERROR. Ideally, we shouldn't even need the above\n    # handler now, but I'm keeping it for now just in case.\n    restart_program.restarting = True\n\nrestart_program.restarting = False\n\n@command(\"ping\", pm=True)\ndef pinger(wrapper: MessageDispatcher, message: str):\n    \"\"\"Check if you or the bot is still connected.\"\"\"\n    wrapper.reply(messages[\"ping\"].format(nick=wrapper.source, bot_nick=users.Bot))\n\n@command(\"notice\", pm=True)\ndef mark_prefer_notice(wrapper: MessageDispatcher, message: str):\n    \"\"\"Makes the bot NOTICE you for every interaction.\"\"\"\n    if wrapper.private and message:\n        # Ignore if called in PM with parameters, likely a message to wolfchat\n        # and not an intentional invocation of this command\n        return\n\n    temp = wrapper.source.lower()\n\n    account = temp.account\n\n    if not account:\n        wrapper.pm(messages[\"not_logged_in\"])\n        return\n\n    notice = wrapper.source.prefers_notice()\n    action, toggle = (db.PREFER_NOTICE.discard, \"off\") if notice else (db.PREFER_NOTICE.add, \"on\")\n\n    action(account)\n    db.toggle_notice(account)\n    # message keys used: \"notice_on\", \"notice_off\"\n    wrapper.pm(messages[\"notice_\" + toggle])\n\n@command(\"swap\", pm=True)\ndef replace(wrapper: MessageDispatcher, message: str):\n    \"\"\"Swap out a player logged in to your account.\"\"\"\n    if wrapper.source not in channels.Main.users:\n        wrapper.pm(messages[\"invalid_channel\"].format(channels.Main))\n        return\n\n    var = wrapper.game_state\n    if var is None:\n        return\n\n    pl = get_players(var)\n    if wrapper.source in pl:\n        wrapper.pm(messages[\"you_already_playing\"])\n        return\n\n    if not wrapper.source.account:\n        wrapper.pm(messages[\"not_logged_in\"])\n        return\n\n    participants = get_participants(var)\n    target: Optional[User] = None\n\n    for us",
+      "total_lines": 1522
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 334,
+      "end_line": 391,
+      "excerpt": "def replace(wrapper: MessageDispatcher, message: str):\n    \"\"\"Swap out a player logged in to your account.\"\"\"\n    if wrapper.source not in channels.Main.users:\n        wrapper.pm(messages[\"invalid_channel\"].format(channels.Main))\n        return\n\n    var = wrapper.game_state\n    if var is None:\n        return\n\n    pl = get_players(var)\n    if wrapper.source in pl:\n        wrapper.pm(messages[\"you_already_playing\"])\n        return\n\n    if not wrapper.source.account:\n        wrapper.pm(messages[\"not_logged_in\"])\n        return\n\n    participants = get_participants(var)\n    target: Optional[User] = None\n\n    for user in var.players:\n        if context.equals(user.account, wrapper.source.account):\n            if user is wrapper.source or user not in participants:\n                continue\n            elif target is None:\n                target = user\n            else:\n                wrapper.pm(messages[\"swap_notice\"])\n                return\n\n    if target is None:\n        wrapper.pm(messages[\"account_not_playing\"])\n        return\n    elif target is not wrapper.source:\n        target.swap(wrapper.source)\n        if var.in_game:\n            reaper.return_to_village(var, wrapper.source, show_message=False)\n\n        cmodes = []\n\n        if (config.Main.get(\"gameplay.nightchat\") or var.current_phase != \"night\") and target in pl:\n            cmodes += [(\"-v\", target), (\"+v\", wrapper.source)]\n\n        toggle_modes = config.Main.get(\"transports[0].channels.main.auto_mode_toggle\", ())\n        for mode in set(toggle_modes) & wrapper.source.channels[channels.Main]: # user.channels is a set of current modes\n            cmodes.append((\"-\" + mode, wrapper.source))\n            channels.Main.old_modes[wrapper.source].add(mode)\n\n        for mode in channels.Main.old_modes[target]:\n            cmodes.append((\"+\" + mode, target))\n\n        channels.Main.mode(*cmodes)\n\n        channels.Main.send(messages[\"player_swap\"].format(wrapper.source, target))\n        if var.in_game:\n            myrole.func(wrapper, \"\")",
+      "symbol_name": "replace",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "src/wolfgame.py",
+      "sha": "ad94c5a975958d7579490b8baab63f4488291e1f",
+      "download_url": "https://raw.githubusercontent.com/lykoss/lykos/master/src/wolfgame.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "itertools",
+        "json",
+        "logging",
+        "os",
+        "re",
+        "signal",
+        "socket",
+        "subprocess",
+        "sys",
+        "urllib.request",
+        "urllib.error",
+        "collections:Counter",
+        "collections:defaultdict",
+        "datetime:datetime",
+        "typing:Optional",
+        "src",
+        "src:db",
+        "src:config",
+        "src:locks",
+        "src:dispatcher",
+        "src:channels",
+        "src:users",
+        "src:hooks",
+        "src:handler",
+        "src:trans",
+        "src:reaper",
+        "src:context",
+        "src:relay",
+        "src:votes"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/lykoss/lykos/master/README.md",
+      "content_excerpt": "# Lykos, the Open-Source Werewolf bot\n\n## General information\n\n### What does Open-Source mean?\n\nOpen-Source means that the code is available for free for everyone to view, download, use, and modify. We however have a [License][license], which requires that you include it in all derivative works and other works which include lykos code.\n\n### What is Werewolf?\n\nWerewolf is a popular party game, similar to and inspired by [mafia][mafia]. In Werewolf, several players take roles as either wolves or their allies, or as villagers - some with special powers - who try to figure out who the wolves are and eliminate them before it is too late. There may also be some other players who play towards their own goals, which may or may not help any side.\n\n### Where can I play this game?\n\nWe run an instance of the bot in the [#werewolf channel][game_webchat] on Libera. Off-topic discussion happens in #werewolf-meta on the same network, and channel operators can be reached in #werewolf-ops. There are also other networks listed in the [Networks page][wikinet] of our [official wiki][wiki]. Keep in mind that, just because someone appears online, does not mean they are around or available to play.\n\n## For players\n\n### I've never played such a game before. How do I play?\n\nYou can join a new game with `!join`. There must be at least 6 players to be able to start a game. When the game is started, the bot will message you privately telling you your role, what command(s) you have access to as that role, and what your goal is. You may then send commands privately to the bot; for example `see person`. S"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "replace test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_config_merge.py",
+          "path": "test/test_config_merge.py",
+          "sha": "6ab418e00fec09c81c99a0b6ffe715b31cb05b78",
+          "html_url": "https://github.com/lykoss/lykos/blob/21beca2c4181e7bff295ed3e250f189c1fb2ed3a/test/test_config_merge.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 17,
+          "excerpt": "1: from unittest import TestCase\n2: from src.config import merge, Empty\n3: \n4: class TestConfigMerge(TestCase):\n5:     def test_merge_str_replace(self):\n6:         metadata = {\"_type\": \"str\", \"_default\": \"foo\", \"_merge\": \"replace\"}\n7:         with self.subTest(\"default fallback\"):\n8:             self.assertEqual(merge(metadata, Empty, Empty), \"foo\")\n9:         with self.subTest(\"base fallback\"):\n10:             self.assertEqual(merge(metadata, \"bar\", Empty), \"bar\")\n11:         with self.subTest(\"empty base\"):\n12:             self.assertEqual(merge(metadata, Empty, \"baz\"), \"baz\")\n13:         with self.subTest(\"non-empty base\"):\n14:             self.assertEqual(merge(metadata, \"bar\", \"baz\"), \"baz\")\n15: \n16:     def test_merge_int_replace(self):\n17:         metadata = {\"_type\": \"int\", \"_default\": 1, \"_merge\": \"replace\"}",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"replace(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "roles.py",
+          "path": "src/gamemodes/roles.py",
+          "sha": "2c0dfdd39148f5714d0537e9c67dfdc3f3cec935",
+          "html_url": "https://github.com/lykoss/lykos/blob/21beca2c4181e7bff295ed3e250f189c1fb2ed3a/src/gamemodes/roles.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 4,
+          "end_line": 28,
+          "excerpt": "4: from src.gamemodes import game_mode, GameMode, InvalidModeException\n5: from src.messages import messages\n6: from src import events, channels, users, cats, config\n7: \n8: @game_mode(\"roles\", minp=4, maxp=35)\n9: class ChangedRolesMode(GameMode):\n10:     \"\"\"Example: !fgame roles=wolf:1,seer:0,guardian angel:1\"\"\"\n11: \n12:     def __init__(self, arg=\"\"):\n13:         super().__init__(arg)\n14:         self.ROLE_GUIDE[1] = []\n15:         self.SECONDARY_ROLES = {}\n16:         arg = arg.replace(\"=\", \":\").replace(\";\", \",\")\n17: \n18:         pairs = [arg]\n19:         while pairs:\n20:             pair, *pairs = pairs[0].split(\",\", 1)\n21:             change = pair.lower().replace(\":\", \" \").strip().rsplit(None, 1)\n22:             if len(change) != 2:\n23:                 raise InvalidModeException(messages[\"invalid_mode_roles\"].format(arg))\n24:             role, num = change\n25:             try:\n26:                 if \"/\" in role:\n27:                     choose = role.split(\"/\")\n28:                     for c in choose:",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "mystics.py",
+          "path": "src/roles/helper/mystics.py",
+          "sha": "35a0c885557a978106cfbdcb8ba0295819a972f9",
+          "html_url": "https://github.com/lykoss/lykos/blob/21beca2c4181e7bff295ed3e250f189c1fb2ed3a/src/roles/helper/mystics.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 8,
+          "end_line": 32,
+          "excerpt": "8: from src.functions import get_players, get_all_players\n9: from src.messages import messages\n10: from src.gamestate import GameState\n11: from src.users import User\n12: \n13: # Generated message keys used in this file:\n14: # mystic_night_num, mystic_day_num, mystic_info,\n15: # mystic_notify, wolf_mystic_notify\n16: \n17: def register_mystic(rolename: str, *, send_role: bool, types: Iterable[str]):\n18:     LAST_COUNT: UserDict[User, list[tuple[str, int]]] = UserDict()\n19: \n20:     role = rolename.replace(\" \", \"_\")\n21: \n22:     @event_listener(\"send_role\", listener_id=\"mystics.<{}>.on_send_role\".format(rolename))\n23:     def on_send_role(evt: Event, var: GameState):\n24:         values = []\n25: \n26:         for i, t in enumerate(types):\n27:             cat = cats.get(t)\n28:             orig_players = get_players(var, cat, mainroles=var.original_main_roles)\n29:             num_players = len(get_players(var, cat))\n30:             # if the game didn't start with any of this type of role and the count is 0, hide it from the output\n31:             # for safety, we'll always display the first type listed even if there aren't any of that type\n32:             if i > 0 and num_players == 0 and not orig_players:",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "_messages.py",
+          "path": "src/messages/_messages.py",
+          "sha": "f969a21160dea5a1c0d30fe4316a7c0ed6f88ea0",
+          "html_url": "https://github.com/lykoss/lykos/blob/21beca2c4181e7bff295ed3e250f189c1fb2ed3a/src/messages/_messages.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 58,
+          "end_line": 82,
+          "excerpt": "58:         cache_key = \"role_map_\" + str(reverse) + str(remove_spaces)\n59:         if cache_key in self.cache:\n60:             return self.cache[cache_key]\n61: \n62:         plural_rules = self.messages[\"_metadata\"][\"plural\"]\n63:         plural_index = 0\n64:         for rule in plural_rules:\n65:             if rule[\"number\"] == 1 or rule[\"number\"] is None:\n66:                 plural_index = rule[\"index\"]\n67:                 break\n68: \n69:         def maybe_remove_spaces(x: str) -> str:\n70:             return x.replace(\" \", \"\") if remove_spaces else x\n71: \n72:         roles: dict[str, str] = {}\n73:         for key, role in self.messages[\"_roles\"].items():\n74:             if key.startswith(\"*\"):\n75:                 continue\n76:             internal = key\n77:             local = role[plural_index]\n78:             if reverse:\n79:                 roles[maybe_remove_spaces(local)] = internal\n80:             else:\n81:                 roles[maybe_remove_spaces(internal)] = local\n82: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "functions.py",
+          "path": "src/functions.py",
+          "sha": "ecfd2544b80287007015bdbb7af5edce7e2d5351",
+          "html_url": "https://github.com/lykoss/lykos/blob/21beca2c4181e7bff295ed3e250f189c1fb2ed3a/src/functions.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 219,
+          "end_line": 243,
+          "excerpt": "219:     :param role: Partial role to match on\n220:     :param remove_spaces: Whether to remove all spaces before matching.\n221:         This is meant for contexts where we truly cannot allow spaces somewhere; otherwise we should\n222:         prefer that the user matches including spaces where possible for friendlier-looking commands.\n223:     :param allow_extra: Whether to allow keys that are defined in the translation file but do not exist in the bot.\n224:         Typically these are roles that were previously removed.\n225:     :param allow_special: Whether to allow special keys (lover, vg activated, etc.).\n226:         If scope is set, this parameter is ignored.\n227:     :param scope: Limit matched roles to these explicitly passed-in roles (iterable of internal role names).\n228:     :return: Match object with all matches (see src.match.match_all)\n229:     \"\"\"\n230:     if remove_spaces:\n231:         role = role.replace(\" \", \"\")\n232: \n233:     role_map = messages.get_role_mapping(reverse=True, remove_spaces=remove_spaces)\n234: \n235:     special_keys: set[str] = set()\n236:     if scope is None and allow_special:\n237:         evt = Event(\"get_role_metadata\", {})\n238:         evt.dispatch(None, \"special_keys\")\n239:         special_keys = functools.reduce(lambda x, y: x | y, evt.data.values(), special_keys)\n240: \n241:     matches = match_all(role, role_map.keys())\n242: \n243:     # strip matches that don't refer to actual roles or special keys (i.e. refer to team names)",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src",
+      "count": 38,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "src/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "cats.py",
+          "path": "src/cats.py",
+          "type": "file"
+        },
+        {
+          "name": "channels.py",
+          "path": "src/channels.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "src/config.py",
+          "type": "file"
+        },
+        {
+          "name": "containers.py",
+          "path": "src/containers.py",
+          "type": "file"
+        },
+        {
+          "name": "context.py",
+          "path": "src/context.py",
+          "type": "file"
+        },
+        {
+          "name": "db",
+          "path": "src/db",
+          "type": "dir"
+        },
+        {
+          "name": "debug",
+          "path": "src/debug",
+          "type": "dir"
+        },
+        {
+          "name": "decorators.py",
+          "path": "src/decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "defaultsettings.yml",
+          "path": "src/defaultsettings.yml",
+          "type": "file"
+        },
+        {
+          "name": "dispatcher.py",
+          "path": "src/dispatcher.py",
+          "type": "file"
+        },
+        {
+          "name": "events.py",
+          "path": "src/events.py",
+          "type": "file"
+        },
+        {
+          "name": "functions.py",
+          "path": "src/functions.py",
+          "type": "file"
+        },
+        {
+          "name": "game_stats.py",
+          "path": "src/game_stats.py",
+          "type": "file"
+        },
+        {
+          "name": "gamecmds.py",
+          "path": "src/gamecmds.py",
+          "type": "file"
+        },
+        {
+          "name": "gamejoin.py",
+          "path": "src/gamejoin.py",
+          "type": "file"
+        },
+        {
+          "name": "gamemodes",
+          "path": "src/gamemodes",
+          "type": "dir"
+        },
+        {
+          "name": "gamestate.py",
+          "path": "src/gamestate.py",
+          "type": "file"
+        },
+        {
+          "name": "handler.py",
+          "path": "src/handler.py",
+          "type": "file"
+        },
+        {
+          "name": "hooks.py",
+          "path": "src/hooks.py",
+          "type": "file"
+        },
+        {
+          "name": "lineparse.py",
+          "path": "src/lineparse.py",
+          "type": "file"
+        },
+        {
+          "name": "locations.py",
+          "path": "src/locations.py",
+          "type": "file"
+        },
+        {
+          "name": "locks.py",
+          "path": "src/locks.py",
+          "type": "file"
+        },
+        {
+          "name": "logger.py",
+          "path": "src/logger.py",
+          "type": "file"
+        },
+        {
+          "name": "match.py",
+          "path": "src/match.py",
+          "type": "file"
+        },
+        {
+          "name": "messages",
+          "path": "src/messages",
+          "type": "dir"
+        },
+        {
+          "name": "pregame.py",
+          "path": "src/pregame.py",
+          "type": "file"
+        },
+        {
+          "name": "random.py",
+          "path": "src/random.py",
+          "type": "file"
+        },
+        {
+          "name": "reaper.py",
+          "path": "src/reaper.py",
+          "type": "file"
+        },
+        {
+          "name": "relay.py",
+          "path": "src/relay.py",
+          "type": "file"
+        },
+        {
+          "name": "roles",
+          "path": "src/roles",
+          "type": "dir"
+        },
+        {
+          "name": "status",
+          "path": "src/status",
+          "type": "dir"
+        },
+        {
+          "name": "trans.py",
+          "path": "src/trans.py",
+          "type": "file"
+        },
+        {
+          "name": "transport",
+          "path": "src/transport",
+          "type": "dir"
+        },
+        {
+          "name": "users.py",
+          "path": "src/users.py",
+          "type": "file"
+        },
+        {
+          "name": "votes.py",
+          "path": "src/votes.py",
+          "type": "file"
+        },
+        {
+          "name": "warnings.py",
+          "path": "src/warnings.py",
+          "type": "file"
+        },
+        {
+          "name": "wolfgame.py",
+          "path": "src/wolfgame.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Enforce a strict import ordering to ensure things are properly defined when they need to be\n2: \n3: # This \"bootstraps\" the bot in preparation for importing the bulk of the code. Some imports\n4: # change behavior based on whether or not we're in debug mode, so that must be established before\n5: # we continue on to import other files\n6: from src import config, lineparse, locks, match, random\n7: \n8: # Initialize config.Main\n9: config.init()\n10: \n11: # Initialize logging framework\n12: from src import logger\n13: logger.init()"
+        },
+        {
+          "name": "cats.py",
+          "path": "src/cats.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # role categories; roles return a subset of these categories when fetching their metadata\n2: # Wolf: Defines the role as a true wolf role (usually can kill, dies when shot, kills visiting harlots, etc.)\n3: # Wolfchat: Defines the role as having access to wolfchat (depending on gameplay.wolfchat config settings)\n4: # Wolfteam: Defines the role as wolfteam for determining winners\n5: # Vampire: Defines the role as a true vampire role (usually able to bite, access to vampire chat)\n6: # Vampire Team: Defines the role as vampire team for determining winners\n7: # Killer: Roles which can kill other roles during the game. Roles which kill upon or after death (ms, vg) don't belong in here\n8: # Village: Defines the role as village for determining winners\n9: # Nocturnal: Defines the role as being awake at night (usually due to having commands which work at night)\n10: # Neutral: Defines the role as neutral (seen as grey by augur) and not in village or wolfteam when determining winners\n11: # Win Stealer: Defines the role as a win stealer (do not win with a built-in team, vigilante can kill them without issue, etc.)\n12: # Hidden: Players with hidden roles do not know that they have that role (told they are an eligible instead, and win with that team)\n13: # Hidden Eligible: Roles that the bot can re-map players with hidden roles to. These roles should never have special powers."
+        },
+        {
+          "name": "channels.py",
+          "path": "src/channels.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: import time\n4: from enum import Enum\n5: from typing import Optional, TYPE_CHECKING\n6: from collections import defaultdict\n7: import logging\n8: \n9: from src.context import IRCContext, Features, lower\n10: from src.events import Event, EventListener\n11: from src import users, config\n12: from src.debug import CheckedSet, CheckedDict\n13: from src.users import User, BotUser"
+        },
+        {
+          "name": "config.py",
+          "path": "src/config.py",
+          "match_reason": "anchor_text",
+          "start_line": 294,
+          "end_line": 318,
+          "excerpt": "294: \n295:     ctors = metadata.get(\"_ctors\", [])\n296:     if ctors:\n297:         assert settings_type == \"dict\" and \"_default\" in metadata, f\"Path {path} defines a constructor but is not a dict with a default\"\n298:     if ctors and not isinstance(settings, dict):\n299:         for ctor in ctors:\n300:             # if a constructor fits our current data type, we'll merge that\n301:             # into the default object and return it\n302:             set_metadata = metadata[\"_default\"][ctor[\"_set\"]]\n303:             assert ctor[\"_type\"] == set_metadata[\"_type\"], f\"Path {path} constructor type doesn't match the type of value it is setting\"\n304:             try:\n305:                 value = {ctor[\"_set\"]: merge(set_metadata, Empty, settings, *path, ctor[\"_set\"])}\n306:                 return merge(metadata, base, value, *path, strategy_override=\"replace\")\n307:             except TypeError:\n308:                 continue\n309: \n310:     if settings_type == \"str\":\n311:         if settings is not Empty and not isinstance(settings, str):\n312:             raise TypeError(\"Expected type str for path '{}', got {} instead\".format(\".\".join(path), type(settings)))\n313:         # str only supports one merge type: replace\n314:         if merge_type is None:\n315:             merge_type = \"replace\"\n316:         assert merge_type in (\"replace\",)\n317: \n318:         if settings is not Empty:"
+        },
+        {
+          "name": "containers.py",
+          "path": "src/containers.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: import copy\n4: from abc import ABC, abstractmethod\n5: from typing import Dict, Generic, Iterable, List, Set, TypeVar\n6: \n7: from src.users import User\n8: \n9: __all__ = [\"UserList\", \"UserSet\", \"UserDict\", \"DefaultUserDict\"]\n10: \n11: KT = TypeVar(\"KT\")\n12: VT = TypeVar(\"VT\")\n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/wolfgame.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "a1ef679235d492e430093a06f8d411aff59895e6",
+          "html_url": "https://github.com/lykoss/lykos/commit/a1ef679235d492e430093a06f8d411aff59895e6",
+          "message": "Fix access flags checks and message-tags support\n\n- Access flag accounts are normalized to all-lowercase in db.py so\n  ensure that we normalize when checking them as well\n- We requested message-tags but oyoyo had no support for parsing them\n  and it broke everything if enabled. Fix that, and also en",
+          "author": "Ryan Schmidt",
+          "date": "2025-12-06T23:33:48Z"
+        },
+        {
+          "sha": "469ed1b6705575b57d43df5e654f8f9c9fc205ac",
+          "html_url": "https://github.com/lykoss/lykos/commit/469ed1b6705575b57d43df5e654f8f9c9fc205ac",
+          "message": "Numerous changes\n\nMessage System:\n\n- The !role conversion and !cat conversion both now accept Category\n  instances, and will convert those to the localized category name\n  according to _role_categories metadata.\n- The !role conversion accepts a string Category name (distinguished via\n  an uppercase ",
+          "author": "Ryan Schmidt",
+          "date": "2025-04-28T16:51:25Z"
+        },
+        {
+          "sha": "ef5a66dd534a3253e07ea63ffb07b8e1748443ce",
+          "html_url": "https://github.com/lykoss/lykos/commit/ef5a66dd534a3253e07ea63ffb07b8e1748443ce",
+          "message": "Update submodules when running !update\n\nThis should help bot owners who establish custom code in gamemodes/,\nroles/, or hooks/ as git submodules to ensure everything stays synced\nwith a single !update command.\n\nIf this breaks your workflow, please let us know and we can add a config\noption for this.",
+          "author": "Ryan Schmidt",
+          "date": "2025-04-04T23:23:04Z"
+        },
+        {
+          "sha": "d98363f42ad92cfac609a06ccfb1ccaa1c34d058",
+          "html_url": "https://github.com/lykoss/lykos/commit/d98363f42ad92cfac609a06ccfb1ccaa1c34d058",
+          "message": "Probably break a lot of things\n\n- Winners are now tracked internally via categories rather than plural\n  role names. A DB migration will automatically remap old entries,\n  however if playing with custom roles/modes you should ensure that\n  remapping was done properly and that the role/mode supports ",
+          "author": "Ryan Schmidt",
+          "date": "2025-04-03T23:45:10Z"
+        },
+        {
+          "sha": "4b6e4c1240a96be6162c893650e9aa9d287f8930",
+          "html_url": "https://github.com/lykoss/lykos/commit/4b6e4c1240a96be6162c893650e9aa9d287f8930",
+          "message": "Overhaul !roles\n\nRoles now properly lists the localized role names in all instances.\nAdditionally, formatting is now corrected to always output in the !stats\nrole order and to only list roles once even if they are added/removed\nmultiple times in a particular player count (the final number of that\nro",
+          "author": "Ryan Schmidt",
+          "date": "2025-04-01T18:03:34Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "replace FIXME Need once DEAD holds",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/wolfgame.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "a1ef679235d492e430093a06f8d411aff59895e6",
+        "html_url": "https://github.com/lykoss/lykos/commit/a1ef679235d492e430093a06f8d411aff59895e6",
+        "message": "Fix access flags checks and message-tags support\n\n- Access flag accounts are normalized to all-lowercase in db.py so\n  ensure that we normalize when checking them as well\n- We requested message-tags but oyoyo had no support for parsing them\n  and it broke everything if enabled. Fix that, and also en",
+        "author": "Ryan Schmidt",
+        "date": "2025-12-06T23:33:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

@@ -1,0 +1,326 @@
+{
+  "task_id": "88",
+  "repo_owner": "dimagi",
+  "repo_name": "commcare-hq",
+  "file_path": "corehq/form_processor/backends/sql/dbaccessors.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T06:03:52+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T06:04:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T06:04:10+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "corehq/form_processor/backends/sql/dbaccessors.py",
+    "original_code": "def is_sharded(self):\n    \"\"\"\n    :return: True the django model is sharded, otherwise false.\n    \"\"\"\n    # TODO check for subclass of PartitionedModel when PR merged:\n    # https://github.com/dimagi/commcare-hq/pull/14852\n    from corehq.form_processor.models import RestrictedManager\n    return isinstance(self.model_class.objects, RestrictedManager)",
+    "original_signature": "def is_sharded(self):",
+    "satd_comment": "# TODO check for subclass of PartitionedModel when PR merged:\n# https://github.com/dimagi/commcare-hq/pull/14852",
+    "target_file": {
+      "ok": true,
+      "path": "corehq/form_processor/backends/sql/dbaccessors.py",
+      "sha": "cfba2ab364c3257993e6a6699e9b40fa1f42cf92",
+      "download_url": "https://raw.githubusercontent.com/dimagi/commcare-hq/master/corehq/form_processor/backends/sql/dbaccessors.py",
+      "content_excerpt": "import functools\nimport itertools\nimport operator\nimport struct\nfrom abc import ABCMeta, abstractmethod, abstractproperty\nfrom collections import namedtuple\nfrom uuid import UUID\n\nfrom django.conf import settings\nfrom django.db import InternalError, transaction, router\nfrom django.db.models import Q\nfrom django.db.models.expressions import Value\nfrom django.db.models.functions import Concat\n\nimport csiphash\n\nfrom dimagi.utils.chunked import chunked\n\nfrom corehq.form_processor.exceptions import (\n    CaseNotFound,\n    LedgerSaveError,\n    LedgerValueNotFound,\n    MissingFormXml,\n    XFormNotFound,\n)\nfrom corehq.form_processor.interfaces.dbaccessors import AbstractLedgerAccessor\nfrom corehq.form_processor.models import (\n    CommCareCase,\n    LedgerTransaction,\n    LedgerValue,\n    XFormInstance,\n)\nfrom corehq.form_processor.utils.sql import fetchall_as_namedtuple\nfrom corehq.sql_db.config import plproxy_config\nfrom corehq.sql_db.util import (\n    estimate_row_count,\n    get_db_aliases_for_partitioned_query,\n    split_list_by_db_partition,\n)\n\ndoc_type_to_state = XFormInstance.DOC_TYPE_TO_STATE\n\n\ndef iter_all_rows(reindex_accessor):\n    \"\"\"Returns a generator that will iterate over all rows provided by the\n    reindex accessor\n    \"\"\"\n    for db_alias in reindex_accessor.sql_db_aliases:\n        docs = reindex_accessor.get_docs(db_alias)\n        while docs:\n            for doc in docs:\n                yield doc\n\n            last_id = getattr(doc, reindex_accessor.primary_key_field_name)\n            docs = reindex_accessor.get_docs(db_alias, last_doc_pk=last_id)\n\n\ndef iter_all_ids(reindex_accessor):\n    return itertools.chain.from_iterable(iter_all_ids_chunked(reindex_accessor))\n\n\ndef iter_all_ids_chunked(reindex_accessor):\n    for db_alias in reindex_accessor.sql_db_aliases:\n        docs = list(reindex_accessor.get_doc_ids(db_alias))\n        while docs:\n            yield [d.doc_id for d in docs]\n\n            last_id = docs[-1].primary_key\n            docs = list(reindex_accessor.get_doc_ids(db_alias, last_doc_pk=last_id))\n\n\nclass ShardAccessor(object):\n    hash_key = b'\\x00' * 16\n\n    @staticmethod\n    def hash_doc_ids_sql_for_testing(doc_ids):\n        \"\"\"Get HASH for each doc_id from PostgreSQL\n\n        This is used to ensure the python version is consistent with what's\n        being used by PL/Proxy\n        \"\"\"\n        assert settings.USE_PARTITIONED_DATABASE\n\n        params = ','.join([\"(%s)\"] * len(doc_ids))\n        query = \"\"\"\n            SELECT doc_id, hash_string(doc_id, 'siphash24') AS hash\n            FROM (VALUES {}) AS t (doc_id)\n        \"\"\".format(params)\n        with XFormInstance.get_plproxy_cursor() as cursor:\n            cursor.execute(query, doc_ids)\n            rows = fetchall_as_namedtuple(cursor)\n            return {row.doc_id: row.hash for row in rows}\n\n    @staticmethod\n    def hash_doc_uuid_sql_for_testing(doc_uuid):\n        \"\"\"Get the hash for a UUID from PostgreSQL\n\n        This is used to ensure the python version is consistent with what's\n        being used by PL/Proxy\n        \"\"\"\n        assert settings.USE_PARTITIONED_DATABASE\n\n        if not isinstance(doc_uuid, UUID):\n            raise ValueError(\"Expected an instance of UUID\")\n\n        query = \"SELECT hash_string(CAST(%s AS bytea), 'siphash24') AS hash\"\n        with XFormInstance.get_plproxy_cursor() as cursor:\n            doc_uuid_before_cast = '\\\\x%s' % doc_uuid.hex\n            cursor.execute(query, [doc_uuid_before_cast])\n            return cursor.fetchone()[0]\n\n    @staticmethod\n    def hash_doc_ids_python(doc_ids):\n        return {\n            doc_id: ShardAccessor.hash_doc_id_python(doc_id)\n            for doc_id in doc_ids\n        }\n\n    @staticmethod\n    def hash_doc_id_python(doc_id):\n        if isinstance(doc_id, str):\n            doc_id = doc_id.encode('utf-8')\n        elif isinstance(doc_id, UUID):\n            # Hash the 16-byte string\n            doc_id = doc_id.bytes\n\n        digest = csiphash.siphash24(ShardAccessor.hash_key, doc_id)\n        hash_long = struct.unpack(\"<Q\", digest)[0]  # convert byte string to long\n        # convert 64 bit hash to 32 bit to match Postgres\n        return hash_long & 0xffffffff\n\n    @staticmethod\n    def get_database_for_docs(doc_ids):\n        \"\"\"\n        :param doc_ids:\n        :return: Dict of ``doc_id -> Django DB alias``\n        \"\"\"\n        return ShardAccessor._get_doc_database_map(doc_ids, by_doc=True)\n\n    @staticmethod\n    def get_docs_by_database(doc_ids):\n        \"\"\"\n        :param doc_ids:\n        :return: Dict of ``Django DB alias -> doc_id``\n        \"\"\"\n        return ShardAccessor._get_doc_database_map(doc_ids, by_doc=False)\n\n    @staticmethod\n    def _get_doc_database_map(doc_ids, by_doc=True):\n        assert settings.USE_PARTITIONED_DATABASE, \"\"\"Partitioned DB not in use,\n        consider using `corehq.sql_db.get_db_alias_for_partitioned_doc` instead\"\"\"\n        databases = {}\n        shard_map = plproxy_config.get_django_shard_map()\n        part_mask = len(shard_map) - 1\n        for chunk in chunked(doc_ids, 100):\n            hashes = ShardAccessor.hash_doc_ids_python(chunk)\n            shards = {doc_id: hash_ & part_mask for doc_id, hash_ in hashes.items()}\n            for doc_id, shard_id in shards.items():\n                dbname = shard_map[shard_id].django_dbname\n                if by_doc:\n                    databases.update({\n                        doc_id: dbname\n                    })\n                else:\n                    if dbname not in databases:\n                        databases[dbname] = [doc_id]\n                    else:\n                        databases[dbname].append(doc_id)\n        return databases\n\n    @staticmethod\n    def get_shard_id_and_database_for_doc(doc_id):\n        assert settings.USE_PARTITIONED_DATABASE, \"\"\"Partitioned DB not in use,\n        consider using `corehq.sql_db.get_db_alias_for_partitioned_doc` instead\"\"\"\n        shard_map = plproxy_config.get_django_shard_map()\n        part_mask = len(shard_map) - 1\n        hash_ = ShardAccessor.hash_doc_id_python(doc_id)\n        shard_id = hash_ & part_mask\n        return shard_id, shard_map[shard_id].django_dbname\n\n    @staticmethod\n    def get_database_for_doc(doc_id):\n        \"\"\"\n        :return: Django DB alias in which the doc should be stored\n        \"\"\"\n        return ShardAccessor.get_shard_id_and_database_for_doc(doc_id)[1]\n\n\nDocIds = namedtuple('DocIds', 'doc_id primary_key')\n\n\nclass ReindexAccessor(metaclass=ABCMeta):\n    primary_key_field_name = 'id'\n\n    def __init__(self, limit_db_aliases=None):\n        self.limit_db_aliases = limit_db_aliases\n\n    def is_sharded(self):\n        \"\"\"\n        :return: True the django model is sharded, otherwise false.\n        \"\"\"\n        from corehq.sql_db.models import PartitionedModel\n        return issubclass(self.model_class, PartitionedModel)\n\n    @property\n    def sql_db_aliases(self):\n        all_db_aliases = get_db_aliases_for_partitioned_query() if self.is_sharded() \\\n            else [router.db_for_read(self.model_class)]\n        if self.limit_db_aliases:\n            db_aliases = list(set(all_db_aliases) & set(self.limit_db_aliases))\n            assert db_aliases, 'Limited DBs not in expected list: {} {}'.format(\n                all_db_aliases, self.limit_db_aliases\n            )\n            return db_aliases\n        return all_db_aliases\n\n    @abstractproperty\n    def model_class(self):\n        \"\"\"\n        :return: the django model class belonging to this reindexer\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractproperty\n    def id_field(self):\n        \"\"\"\n        :return: The name of the model field to return when calling ``get_doc_ids``. Return a string\n                 or a dict mapping an alias to a SQL expression\n        \"\"\"\n        raise NotImplementedError\n\n    @abstractmethod\n    def get_doc(self, doc_id):\n        \"\"\"\n        :param doc_id: ID of the doc\n        :return: The doc with the given ID\n        \"\"\"\n        raise NotImplementedError\n\n    def doc_to_json(self, doc):\n        \"\"\"\n        :param doc:\n        :return: The JSON representation of the doc\n        \"\"\"\n        return doc.to_json()\n\n    def filters(self, last_doc_pk=None, for_count=False):\n        filters = []\n        if last_doc_pk is not None:\n            filters.append(Q(**{self.primary_key_field_name + \"__gt\": last_doc_pk}))\n        filters.extend(self.extra_filters(for_count=for_count))\n        return functools.reduce(operator.and_, filters) if filters else None\n\n    def query(self, from_db, last_doc_pk=None, for_count=False):\n        filters = self.filters(last_doc_pk, for_count)\n        query = self.model_class.objects.using(from_db)\n        if filters:\n            query = query.filter(filters)\n        return query\n\n    def get_doc_ids(self, from_db, last_doc_pk=None, limit=500):\n        \"\"\"\n        :param from_db: The DB alias to query\n        :param last_doc_pk: The primary key of the last doc from the previous batch\n        :param limit: Desired batch size\n        :return: Generator of DocIds namedtuple\n        \"\"\"\n        query = self.query(from_db, last_doc_pk)\n        field = self.id_field\n        if isinstance(field, dict):\n            query = query.annotate(**field)\n            field = list(field)[0]\n        query = query.values(self.primary_key_field_name, field)\n        for row in query.order_by(self.primary_key_field_name)[:limit]:\n            yield DocIds(row[field], row[self.primary_key_field_name])\n\n    def get_docs(self, from_db, last_doc_pk=None, limit=500):\n        \"\"\"Get a batch of\n        :param from_db: The DB alias to query\n        :param last_doc_pk: The primary key of the last doc from the previous batch\n        :param limit: Desired batch size\n        :return: List of documents\n        \"\"\"\n        query = self.query(from_db, last_doc_pk)\n        return query.order_by(self.primary_key_field_name)[:limit]\n\n    def extra_filters(self, for_count=False):\n        \"\"\"\n        :param for_count: True if only filters required for the count query. Only simple filters\n                          should be included for the count query.\n        :return: list of sql filters\n        \"\"\"\n        return []\n\n    def get_approximate_doc_count(self, from_db):\n        \"\"\"Get the approximate doc count from the given DB\n\n        :param from_db: The DB alias to query\n        \"\"\"\n        query = self.query(from_db, for_count=True)\n        return estimate_row_count(query, from_db)\n\n\nclass FormReindexAccessor(ReindexAccessor):\n\n    def __init__(self, domain=None, include_attachments=True, limit_db_aliases=None, include_deleted=False,\n                 start_date=None, end_date=None):\n        super(FormReindexAccessor, self).__init__(limit_db_aliases)\n        self.domain = domain\n        self.include_attachments = include_attachments\n        self.include_deleted = include_deleted\n        self.start_date = start_date\n        self.end_date = end_date\n\n    @property\n    def model_class(self):\n        return XFormInstance\n\n    @property\n    def id_field(self):\n        return 'form_id'\n\n    def get_doc(self, doc_id):\n        try:\n            return XFormInstance.objects.get_form(doc_id, self.domain)\n        except XFormNotFound:\n            pass\n\n    def doc_to_json(self, doc):\n        try:\n            return doc.to_json(include_attachments=self.include_attachments)\n        except MissingFormXml:\n            return {}\n\n    def extra_filters(self, for_count=False):\n        filters = []\n        if not (for_count or self.include_deleted):\n            # don't include in count query since the query planner can't account for it\n            filters.append(Q(deleted_on__isnull=True))\n        if self.domain:\n            filters.append(Q(domain=self.domain))\n        if self.start_date is not None:\n            filters.append(Q(received_on__gte=self.start_date))\n        if self.end_date is not None:\n            filters.append(Q(received_on__lt=self.end_date))\n        return filters\n\n\nclass CaseReindexAccessor(ReindexAccessor):\n    \"",
+      "total_lines": 579
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 198,
+      "end_line": 203,
+      "excerpt": "    def is_sharded(self):\n        \"\"\"\n        :return: True the django model is sharded, otherwise false.\n        \"\"\"\n        from corehq.sql_db.models import PartitionedModel\n        return issubclass(self.model_class, PartitionedModel)",
+      "symbol_name": "is_sharded",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "corehq/form_processor/backends/sql/dbaccessors.py",
+      "sha": "cfba2ab364c3257993e6a6699e9b40fa1f42cf92",
+      "download_url": "https://raw.githubusercontent.com/dimagi/commcare-hq/master/corehq/form_processor/backends/sql/dbaccessors.py"
+    },
+    "imports": {
+      "imports": [
+        "functools",
+        "itertools",
+        "operator",
+        "struct",
+        "abc:ABCMeta",
+        "abc:abstractmethod",
+        "abc:abstractproperty",
+        "collections:namedtuple",
+        "uuid:UUID",
+        "django.conf:settings",
+        "django.db:InternalError",
+        "django.db:transaction",
+        "django.db:router",
+        "django.db.models:Q",
+        "django.db.models.expressions:Value",
+        "django.db.models.functions:Concat",
+        "csiphash",
+        "dimagi.utils.chunked:chunked",
+        "corehq.form_processor.exceptions:CaseNotFound",
+        "corehq.form_processor.exceptions:LedgerSaveError",
+        "corehq.form_processor.exceptions:LedgerValueNotFound",
+        "corehq.form_processor.exceptions:MissingFormXml",
+        "corehq.form_processor.exceptions:XFormNotFound",
+        "corehq.form_processor.interfaces.dbaccessors:AbstractLedgerAccessor",
+        "corehq.form_processor.models:CommCareCase",
+        "corehq.form_processor.models:LedgerTransaction",
+        "corehq.form_processor.models:LedgerValue",
+        "corehq.form_processor.models:XFormInstance",
+        "corehq.form_processor.utils.sql:fetchall_as_namedtuple",
+        "corehq.sql_db.config:plproxy_config"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/dimagi/commcare-hq/master/README.md",
+      "content_excerpt": "CommCare HQ\n===========\n\nCommCare HQ is a web application for building complex, customizable, frontline worker solutions.\n\nIt includes multi-tenant application building, user management, data collection, and reporting.\n\nCommCare HQ apps work with [CommCare mobile](https://github.com/dimagi/commcare-android) and its\nbundled [web application platform](https://github.com/dimagi/formplayer).\n\n### Key Components\n\n+ CommCare application builder\n+ OpenRosa compliant XForms designer\n+ SMS integration\n+ Domain/user/mobile worker management\n+ XForms data collection\n+ Case management\n+ Over-the-air (ota) restore of user and cases\n+ Integrated web and email reporting\n\n### More Information\n\n+ To try CommCare you can use [this production instance of hosted CommCare](https://www.commcarehq.org/).\n+ For setting up a local CommCare HQ developer environment, see [Setting up CommCare HQ for Developers](https://github.com/dimagi/commcare-hq/blob/master/DEV_SETUP.md).\n+ For setting up a production CommCare HQ environment, check out [CommCare Cloud](https://commcare-cloud.readthedocs.io/), our toolkit for deploying and maintaining CommCare servers.\n+ Additional documentation is available on [ReadTheDocs](https://commcare-hq.readthedocs.io/).\n+ We welcome contributions, see [Contributing](CONTRIBUTING.rst) for more.\n+ Questions?  Contact the CommCare community at our [forum](https://forum.dimagi.com/).\n\n*CommCare is built by [Dimagi](https://dimagi.com/) and our open-source contributors.*\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "is_sharded test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"is_sharded(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "dbaccessors.py",
+          "path": "corehq/form_processor/backends/sql/dbaccessors.py",
+          "sha": "cfba2ab364c3257993e6a6699e9b40fa1f42cf92",
+          "html_url": "https://github.com/dimagi/commcare-hq/blob/9ee8510c7c934641e4264f4dc418f74d6ac9a711/corehq/form_processor/backends/sql/dbaccessors.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 198,
+          "end_line": 203,
+          "excerpt": "    def is_sharded(self):\n        \"\"\"\n        :return: True the django model is sharded, otherwise false.\n        \"\"\"\n        from corehq.sql_db.models import PartitionedModel\n        return issubclass(self.model_class, PartitionedModel)",
+          "symbol_name": "is_sharded",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "corehq/form_processor/backends/sql",
+      "count": 7,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "corehq/form_processor/backends/sql/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "casedb.py",
+          "path": "corehq/form_processor/backends/sql/casedb.py",
+          "type": "file"
+        },
+        {
+          "name": "dbaccessors.py",
+          "path": "corehq/form_processor/backends/sql/dbaccessors.py",
+          "type": "file"
+        },
+        {
+          "name": "ledger.py",
+          "path": "corehq/form_processor/backends/sql/ledger.py",
+          "type": "file"
+        },
+        {
+          "name": "processor.py",
+          "path": "corehq/form_processor/backends/sql/processor.py",
+          "type": "file"
+        },
+        {
+          "name": "supply.py",
+          "path": "corehq/form_processor/backends/sql/supply.py",
+          "type": "file"
+        },
+        {
+          "name": "update_strategy.py",
+          "path": "corehq/form_processor/backends/sql/update_strategy.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "corehq/form_processor/backends/sql/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "casedb.py",
+          "path": "corehq/form_processor/backends/sql/casedb.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from casexml.apps.case.exceptions import IllegalCaseId\n2: from corehq.form_processor.backends.sql.update_strategy import SqlCaseUpdateStrategy\n3: from corehq.form_processor.casedb_base import AbstractCaseDbCache\n4: from corehq.form_processor.models import CommCareCase\n5: \n6: \n7: class CaseDbCacheSQL(AbstractCaseDbCache):\n8:     case_model_classes = (CommCareCase,)\n9:     case_update_strategy = SqlCaseUpdateStrategy\n10: \n11:     def __init__(self, *args, **kw):\n12:         super(CaseDbCacheSQL, self).__init__(*args, **kw)\n13:         if not self.wrap:"
+        },
+        {
+          "name": "ledger.py",
+          "path": "corehq/form_processor/backends/sql/ledger.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from corehq.apps.commtrack.processing import compute_ledger_values\n2: from corehq.form_processor.backends.sql.dbaccessors import LedgerAccessorSQL\n3: from corehq.form_processor.change_publishers import publish_ledger_v2_saved, publish_ledger_v2_deleted\n4: from corehq.form_processor.exceptions import LedgerValueNotFound\n5: from corehq.form_processor.interfaces.ledger_processor import LedgerProcessorInterface, StockModelUpdateResult, \\\n6:     LedgerDBInterface\n7: from corehq.form_processor.models import LedgerValue, LedgerTransaction\n8: from corehq.util.metrics.load_counters import ledger_load_counter\n9: \n10: \n11: class LedgerDBSQL(LedgerDBInterface):\n12: \n13:     def get_ledgers_for_case(self, case_id):"
+        },
+        {
+          "name": "processor.py",
+          "path": "corehq/form_processor/backends/sql/processor.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import datetime\n2: import logging\n3: import uuid\n4: from itertools import chain\n5: \n6: import redis\n7: from contextlib import ExitStack\n8: from django.db import transaction, DatabaseError\n9: from lxml import etree\n10: \n11: from casexml.apps.case import const\n12: from casexml.apps.case.xform import get_case_updates\n13: from corehq.form_processor.backends.sql.update_strategy import SqlCaseUpdateStrategy"
+        },
+        {
+          "name": "supply.py",
+          "path": "corehq/form_processor/backends/sql/supply.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from corehq.apps.commtrack.helpers import make_supply_point\n2: from corehq.apps.locations.models import SQLLocation\n3: from corehq.form_processor.models import CommCareCase\n4: \n5: \n6: class SupplyPointSQL:\n7: \n8:     @classmethod\n9:     def get_or_create_by_location(cls, location):\n10:         sp = SupplyPointSQL.get_by_location(location)\n11:         if not sp:\n12:             sp = make_supply_point(location.domain, location)\n13:         return sp"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "corehq/form_processor/backends/sql/dbaccessors.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "62a7c17daa7fe0a2669b08004f1403e3a20a6fa7",
+          "html_url": "https://github.com/dimagi/commcare-hq/commit/62a7c17daa7fe0a2669b08004f1403e3a20a6fa7",
+          "message": "Revert \"Revert \"remove usage of XFormInstance.DELETED (part 1)\"\"",
+          "author": "Minha Lee",
+          "date": "2023-09-14T17:06:53Z"
+        },
+        {
+          "sha": "c03f25ebff7e3257b109694dcca46f1d48b92acb",
+          "html_url": "https://github.com/dimagi/commcare-hq/commit/c03f25ebff7e3257b109694dcca46f1d48b92acb",
+          "message": "Revert \"remove usage of XFormInstance.DELETED (part 1)\"",
+          "author": "Minha Lee",
+          "date": "2023-09-13T15:59:26Z"
+        },
+        {
+          "sha": "e807698cf3ac17c52d65aa4a9f83df38811f5d5f",
+          "html_url": "https://github.com/dimagi/commcare-hq/commit/e807698cf3ac17c52d65aa4a9f83df38811f5d5f",
+          "message": "Remove usage of XFormInstance.DELETED",
+          "author": "Minha",
+          "date": "2023-08-23T16:10:07Z"
+        },
+        {
+          "sha": "306e351edc79846acdac69f9f8c661db65a3b5b3",
+          "html_url": "https://github.com/dimagi/commcare-hq/commit/306e351edc79846acdac69f9f8c661db65a3b5b3",
+          "message": "Remove CaseAccessors and CaseAccessorSQL",
+          "author": "Daniel Miller",
+          "date": "2022-02-08T22:19:39Z"
+        },
+        {
+          "sha": "5a04a614ed36e10dad1462615516e7b05a16fd29",
+          "html_url": "https://github.com/dimagi/commcare-hq/commit/5a04a614ed36e10dad1462615516e7b05a16fd29",
+          "message": "Remove remaining references to CaseAccessorSQL",
+          "author": "Daniel Miller",
+          "date": "2022-02-08T22:04:17Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "is_sharded TODO check subclass PartitionedModel when",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "corehq/form_processor/backends/sql/dbaccessors.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "62a7c17daa7fe0a2669b08004f1403e3a20a6fa7",
+        "html_url": "https://github.com/dimagi/commcare-hq/commit/62a7c17daa7fe0a2669b08004f1403e3a20a6fa7",
+        "message": "Revert \"Revert \"remove usage of XFormInstance.DELETED (part 1)\"\"",
+        "author": "Minha Lee",
+        "date": "2023-09-14T17:06:53Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

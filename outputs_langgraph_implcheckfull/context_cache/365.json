@@ -1,0 +1,454 @@
+{
+  "task_id": "365",
+  "repo_owner": "posthog",
+  "repo_name": "posthog",
+  "file_path": "posthog/models/activity_logging/activity_log.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T10:32:17+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 4,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T10:33:01+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T10:33:09+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "posthog/models/activity_logging/activity_log.py",
+    "original_code": "def changes_between(\n    model_type: Literal[\"FeatureFlag\", \"Person\", \"Insight\"],\n    previous: Optional[models.Model],\n    current: Optional[models.Model],\n) -> List[Change]:\n    \"\"\"\n    Identifies changes between two models by comparing fields\n    \"\"\"\n    changes: List[Change] = []\n\n    if previous is None and current is None:\n        # there are no changes between two things that don't exist\n        return changes\n\n    if previous is not None:\n        fields = current._meta.fields if current is not None else []\n\n        # TODO how to include tags in the fields assessed\n        filtered_fields = [f.name for f in fields if f.name not in field_exclusions[model_type]]\n        for field in filtered_fields:\n            left = getattr(previous, field, None)\n            right = getattr(current, field, None)\n\n            if left is None and right is not None:\n                changes.append(Change(type=model_type, field=field, action=\"created\", after=right,))\n            elif right is None and left is not None:\n                changes.append(Change(type=model_type, field=field, action=\"deleted\", before=left,))\n            elif left != right:\n                changes.append(Change(type=model_type, field=field, action=\"changed\", before=left, after=right,))\n\n    return changes",
+    "original_signature": "def changes_between(",
+    "satd_comment": "# TODO how to include tags in the fields assessed",
+    "target_file": {
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "sha": "bafd7b24388c3d407e09421401e33b4677386fba",
+      "download_url": "https://raw.githubusercontent.com/PostHog/posthog/master/posthog/models/activity_logging/activity_log.py",
+      "content_excerpt": "import json\nimport dataclasses\nfrom typing import TYPE_CHECKING, Any, Literal, Optional, Required, TypedDict, Union\nfrom uuid import UUID\n\nfrom django.conf import settings\nfrom django.contrib.auth.models import AnonymousUser\nfrom django.contrib.postgres.indexes import GinIndex\nfrom django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist\nfrom django.core.paginator import Paginator\nfrom django.db import models, transaction\nfrom django.db.models import QuerySet\nfrom django.db.models.signals import post_save\nfrom django.dispatch.dispatcher import receiver\nfrom django.utils import timezone\n\nimport structlog\n\nfrom posthog.exceptions_capture import capture_exception\nfrom posthog.models.utils import ActivityDetailEncoder, UUIDTModel\n\nif TYPE_CHECKING:\n    from posthog.models.user import User\n\nlogger = structlog.get_logger(__name__)\n\nActivityScope = Literal[\n    \"Cohort\",\n    \"FeatureFlag\",\n    \"Person\",\n    \"Group\",\n    \"Insight\",\n    \"Plugin\",\n    \"PluginConfig\",\n    \"HogFunction\",\n    \"HogFlow\",\n    \"DataManagement\",\n    \"EventDefinition\",\n    \"PropertyDefinition\",\n    \"Notebook\",\n    \"Endpoint\",\n    \"EndpointVersion\",\n    \"Dashboard\",\n    \"Replay\",\n    \"Experiment\",\n    \"ExperimentHoldout\",\n    \"ExperimentSavedMetric\",\n    \"Survey\",\n    \"EarlyAccessFeature\",\n    \"SessionRecordingPlaylist\",\n    \"Comment\",\n    \"Team\",\n    \"Project\",\n    \"ErrorTrackingIssue\",\n    \"DataWarehouseSavedQuery\",\n    \"Organization\",\n    \"OrganizationDomain\",\n    \"OrganizationMembership\",\n    \"Role\",\n    \"UserGroup\",\n    \"BatchExport\",\n    \"BatchImport\",\n    \"Integration\",\n    \"Annotation\",\n    \"Tag\",\n    \"TaggedItem\",\n    \"Subscription\",\n    \"PersonalAPIKey\",\n    \"User\",\n    \"Action\",\n    \"AlertConfiguration\",\n    \"Threshold\",\n    \"AlertSubscription\",\n    \"ExternalDataSource\",\n    \"ExternalDataSchema\",\n    \"LLMTrace\",\n    \"WebAnalyticsFilterPreset\",\n    \"CustomerProfileConfig\",\n    \"Log\",\n    \"LogsAlertConfiguration\",\n    \"ProductTour\",\n    \"Ticket\",\n]\nChangeAction = Literal[\n    \"changed\", \"created\", \"deleted\", \"merged\", \"split\", \"exported\", \"revoked\", \"logged_in\", \"logged_out\", \"copied\"\n]\n\n\n@dataclasses.dataclass(frozen=True)\nclass Change:\n    type: ActivityScope | str\n    action: ChangeAction\n    field: Optional[str] = None\n    before: Optional[Any] = None\n    after: Optional[Any] = None\n\n\n@dataclasses.dataclass(frozen=True)\nclass Trigger:\n    job_type: str\n    job_id: str\n    payload: dict\n\n\n@dataclasses.dataclass(frozen=True)\nclass ActivityContextBase:\n    \"\"\"\n    Extend this class in specific implementations to add context-specific fields.\n    \"\"\"\n\n    pass\n\n\n@dataclasses.dataclass(frozen=True)\nclass Detail:\n    # The display name of the item in question\n    name: Optional[str] = None\n    # The short_id if it has one\n    short_id: Optional[str] = None\n    type: Optional[str] = None\n    changes: Optional[list[Change]] = None\n    trigger: Optional[Trigger] = None\n    context: Optional[ActivityContextBase] = None\n\n\nclass ActivityLog(UUIDTModel):\n    class Meta:\n        constraints = [\n            models.CheckConstraint(\n                name=\"must_have_team_or_organization_id\",\n                check=models.Q(team_id__isnull=False) | models.Q(organization_id__isnull=False),\n            ),\n        ]\n        indexes = [\n            models.Index(fields=[\"team_id\", \"scope\", \"item_id\"]),\n            models.Index(\n                fields=[\"organization_id\", \"scope\", \"-created_at\"],\n                name=\"idx_alog_org_scope_created_at\",\n                condition=models.Q(detail__isnull=False) & models.Q(detail__jsonb_typeof=\"object\"),\n            ),\n            models.Index(\n                fields=[\"organization_id\"],\n                name=\"idx_alog_org_detail_exists\",\n                condition=models.Q(detail__isnull=False) & models.Q(detail__jsonb_typeof=\"object\"),\n            ),\n            # Used for searching on the detail field, e.g. containing a specific value\n            GinIndex(\n                name=\"activitylog_detail_gin\",\n                fields=[\"detail\"],\n                opclasses=[\"jsonb_ops\"],\n            ),\n            # Used primarily for available_filters queries\n            GinIndex(\n                name=\"idx_alog_detail_gin_path_ops\",\n                fields=[\"detail\"],\n                opclasses=[\"jsonb_path_ops\"],\n                condition=models.Q(detail__isnull=False),\n            ),\n            # User-specific filtered queries\n            models.Index(\n                fields=[\"team_id\", \"activity\", \"scope\", \"user\"],\n                name=\"idx_alog_team_act_scope_usr\",\n                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),\n            ),\n            # Advanced activity logs: team-scoped queries with ordering\n            models.Index(\n                fields=[\"team_id\", \"scope\", \"-created_at\"],\n                name=\"idx_alog_team_scope_created\",\n                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),\n            ),\n            # Advanced activity logs: team queries with activity filter\n            models.Index(\n                fields=[\"team_id\", \"scope\", \"activity\", \"-created_at\"],\n                name=\"idx_alog_team_scp_act_crtd\",\n                condition=models.Q(was_impersonated=False) & models.Q(is_system=False),\n            ),\n        ]\n\n    team_id = models.PositiveIntegerField(null=True)\n    organization_id = models.UUIDField(null=True)\n    user = models.ForeignKey(\"posthog.User\", null=True, on_delete=models.SET_NULL)\n    was_impersonated = models.BooleanField(null=True)\n    # If truthy, user can be unset and this indicates a 'system' user made activity asynchronously\n    is_system = models.BooleanField(null=True)\n\n    activity = models.fields.CharField(max_length=79, null=False)\n    # if scoped to a model this activity log holds the id of the model being logged\n    # if not scoped to a model this log might not hold an item_id\n    # this might be a numerical id, short id, or UUID, so each will be converted to string\n    # it will be used to lookup rows with exactly matching item_ids\n    # it probably only needs to be 36 characters in order to hold a GUID\n    # but 72 may be useful to avoid a migration in future\n    item_id = models.fields.CharField(max_length=72, null=True)\n    # e.g. FeatureFlags - this will often be the name of a model class\n    scope = models.fields.CharField(max_length=79, null=False)\n    detail = models.JSONField(encoder=ActivityDetailEncoder, null=True)\n    created_at = models.DateTimeField(default=timezone.now)\n\n\ncommon_field_exclusions = [\n    \"id\",\n    \"uuid\",\n    \"short_id\",\n    \"created_at\",\n    \"created_by\",\n    \"last_modified_at\",\n    \"last_modified_by\",\n    \"updated_at\",\n    \"updated_by\",\n    \"team\",\n    \"team_id\",\n]\n\n\nfield_with_masked_contents: dict[ActivityScope, list[str]] = {\n    \"HogFunction\": [\n        \"encrypted_inputs\",\n    ],\n    \"Integration\": [\n        \"config\",\n        \"sensitive_config\",\n    ],\n    \"BatchImport\": [\n        \"import_config\",\n    ],\n    \"Subscription\": [\n        \"target_value\",\n    ],\n    \"ExternalDataSource\": [\n        \"job_inputs\",\n    ],\n    \"OrganizationDomain\": [\n        \"scim_bearer_token\",\n        \"verification_challenge\",\n        \"saml_x509_cert\",\n    ],\n    \"User\": [\n        \"email\",\n        \"password\",\n        # No longer used but kept for backwards-compatibility with existing activity log entries\n        \"temporary_token\",\n        \"pending_email\",\n    ],\n}\n\nfield_name_overrides: dict[ActivityScope, dict[str, str]] = {\n    \"HogFunction\": {\n        \"execution_order\": \"priority\",\n    },\n    \"Organization\": {\n        \"name\": \"organization name\",\n        \"enforce_2fa\": \"two-factor authentication requirement\",\n        \"members_can_invite\": \"member invitation permissions\",\n        \"members_can_use_personal_api_keys\": \"personal API key permissions\",\n        \"allow_publicly_shared_resources\": \"public sharing permissions\",\n        \"is_member_join_email_enabled\": \"member join email notifications\",\n        \"session_cookie_age\": \"session cookie age\",\n        \"default_experiment_stats_method\": \"default experiment stats method\",\n    },\n    \"BatchExport\": {\n        \"paused\": \"enabled\",\n    },\n    \"ExternalDataSource\": {\n        \"job_inputs\": \"configuration\",\n    },\n    \"ExternalDataSchema\": {\n        \"should_sync\": \"enabled\",\n    },\n    \"OrganizationDomain\": {\n        \"jit_provisioning_enabled\": \"just-in-time provisioning\",\n        \"sso_enforcement\": \"SSO enforcement\",\n        \"saml_entity_id\": \"SAML entity ID\",\n        \"saml_acs_url\": \"SAML ACS URL\",\n        \"saml_x509_cert\": \"SAML X.509 certificate\",\n        \"scim_enabled\": \"SCIM provisioning\",\n        \"verified_at\": \"domain verification\",\n    },\n}\n\n# Fields that prevent activity signal triggering entirely when only these fields change\nsignal_exclusions: dict[ActivityScope, list[str]] = {\n    \"AlertConfiguration\": [\n        \"last_checked_at\",\n        \"next_check_at\",\n        \"is_calculating\",\n        \"last_notified_at\",\n        \"last_error_at\",\n    ],\n    \"Dashboard\": [\"last_accessed_at\"],\n    \"LogsAlertConfiguration\": [\n        \"next_check_at\",\n        \"last_notified_at\",\n        \"last_checked_at\",\n        \"consecutive_failures\",\n        \"state\",\n    ],\n    \"PersonalAPIKey\": [\n        \"last_used_at\",\n    ],\n    \"User\": [\n        \"last_login\",\n        \"date_joined\",\n        \"current_organization\",\n        \"current_team\",\n        \"current_organization_id\",\n        \"current_team_id\",\n    ],\n    \"OrganizationDomain\": [\n        \"last_verification_retry\",\n    ],\n}\n\n# Activity visibility restrictions - controls which users can see certain activity logs\n# Used to hide sensitive activities (e.g., impersonated logins, user account changes) from non-staff users\nactivity_visibility_restrictions: list[dict[str, Any]] = [\n    {\n        \"scope\": \"User\",\n        \"activities\": [\"logged_in\", \"logged_out\"],\n        \"exclude_when\": {\"was_impersonated\": True},\n        \"allow_staff\": True,\n    },\n    {\n        \"scope\": \"User\",\n        \"activities\": [\"created\", \"updated\"],\n        \"exclude_when\": {},\n        \"allow_staff\": True,\n    },\n    {\n        \"scope\": \"User\",\n        \"activities\": [\"scim_provisioned\", \"scim_replaced\", \"scim_updated\", \"scim_deprovisioned\"],\n        \"exclude_when\": {},\n        \"allow_staff\": True,\n    },\n    {\n        \"scope\": \"Role\",\n        \"activities\": [\"scim_provisioned\", \"scim_replaced\", \"scim_updated\", \"scim_deprovisioned\"],\n        \"exclude_when\": {},\n        \"allow_staff\": True,\n    },\n]\n\nfield_exclusions: dict[ActivityScope, list[str]] = {\n    \"OrganizationDomain\": [\n        \"organization\",\n        \"scim_provisioned_users\",\n    ],\n    \"Cohort\": [\n        \"version\",\n        \"pending_version\",\n        \"count\",\n        \"is_calculating\",\n        \"last_calculation\",\n        \"last_error_at\",\n        \"errors_calculating\",\n    ],\n    \"HogFunction\": [\n        \"bytecode\",\n        \"icon_url\",\n    ],\n    \"Notebook\": [\n        \"text_content\",\n    ],\n    \"FeatureFlag\": [\n        \"experiment\",\n        \"featureflagoverride\",\n        \"usage_dashboard\",\n        \"analytics_dashboards\",\n    ],\n    \"Experiment\": [\n        \"feature_flag\",\n        \"exposure_cohort\",\n        \"holdout\",\n        \"saved_metrics\",\n        \"experimenttosavedmetric_set\",\n    ],\n    \"ExperimentSavedMetric\": [\n        \"experiments\",\n        \"experimenttosavedmetric_set\",\n    ],\n    \"Person\": [\n        \"distinct_ids\",\n        \"name\",\n        \"is_identified\",\n        \"persondistinctid\",\n        \"cohort\",\n        \"cohortpeople\",\n        \"properties_last_updated_at\",\n        \"properties_last_operation\",\n        \"version\",\n        \"is_user\",\n    ],\n    \"Insight\": [\n        \"filters_hash\",\n        \"refreshing\",\n        \"dive_dashboard\",\n        \"type\",\n        \"funnel\",\n        \"layouts\",\n        \"color\",\n        \"order\",\n        \"result\",\n        \"dashboard\",\n        \"last_refresh\",\n        \"saved\",\n        \"is_sample\",\n        \"refresh_attempt\",\n        \"short_id\",\n        \"insightviewed\",\n        \"dashboardtile\",\n        \"caching_states\",\n    ",
+      "total_lines": 1053
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 644,
+      "end_line": 709,
+      "excerpt": "def changes_between(\n    model_type: ActivityScope,\n    previous: Optional[models.Model],\n    current: Optional[models.Model],\n) -> list[Change]:\n    \"\"\"\n    Identifies changes between two models by comparing fields.\n    Note that this method only really works for models that have a single instance\n    and not for models that have a many-to-many relationship with another model.\n    \"\"\"\n    changes: list[Change] = []\n\n    if previous is None and current is None:\n        # There are no changes between two things that don't exist.\n        return changes\n\n    if previous is not None:\n        fields = current._meta.get_fields() if current is not None else []\n        excluded_fields = field_exclusions.get(model_type, []) + common_field_exclusions\n        masked_fields = field_with_masked_contents.get(model_type, [])\n        filtered_fields = [f for f in fields if f.name not in excluded_fields]\n        filtered_field_names = [f.name for f in filtered_fields]\n\n        for field in filtered_fields:\n            field_name = field.name\n            left = safely_get_field_value(previous, field_name)\n            right = safely_get_field_value(current, field_name)\n\n            if field_name == \"tagged_items\":\n                field_name = \"tags\"  # Or the UI needs to be coupled to this internal backend naming.\n\n            if field_name == \"dashboards\" and \"dashboard_tiles\" in filtered_field_names:\n                # Only process dashboard_tiles when it is present. It supersedes dashboards.\n                continue\n\n            if model_type == \"Insight\" and field_name == \"dashboard_tiles\":\n                # The API exposes this as dashboards and that's what the activity describers expect.\n                field_name = \"dashboards\"\n\n            # if is a django model field, check the empty_values list\n            left_is_none = left is None or (hasattr(field, \"empty_values\") and left in field.empty_values)\n            right_is_none = right is None or (hasattr(field, \"empty_values\") and right in field.empty_values)\n\n            left_value = \"masked\" if field_name in masked_fields else left\n            right_value = \"masked\" if field_name in masked_fields else right\n\n            #",
+      "symbol_name": "changes_between",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "sha": "bafd7b24388c3d407e09421401e33b4677386fba",
+      "download_url": "https://raw.githubusercontent.com/PostHog/posthog/master/posthog/models/activity_logging/activity_log.py"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "dataclasses",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Literal",
+        "typing:Optional",
+        "typing:Required",
+        "typing:TypedDict",
+        "typing:Union",
+        "uuid:UUID",
+        "django.conf:settings",
+        "django.contrib.auth.models:AnonymousUser",
+        "django.contrib.postgres.indexes:GinIndex",
+        "django.core.exceptions:FieldDoesNotExist",
+        "django.core.exceptions:ObjectDoesNotExist",
+        "django.core.paginator:Paginator",
+        "django.db:models",
+        "django.db:transaction",
+        "django.db.models:QuerySet",
+        "django.db.models.signals:post_save",
+        "django.dispatch.dispatcher:receiver",
+        "django.utils:timezone",
+        "structlog",
+        "posthog.exceptions_capture:capture_exception",
+        "posthog.models.utils:ActivityDetailEncoder",
+        "posthog.models.utils:UUIDTModel",
+        "posthog.models.user:User",
+        "posthog.models.dashboard:Dashboard",
+        "posthog.models.dashboard_tile:DashboardTile",
+        "posthog.models.activity_logging.utils:activity_visibility_manager"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/PostHog/posthog/master/README.md",
+      "content_excerpt": "<p align=\"center\">\n  <img alt=\"posthoglogo\" src=\"https://user-images.githubusercontent.com/65415371/205059737-c8a4f836-4889-4654-902e-f302b187b6a0.png\">\n</p>\n<p align=\"center\">\n  <a href='https://posthog.com/contributors'><img alt=\"GitHub contributors\" src=\"https://img.shields.io/github/contributors/posthog/posthog\"/></a>\n  <a href='http://makeapullrequest.com'><img alt='PRs Welcome' src='https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=shields'/></a>\n  <img alt=\"Docker Pulls\" src=\"https://img.shields.io/docker/pulls/posthog/posthog\"/>\n  <a href=\"https://github.com/PostHog/posthog/commits/master\"><img alt=\"GitHub commit activity\" src=\"https://img.shields.io/github/commit-activity/m/posthog/posthog\"/> </a>\n  <a href=\"https://github.com/PostHog/posthog/issues?q=is%3Aissue%20state%3Aclosed\"><img alt=\"GitHub closed issues\" src=\"https://img.shields.io/github/issues-closed/posthog/posthog\"/> </a>\n</p>\n\n<p align=\"center\">\n  <a href=\"https://posthog.com/docs\">Docs</a> - <a href=\"https://posthog.com/community\">Community</a> - <a href=\"https://posthog.com/roadmap\">Roadmap</a> - <a href=\"https://posthog.com/why\">Why PostHog?</a> - <a href=\"https://posthog.com/changelog\">Changelog</a> - <a href=\"https://github.com/PostHog/posthog/issues/new?assignees=&labels=bug&template=bug_report.yml\">Bug reports</a>\n</p>\n\n<p align=\"center\">\n  <a href=\"https://www.youtube.com/watch?v=2jQco8hEvTI\">\n    <img src=\"https://res.cloudinary.com/dmukukwp6/image/upload/demo_thumb_68d0d8d56d\" alt=\"PostHog Demonstration\">\n  </a>\n</p>\n\n## PostHog is an all-in-one, open source platform for building "
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "changes_between test",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_activity_logging.py",
+          "path": "posthog/models/test/test_activity_logging.py",
+          "sha": "e7f3ed4c136635a08d4be7b9c3f002cdbc69a89d",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/posthog/models/test/test_activity_logging.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 15,
+          "excerpt": "1: from django.test import TestCase\n2: \n3: from posthog.models.activity_logging.activity_log import Change, dict_changes_between\n4: \n5: \n6: class TeatActivityLog(TestCase):\n7:     def test_dict_changes_between(self):\n8:         changes = dict_changes_between(\n9:             model_type=\"Plugin\",\n10:             previous={\"change_field\": \"foo\", \"delete_field\": \"foo\"},\n11:             new={\"change_field\": \"bar\", \"new_field\": \"bar\"},\n12:         )\n13: \n14:         self.assertEqual(len(changes), 3)\n15: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_insight_activity_logging.py",
+          "path": "posthog/test/activity_logging/test_insight_activity_logging.py",
+          "sha": "01701f60cc1024048e7caee35a97fc21d1002954",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/posthog/test/activity_logging/test_insight_activity_logging.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 21,
+          "excerpt": "1: import random\n2: import string\n3: \n4: from posthog.test.base import BaseTest\n5: \n6: from dateutil import parser\n7: \n8: from posthog.models import Dashboard, DashboardTile, Insight, Tag\n9: from posthog.models.activity_logging.activity_log import Change, changes_between\n10: \n11: \n12: class TestChangesBetweenInsights(BaseTest):\n13:     def test_a_change_of_insight_dashboard_can_be_logged(self) -> None:\n14:         insight_before = self._an_insight_with(name=\"name\", tagged_items=[])\n15:         insight_after = self._an_insight_with(name=\"name\", tagged_items=[])\n16:         dashboard = Dashboard.objects.create(team=self.team, name=\"the dashboard\")\n17:         DashboardTile.objects.create(insight=insight_after, dashboard=dashboard)\n18: \n19:         actual = changes_between(model_type=\"Insight\", previous=insight_before, current=insight_after)\n20:         expected = [\n21:             Change(",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_person_activity_logging.py",
+          "path": "posthog/test/activity_logging/test_person_activity_logging.py",
+          "sha": "d1ff771c2a06dbdea985f4b1fb7adce1cf0be9e2",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/posthog/test/activity_logging/test_person_activity_logging.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 18,
+          "excerpt": "1: import unittest\n2: \n3: from dateutil import parser\n4: \n5: from posthog.models import Person, Team, User\n6: from posthog.models.activity_logging.activity_log import changes_between\n7: from posthog.models.utils import UUIDT\n8: \n9: \n10: class TestChangesBetweenPersons(unittest.TestCase):\n11:     def test_can_exclude_changed_fields_in_persons(self) -> None:\n12:         actual = changes_between(\n13:             model_type=\"Person\",\n14:             previous=self._a_person_with(\n15:                 id=\"before\",\n16:                 uuid=\"before\",\n17:                 distinct_ids=\"before\",\n18:                 created_at=\"before\",",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_feature_flag_activity_logging.py",
+          "path": "posthog/test/activity_logging/test_feature_flag_activity_logging.py",
+          "sha": "592174dee87b1831205051393b55d3c0beb4b00c",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/posthog/test/activity_logging/test_feature_flag_activity_logging.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 20,
+          "excerpt": "1: from typing import Optional\n2: \n3: from posthog.test.base import APIBaseTest\n4: \n5: from dateutil import parser\n6: \n7: from posthog.models import FeatureFlag\n8: from posthog.models.activity_logging.activity_log import Change, changes_between\n9: \n10: \n11: class TestChangesBetweenFeatureFlags(APIBaseTest):\n12:     def test_comparing_two_nothings_results_in_no_changes(self) -> None:\n13:         actual = changes_between(model_type=\"FeatureFlag\", previous=None, current=None)\n14:         assert actual == []\n15: \n16:     def test_a_change_of_name_can_be_logged(self) -> None:\n17:         actual = changes_between(\n18:             model_type=\"FeatureFlag\",\n19:             previous=self._a_feature_flag_with(name=\"a\"),\n20:             current=self._a_feature_flag_with(name=\"b\"),",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"changes_between(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "utils.py",
+          "path": "products/customer_analytics/backend/api/utils.py",
+          "sha": "d6ce94a85d231c9a726c7a0c5875cf4753584bd7",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/products/customer_analytics/backend/api/utils.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 6,
+          "end_line": 29,
+          "excerpt": "6: from posthog.models.user import User\n7: \n8: from products.customer_analytics.backend.models import CustomerProfileConfig\n9: \n10: \n11: def log_customer_profile_config_activity(\n12:     viewset,\n13:     instance: CustomerProfileConfig,\n14:     activity: str,\n15:     previous: Optional[CustomerProfileConfig] = None,\n16: ) -> None:\n17:     name = f\"{instance.scope} profile\"\n18:     changes = changes_between(\"CustomerProfileConfig\", previous=previous, current=instance)\n19:     detail = Detail(name=name, changes=changes)\n20:     log_activity(\n21:         organization_id=viewset.organization.id,\n22:         team_id=viewset.team.id,\n23:         user=cast(User, viewset.request.user),\n24:         was_impersonated=is_impersonated_session(viewset.request),\n25:         item_id=str(instance.id),\n26:         scope=\"CustomerProfileConfig\",\n27:         activity=activity,\n28:         detail=detail,\n29:     )",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "alert.py",
+          "path": "posthog/api/alert.py",
+          "sha": "3a8f7e9e35e0019297edbb26e28b6ff534b27697",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/posthog/api/alert.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 683,
+          "end_line": 707,
+          "excerpt": "683: def handle_alert_configuration_change(\n684:     sender, scope, before_update, after_update, activity, user, was_impersonated=False, **kwargs\n685: ):\n686:     log_activity(\n687:         organization_id=after_update.team.organization_id,\n688:         team_id=after_update.team_id,\n689:         user=user,\n690:         was_impersonated=was_impersonated,\n691:         item_id=after_update.id,\n692:         scope=scope,\n693:         activity=activity,\n694:         detail=Detail(\n695:             changes=changes_between(scope, previous=before_update, current=after_update),\n696:             name=after_update.name or f\"Alert for {after_update.insight.name}\",\n697:             context=AlertConfigurationContext(\n698:                 insight_id=after_update.insight_id,\n699:                 insight_short_id=after_update.insight.short_id,\n700:                 insight_name=after_update.insight.name,\n701:             ),\n702:         ),\n703:     )\n704: \n705: \n706: @mutable_receiver(model_activity_signal, sender=Threshold)\n707: def handle_threshold_change(",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "ee_property_definition.py",
+          "path": "ee/api/ee_property_definition.py",
+          "sha": "9bd589a7eb537fc15e99d3925890196ce9fad304",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/ee/api/ee_property_definition.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 89,
+          "end_line": 113,
+          "excerpt": "89:             else:\n90:                 # Attempting to re-verify an already verified property, invalid action. Ignore attribute.\n91:                 validated_data.pop(\"verified\")\n92: \n93:         before_state = {\n94:             k: property_definition.__dict__[k] for k in validated_data.keys() if k in property_definition.__dict__\n95:         }\n96:         # KLUDGE: if we get a None value for tags, and we're not adding any\n97:         # then we get an activity log that we went from null to the empty array ¯\\_(ツ)_/¯\n98:         if \"tags\" not in before_state or before_state[\"tags\"] is None:\n99:             before_state[\"tags\"] = []\n100: \n101:         changes = dict_changes_between(\"PropertyDefinition\", before_state, validated_data, True)\n102: \n103:         log_activity(\n104:             organization_id=None,\n105:             team_id=self.context[\"team_id\"],\n106:             user=self.context[\"request\"].user,\n107:             was_impersonated=is_impersonated_session(self.context[\"request\"]),\n108:             item_id=str(property_definition.id),\n109:             scope=\"PropertyDefinition\",\n110:             activity=\"changed\",\n111:             detail=Detail(\n112:                 name=str(property_definition.name),\n113:                 type=PropertyDefinition.Type(property_definition.type).label,",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "project.py",
+          "path": "posthog/api/project.py",
+          "sha": "4c46e15b85f779e91834bbff7c2ac5f7983d0182",
+          "html_url": "https://github.com/PostHog/posthog/blob/57733c170f097a32e0784494122939a2c9238d07/posthog/api/project.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 425,
+          "end_line": 449,
+          "excerpt": "425:         project_before_update = instance.__dict__.copy()\n426: \n427:         if \"survey_config\" in validated_data:\n428:             if team.survey_config is not None and validated_data.get(\"survey_config\") is not None:\n429:                 validated_data[\"survey_config\"] = {\n430:                     **team.survey_config,\n431:                     **validated_data[\"survey_config\"],\n432:                 }\n433: \n434:             if validated_data.get(\"survey_config\") is None:\n435:                 del team_before_update[\"survey_config\"]\n436: \n437:             survey_config_changes_between = dict_changes_between(\n438:                 \"Survey\",\n439:                 team_before_update.get(\"survey_config\", {}),\n440:                 validated_data.get(\"survey_config\", {}),\n441:                 use_field_exclusions=True,\n442:             )\n443:             if survey_config_changes_between:\n444:                 log_activity(\n445:                     organization_id=cast(UUIDT, instance.organization_id),\n446:                     team_id=instance.pk,\n447:                     user=cast(User, self.context[\"request\"].user),\n448:                     was_impersonated=is_impersonated_session(request),\n449:                     scope=\"Survey\",",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "posthog/models/activity_logging",
+      "count": 13,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "posthog/models/activity_logging/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "activity_log.py",
+          "path": "posthog/models/activity_logging/activity_log.py",
+          "type": "file"
+        },
+        {
+          "name": "activity_page.py",
+          "path": "posthog/models/activity_logging/activity_page.py",
+          "type": "file"
+        },
+        {
+          "name": "batch_export_utils.py",
+          "path": "posthog/models/activity_logging/batch_export_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "batch_import_utils.py",
+          "path": "posthog/models/activity_logging/batch_import_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "external_data_utils.py",
+          "path": "posthog/models/activity_logging/external_data_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "model_activity.py",
+          "path": "posthog/models/activity_logging/model_activity.py",
+          "type": "file"
+        },
+        {
+          "name": "notification_viewed.py",
+          "path": "posthog/models/activity_logging/notification_viewed.py",
+          "type": "file"
+        },
+        {
+          "name": "personal_api_key_utils.py",
+          "path": "posthog/models/activity_logging/personal_api_key_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "serializers.py",
+          "path": "posthog/models/activity_logging/serializers.py",
+          "type": "file"
+        },
+        {
+          "name": "signal_handlers.py",
+          "path": "posthog/models/activity_logging/signal_handlers.py",
+          "type": "file"
+        },
+        {
+          "name": "tag_utils.py",
+          "path": "posthog/models/activity_logging/tag_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "posthog/models/activity_logging/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "posthog/models/activity_logging/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "activity_page.py",
+          "path": "posthog/models/activity_logging/activity_page.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from rest_framework import request, response, serializers, status\n2: \n3: from posthog.models.activity_logging.activity_log import ActivityPage\n4: from posthog.models.activity_logging.serializers import ActivityLogSerializer\n5: from posthog.utils import format_query_params_absolute_url\n6: \n7: \n8: class ActivityLogPaginatedResponseSerializer(serializers.Serializer):\n9:     \"\"\"Response shape for paginated activity log endpoints.\"\"\"\n10: \n11:     results = ActivityLogSerializer(many=True)\n12:     next = serializers.URLField(allow_null=True)\n13:     previous = serializers.URLField(allow_null=True)"
+        },
+        {
+          "name": "batch_export_utils.py",
+          "path": "posthog/models/activity_logging/batch_export_utils.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from typing import Optional\n2: \n3: \n4: def get_batch_export_destination_type(batch_export) -> str:\n5:     \"\"\"Get destination type from BatchExport\"\"\"\n6:     destination_type = \"\"\n7:     try:\n8:         if batch_export.destination:\n9:             destination_type = batch_export.destination.type\n10:     except Exception:\n11:         destination_type = \"unknown\"\n12:     return destination_type\n13: "
+        },
+        {
+          "name": "batch_import_utils.py",
+          "path": "posthog/models/activity_logging/batch_import_utils.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from typing import Optional\n2: \n3: from posthog.models.user import User\n4: \n5: \n6: def extract_batch_import_info(batch_import) -> tuple[str, str, Optional[str], Optional[str]]:\n7:     \"\"\"Extract source type, content type, start date, and end date from BatchImport\"\"\"\n8:     source_type = \"unknown\"\n9:     content_type = \"unknown\"\n10:     start_date = None\n11:     end_date = None\n12: \n13:     if batch_import.import_config:"
+        },
+        {
+          "name": "external_data_utils.py",
+          "path": "posthog/models/activity_logging/external_data_utils.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from typing import Optional\n2: \n3: from products.data_warehouse.backend.models.external_data_source import ExternalDataSource\n4: \n5: \n6: def get_external_data_source_detail_name(external_data_source: ExternalDataSource) -> str:\n7:     \"\"\"Generate detail name for ExternalDataSource activity\"\"\"\n8:     source_type = external_data_source.source_type or \"unknown\"\n9: \n10:     if external_data_source.prefix:\n11:         return f\"{source_type} ({external_data_source.prefix})\"\n12: \n13:     return source_type"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "78e1c21b955ed67cd4d0009b957f043b86070643",
+          "html_url": "https://github.com/PostHog/posthog/commit/78e1c21b955ed67cd4d0009b957f043b86070643",
+          "message": "feat(logs-alerting): add alerting models, migration, and feature flag (#50364)\n\n## Problem\n\nAlerting is the top blocker for logs adoption. Customers can't switch from competing solutions without alerts - they need to know when errors spike without manually checking the logs viewer.\n\n## Changes\n\nSpik",
+          "author": "Jon McCallum",
+          "date": "2026-03-09T18:12:39Z"
+        },
+        {
+          "sha": "073976b0529b0e79a7a55eebe110c3638532f46d",
+          "html_url": "https://github.com/PostHog/posthog/commit/073976b0529b0e79a7a55eebe110c3638532f46d",
+          "message": "feat: ticket activity history (#49967)",
+          "author": "Alex V",
+          "date": "2026-03-05T12:28:06Z"
+        },
+        {
+          "sha": "901f6087e216ed1e4752276e5f3c7331fbb1715c",
+          "html_url": "https://github.com/PostHog/posthog/commit/901f6087e216ed1e4752276e5f3c7331fbb1715c",
+          "message": "fix(toolbar): simplify oauth flow (#49579)\n\n## Problem\n\nThe toolbar OAuth flow used a popup window (`window.open`) to authenticate users. This broke on customer sites with strict `Cross-Origin-Opener-Policy` headers, which sever `window.opener` and prevent the popup from delivering tokens back to th",
+          "author": "Fernando Gomes",
+          "date": "2026-03-03T16:16:25Z"
+        },
+        {
+          "sha": "57c2bf29be9714ba2518ff51bef25c4345082dcc",
+          "html_url": "https://github.com/PostHog/posthog/commit/57c2bf29be9714ba2518ff51bef25c4345082dcc",
+          "message": "feat: ensure SCIM can only act on org domain (#49160)",
+          "author": "Tom Piccirello",
+          "date": "2026-02-26T05:50:18Z"
+        },
+        {
+          "sha": "827bb9dae72da547f97f381ee2f7cae735b42d6e",
+          "html_url": "https://github.com/PostHog/posthog/commit/827bb9dae72da547f97f381ee2f7cae735b42d6e",
+          "message": "fix: improve activity logging for resource transfers (#48609)\n\nCo-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>",
+          "author": "Reece Jones",
+          "date": "2026-02-23T21:16:47Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "changes_between TODO include tags fields assessed",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "posthog/models/activity_logging/activity_log.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "78e1c21b955ed67cd4d0009b957f043b86070643",
+        "html_url": "https://github.com/PostHog/posthog/commit/78e1c21b955ed67cd4d0009b957f043b86070643",
+        "message": "feat(logs-alerting): add alerting models, migration, and feature flag (#50364)\n\n## Problem\n\nAlerting is the top blocker for logs adoption. Customers can't switch from competing solutions without alerts - they need to know when errors spike without manually checking the logs viewer.\n\n## Changes\n\nSpik",
+        "author": "Jon McCallum",
+        "date": "2026-03-09T18:12:39Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 4,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

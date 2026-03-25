@@ -1,0 +1,479 @@
+{
+  "task_id": "990",
+  "repo_owner": "pytorch",
+  "repo_name": "pytorch",
+  "file_path": "test/inductor/test_mkldnn_pattern_matcher.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T04:12:26+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 62,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "partial",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T04:12:37+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T04:12:42+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "test/inductor/test_mkldnn_pattern_matcher.py",
+    "original_code": "def test_dequant_promotion(self):\n    class M(torch.nn.Module):\n        def __init__(\n            self,\n        ):\n            super().__init__()\n            self.conv1 = torch.nn.Conv2d(3, 6, kernel_size=3, stride=1)\n            self.conv2 = torch.nn.Conv2d(6, 6, kernel_size=3, stride=1)\n            self.conv3 = torch.nn.Conv2d(6, 6, kernel_size=3, stride=1)\n\n        def forward(self, x):\n            temp = self.conv1(x)\n            temp = self.conv2(temp) + self.conv3(temp)\n            return temp\n\n    mod = M().eval()\n    v = torch.randn((1, 3, 8, 8), dtype=torch.float32, requires_grad=False).add(1)\n    # For now, we have annotated conv_add in x86InductorQuantizer. But we didn't implement the lowering.\n    # TODO <leslie>: Modify the pattern matcher count after we implement the qconv2d_add lowering.\n    # Totally 10 pattern_matcher_count, 43 pattern_matcher_nodes\n    # 1. Pair of to_int8 and to_fp32 at conv input * 2, extra input of add * 1, and graph output * 1\n    #    matched in pointless_convert pass at\n    #    torch/_inductor/fx_passes/joint_graph.py: [convert_element_type, convert_element_type_1]\n    # 2. Dequant pattern matcher for dequant promotion * 1\n    #    [convert_element_type_3, sub_1, mul_3]\n    # 3. Dequant-conv pattern matched in quantization weight prepack * 3\n    #    [convert_element_type_1, sub, mul_1, dequantize_per_channel, clone, convolution]\n    # 4. Quantization fusion in post-grad fusion pass * 2\n    #    [qconv2d_pointwise_default, div_1, round_2, add_1, clamp_min_1, clamp_max_1, convert_element_type_2]\n    self._test_common(\n        mod,\n        (v,),\n        10,\n        43,\n        check_quantization=True,\n    )",
+    "original_signature": "def test_dequant_promotion(self):",
+    "satd_comment": "# TODO <leslie>: Modify the pattern matcher count after we implement the qconv2d_add lowering.\n# Totally 10 pattern_matcher_count, 43 pattern_matcher_nodes\n# 1. Pair of to_int8 and to_fp32 at conv input * 2, extra input of add * 1, and graph output * 1\n#    matched in pointless_convert pass at\n#    torch/_inductor/fx_passes/joint_graph.py: [convert_element_type, convert_element_type_1]\n# 2. Dequant pattern matcher for dequant promotion * 1\n#    [convert_element_type_3, sub_1, mul_3]\n# 3. Dequant-conv pattern matched in quantization weight prepack * 3\n#    [convert_element_type_1, sub, mul_1, dequantize_per_channel, clone, convolution]\n# 4. Quantization fusion in post-grad fusion pass * 2\n#    [qconv2d_pointwise_default, div_1, round_2, add_1, clamp_min_1, clamp_max_1, convert_element_type_2]",
+    "target_file": {
+      "ok": true,
+      "path": "test/inductor/test_mkldnn_pattern_matcher.py",
+      "sha": "a342e67deecbdddcd0a52f6e9185bad111c933f0",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/test/inductor/test_mkldnn_pattern_matcher.py",
+      "content_excerpt": "# Owner(s): [\"oncall: cpu inductor\"]\nimport contextlib\nimport copy\nimport itertools\nimport unittest\n\nimport torch\nfrom torch._dynamo import config as dynamo_config\nfrom torch._dynamo.utils import counters\nfrom torch._inductor import config, metrics\nfrom torch._inductor.test_case import run_tests, TestCase\nfrom torch._inductor.utils import (\n    is_mkldnn_bf16_supported,\n    is_mkldnn_fp16_supported,\n    run_and_get_code,\n)\nfrom torch.nn import functional as F\nfrom torch.testing._internal.common_device_type import instantiate_device_type_tests\nfrom torch.testing._internal.common_mkldnn import reduced_f32_on_and_off\nfrom torch.testing._internal.common_quantization import (\n    skipIfNoDynamoSupport,\n    skipIfNoONEDNN,\n)\nfrom torch.testing._internal.common_utils import (\n    instantiate_parametrized_tests,\n    IS_FBCODE,\n    IS_LINUX,\n    skipIfXpu,\n    TEST_ACL,\n    TEST_MKL,\n    xfailIfACL,\n)\nfrom torch.testing._internal.inductor_utils import (\n    _check_has_dynamic_shape,\n    clone_preserve_strides_offset,\n    HAS_CPU,\n)\n\n\n# The dict value is match_nodes(computation_op+unary_op)\n\nunary_list = {\n    torch.nn.ReLU(): 2,\n    torch.nn.Sigmoid(): 2,\n    torch.nn.Tanh(): 2,\n    torch.nn.Hardswish(): 6,\n    torch.nn.LeakyReLU(0.1, inplace=False): 4,\n    # Use floats for min/max, otherwise they can get converted to symints\n    torch.nn.Hardtanh(min_val=-0.5, max_val=4.0, inplace=False): 3,\n    torch.nn.Hardtanh(min_val=-0.5, max_val=float(\"inf\"), inplace=False): 3,\n    torch.nn.GELU(approximate=\"none\"): 6,\n    torch.nn.GELU(approximate=\"tanh\"): 10,\n    torch.nn.ReLU6(): 3,\n    torch.nn.SiLU(): 5,\n    torch.nn.Hardsigmoid(): 5,\n}\n\nnon_decomposed_unary_list = [\n    torch.nn.ReLU,\n    torch.nn.Sigmoid,\n    torch.nn.Tanh,\n]\n\n# The dict value is (match_count, match_nodes, inplace)\nbinary_list = {\n    lambda x, y: torch.add(x, y): (1, 2, False),  # call_function\n    lambda x, y: torch.add(y, x): (1, 2, False),  # call_function\n    lambda x, y: x.add(y): (1, 2, False),  # call_method\n    lambda x, y: x.add_(y): (1, 2, True),  # call_method\n    lambda x, y: torch.sub(x, y): (1, 2, False),  # call_function\n    lambda x, y: x.sub(y): (1, 2, False),  # call_method\n    lambda x, y: x.sub_(y): (1, 2, True),  # call_method\n}\n\nquantization_add_fn_list = [\n    lambda x, y: torch.add(x, y),\n    lambda x, y: x.add(y),\n]\n\nquantization_inplace_add_fn_list = [\n    lambda x, y: x.add_(y),\n]\n\n\ndef cal_conv_generated_kernel_number(mod, input, dtype, dim=4, device=\"cpu\"):\n    # this function is to decide how many kernels are generated\n    # while testing conv2d/3d/deconv2d\n    # the assumption is:\n    #   (1) There will be a to_dtype kernel for input for lp\n    #   (2) inductor always use channel_last format, there will\n    #       be a to_channel_last format for input\n    #   (3) to_dtype and to_channel_last for input can be fused\n    #   (4) inductor always get channel last format from mkldnn_conv_pointwise(binary),\n    #       and force the output to have same stride with eager.\n    #       So there will be a to_contiguous for output if eager output is contiguouse\n    mod = copy.deepcopy(mod)\n    mod = mod.to(device=device)\n    input = input.clone()\n    input = input.to(device)\n\n    if dtype == torch.float32:\n        maybe_autocast = contextlib.nullcontext()\n    else:\n        maybe_autocast = torch.amp.autocast(device_type=device, dtype=dtype)\n    with torch.no_grad(), maybe_autocast:\n        output = mod(input)\n    input_kernel, output_kernel = 0, 0\n    if (\n        input.is_contiguous(memory_format=torch.contiguous_format)\n        or dtype != torch.float32\n        or (TEST_ACL and dim == 4)\n    ):\n        input_kernel = 1\n    if output.is_contiguous(memory_format=torch.contiguous_format) or (\n        TEST_ACL and (dtype == torch.bfloat16 or dtype == torch.half)\n    ):\n        output_kernel = 1\n\n    return input_kernel + output_kernel\n\n\nclass TestPatternMatcherBase(TestCase):\n    def setUp(self):\n        super().setUp()\n        self.ctx_stack = contextlib.ExitStack()\n        self.ctx_stack.enter_context(config.patch({\"freezing\": True}))\n\n    def tearDown(self):\n        TestCase.tearDown(self)\n        self.ctx_stack.close()\n\n    def _check_unary_is_decomposed(self, unary_fn):\n        return not any(\n            isinstance(unary_fn, fn)\n            for fn in [torch.nn.ReLU, torch.nn.Sigmoid, torch.nn.Tanh]\n        )\n\n    def _clone_inputs(self, inputs):\n        def clone(x):\n            if not isinstance(x, torch.Tensor):\n                return x\n            return x.clone()\n\n        return tuple(clone(x) for x in inputs)\n\n    def _test_common(\n        self,\n        mod,\n        inputs,\n        matcher_check_fn,\n        atol=1e-5,\n        rtol=1.3e-6,\n        check_autocast=torch.float32,\n        check_quantization=False,\n        is_qat=False,\n        dtype=None,\n        is_dynamic=False,\n        quantizer=None,\n        compile_options={},  # noqa: B006\n        quantization_with_autocast=False,\n    ):\n        if not hasattr(self, \"device\"):\n            has_xpu = any(\n                isinstance(input, torch.Tensor) and input.device.type == \"xpu\"\n                for input in inputs\n            )\n            device = \"xpu\" if has_xpu else \"cpu\"\n        else:\n            device = self.device\n\n        mod = mod.to(device=device)\n        if device != \"cpu\":\n            inputs = tuple(\n                clone_preserve_strides_offset(x, device=device) for x in inputs\n            )\n        counters.clear()\n        torch._dynamo.reset()\n        if check_autocast == torch.bfloat16 and is_mkldnn_bf16_supported(device):\n            maybe_autocast = torch.amp.autocast(\n                device_type=device, dtype=torch.bfloat16\n            )\n            atol, rtol = 5e-2, 5e-2\n        elif check_autocast == torch.float16 and (is_mkldnn_fp16_supported(device)):\n            maybe_autocast = torch.amp.autocast(device_type=device, dtype=torch.float16)\n            atol, rtol = 5e-2, 5e-2\n        else:\n            if check_autocast != torch.float32:\n                raise AssertionError(\n                    f\"Expected check_autocast to be torch.float32, got {check_autocast}\"\n                )\n            maybe_autocast = contextlib.nullcontext()\n        if check_quantization:\n            raise NotImplementedError(\"not supported, please migrate to torchao\")\n            \"\"\"\n            if quantization_with_autocast:\n                with maybe_autocast:\n                    convert_model = _generate_qdq_quantized_model(\n                        mod, inputs, is_qat, is_dynamic, quantizer\n                    )\n            else:\n                convert_model = _generate_qdq_quantized_model(\n                    mod, inputs, is_qat, is_dynamic, quantizer\n                )\n            with torch.no_grad(), maybe_autocast:\n                _ = torch.compile(convert_model)(*inputs)\n                matcher_check_fn()\n            \"\"\"\n        else:\n            with torch.no_grad(), maybe_autocast:\n                clone_inputs = self._clone_inputs(inputs)\n                expected = mod(*inputs)\n                actual = torch.compile(mod, **compile_options)(*clone_inputs)\n                if self.precision != 0:\n                    torch.testing.assert_close(\n                        actual, expected, atol=self.precision, rtol=self.precision\n                    )\n                else:\n                    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)\n                matcher_check_fn()\n\n    def _test_code_common(\n        self,\n        mod,\n        inputs,\n        include_ops,\n        exclude_ops,\n        atol=1e-5,\n        rtol=1.3e-6,\n        check_quantization=False,\n        check_dynamic=None,\n        num_include_ops=None,\n        quantizer=None,\n    ):\n        with torch.no_grad():\n            clone_inputs = self._clone_inputs(inputs)\n            if check_quantization:\n                raise NotImplementedError(\"not supported, please migrate to torchao\")\n                \"\"\"\n                mod = _generate_qdq_quantized_model(mod, inputs, quantizer=quantizer)\n                \"\"\"\n            expected = mod(*inputs)\n            actual, (source_code,) = run_and_get_code(\n                torch.compile(mod, fullgraph=True, dynamic=check_dynamic),\n                *clone_inputs,\n            )\n            assert_keywords = [\"assert_size_stride\", \"assert_alignment\"]\n            filtered_lines = [\n                line\n                for line in source_code.splitlines()\n                if not any(assert_key in line for assert_key in assert_keywords)\n            ]\n            source_code = \"\\n\".join(filtered_lines)\n\n            for op in include_ops:\n                self.assertIn(op, source_code)\n            if num_include_ops is not None:\n                if len(include_ops) != len(num_include_ops):\n                    raise AssertionError(\n                        f\"len(include_ops)={len(include_ops)} != len(num_include_ops)={len(num_include_ops)}\"\n                    )\n                for i in range(len(include_ops)):\n                    self.assertEqual(\n                        source_code.count(include_ops[i]), num_include_ops[i]\n                    )\n            for op in exclude_ops:\n                self.assertNotIn(op, source_code)\n            if check_dynamic is not None:\n                _check_has_dynamic_shape(self, source_code)\n            if not check_quantization:\n                # Skip due to reduce range setting for Quantization on preCI system.\n                torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)\n\n\nclass TestPatternMatcherGeneric(TestPatternMatcherBase):\n    def _test_conv_unary_base(self, dim=4):\n        if dim != 4 and dim != 5:\n            raise AssertionError(f\"Expected dim to be 4 or 5, got {dim}\")\n\n        class M(torch.nn.Module):\n            def __init__(\n                self,\n                unary_fn,\n                **kwargs,\n            ):\n                super().__init__()\n                if dim == 4:\n                    self.conv = torch.nn.Conv2d(3, 16, kernel_size=3, stride=1)\n                else:\n                    self.conv = torch.nn.Conv3d(3, 16, kernel_size=3, stride=1)\n                self.unary_fn = unary_fn\n\n            def forward(self, x):\n                x = self.conv(x)\n                return self.unary_fn(x)\n\n        dtypes = [\n            torch.float,\n        ]\n        if is_mkldnn_bf16_supported(self.device):\n            dtypes.append(torch.bfloat16)\n        if is_mkldnn_fp16_supported(self.device):\n            dtypes.append(torch.float16)\n        cl_format = torch.channels_last if dim == 4 else torch.channels_last_3d\n        options = itertools.product(\n            unary_list.keys(),\n            [torch.contiguous_format, cl_format],\n            dtypes,\n        )\n\n        for (\n            unary_fn,\n            memory_format,\n            dtype,\n        ) in options:\n            if (\n                dtype != torch.float32\n                and torch.backends.mkldnn.matmul.fp32_precision == \"tf32\"\n            ):\n                continue\n            metrics.reset()\n            if dim == 4:\n                x_shape = (1, 3, 56, 56)\n            else:\n                x_shape = (1, 3, 20, 56, 56)\n            mod = M(unary_fn).to(memory_format=memory_format).eval()\n\n            v = (\n                torch.randn(x_shape, dtype=torch.float32)\n                .add(1)\n                .to(memory_format=memory_format)\n            )\n\n            def matcher_check_fn():\n                match_nodes = unary_list[unary_fn]\n                if dtype in (\n                    torch.float16,\n                    torch.bfloat16,\n                ) and self._check_unary_is_decomposed(unary_fn):\n                    # Has extra dtype conversion nodes for autocast.\n                    match_nodes += 2\n                self.assertEqual(\n                    counters[\"inductor\"][\"mkldnn_unary_fusion_matcher_nodes\"],\n                    0 if TEST_ACL else match_nodes,\n                )\n           ",
+      "total_lines": 1783
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 62,
+      "start_line": 42,
+      "end_line": 82,
+      "matched_line": "]",
+      "excerpt": "42: unary_list = {\n43:     torch.nn.ReLU(): 2,\n44:     torch.nn.Sigmoid(): 2,\n45:     torch.nn.Tanh(): 2,\n46:     torch.nn.Hardswish(): 6,\n47:     torch.nn.LeakyReLU(0.1, inplace=False): 4,\n48:     # Use floats for min/max, otherwise they can get converted to symints\n49:     torch.nn.Hardtanh(min_val=-0.5, max_val=4.0, inplace=False): 3,\n50:     torch.nn.Hardtanh(min_val=-0.5, max_val=float(\"inf\"), inplace=False): 3,\n51:     torch.nn.GELU(approximate=\"none\"): 6,\n52:     torch.nn.GELU(approximate=\"tanh\"): 10,\n53:     torch.nn.ReLU6(): 3,\n54:     torch.nn.SiLU(): 5,\n55:     torch.nn.Hardsigmoid(): 5,\n56: }\n57: \n58: non_decomposed_unary_list = [\n59:     torch.nn.ReLU,\n60:     torch.nn.Sigmoid,\n61:     torch.nn.Tanh,\n62: ]\n63: \n64: # The dict value is (match_count, match_nodes, inplace)\n65: binary_list = {\n66:     lambda x, y: torch.add(x, y): (1, 2, False),  # call_function\n67:     lambda x, y: torch.add(y, x): (1, 2, False),  # call_function\n68:     lambda x, y: x.add(y): (1, 2, False),  # call_method\n69:     lambda x, y: x.add_(y): (1, 2, True),  # call_method\n70:     lambda x, y: torch.sub(x, y): (1, 2, False),  # call_function\n71:     lambda x, y: x.sub(y): (1, 2, False),  # call_method\n72:     lambda x, y: x.sub_(y): (1, 2, True),  # call_method\n73: }\n74: \n75: quantization_add_fn_list = [\n76:     lambda x, y: torch.add(x, y),\n77:     lambda x, y: x.add(y),\n78: ]\n79: \n80: quantization_inplace_add_fn_list = [\n81:     lambda x, y: x.add_(y),\n82: ]"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "current_file_focus": {
+      "match_reason": "anchor_text",
+      "start_line": 50,
+      "end_line": 74,
+      "excerpt": "50:     torch.nn.Hardtanh(min_val=-0.5, max_val=float(\"inf\"), inplace=False): 3,\n51:     torch.nn.GELU(approximate=\"none\"): 6,\n52:     torch.nn.GELU(approximate=\"tanh\"): 10,\n53:     torch.nn.ReLU6(): 3,\n54:     torch.nn.SiLU(): 5,\n55:     torch.nn.Hardsigmoid(): 5,\n56: }\n57: \n58: non_decomposed_unary_list = [\n59:     torch.nn.ReLU,\n60:     torch.nn.Sigmoid,\n61:     torch.nn.Tanh,\n62: ]\n63: \n64: # The dict value is (match_count, match_nodes, inplace)\n65: binary_list = {\n66:     lambda x, y: torch.add(x, y): (1, 2, False),  # call_function\n67:     lambda x, y: torch.add(y, x): (1, 2, False),  # call_function\n68:     lambda x, y: x.add(y): (1, 2, False),  # call_method\n69:     lambda x, y: x.add_(y): (1, 2, True),  # call_method\n70:     lambda x, y: torch.sub(x, y): (1, 2, False),  # call_function\n71:     lambda x, y: x.sub(y): (1, 2, False),  # call_method\n72:     lambda x, y: x.sub_(y): (1, 2, True),  # call_method\n73: }\n74: ",
+      "symbol_name": null,
+      "symbol_type": null,
+      "ok": true,
+      "path": "test/inductor/test_mkldnn_pattern_matcher.py",
+      "sha": "a342e67deecbdddcd0a52f6e9185bad111c933f0",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/test/inductor/test_mkldnn_pattern_matcher.py"
+    },
+    "imports": {
+      "imports": [
+        "contextlib",
+        "copy",
+        "itertools",
+        "unittest",
+        "torch",
+        "torch._dynamo:config",
+        "torch._dynamo.utils:counters",
+        "torch._inductor:config",
+        "torch._inductor:metrics",
+        "torch._inductor.test_case:run_tests",
+        "torch._inductor.test_case:TestCase",
+        "torch._inductor.utils:is_mkldnn_bf16_supported",
+        "torch._inductor.utils:is_mkldnn_fp16_supported",
+        "torch._inductor.utils:run_and_get_code",
+        "torch.nn:functional",
+        "torch.testing._internal.common_device_type:instantiate_device_type_tests",
+        "torch.testing._internal.common_mkldnn:reduced_f32_on_and_off",
+        "torch.testing._internal.common_quantization:skipIfNoDynamoSupport",
+        "torch.testing._internal.common_quantization:skipIfNoONEDNN",
+        "torch.testing._internal.common_utils:instantiate_parametrized_tests",
+        "torch.testing._internal.common_utils:IS_FBCODE",
+        "torch.testing._internal.common_utils:IS_LINUX",
+        "torch.testing._internal.common_utils:skipIfXpu",
+        "torch.testing._internal.common_utils:TEST_ACL",
+        "torch.testing._internal.common_utils:TEST_MKL",
+        "torch.testing._internal.common_utils:xfailIfACL",
+        "torch.testing._internal.inductor_utils:_check_has_dynamic_shape",
+        "torch.testing._internal.inductor_utils:clone_preserve_strides_offset",
+        "torch.testing._internal.inductor_utils:HAS_CPU"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/README.md",
+      "content_excerpt": "![PyTorch Logo](https://github.com/pytorch/pytorch/raw/main/docs/source/_static/img/pytorch-logo-dark.png)\n\n--------------------------------------------------------------------------------\n\nPyTorch is a Python package that provides two high-level features:\n- Tensor computation (like NumPy) with strong GPU acceleration\n- Deep neural networks built on a tape-based autograd system\n\nYou can reuse your favorite Python packages such as NumPy, SciPy, and Cython to extend PyTorch when needed.\n\nOur trunk health (Continuous Integration signals) can be found at [hud.pytorch.org](https://hud.pytorch.org/ci/pytorch/pytorch/main).\n\n<!-- toc -->\n\n- [More About PyTorch](#more-about-pytorch)\n  - [A GPU-Ready Tensor Library](#a-gpu-ready-tensor-library)\n  - [Dynamic Neural Networks: Tape-Based Autograd](#dynamic-neural-networks-tape-based-autograd)\n  - [Python First](#python-first)\n  - [Imperative Experiences](#imperative-experiences)\n  - [Fast and Lean](#fast-and-lean)\n  - [Extensions Without Pain](#extensions-without-pain)\n- [Installation](#installation)\n  - [Binaries](#binaries)\n    - [NVIDIA Jetson Platforms](#nvidia-jetson-platforms)\n  - [From Source](#from-source)\n    - [Prerequisites](#prerequisites)\n      - [NVIDIA CUDA Support](#nvidia-cuda-support)\n      - [AMD ROCm Support](#amd-rocm-support)\n      - [Intel GPU Support](#intel-gpu-support)\n    - [Get the PyTorch Source](#get-the-pytorch-source)\n    - [Install Dependencies](#install-dependencies)\n    - [Install PyTorch](#install-pytorch)\n      - [Adjust Build Options (Optional)](#adjust-build-options-optional)\n  - [Docker Image](#d"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "test_dequant_promotion test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"test_dequant_promotion(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "test/inductor",
+      "count": 40,
+      "entries": [
+        {
+          "name": "CMakeLists.txt",
+          "path": "test/inductor/CMakeLists.txt",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "test/inductor/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "cpp",
+          "path": "test/inductor/cpp",
+          "type": "dir"
+        },
+        {
+          "name": "custom_inductor_config.py",
+          "path": "test/inductor/custom_inductor_config.py",
+          "type": "file"
+        },
+        {
+          "name": "custom_ops.cpp",
+          "path": "test/inductor/custom_ops.cpp",
+          "type": "file"
+        },
+        {
+          "name": "extension_backends",
+          "path": "test/inductor/extension_backends",
+          "type": "dir"
+        },
+        {
+          "name": "indirect_assert_helper.py",
+          "path": "test/inductor/indirect_assert_helper.py",
+          "type": "file"
+        },
+        {
+          "name": "minifier_smoke.py",
+          "path": "test/inductor/minifier_smoke.py",
+          "type": "file"
+        },
+        {
+          "name": "opinfo_harness.py",
+          "path": "test/inductor/opinfo_harness.py",
+          "type": "file"
+        },
+        {
+          "name": "pallas_expected_failures",
+          "path": "test/inductor/pallas_expected_failures",
+          "type": "dir"
+        },
+        {
+          "name": "pallas_skip_tests",
+          "path": "test/inductor/pallas_skip_tests",
+          "type": "dir"
+        },
+        {
+          "name": "s429861_repro.py",
+          "path": "test/inductor/s429861_repro.py",
+          "type": "file"
+        },
+        {
+          "name": "test_alignment.py",
+          "path": "test/inductor/test_alignment.py",
+          "type": "file"
+        },
+        {
+          "name": "test_analysis.py",
+          "path": "test/inductor/test_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aot_inductor.py",
+          "path": "test/inductor/test_aot_inductor.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aot_inductor_arrayref.py",
+          "path": "test/inductor/test_aot_inductor_arrayref.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aot_inductor_custom_ops.py",
+          "path": "test/inductor/test_aot_inductor_custom_ops.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aot_inductor_package.py",
+          "path": "test/inductor/test_aot_inductor_package.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aot_inductor_utils.py",
+          "path": "test/inductor/test_aot_inductor_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "test_aoti_cross_compile_windows.py",
+          "path": "test/inductor/test_aoti_cross_compile_windows.py",
+          "type": "file"
+        },
+        {
+          "name": "test_async_compile.py",
+          "path": "test/inductor/test_async_compile.py",
+          "type": "file"
+        },
+        {
+          "name": "test_augmented_graph_helper.py",
+          "path": "test/inductor/test_augmented_graph_helper.py",
+          "type": "file"
+        },
+        {
+          "name": "test_auto_chunker.py",
+          "path": "test/inductor/test_auto_chunker.py",
+          "type": "file"
+        },
+        {
+          "name": "test_auto_functionalize.py",
+          "path": "test/inductor/test_auto_functionalize.py",
+          "type": "file"
+        },
+        {
+          "name": "test_autoheuristic.py",
+          "path": "test/inductor/test_autoheuristic.py",
+          "type": "file"
+        },
+        {
+          "name": "test_b2b_gemm.py",
+          "path": "test/inductor/test_b2b_gemm.py",
+          "type": "file"
+        },
+        {
+          "name": "test_benchmark_fusion.py",
+          "path": "test/inductor/test_benchmark_fusion.py",
+          "type": "file"
+        },
+        {
+          "name": "test_benchmarking.py",
+          "path": "test/inductor/test_benchmarking.py",
+          "type": "file"
+        },
+        {
+          "name": "test_best_config.py",
+          "path": "test/inductor/test_best_config.py",
+          "type": "file"
+        },
+        {
+          "name": "test_binary_folding.py",
+          "path": "test/inductor/test_binary_folding.py",
+          "type": "file"
+        },
+        {
+          "name": "test_block_analysis.py",
+          "path": "test/inductor/test_block_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "test_cache.py",
+          "path": "test/inductor/test_cache.py",
+          "type": "file"
+        },
+        {
+          "name": "test_caching.py",
+          "path": "test/inductor/test_caching.py",
+          "type": "file"
+        },
+        {
+          "name": "test_ck_backend.py",
+          "path": "test/inductor/test_ck_backend.py",
+          "type": "file"
+        },
+        {
+          "name": "test_codecache.py",
+          "path": "test/inductor/test_codecache.py",
+          "type": "file"
+        },
+        {
+          "name": "test_codegen_triton.py",
+          "path": "test/inductor/test_codegen_triton.py",
+          "type": "file"
+        },
+        {
+          "name": "test_collective_autotuning.py",
+          "path": "test/inductor/test_collective_autotuning.py",
+          "type": "file"
+        },
+        {
+          "name": "test_combo_kernels.py",
+          "path": "test/inductor/test_combo_kernels.py",
+          "type": "file"
+        },
+        {
+          "name": "test_comm_analysis.py",
+          "path": "test/inductor/test_comm_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "test_compile.py",
+          "path": "test/inductor/test_compile.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "CMakeLists.txt",
+          "path": "test/inductor/CMakeLists.txt",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 8,
+          "excerpt": "1: # Build separate libraries the define custom classes/operators used from our Python tests.\n2: # These are intended to be used with torch.ops.load_library() in our Python test suite.\n3: add_library(aoti_custom_ops SHARED custom_ops.cpp)\n4: target_link_libraries(aoti_custom_ops torch)\n5: \n6: if(INSTALL_TEST)\n7:   install(TARGETS aoti_custom_ops DESTINATION lib)\n8: endif()"
+        },
+        {
+          "name": "__init__.py",
+          "path": "test/inductor/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "custom_inductor_config.py",
+          "path": "test/inductor/custom_inductor_config.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Owner(s): [\"module: inductor\"]\n2: \n3: # This module is used in test_codecache.py to verify the correctness\n4: # of FXGraphHashDetails when a custom inductor backend registers its own\n5: # config object\n6: \n7: import sys\n8: \n9: from torch.utils._config_module import install_config_module\n10: \n11: \n12: enable_optimisation: bool = False\n13: "
+        },
+        {
+          "name": "custom_ops.cpp",
+          "path": "test/inductor/custom_ops.cpp",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #include <torch/csrc/api/include/torch/types.h>  // @manual=fbcode//caffe2:libtorch\n2: \n3: #include <torch/csrc/inductor/aoti_torch/c/shim.h> // @manual\n4: #include <torch/csrc/inductor/aoti_torch/utils.h> // @manual\n5: \n6: #include <cstdint>\n7: #include <iostream>\n8: #include <string>\n9: \n10: namespace at {\n11: \n12: Tensor custom_add_impl(Tensor t1, Tensor t2) {\n13:   return t1 + t2;"
+        },
+        {
+          "name": "indirect_assert_helper.py",
+          "path": "test/inductor/indirect_assert_helper.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import sys\n2: \n3: import torch\n4: from torch.testing._internal.inductor_utils import GPU_TYPE\n5: \n6: \n7: def first_arg(x, y):\n8:     return x[y]\n9: \n10: \n11: def second_arg(x, y):\n12:     return x[:, y]\n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "test/inductor/test_mkldnn_pattern_matcher.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "411751c356cdc700a1bd453636a908b513140d61",
+          "html_url": "https://github.com/pytorch/pytorch/commit/411751c356cdc700a1bd453636a908b513140d61",
+          "message": "Remove redundant inline_inbuilt_nn_modules=True patches from tests (#177971)\n\nIn preparation for making inline_inbuilt_nn_modules always True,\nremove all test patches that explicitly set it to True.\n\nPull Request resolved: https://github.com/pytorch/pytorch/pull/177971\nApproved by: https://github.co",
+          "author": "Animesh Jain",
+          "date": "2026-03-20T18:58:48Z"
+        },
+        {
+          "sha": "5091ccd42fd9c68544ecb0faee97c41a4b77b84a",
+          "html_url": "https://github.com/pytorch/pytorch/commit/5091ccd42fd9c68544ecb0faee97c41a4b77b84a",
+          "message": "Revert \"[dynamo] Deprecate inline_inbuilt_nn_modules config (#177490)\"\n\nThis reverts commit 95ef4718d076cd3b2761fb74e35090ff5683547a.\n\nReverted https://github.com/pytorch/pytorch/pull/177490 on behalf of https://github.com/anijain2305 due to needs breaking into smaller PRs to make future reverts eas",
+          "author": "PyTorch MergeBot",
+          "date": "2026-03-18T23:39:13Z"
+        },
+        {
+          "sha": "95ef4718d076cd3b2761fb74e35090ff5683547a",
+          "html_url": "https://github.com/pytorch/pytorch/commit/95ef4718d076cd3b2761fb74e35090ff5683547a",
+          "message": "[dynamo] Deprecate inline_inbuilt_nn_modules config (#177490)\n\ninline_inbuilt_nn_modules has defaulted to True and the False path is legacy. This makes the config a no-op (always True), emits a deprecation warning when users set it to False, and removes  all dead False-path code from runtime and tes",
+          "author": "Animesh Jain",
+          "date": "2026-03-18T23:31:19Z"
+        },
+        {
+          "sha": "51bef7ff70d9cad1f4063d035b308a5acef5ecd3",
+          "html_url": "https://github.com/pytorch/pytorch/commit/51bef7ff70d9cad1f4063d035b308a5acef5ecd3",
+          "message": "Finish test/inductor assert removal (#174614)\n\nPull Request resolved: https://github.com/pytorch/pytorch/pull/174614\nApproved by: https://github.com/ezyang\nghstack dependencies: #174613",
+          "author": "albanD",
+          "date": "2026-03-01T21:14:02Z"
+        },
+        {
+          "sha": "714c738756558475e6e1eb6a1b152143af1e1c2e",
+          "html_url": "https://github.com/pytorch/pytorch/commit/714c738756558475e6e1eb6a1b152143af1e1c2e",
+          "message": "Revert \"Finish test/inductor assert removal (#174614)\"\n\nThis reverts commit 42272a7498a6ded7e5484ee894287d66b35d0537.\n\nReverted https://github.com/pytorch/pytorch/pull/174614 on behalf of https://github.com/jeanschmidt due to breaks internal signals, see [D94598545](https://www.internalfb.com/diff/D",
+          "author": "PyTorch MergeBot",
+          "date": "2026-03-01T19:01:15Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "test_dequant_promotion TODO leslie Modify pattern matcher",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "test/inductor/test_mkldnn_pattern_matcher.py",
+      "satd_line": 62,
+      "last_commit": {
+        "sha": "411751c356cdc700a1bd453636a908b513140d61",
+        "html_url": "https://github.com/pytorch/pytorch/commit/411751c356cdc700a1bd453636a908b513140d61",
+        "message": "Remove redundant inline_inbuilt_nn_modules=True patches from tests (#177971)\n\nIn preparation for making inline_inbuilt_nn_modules always True,\nremove all test patches that explicitly set it to True.\n\nPull Request resolved: https://github.com/pytorch/pytorch/pull/177971\nApproved by: https://github.co",
+        "author": "Animesh Jain",
+        "date": "2026-03-20T18:58:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "partial",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "partial"
+    }
+  }
+}

@@ -1,0 +1,512 @@
+{
+  "task_id": "27",
+  "repo_owner": "openstack",
+  "repo_name": "ironic",
+  "file_path": "ironic/drivers/modules/agent.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T04:21:19+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "configure_local_boot",
+    "satd_line": 917,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 1,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 2,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T04:21:33+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T04:21:40+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "ironic/drivers/modules/agent.py",
+    "original_code": "def validate(self, task):\n    \"\"\"Validate that the node has required properties for agent rescue.\n\n    :param task: a TaskManager instance with the node being checked\n    :raises: InvalidParameterValue if 'instance_info/rescue_password' has\n        empty password or rescuing network UUID config option\n        has an invalid value when 'neutron' network is used.\n    :raises: MissingParameterValue if node is missing one or more required\n        parameters\n    \"\"\"\n    node = task.node\n    missing_params = []\n\n    # Validate rescuing network\n    task.driver.network.validate_rescue(task)\n\n    if CONF.agent.manage_agent_boot:\n        # TODO(stendulker): boot.validate() performs validation of\n        # provisioning related parameters which is not required during\n        # rescue operation.\n        task.driver.boot.validate(task)\n        for req in RESCUE_PROPERTIES:\n            if node.driver_info.get(req) is None:\n                missing_params.append('driver_info/' + req)\n\n    rescue_pass = node.instance_info.get('rescue_password')\n    if rescue_pass is None:\n        missing_params.append('instance_info/rescue_password')\n\n    if missing_params:\n        msg = _('Node %(node)s is missing parameter(s): '\n                '%(params)s. These are required for rescuing node.')\n        raise exception.MissingParameterValue(\n            msg % {'node': node.uuid,\n                   'params': ', '.join(missing_params)})\n\n    if not rescue_pass.strip():\n        msg = (_(\"The 'instance_info/rescue_password' is an empty string \"\n                 \"for node %s. The 'rescue_password' must be a non-empty \"\n                 \"string value.\") % node.uuid)\n        raise exception.InvalidParameterValue(msg)",
+    "original_signature": "def validate(self, task):",
+    "satd_comment": "# TODO(stendulker): boot.validate() performs validation of\n# provisioning related parameters which is not required during\n# rescue operation.",
+    "target_file": {
+      "ok": true,
+      "path": "ironic/drivers/modules/agent.py",
+      "sha": "83f0c15ee08db39b0af45aa4c15f7c790f499422",
+      "download_url": "https://raw.githubusercontent.com/openstack/ironic/master/ironic/drivers/modules/agent.py",
+      "content_excerpt": "# Copyright 2014 Rackspace, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#    http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport base64\nfrom urllib import parse as urlparse\n\nfrom oslo_log import log\nfrom oslo_utils import strutils\nimport tenacity\n\nfrom ironic.common import async_steps\nfrom ironic.common import boot_devices\nfrom ironic.common import boot_modes\nfrom ironic.common import exception\nfrom ironic.common.glance_service import service_utils\nfrom ironic.common.i18n import _\nfrom ironic.common import image_service\nfrom ironic.common import images\nfrom ironic.common import metrics_utils\nfrom ironic.common import oci_registry as oci\nfrom ironic.common import raid\nfrom ironic.common import states\nfrom ironic.common import utils\nfrom ironic.conductor import configdrive_utils\nfrom ironic.conductor import deployments\nfrom ironic.conductor import steps as conductor_steps\nfrom ironic.conductor import task_manager\nfrom ironic.conductor import utils as manager_utils\nfrom ironic.conf import CONF\nfrom ironic.drivers import base\nfrom ironic.drivers.modules import agent_base\nfrom ironic.drivers.modules import agent_client\nfrom ironic.drivers.modules import boot_mode_utils\nfrom ironic.drivers.modules import deploy_utils\nfrom ironic.drivers import utils as driver_utils\n\n\nLOG = log.getLogger(__name__)\n\nMETRICS = metrics_utils.get_metrics_logger(__name__)\n\nREQUIRED_PROPERTIES = {\n    'deploy_kernel': _('UUID (from Glance) of the deployment kernel. '\n                       'Required.'),\n    'deploy_ramdisk': _('UUID (from Glance) of the ramdisk with agent that is '\n                        'used at deploy time. Required.'),\n}\n\nOPTIONAL_PROPERTIES = {\n    'image_http_proxy': _('URL of a proxy server for HTTP connections. '\n                          'Optional.'),\n    'image_https_proxy': _('URL of a proxy server for HTTPS connections. '\n                           'Optional.'),\n    'image_no_proxy': _('A comma-separated list of host names, IP addresses '\n                        'and domain names (with optional :port) that will be '\n                        'excluded from proxying. To denote a domain name, use '\n                        'a dot to prefix the domain name. This value will be '\n                        'ignored if ``image_http_proxy`` and '\n                        '``image_https_proxy`` are not specified. Optional.'),\n    'image_download_source': _('Specifies whether direct deploy interface '\n                               'should try to use the image source directly '\n                               'or if ironic should cache the image on the '\n                               'conductor and serve it from ironic\\'s own '\n                               'HTTP server. Accepted values are \"swift\", '\n                               '\"http\" and \"local\". Optional.'),\n}\n\n_RAID_APPLY_CONFIGURATION_ARGSINFO = {\n    \"raid_config\": {\n        \"description\": \"The RAID configuration to apply.\",\n        \"required\": True,\n    },\n    \"delete_existing\": {\n        \"description\": (\n            \"Setting this to 'True' indicates to delete existing RAID \"\n            \"configuration prior to creating the new configuration. \"\n            \"Default value is 'True'.\"\n        ),\n        \"required\": False,\n    }\n}\n\nCOMMON_PROPERTIES = REQUIRED_PROPERTIES.copy()\nCOMMON_PROPERTIES.update(OPTIONAL_PROPERTIES)\nCOMMON_PROPERTIES.update(agent_base.VENDOR_PROPERTIES)\n\nPARTITION_IMAGE_LABELS = ('kernel', 'ramdisk', 'root_gb', 'root_mb', 'swap_mb',\n                          'ephemeral_mb', 'ephemeral_format', 'configdrive',\n                          'preserve_ephemeral', 'image_type',\n                          'deploy_boot_mode')\n\n\n@METRICS.timer('validate_image_proxies')\ndef validate_image_proxies(node):\n    \"\"\"Check that the provided proxy parameters are valid.\n\n    :param node: an Ironic node.\n    :raises: InvalidParameterValue if any of the provided proxy parameters are\n        incorrect.\n    \"\"\"\n    invalid_proxies = {}\n    for scheme in ('http', 'https'):\n        proxy_param = 'image_%s_proxy' % scheme\n        proxy = node.driver_info.get(proxy_param)\n        if proxy:\n            chunks = urlparse.urlparse(proxy)\n            # NOTE(vdrok) If no scheme specified, this is still a valid\n            # proxy address. It is also possible for a proxy to have a\n            # scheme different from the one specified in the image URL,\n            # e.g. it is possible to use https:// proxy for downloading\n            # http:// image.\n            if chunks.scheme not in ('', 'http', 'https'):\n                invalid_proxies[proxy_param] = proxy\n    msg = ''\n    if invalid_proxies:\n        msg += _(\"Proxy URL should either have HTTP(S) scheme \"\n                 \"or no scheme at all, the following URLs are \"\n                 \"invalid: %s.\") % invalid_proxies\n    no_proxy = node.driver_info.get('image_no_proxy')\n    if no_proxy is not None and not utils.is_valid_no_proxy(no_proxy):\n        msg += _(\n            \"image_no_proxy should be a list of host names, IP addresses \"\n            \"or domain names to exclude from proxying, the specified list \"\n            \"%s is incorrect. To denote a domain name, prefix it with a dot \"\n            \"(instead of e.g. '.*').\") % no_proxy\n    if msg:\n        raise exception.InvalidParameterValue(msg)\n\n\ndef validate_http_provisioning_configuration(node):\n    \"\"\"Validate configuration options required to perform HTTP provisioning.\n\n    :param node: an ironic node object\n    :raises: MissingParameterValue if required option(s) is not set.\n    \"\"\"\n    image_source = node.instance_info.get('image_source')\n    image_download_source = deploy_utils.get_image_download_source(node)\n    if image_download_source not in ('swift', 'http', 'local'):\n        raise exception.InvalidParameterValue(\n            _('Invalid value for image_download_source: \"%s\". Valid values '\n              'are swift, http or local.') % image_download_source)\n\n    # NOTE(dtantsur): local HTTP configuration is required in two cases:\n    # 1. Glance images with image_download_source == http\n    # 2. File images (since we need to serve them to IPA)\n    if (not image_source.startswith('file://')\n            and image_download_source != 'local'\n            and (not service_utils.is_glance_image(image_source)\n                 or image_download_source == 'swift')):\n        return\n\n    params = {\n        '[deploy]http_url': CONF.deploy.http_url,\n        '[deploy]http_root': CONF.deploy.http_root,\n        '[deploy]http_image_subdir': CONF.deploy.http_image_subdir\n    }\n    error_msg = _('Node %s failed to validate http provisioning. Some '\n                  'configuration options were missing') % node.uuid\n    deploy_utils.check_for_missing_params(params, error_msg)\n\n\ndef soft_power_off(task, client=None):\n    \"\"\"Power off the node using the agent API.\"\"\"\n    if client is None:\n        client = agent_client.get_client(task)\n\n    wait = CONF.agent.post_deploy_get_power_state_retry_interval\n    attempts = CONF.agent.post_deploy_get_power_state_retries + 1\n\n    @tenacity.retry(stop=tenacity.stop_after_attempt(attempts),\n                    retry=(tenacity.retry_if_result(\n                        lambda state: state != states.POWER_OFF)\n                        | tenacity.retry_if_exception_type(Exception)),\n                    wait=tenacity.wait_fixed(wait),\n                    reraise=True)\n    def _wait_until_powered_off(task):\n        return task.driver.power.get_power_state(task)\n\n    try:\n        client.power_off(task.node)\n    except Exception as e:\n        LOG.warning('Failed to soft power off node %(node_uuid)s. '\n                    '%(cls)s: %(error)s',\n                    {'node_uuid': task.node.uuid,\n                     'cls': e.__class__.__name__, 'error': e},\n                    exc_info=not isinstance(\n                        e, exception.IronicException))\n\n    # NOTE(dtantsur): in rare cases it may happen that the power\n    # off request comes through but we never receive the response.\n    # Check the power state before trying to force off.\n    try:\n        _wait_until_powered_off(task)\n    except Exception:\n        LOG.warning('Failed to soft power off node %(node_uuid)s '\n                    'in at least %(timeout)d seconds. Forcing '\n                    'hard power off and proceeding.',\n                    {'node_uuid': task.node.uuid,\n                     'timeout': (wait * (attempts - 1))})\n        manager_utils.node_power_action(task, states.POWER_OFF)\n\n\ndef set_boot_to_disk(task, target_boot_mode=None):\n    \"\"\"Boot a node to disk.\n\n    This is a helper method to reduce duplication of code around\n    handling vendor specifics for setting boot modes between multiple\n    deployment interfaces inside of Ironic.\n\n    :param task: A Taskmanager object.\n    :param target_boot_mode: The target boot_mode, defaults to UEFI.\n    \"\"\"\n    if not target_boot_mode:\n        target_boot_mode = boot_modes.UEFI\n    node = task.node\n    try:\n        persistent = True\n        # NOTE(TheJulia): We *really* only should be doing this in bios\n        # boot mode. In UEFI this might just get disregarded, or cause\n        # issues/failures.\n        if node.driver_info.get('force_persistent_boot_device',\n                                'Default') == 'Never':\n            persistent = False\n\n        vendor = task.node.properties.get('vendor', None)\n        if not (vendor and vendor.lower() == 'lenovo'\n                and target_boot_mode == 'uefi'):\n            # Lenovo hardware is modeled on a \"just update\"\n            # UEFI nvram model of use, and if multiple actions\n            # get requested, you can end up in cases where NVRAM\n            # changes are deleted as the host \"restores\" to the\n            # backup. For more information see\n            # https://bugs.launchpad.net/ironic/+bug/2053064\n            # NOTE(TheJulia): We likely just need to do this with\n            # all hosts in uefi mode, but libvirt VMs don't handle\n            # nvram only changes *and* this pattern is known to generally\n            # work for Ironic operators.\n            deploy_utils.try_set_boot_device(task, boot_devices.DISK,\n                                             persistent=persistent)\n    except Exception as e:\n        msg = (_(\"Failed to change the boot device to %(boot_dev)s \"\n                 \"when deploying node %(node)s: %(error)s\") %\n               {'boot_dev': boot_devices.DISK, 'node': node.uuid,\n                'error': e})\n        agent_base.log_and_raise_deployment_error(task, msg, exc=e)\n\n\nclass CustomAgentDeploy(agent_base.AgentBaseMixin,\n                        agent_base.HeartbeatMixin,\n                        agent_base.AgentOobStepsMixin,\n                        base.DeployInterface):\n    \"\"\"A deploy interface that relies on a custom agent to deploy.\n\n    Only provides the basic deploy steps to start the ramdisk, tear down\n    the ramdisk and prepare the instance boot.\n    \"\"\"\n\n    def get_properties(self):\n        \"\"\"Return the properties of the interface.\n\n        :returns: dictionary of <property name>:<property description> entries.\n        \"\"\"\n        return COMMON_PROPERTIES\n\n    def should_manage_boot(self, task):\n        \"\"\"Whether agent boot is managed by ironic.\"\"\"\n        return CONF.agent.manage_agent_boot\n\n    @METRICS.timer('CustomAgentDeploy.validate')\n    def validate(self, task):\n        \"\"\"Validate the driver-specific Node deployment info.\n\n        This method validates whether the properties of the supplied node\n        contain the required information for this driver ",
+      "total_lines": 1340
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 917,
+      "start_line": 897,
+      "end_line": 937,
+      "matched_line": "            )",
+      "excerpt": "897:                     LOG.debug('Got rootfs_uuid from driver internal info: '\n898:                               '%s (node %s)', root_uuid, node.uuid)\n899: \n900:         # For whole disk images it is not necessary that the root_uuid\n901:         # be provided since the bootloaders on the disk will be used\n902:         whole_disk_image = internal_info.get('is_whole_disk_image')\n903:         if (software_raid or (root_uuid and not whole_disk_image)\n904:                 or (whole_disk_image\n905:                     and boot_mode_utils.get_boot_mode(node) == 'uefi')):\n906:             LOG.debug('Installing the bootloader for node %(node)s on '\n907:                       'partition %(part)s, EFI system partition %(efi)s',\n908:                       {'node': node.uuid, 'part': root_uuid,\n909:                        'efi': efi_system_part_uuid})\n910:             client = agent_client.get_client(task)\n911:             result = client.install_bootloader(\n912:                 node, root_uuid=root_uuid,\n913:                 efi_system_part_uuid=efi_system_part_uuid,\n914:                 prep_boot_part_uuid=prep_boot_part_uuid,\n915:                 target_boot_mode=target_boot_mode,\n916:                 software_raid=software_raid\n917:             )\n918:             if result['command_status'] == 'FAILED':\n919:                 msg = (_(\"Failed to install a bootloader when \"\n920:                          \"deploying node %(node)s: %(error)s\") %\n921:                        {'node': node.uuid,\n922:                         'error': agent_client.get_command_error(result)})\n923:                 agent_base.log_and_raise_deployment_error(task, msg)\n924: \n925:         set_boot_to_disk(task, target_boot_mode)\n926:         LOG.info('Local boot successfully configured for node %s', node.uuid)\n927: \n928: \n929: class BootcAgentDeploy(CustomAgentDeploy):\n930:     \"\"\"Interface for deploy-related actions.\"\"\"\n931: \n932:     @METRICS.timer('AgentBootcDeploy.validate')\n933:     def validate(self, task):\n934:         \"\"\"Validate the driver-specific Node deployment info.\n935: \n936:         This method validates whether the properties of the supplied node\n937:         contain the required information for this driver to deploy images to"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "configure_local_boot",
+      "start_line": 827,
+      "end_line": 926,
+      "source": "    def configure_local_boot(self, task, root_uuid=None,\n                             efi_system_part_uuid=None,\n                             prep_boot_part_uuid=None):\n        \"\"\"Helper method to configure local boot on the node.\n\n        This method triggers bootloader installation on the node.\n        On successful installation of bootloader, this method sets the\n        node to boot from disk.\n\n        :param task: a TaskManager object containing the node\n        :param root_uuid: The UUID of the root partition. This is used\n            for identifying the partition which contains the image deployed\n            or None in case of whole disk images which we expect to already\n            have a bootloader installed.\n        :param efi_system_part_uuid: The UUID of the efi system partition.\n            This is used only in uefi boot mode.\n        :param prep_boot_part_uuid: The UUID of the PReP Boot partition.\n            This is used only for booting ppc64* hardware.\n        :raises: InstanceDeployFailure if bootloader installation failed or\n            on encountering error while setting the boot device on the node.\n        \"\"\"\n        node = task.node\n        # Almost never taken into account on agent side, just used for softraid\n        # Can be useful with whole_disk_images\n        target_boot_mode = boot_mode_utils.get_boot_mode(task.node)\n        LOG.debug('Configuring local boot for node %s', node.uuid)\n\n        # If the target RAID configuration is set to 'software' for the\n        # 'controller', we need to trigger the installation of grub on\n        # the holder disks of the desired Software RAID.\n        internal_info = node.driver_internal_info\n        raid_config = node.target_raid_config\n        logical_disks = raid_config.get('logical_disks', [])\n        software_raid = False\n        for logical_disk in logical_disks:\n            if logical_disk.get('controller') == 'software':\n                LOG.debug('Node %s has a Software RAID configuration',\n                          node.uuid)\n                software_raid = True\n                break\n\n        # For software RAID try to get the UUID of the root fs from the\n        # image's metadata (via Glance). Fall back to the driver internal\n        # info in case it is not available (e.g. not set or there's no Glance).\n        if software_raid:\n            root_uuid = node.instance_info.get('image_rootfs_uuid')\n            if not root_uuid:\n                image_source = node.instance_info.get('image_source')\n                try:\n                    context = task.context\n                    # TODO(TheJulia): Uhh, is_admin likely needs to be\n                    # addressed in Xena as undesirable behavior may\n                    # result, or just outright break in an entirely\n                    # system scoped configuration.\n                    context.is_admin = True\n                    glance = image_service.GlanceImageService(\n                        context=context)\n                    image_info = glance.show(image_source)\n                    image_properties = image_info.get('properties')\n                    root_uuid = image_properties['rootfs_uuid']\n                    LOG.debug('Got rootfs_uuid from Glance: %s '\n                              '(node %s)', root_uuid, node.uuid)\n                except Exception as e:\n                    LOG.warning(\n                        'Could not get \\'rootfs_uuid\\' property for '\n                        'image %(image)s from Glance for node %(node)s. '\n                        '%(cls)s: %(error)s.',\n                        {'image': image_source, 'node': node.uuid,\n                         'cls': e.__class__.__name__, 'error': e})\n                    root_uuid = internal_info.get('root_uuid_or_disk_id')\n                    LOG.debug('Got rootfs_uuid from driver internal info: '\n                              '%s (node %s)', root_uuid, node.uuid)\n\n        # For whole disk images it is not necessary that the root_uuid\n        # be provided since the bootloaders on the disk will be used\n        whole_disk_image = internal_info.get('is_whole_disk_image')\n        if (software_raid or (root_uuid and not whole_disk_image)\n                or (whole_disk_image\n                    and boot_mode_utils.get_boot_mode(node) == 'uefi')):\n            LOG.debug('Installing the bootloader for node %(node)s on '\n                      'partition %(part)s, EFI system partition %(efi)s',\n                      {'node': node.uuid, 'part': root_uuid,\n                       'efi': efi_system_part_uuid})\n            client = agent_client.get_client(task)\n            result = client.install_bootloader(\n                node, root_uuid=root_uuid,\n                efi_system_part_uuid=efi_system_part_uuid,\n                prep_boot_part_uuid=prep_boot_part_uuid,\n                target_boot_mode=target_boot_mode,\n                software_raid=software_raid\n            )\n            if result['command_status'] == 'FAILED':\n                msg = (_(\"Failed to install a bootloader when \"\n                         \"deploying node %(node)s: %(error)s\") %\n                       {'node': node.uuid,\n                        'error': agent_client.get_command_error(result)})\n                agent_base.log_and_raise_deployment_error(task, msg)\n\n        set_boot_to_disk(task, target_boot_mode)\n        LOG.info('Local boot successfully configured for node %s', node.uuid)"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 827,
+      "end_line": 926,
+      "excerpt": "    def configure_local_boot(self, task, root_uuid=None,\n                             efi_system_part_uuid=None,\n                             prep_boot_part_uuid=None):\n        \"\"\"Helper method to configure local boot on the node.\n\n        This method triggers bootloader installation on the node.\n        On successful installation of bootloader, this method sets the\n        node to boot from disk.\n\n        :param task: a TaskManager object containing the node\n        :param root_uuid: The UUID of the root partition. This is used\n            for identifying the partition which contains the image deployed\n            or None in case of whole disk images which we expect to already\n            have a bootloader installed.\n        :param efi_system_part_uuid: The UUID of the efi system partition.\n            This is used only in uefi boot mode.\n        :param prep_boot_part_uuid: The UUID of the PReP Boot partition.\n            This is used only for booting ppc64* hardware.\n        :raises: InstanceDeployFailure if bootloader installation failed or\n            on encountering error while setting the boot device on the node.\n        \"\"\"\n        node = task.node\n        # Almost never taken into account on agent side, just used for softraid\n        # Can be useful with whole_disk_images\n        target_boot_mode = boot_mode_utils.get_boot_mode(task.node)\n        LOG.debug('Configuring local boot for node %s', node.uuid)\n\n        # If the target RAID configuration is set to 'software' for the\n        # 'controller', we need to trigger the installation of grub on\n        # the holder disks of the desired Software RAID.\n        internal_info = node.driver_internal_info\n        raid_config = node.target_raid_config\n        logical_disks = raid_config.get('logical_disks', [])\n        software_raid = False\n        for logical_disk in logical_disks:\n            if logical_disk.get('controller') == 'software':\n                LOG.debug('Node %s has a Software RAID configuration',\n                          node.uuid)\n                software_raid = True\n                break\n\n        # For software RAID try to get the UUID of the root fs from the\n        # image's metadata (via ",
+      "symbol_name": "configure_local_boot",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "ironic/drivers/modules/agent.py",
+      "sha": "83f0c15ee08db39b0af45aa4c15f7c790f499422",
+      "download_url": "https://raw.githubusercontent.com/openstack/ironic/master/ironic/drivers/modules/agent.py"
+    },
+    "imports": {
+      "imports": [
+        "base64",
+        "urllib:parse",
+        "oslo_log:log",
+        "oslo_utils:strutils",
+        "tenacity",
+        "ironic.common:async_steps",
+        "ironic.common:boot_devices",
+        "ironic.common:boot_modes",
+        "ironic.common:exception",
+        "ironic.common.glance_service:service_utils",
+        "ironic.common.i18n:_",
+        "ironic.common:image_service",
+        "ironic.common:images",
+        "ironic.common:metrics_utils",
+        "ironic.common:oci_registry",
+        "ironic.common:raid",
+        "ironic.common:states",
+        "ironic.common:utils",
+        "ironic.conductor:configdrive_utils",
+        "ironic.conductor:deployments",
+        "ironic.conductor:steps",
+        "ironic.conductor:task_manager",
+        "ironic.conductor:utils",
+        "ironic.conf:CONF",
+        "ironic.drivers:base",
+        "ironic.drivers.modules:agent_base",
+        "ironic.drivers.modules:agent_client",
+        "ironic.drivers.modules:boot_mode_utils",
+        "ironic.drivers.modules:deploy_utils",
+        "ironic.drivers:utils"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/ironic/master/README.rst",
+      "content_excerpt": "======\nIronic\n======\n\n.. image:: https://governance.openstack.org/tc/badges/ironic.svg\n\nOverview\n--------\n\nIronic consists of an API and plug-ins for managing and provisioning\nphysical machines in a security-aware and fault-tolerant manner. It can be\nused with nova as a hypervisor driver, or standalone service.\n\nBy default, it will use PXE and IPMI/Redfish to interact with bare metal\nmachines. Some drivers, like the Redfish drivers, also support advanced\nfeatures like leveraging HTTPBoot or Virtual Media based boot operations\ndepending on the configuration by the user. Ironic also supports\nvendor-specific plug-ins which may implement additional functionality,\nhowever many vendors have chosen to focus on their Redfish implementations\ninstead of customized drivers.\n\nNumerous ways exist to leverage Ironic to deploy a bare metal node, above\nand beyond asking Nova for a \"bare metal\" instance, or for asking Ironic\nto manually deploy a specific machine. Bifrost and Metal3 are related\nprojects which seek to simplify the use and interaction of Ironic.\n\nIronic is distributed under the terms of the Apache License, Version 2.0. The\nfull terms and conditions of this license are detailed in the LICENSE file.\n\nProject resources\n~~~~~~~~~~~~~~~~~\n\n* Documentation: https://docs.openstack.org/ironic/latest\n* Source: https://opendev.org/openstack/ironic\n* Bugs: https://bugs.launchpad.net/ironic/+bugs\n* Wiki: https://wiki.openstack.org/wiki/Ironic\n* APIs: https://docs.openstack.org/api-ref/baremetal/index.html\n* Release Notes: https://docs.openstack.org/releasenotes/ironic/\n* Design Specificat"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "configure_local_boot test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_agent.py",
+          "path": "ironic/tests/unit/drivers/modules/test_agent.py",
+          "sha": "046714c75baa90480739e9f0f54af57feab54c11",
+          "html_url": "https://github.com/openstack/ironic/blob/f700d3da53fdecd703d1ea396b1f4bdd0b253679/ironic/tests/unit/drivers/modules/test_agent.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 2783,
+          "end_line": 2807,
+          "excerpt": "2783: \n2784: class ConfigureLocalBootTest(test_agent_base.AgentDeployMixinBaseTest):\n2785: \n2786:     def setUp(self):\n2787:         super().setUp()\n2788:         self.deploy = agent.AgentDeploy()\n2789: \n2790:     @mock.patch.object(agent_client.AgentClient, 'install_bootloader',\n2791:                        autospec=True)\n2792:     @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)\n2793:     @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,\n2794:                        return_value='whatever')\n2795:     def test_configure_local_boot(self, boot_mode_mock,\n2796:                                   try_set_boot_device_mock,\n2797:                                   install_bootloader_mock):\n2798:         install_bootloader_mock.return_value = {\n2799:             'command_status': 'SUCCESS', 'command_error': None}\n2800:         with task_manager.acquire(self.context, self.node['uuid'],\n2801:                                   shared=False) as task:\n2802:             task.node.driver_internal_info['is_whole_disk_image'] = False\n2803:             self.deploy.configure_local_boot(task, root_uuid='some-root-uuid')\n2804:             try_set_boot_device_mock.assert_called_once_with(\n2805:                 task, boot_devices.DISK, persistent=True)\n2806:             boot_mode_mock.assert_called_once_with(task.node)\n2807:             install_bootloader_mock.assert_called_once_with(",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"configure_local_boot(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "agent.py",
+          "path": "ironic/drivers/modules/agent.py",
+          "sha": "83f0c15ee08db39b0af45aa4c15f7c790f499422",
+          "html_url": "https://github.com/openstack/ironic/blob/f700d3da53fdecd703d1ea396b1f4bdd0b253679/ironic/drivers/modules/agent.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 827,
+          "end_line": 926,
+          "excerpt": "    def configure_local_boot(self, task, root_uuid=None,\n                             efi_system_part_uuid=None,\n                             prep_boot_part_uuid=None):\n        \"\"\"Helper method to configure local boot on the node.\n\n        This method triggers bootloader installation on the node.\n        On successful installation of bootloader, this method sets the\n        node to boot from disk.\n\n        :param task: a TaskManager object containing the node\n        :param root_uuid: The UUID of the root partition. This is used\n            for identifying the partition which contains the image deployed\n            or None in case of whole disk images which we expect to already\n            have a bootloader installed.\n        :param efi_system_part_uuid: The UUID of the efi system partition.\n            This is used only in uefi boot mode.\n        :param prep_boot_part_uuid: The UUID of the PReP Boot partition.\n            This is used only for booting ppc64* hardware.\n        :raises: InstanceDeployFailure if bootloader installation failed or\n            on encountering error while setting the boot device on the node.\n        \"\"\"\n        node = task.node\n        # Almost never taken into account on agent side, just used for softraid\n        # Can be useful with whole_disk_images\n        target_boot_mode = boot_mode_utils.get_boot_mode(task.node)\n        LOG.debug('Configuring local boot for node %s', node.uuid)\n\n        # If the target RAID configuration is set to 'software' for the\n        # 'controller', we need to trigger the installation of grub on\n        # the holder disks of the desired Software RAID.\n        internal_info = node.driver_internal_info\n        raid_config = node.target_raid_config\n        logical_disks = raid_config.get('logical_disks', [])\n        software_raid = False\n        for logical_disk in logical_disks:\n            if logical_disk.get('controller') == 'software':\n                LOG.debug('Node %s has a Software RAID configuration',\n                          node.uuid)\n                software_raid = True\n                break\n\n        # For software RAID try to get the UUID of the root fs from the\n        # image's metadata (via ",
+          "symbol_name": "configure_local_boot",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "test_agent.py",
+          "path": "ironic/tests/unit/drivers/modules/test_agent.py",
+          "sha": "046714c75baa90480739e9f0f54af57feab54c11",
+          "html_url": "https://github.com/openstack/ironic/blob/f700d3da53fdecd703d1ea396b1f4bdd0b253679/ironic/tests/unit/drivers/modules/test_agent.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 2783,
+          "end_line": 2807,
+          "excerpt": "2783: \n2784: class ConfigureLocalBootTest(test_agent_base.AgentDeployMixinBaseTest):\n2785: \n2786:     def setUp(self):\n2787:         super().setUp()\n2788:         self.deploy = agent.AgentDeploy()\n2789: \n2790:     @mock.patch.object(agent_client.AgentClient, 'install_bootloader',\n2791:                        autospec=True)\n2792:     @mock.patch.object(deploy_utils, 'try_set_boot_device', autospec=True)\n2793:     @mock.patch.object(boot_mode_utils, 'get_boot_mode', autospec=True,\n2794:                        return_value='whatever')\n2795:     def test_configure_local_boot(self, boot_mode_mock,\n2796:                                   try_set_boot_device_mock,\n2797:                                   install_bootloader_mock):\n2798:         install_bootloader_mock.return_value = {\n2799:             'command_status': 'SUCCESS', 'command_error': None}\n2800:         with task_manager.acquire(self.context, self.node['uuid'],\n2801:                                   shared=False) as task:\n2802:             task.node.driver_internal_info['is_whole_disk_image'] = False\n2803:             self.deploy.configure_local_boot(task, root_uuid='some-root-uuid')\n2804:             try_set_boot_device_mock.assert_called_once_with(\n2805:                 task, boot_devices.DISK, persistent=True)\n2806:             boot_mode_mock.assert_called_once_with(task.node)\n2807:             install_bootloader_mock.assert_called_once_with(",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "ironic/drivers/modules",
+      "count": 38,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "ironic/drivers/modules/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "agent.py",
+          "path": "ironic/drivers/modules/agent.py",
+          "type": "file"
+        },
+        {
+          "name": "agent_base.py",
+          "path": "ironic/drivers/modules/agent_base.py",
+          "type": "file"
+        },
+        {
+          "name": "agent_client.py",
+          "path": "ironic/drivers/modules/agent_client.py",
+          "type": "file"
+        },
+        {
+          "name": "agent_power.py",
+          "path": "ironic/drivers/modules/agent_power.py",
+          "type": "file"
+        },
+        {
+          "name": "ansible",
+          "path": "ironic/drivers/modules/ansible",
+          "type": "dir"
+        },
+        {
+          "name": "autodetect.py",
+          "path": "ironic/drivers/modules/autodetect.py",
+          "type": "file"
+        },
+        {
+          "name": "boot.ipxe",
+          "path": "ironic/drivers/modules/boot.ipxe",
+          "type": "file"
+        },
+        {
+          "name": "boot_mode_utils.py",
+          "path": "ironic/drivers/modules/boot_mode_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "console_utils.py",
+          "path": "ironic/drivers/modules/console_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "deploy_utils.py",
+          "path": "ironic/drivers/modules/deploy_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "drac",
+          "path": "ironic/drivers/modules/drac",
+          "type": "dir"
+        },
+        {
+          "name": "fake.py",
+          "path": "ironic/drivers/modules/fake.py",
+          "type": "file"
+        },
+        {
+          "name": "graphical_console.py",
+          "path": "ironic/drivers/modules/graphical_console.py",
+          "type": "file"
+        },
+        {
+          "name": "ilo",
+          "path": "ironic/drivers/modules/ilo",
+          "type": "dir"
+        },
+        {
+          "name": "image_cache.py",
+          "path": "ironic/drivers/modules/image_cache.py",
+          "type": "file"
+        },
+        {
+          "name": "image_utils.py",
+          "path": "ironic/drivers/modules/image_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "initial_grub_cfg.template",
+          "path": "ironic/drivers/modules/initial_grub_cfg.template",
+          "type": "file"
+        },
+        {
+          "name": "inspect_utils.py",
+          "path": "ironic/drivers/modules/inspect_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "inspector",
+          "path": "ironic/drivers/modules/inspector",
+          "type": "dir"
+        },
+        {
+          "name": "intel_ipmi",
+          "path": "ironic/drivers/modules/intel_ipmi",
+          "type": "dir"
+        },
+        {
+          "name": "ipmitool.py",
+          "path": "ironic/drivers/modules/ipmitool.py",
+          "type": "file"
+        },
+        {
+          "name": "ipxe.py",
+          "path": "ironic/drivers/modules/ipxe.py",
+          "type": "file"
+        },
+        {
+          "name": "ipxe_config.template",
+          "path": "ironic/drivers/modules/ipxe_config.template",
+          "type": "file"
+        },
+        {
+          "name": "irmc",
+          "path": "ironic/drivers/modules/irmc",
+          "type": "dir"
+        },
+        {
+          "name": "ks.cfg.template",
+          "path": "ironic/drivers/modules/ks.cfg.template",
+          "type": "file"
+        },
+        {
+          "name": "network",
+          "path": "ironic/drivers/modules/network",
+          "type": "dir"
+        },
+        {
+          "name": "noop.py",
+          "path": "ironic/drivers/modules/noop.py",
+          "type": "file"
+        },
+        {
+          "name": "noop_mgmt.py",
+          "path": "ironic/drivers/modules/noop_mgmt.py",
+          "type": "file"
+        },
+        {
+          "name": "pxe.py",
+          "path": "ironic/drivers/modules/pxe.py",
+          "type": "file"
+        },
+        {
+          "name": "pxe_base.py",
+          "path": "ironic/drivers/modules/pxe_base.py",
+          "type": "file"
+        },
+        {
+          "name": "pxe_config.template",
+          "path": "ironic/drivers/modules/pxe_config.template",
+          "type": "file"
+        },
+        {
+          "name": "pxe_grub_config.template",
+          "path": "ironic/drivers/modules/pxe_grub_config.template",
+          "type": "file"
+        },
+        {
+          "name": "ramdisk.py",
+          "path": "ironic/drivers/modules/ramdisk.py",
+          "type": "file"
+        },
+        {
+          "name": "redfish",
+          "path": "ironic/drivers/modules/redfish",
+          "type": "dir"
+        },
+        {
+          "name": "snmp.py",
+          "path": "ironic/drivers/modules/snmp.py",
+          "type": "file"
+        },
+        {
+          "name": "storage",
+          "path": "ironic/drivers/modules/storage",
+          "type": "dir"
+        },
+        {
+          "name": "switch",
+          "path": "ironic/drivers/modules/switch",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "ironic/drivers/modules/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "agent_base.py",
+          "path": "ironic/drivers/modules/agent_base.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: #\n3: # Copyright 2014 Rackspace, Inc.\n4: # Copyright 2015 Red Hat, Inc.\n5: # All Rights Reserved.\n6: #\n7: #    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n8: #    not use this file except in compliance with the License. You may obtain\n9: #    a copy of the License at\n10: #\n11: #         http://www.apache.org/licenses/LICENSE-2.0\n12: #\n13: #    Unless required by applicable law or agreed to in writing, software"
+        },
+        {
+          "name": "agent_client.py",
+          "path": "ironic/drivers/modules/agent_client.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright 2014 Rackspace, Inc.\n2: #\n3: # Licensed under the Apache License, Version 2.0 (the \"License\");\n4: # you may not use this file except in compliance with the License.\n5: # You may obtain a copy of the License at\n6: #\n7: #    http://www.apache.org/licenses/LICENSE-2.0\n8: #\n9: # Unless required by applicable law or agreed to in writing, software\n10: # distributed under the License is distributed on an \"AS IS\" BASIS,\n11: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n12: # See the License for the specific language governing permissions and\n13: # limitations under the License."
+        },
+        {
+          "name": "agent_power.py",
+          "path": "ironic/drivers/modules/agent_power.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n2: # not use this file except in compliance with the License. You may obtain\n3: # a copy of the License at\n4: #\n5: #      http://www.apache.org/licenses/LICENSE-2.0\n6: #\n7: # Unless required by applicable law or agreed to in writing, software\n8: # distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n9: # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n10: # License for the specific language governing permissions and limitations\n11: # under the License.\n12: \n13: \"\"\""
+        },
+        {
+          "name": "autodetect.py",
+          "path": "ironic/drivers/modules/autodetect.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n2: # not use this file except in compliance with the License. You may obtain\n3: # a copy of the License at\n4: #\n5: #      http://www.apache.org/licenses/LICENSE-2.0\n6: #\n7: # Unless required by applicable law or agreed to in writing, software\n8: # distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n9: # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n10: # License for the specific language governing permissions and limitations\n11: # under the License.\n12: \n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "ironic/drivers/modules/agent.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "6c599876f336ec5f64c90ce93389d29c2caf1c5d",
+          "html_url": "https://github.com/openstack/ironic/commit/6c599876f336ec5f64c90ce93389d29c2caf1c5d",
+          "message": "Add an autodetect deploy interface\n\nAdds a new ``autodetect`` deploy interface that automatically selects\nthe appropriate concrete deploy interface based on image metadata and\nnode configuration. This simplifies node configuration by eliminating\nthe need to manually specify different deploy interfac",
+          "author": "Steve Baker",
+          "date": "2026-01-16T04:21:43Z"
+        },
+        {
+          "sha": "041f0a586d92e1f2056b3204bacb8de4596ca3af",
+          "html_url": "https://github.com/openstack/ironic/commit/041f0a586d92e1f2056b3204bacb8de4596ca3af",
+          "message": "Move `check_image_size` to `deploy_utils`\n\nMove the image size check earlier in the deploy flow so it runs only\nwhen it matters and reuses already-fetched image info.\n\nCloses-Bug: #2133885\nChange-Id: I40518762e3032bbdcfe1d8e7e929147a761a95f8\nSigned-off-by: Afonne-CID <afonnepaulc@gmail.com>",
+          "author": "Afonne-CID",
+          "date": "2025-12-08T20:06:54Z"
+        },
+        {
+          "sha": "c3428fd4f0f0b098a2323d270067f64456577b8e",
+          "html_url": "https://github.com/openstack/ironic/commit/c3428fd4f0f0b098a2323d270067f64456577b8e",
+          "message": "Move configdrive code to configdrive_utils\n\nMoves configdrive utility functions to the more appropriate configdrive\ndedicated utils module to improve code organization and separation of\nconcern.\n\nCloses-Bug: #2113892\nChange-Id: I5851e84fe8f15de05dcddca773b1f28f639dc617\nSigned-off-by: David Nwosu <nw",
+          "author": "Pointbr8ker-123",
+          "date": "2025-11-02T07:53:08Z"
+        },
+        {
+          "sha": "b43d74a8f4b4f3a24b6c5f7edaa905dab3436acc",
+          "html_url": "https://github.com/openstack/ironic/commit/b43d74a8f4b4f3a24b6c5f7edaa905dab3436acc",
+          "message": "Do not silence the actual error in prepare_instance_boot\n\nThis call can fail for a lot of very different reasons (e.g. right now\nI'm looking at secure boot operations getting HTTP 403 from iLO 6, but\nit could just as well be something coming from IPA).\n\nChange-Id: I4a884e3ccc0e1bf12aa9287cf521e1295f",
+          "author": "Dmitry Tantsur",
+          "date": "2025-03-28T14:49:22Z"
+        },
+        {
+          "sha": "676b8c69ace6c0bbf05041a5d44921601677fbba",
+          "html_url": "https://github.com/openstack/ironic/commit/676b8c69ace6c0bbf05041a5d44921601677fbba",
+          "message": "Merge \"OCI: Send the auth header to IPA\"",
+          "author": "Zuul",
+          "date": "2025-02-18T16:03:19Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "configure_local_boot TODO stendulker boot validate performs",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "ironic/drivers/modules/agent.py",
+      "satd_line": 917,
+      "last_commit": {
+        "sha": "6c599876f336ec5f64c90ce93389d29c2caf1c5d",
+        "html_url": "https://github.com/openstack/ironic/commit/6c599876f336ec5f64c90ce93389d29c2caf1c5d",
+        "message": "Add an autodetect deploy interface\n\nAdds a new ``autodetect`` deploy interface that automatically selects\nthe appropriate concrete deploy interface based on image metadata and\nnode configuration. This simplifies node configuration by eliminating\nthe need to manually specify different deploy interfac",
+        "author": "Steve Baker",
+        "date": "2026-01-16T04:21:43Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 1,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "configure_local_boot",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

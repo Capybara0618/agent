@@ -1,0 +1,337 @@
+{
+  "task_id": "387",
+  "repo_owner": "blueye-robotics",
+  "repo_name": "blueye.sdk",
+  "file_path": "blueye/sdk/logs.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T10:45:42+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T10:45:59+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T10:46:03+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "blueye/sdk/logs.py",
+    "original_code": "def _build_log_files_from_dictionary(self, list_of_logs_in_dictionaries):\n    loglist = {}\n    for log in list_of_logs_in_dictionaries:\n        try:\n            loglist[log[\"name\"]] = LogFile(\n                log[\"maxdepth\"], log[\"name\"], log[\"timestamp\"], log[\"binsize\"], self.ip\n            )\n        except dateutil.parser.ParserError:\n            # TODO: Log this instead of printing when logging is implemented\n            print(f\"Could not parse timestamp for log {log['name']}, skipping this log file\")\n    return loglist",
+    "original_signature": "def _build_log_files_from_dictionary(self, list_of_logs_in_dictionaries):",
+    "satd_comment": "# TODO: Log this instead of printing when logging is implemented",
+    "target_file": {
+      "ok": true,
+      "path": "blueye/sdk/logs.py",
+      "sha": "1fce1eb2bf0030f38f409f0a417f09be10a90e57",
+      "download_url": "https://raw.githubusercontent.com/BluEye-Robotics/blueye.sdk/master/blueye/sdk/logs.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport io\nimport logging\nimport zlib\nfrom datetime import datetime, timedelta, timezone\nfrom pathlib import Path\nfrom typing import Callable, Iterator, List, Optional, Tuple\n\nimport blueye.protocol as bp\nimport dateutil.parser\nimport proto\nimport requests\nimport tabulate\nfrom google.protobuf.internal.decoder import _DecodeVarint as decodeVarint\nfrom packaging import version\n\nfrom .utils import deserialize_any_to_message\n\nlogger = logging.getLogger(__name__)\n\n\ndef human_readable_filesize(binsize: int) -> str:\n    \"\"\"Convert bytes to human readable string\"\"\"\n    suffix = \"B\"\n    num = binsize\n    for unit in [\"\", \"Ki\", \"Mi\"]:\n        if abs(num) < 1024.0:\n            return f\"{num:3.1f} {unit}{suffix}\"\n        num /= 1024.0\n    return f\"{num:.1f} Gi{suffix}\"\n\n\ndef is_gzip_compressed(data: bytes) -> bool:\n    \"\"\"Check if data is gzip compressed by looking at the magic header bytes\"\"\"\n    return len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B\n\n\nclass StreamingDecompressor:\n    \"\"\"A streaming decompressor that handles gzip data incrementally\"\"\"\n\n    def __init__(self, compressed_data: bytes):\n        self.compressed_data = compressed_data\n        self.compressed_pos = 0\n        self.decompressor = None\n        self.decompressed_buffer = bytearray()\n        self.eof = False\n\n        if is_gzip_compressed(compressed_data):\n            # Initialize zlib decompressor for gzip data\n            self.decompressor = zlib.decompressobj(wbits=zlib.MAX_WBITS | 16)\n        else:\n            # Data is not compressed\n            self.decompressed_buffer = bytearray(compressed_data)\n            self.eof = True\n\n    def read(self, size: int) -> bytes:\n        \"\"\"Read up to size bytes from the decompressed stream\"\"\"\n        if self.eof and len(self.decompressed_buffer) == 0:\n            return b\"\"\n\n        # If we need more decompressed data and we're not at EOF\n        while len(self.decompressed_buffer) < size and not self.eof:\n            # Read a chunk from compressed data\n            chunk_size = min(8192, len(self.compressed_data) - self.compressed_pos)\n            if chunk_size == 0:\n                # No more compressed data\n                if self.decompressor:\n                    # Finalize decompression. This can fail on corrupted data.\n                    try:\n                        final_data = self.decompressor.flush()\n                        self.decompressed_buffer.extend(final_data)\n                    except zlib.error as e:\n                        logger.warning(\n                            f\"Decompression flush failed, likely due to corrupted data: {e}\"\n                        )\n                    except (MemoryError, OverflowError) as e:\n                        logger.error(f\"Decompression flush failed due to resource limits: {e}\")\n                    except Exception as e:\n                        logger.error(f\"Unexpected error during decompression flush: {e}\")\n                self.eof = True\n                break\n\n            chunk = self.compressed_data[self.compressed_pos : self.compressed_pos + chunk_size]\n            self.compressed_pos += chunk_size\n\n            if self.decompressor:\n                try:\n                    decompressed_chunk = self.decompressor.decompress(chunk)\n                    self.decompressed_buffer.extend(decompressed_chunk)\n                except zlib.error as e:\n                    # If decompression fails, we're probably done. This can happen with\n                    # truncated or corrupted files.\n                    logger.warning(f\"Decompression of chunk failed: {e}\")\n                    self.eof = True\n                    break\n                except (MemoryError, OverflowError) as e:\n                    logger.error(f\"Decompression failed due to resource limits: {e}\")\n                    self.eof = True\n                    break\n                except Exception as e:\n                    logger.error(f\"Unexpected error during decompression: {e}\")\n                    self.eof = True\n                    break\n\n        # Return requested amount of data\n        result_size = min(size, len(self.decompressed_buffer))\n        result = bytes(self.decompressed_buffer[:result_size])\n        self.decompressed_buffer = self.decompressed_buffer[result_size:]\n\n        return result\n\n\nclass LogStream:\n    \"\"\"Class for streaming a log\n\n    Creates a stream from a downloaded log file. Iterate over the object to get the next log record.\n    \"\"\"\n\n    def __init__(self, log: bytes, decompress: bool = True) -> Iterator[\n        Tuple[\n            proto.datetime_helpers.DatetimeWithNanoseconds,  # Real time clock\n            timedelta,  # Time since first message\n            proto.message.MessageMeta,  # Message type\n            proto.message.Message,  # Message contents\n        ]\n    ]:\n        if decompress:\n            self.stream = StreamingDecompressor(log)\n        else:\n            self.stream = io.BytesIO(log)\n\n        self.start_monotonic: proto.datetime_helpers.DatetimeWithNanoseconds = 0\n\n    def __iter__(self):\n        return self\n\n    def __next__(self):\n        # Try to read the varint that indicates message size\n        try:\n            # Read bytes one by one until we have a complete varint\n            varint_bytes = bytearray()\n            while True:\n                byte_data = self.stream.read(1)  # Read one byte at a time\n                if not byte_data:\n                    raise StopIteration  # End of stream\n                varint_bytes.append(byte_data[0])  # Add byte to our varint buffer\n\n                # Check if this is the last byte of the varint (MSB is 0)\n                if byte_data[0] < 0x80:  # 0x80 = 128 = 10000000 binary\n                    break  # MSB is 0, so we're done\n\n                # Prevent infinite loop with malformed data\n                if len(varint_bytes) > 10:  # Max varint size for 64-bit\n                    logger.error(\"Malformed varint detected\")\n                    raise StopIteration\n\n            # Use Google's protobuf decoder to decode the varint\n            msg_size, _ = decodeVarint(bytes(varint_bytes), 0)\n\n            # Read the message data\n            msg_data = self.stream.read(msg_size)\n            if len(msg_data) < msg_size:\n                raise StopIteration\n\n        except (ValueError, IOError) as e:\n            logger.error(f\"Error reading log stream: {e}\")\n            raise StopIteration\n\n        try:\n            msg = bp.BinlogRecord.deserialize(msg_data)\n            payload_type, payload_msg_deserialized = deserialize_any_to_message(msg.payload)\n        except Exception as e:\n            logger.error(f\"Failed to deserialize payload: {e}\")\n            return self.__next__()  # Skip this message and continue with the next\n\n        if self.start_monotonic == 0:\n            self.start_monotonic = msg.clock_monotonic\n        return (\n            msg.unix_timestamp,\n            msg.clock_monotonic - self.start_monotonic,\n            payload_type,\n            payload_msg_deserialized,\n        )\n\n\nclass LogFile:\n    def __init__(\n        self,\n        name: str,\n        is_dive: bool,\n        filesize: int,\n        start_time: int,\n        max_depth_magnitude: int,\n        ip: str,\n    ):\n        self.name = name\n        self.is_dive = is_dive\n        self.filesize = filesize\n        self.start_time: datetime = datetime.fromtimestamp(start_time, tz=timezone.utc)\n        self.max_depth_magnitude = max_depth_magnitude\n        self.download_url = f\"http://{ip}/logs/{self.name}/binlog\"\n        self.content = None\n        self._formatted_values = [\n            self.name,\n            self.start_time.strftime(\"%d. %b %Y %H:%M\"),\n            f\"{self.max_depth_magnitude} m\",\n            human_readable_filesize(self.filesize),\n        ]\n\n    def download(\n        self,\n        output_path: Optional[Path | str] = None,\n        write_to_file: bool = True,\n        timeout: float = 1,\n        overwrite_cache: bool = False,\n    ) -> bytes:\n        \"\"\"Download a log file from the drone\n\n        *Arguments*:\n\n        * `output_path`:\n            Path to write the log file to. If `None`, the log will be written to the\n            current working directory. If the path is a directory, the log will be\n            downloaded to that directory with its original name. Else the log will be\n            downloaded to the specified path.\n        * `write_to_file`:\n            If True, the log will be written to the specified path. If False, the\n            log will only be returned as a bytes object.\n        * `timeout`:\n            Seconds to wait for response\n        * `overwrite_cache`:\n            If True, the log will be downloaded even if it is already been downloaded.\n\n        *Returns*:\n\n        The compressed log file as a bytes object.\n        \"\"\"\n        if self.content is None or overwrite_cache:\n            self.content = requests.get(self.download_url, timeout=timeout).content\n        if write_to_file:\n            if output_path is None:\n                output_path = Path(f\"{self.name}.bez\")\n            else:\n                if type(output_path) == str:\n                    output_path = Path(output_path)\n                if output_path.is_dir():\n                    output_path = output_path.joinpath(f\"{self.name}.bez\")\n            with open(output_path, \"wb\") as f:\n                f.write(self.content)\n        return self.content\n\n    def parse_to_stream(self) -> LogStream:\n        \"\"\"Parse the log file to a stream\n\n        Will download the log if it is not already downloaded.\n\n        *Returns*:\n\n        A `LogStream` object\n        \"\"\"\n        return LogStream(self.download(write_to_file=False))\n\n    def __format__(self, format_specifier):\n        if format_specifier == \"with_header\":\n            return tabulate.tabulate(\n                [self], headers=[\"Name\", \"Time\", \"Max depth\", \"Size\"], tablefmt=\"plain\"\n            )\n        else:\n            return tabulate.tabulate([self], tablefmt=\"plain\")\n\n    def __str__(self):\n        return f\"{self}\"\n\n    def __getitem__(self, item):\n        return self._formatted_values[item]\n\n\nclass Logs:\n    def __init__(self, parent_drone, auto_download_index=False):\n        self._parent_drone = parent_drone\n        self.auto_download_index = auto_download_index\n        self.index_downloaded = False\n        self._logs = {}\n        if auto_download_index:\n            self.refresh_log_index()\n\n    def refresh_log_index(self):\n        \"\"\"Refresh the log index from the drone\n\n        This is method is run on the first log access by default, but if you would like to check\n        for new log files it can be called at any time.\n        \"\"\"\n        if not self._parent_drone.connected:\n            raise ConnectionError(\n                \"The connection to the drone is not established, try calling the connect method \"\n                \"before retrying\"\n            )\n        logger.debug(\"Refreshing log index\")\n        logs_endpoint = f\"http://{self._parent_drone._ip}/logs\"\n        logs: List[dict] = requests.get(logs_endpoint).json()\n\n        if version.parse(self._parent_drone.software_version_short) < version.parse(\"3.3\"):\n            # Extend index with dive info, sends a request for each log file so can be quite slow\n            # for drones with many logs. Not necessary for Blunux >= 3.3 as dive info is included in\n            # the index.\n            logger.debug(f\"Getting dive info for {len(logs)} logs\")\n            for index, log in enumerate(logs):\n                dive_info = requests.get(f\"{logs_endpoint}/{log['name']}/dive_info\").json()\n                logs[index].update(dive_info)\n\n        # Instantiate log objects for each log\n        logger.debug(f\"Creating log objects for {len(logs)} logs\")\n        for log in logs:\n            if log[\"has_binlog\"]:\n                self._logs[log[\"name\"]] = LogFile(\n                    log[\"name\"],\n                    log[\"is_dive\"],\n                    log[\"binlog_size\"],\n              ",
+      "total_lines": 544
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 489,
+      "end_line": 500,
+      "excerpt": "    def _build_log_files_from_dictionary(self, list_of_logs_in_dictionaries):\n        loglist = {}\n        for log in list_of_logs_in_dictionaries:\n            try:\n                loglist[log[\"name\"]] = LegacyLogFile(\n                    log[\"maxdepth\"], log[\"name\"], log[\"timestamp\"], log[\"binsize\"], self.ip\n                )\n            except dateutil.parser.ParserError:\n                logger.warning(\n                    f\"Could not parse timestamp for log {log['name']}, skipping this log file\"\n                )\n        return loglist",
+      "symbol_name": "_build_log_files_from_dictionary",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "blueye/sdk/logs.py",
+      "sha": "1fce1eb2bf0030f38f409f0a417f09be10a90e57",
+      "download_url": "https://raw.githubusercontent.com/BluEye-Robotics/blueye.sdk/master/blueye/sdk/logs.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "io",
+        "logging",
+        "zlib",
+        "datetime:datetime",
+        "datetime:timedelta",
+        "datetime:timezone",
+        "pathlib:Path",
+        "typing:Callable",
+        "typing:Iterator",
+        "typing:List",
+        "typing:Optional",
+        "typing:Tuple",
+        "blueye.protocol",
+        "dateutil.parser",
+        "proto",
+        "requests",
+        "tabulate",
+        "google.protobuf.internal.decoder:_DecodeVarint",
+        "packaging:version",
+        "utils:deserialize_any_to_message"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/BluEye-Robotics/blueye.sdk/master/README.md",
+      "content_excerpt": "# blueye.sdk\n[![Tests](https://github.com/BluEye-Robotics/blueye.sdk/workflows/Tests/badge.svg)](https://github.com/BluEye-Robotics/blueye.sdk/actions)\n[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/ambv/black)\n[![codecov](https://codecov.io/gh/BluEye-Robotics/blueye.sdk/branch/master/graph/badge.svg)](https://codecov.io/gh/BluEye-Robotics/blueye.sdk)\n[![PyPi-version](https://img.shields.io/pypi/v/blueye.sdk.svg?maxAge=3600)](https://pypi.org/project/blueye.sdk/)\n[![python-versions](https://img.shields.io/pypi/pyversions/blueye.sdk.svg?longCache=True)](https://pypi.org/project/blueye.sdk/)\n_________________\n\n[Read Latest Documentation](https://blueye-robotics.github.io/blueye.sdk/) - [Browse GitHub Code Repository](https://github.com/BluEye-Robotics/blueye.sdk)\n_________________\n\nA Python package for remote control of the Blueye underwater drones.\n\n\n![SDK demo](https://user-images.githubusercontent.com/8504604/66751230-d05c7e00-ee8e-11e9-91cb-d46b433aafa5.gif)\n\n## About Blueye Underwater Drones\nBlueye produces and sells three models of underwater drones, the Blueye Pioneer, Blueye Pro, and Blueye X3. The Pioneer and the Pro are drones designed for inspection, while the X3 is extensible with three guest ports that allow attaching for example grippers or sonars.\nVisit [blueyerobotics.com](https://www.blueyerobotics.com/products) for more information about the Blueye products.\n\n## This SDK and the Blueye drones\nA Blueye drone is normally controlled via a mobile device through the Blueye App ([iOS](https://apps.apple.com/no"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_build_log_files_from_dictionary test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_build_log_files_from_dictionary(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "logs.py",
+          "path": "blueye/sdk/logs.py",
+          "sha": "1fce1eb2bf0030f38f409f0a417f09be10a90e57",
+          "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/blob/b2c5a2e58e69211096d7d7ebc5be7e3b6e537950/blueye/sdk/logs.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 489,
+          "end_line": 500,
+          "excerpt": "    def _build_log_files_from_dictionary(self, list_of_logs_in_dictionaries):\n        loglist = {}\n        for log in list_of_logs_in_dictionaries:\n            try:\n                loglist[log[\"name\"]] = LegacyLogFile(\n                    log[\"maxdepth\"], log[\"name\"], log[\"timestamp\"], log[\"binsize\"], self.ip\n                )\n            except dateutil.parser.ParserError:\n                logger.warning(\n                    f\"Could not parse timestamp for log {log['name']}, skipping this log file\"\n                )\n        return loglist",
+          "symbol_name": "_build_log_files_from_dictionary",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "blueye/sdk",
+      "count": 11,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "blueye/sdk/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "battery.py",
+          "path": "blueye/sdk/battery.py",
+          "type": "file"
+        },
+        {
+          "name": "camera.py",
+          "path": "blueye/sdk/camera.py",
+          "type": "file"
+        },
+        {
+          "name": "connection.py",
+          "path": "blueye/sdk/connection.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "blueye/sdk/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "drone.py",
+          "path": "blueye/sdk/drone.py",
+          "type": "file"
+        },
+        {
+          "name": "guestport.py",
+          "path": "blueye/sdk/guestport.py",
+          "type": "file"
+        },
+        {
+          "name": "logs.py",
+          "path": "blueye/sdk/logs.py",
+          "type": "file"
+        },
+        {
+          "name": "mission.py",
+          "path": "blueye/sdk/mission.py",
+          "type": "file"
+        },
+        {
+          "name": "motion.py",
+          "path": "blueye/sdk/motion.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "blueye/sdk/utils.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "blueye/sdk/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 3,
+          "excerpt": "1: from .constants import WaterDensities\n2: from .drone import Drone\n3: from .utils import open_local_documentation"
+        },
+        {
+          "name": "battery.py",
+          "path": "blueye/sdk/battery.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: from typing import TYPE_CHECKING, Optional\n4: \n5: import blueye.protocol\n6: \n7: # Necessary to avoid cyclic imports\n8: if TYPE_CHECKING:\n9:     from .drone import Drone\n10: \n11: \n12: class Battery:\n13:     \"\"\"Contains the battery related functions.\"\"\""
+        },
+        {
+          "name": "camera.py",
+          "path": "blueye/sdk/camera.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: import logging\n4: import re\n5: import warnings\n6: from typing import TYPE_CHECKING, Optional\n7: \n8: import blueye.protocol\n9: import requests\n10: from packaging import version\n11: \n12: # Necessary to avoid cyclic imports\n13: if TYPE_CHECKING:"
+        },
+        {
+          "name": "connection.py",
+          "path": "blueye/sdk/connection.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: import importlib.metadata\n4: import logging\n5: import platform\n6: import queue\n7: import threading\n8: import uuid\n9: from typing import Any, Callable, Dict, List, NamedTuple, Tuple\n10: \n11: import blueye.protocol\n12: import proto\n13: import zmq"
+        },
+        {
+          "name": "constants.py",
+          "path": "blueye/sdk/constants.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: This file contains constants used by the SDK.\n3: \"\"\"\n4: \n5: \n6: class WaterDensities:\n7:     \"\"\"\n8:     Various typical densities for water (in grams/liter).\n9: \n10:     Attributes:\n11:         fresh (float): Density of fresh water.\n12:         brackish (float): Density of brackish water.\n13:         salty (float): Density of salty water."
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "blueye/sdk/logs.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "dc7d8324e25898ac290808df4a200e70aceda702",
+          "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/commit/dc7d8324e25898ac290808df4a200e70aceda702",
+          "message": "Improve exception handling",
+          "author": "Sindre Hansen",
+          "date": "2025-10-27T13:18:31Z"
+        },
+        {
+          "sha": "80d18df8e3a14808405d3cb4bc38a20d00895cef",
+          "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/commit/80d18df8e3a14808405d3cb4bc38a20d00895cef",
+          "message": "Improve log parsing robustness\n\nGoing with a stream based approach for decompression is more reliable\nthan trying to decompress the entire file at once.",
+          "author": "Sindre Hansen",
+          "date": "2025-10-24T08:10:29Z"
+        },
+        {
+          "sha": "938e2733188c326dd2b104354273d1edbab66b44",
+          "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/commit/938e2733188c326dd2b104354273d1edbab66b44",
+          "message": "Run Black",
+          "author": "Andreas Viggen",
+          "date": "2025-08-20T10:11:55Z"
+        },
+        {
+          "sha": "4792e46d892b63d7e9174d7d13a4f88c1c2d00c0",
+          "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/commit/4792e46d892b63d7e9174d7d13a4f88c1c2d00c0",
+          "message": "Skip messages that are not in SDK protocol yet",
+          "author": "Andreas Viggen",
+          "date": "2025-08-20T10:08:29Z"
+        },
+        {
+          "sha": "2a9bc3e8bbb50b2409ac4b813f5e006bb2800864",
+          "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/commit/2a9bc3e8bbb50b2409ac4b813f5e006bb2800864",
+          "message": "Fix bug in LogStream iterator\n\nThe deserialize_any_to_message function expects an Any type, not a\nBinlogRecord, therefore we need to pass the payload field in the\nBinlogRecord message.\n\nSquashed commit of the following:\n\ncommit fedf7208227904930550de9e37cfa1832c793633\nAuthor: Sindre Hansen <sindreha",
+          "author": "Sindre Hansen",
+          "date": "2024-09-10T09:25:34Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_build_log_files_from_dictionary TODO this instead printing when",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "blueye/sdk/logs.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "dc7d8324e25898ac290808df4a200e70aceda702",
+        "html_url": "https://github.com/BluEye-Robotics/blueye.sdk/commit/dc7d8324e25898ac290808df4a200e70aceda702",
+        "message": "Improve exception handling",
+        "author": "Sindre Hansen",
+        "date": "2025-10-27T13:18:31Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

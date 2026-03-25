@@ -1,0 +1,322 @@
+{
+  "task_id": "854",
+  "repo_owner": "codecov",
+  "repo_name": "codecov-api",
+  "file_path": "codecov_auth/views/sentry.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T02:56:35+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 4,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T02:56:47+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T02:56:59+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "codecov_auth/views/sentry.py",
+    "original_code": "def _perform_login(self, request: HttpRequest) -> HttpResponse:\n    code = request.GET.get(\"code\")\n    user_data = self._fetch_user_data(code)\n    if user_data is None:\n        log.warning(\"Unable to log in due to problem on Sentry\", exc_info=True)\n        return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n    # TODO: verify `id_token` by decoding the JWT using our shared secret\n\n    current_user = self._login_user(request, user_data)\n\n    # TEMPORARY: we're assuming a single owner for the time being since there's\n    # no supporting UI to select which owner you'd like to view\n    owner = current_user.owners.first()\n    if owner is not None:\n        service = get_short_service_name(owner.service)\n        return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/{service}\")\n    else:\n        # user has not connected any owners yet\n        return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/sync\")",
+    "original_signature": "def _perform_login(self, request: HttpRequest) -> HttpResponse:",
+    "satd_comment": "# TODO: verify `id_token` by decoding the JWT using our shared secret",
+    "target_file": {
+      "ok": true,
+      "path": "codecov_auth/views/sentry.py",
+      "sha": "a05a903c1fcc2d6f3d2492efac0d8a5c53304330",
+      "download_url": "https://raw.githubusercontent.com/codecov/codecov-api/main/codecov_auth/views/sentry.py",
+      "content_excerpt": "import logging\nfrom typing import Dict, Optional\nfrom urllib.parse import urlencode\n\nimport jwt\nimport requests\nfrom django.conf import settings\nfrom django.contrib.auth import login, logout\nfrom django.http import HttpRequest, HttpResponse\nfrom django.shortcuts import redirect\nfrom django.views import View\n\nfrom codecov_auth.models import SentryUser, User\nfrom codecov_auth.views.base import LoginMixin, StateMixin\nfrom utils.services import get_short_service_name\n\nlog = logging.getLogger(__name__)\n\n\nOAUTH_AUTHORIZE_URL = \"https://sentry.io/oauth/authorize\"\nOAUTH_TOKEN_URL = (\n    \"https://sentry.io/oauth/token/\"  # seems to require the trailing slash\n)\n\n\nclass SentryLoginView(LoginMixin, StateMixin, View):\n    service = \"sentry\"\n\n    def _fetch_user_data(self, code: str, state: str) -> Optional[Dict]:\n        res = requests.post(\n            OAUTH_TOKEN_URL,\n            data={\n                \"grant_type\": \"authorization_code\",\n                \"client_id\": settings.SENTRY_OAUTH_CLIENT_ID,\n                \"client_secret\": settings.SENTRY_OAUTH_CLIENT_SECRET,\n                \"code\": code,\n                \"state\": state,\n            },\n        )\n\n        if res.status_code >= 400:\n            return None\n\n        if not self.verify_state(state):\n            log.warning(\"Invalid state during Sentry OAuth\")\n            return None\n\n        return res.json()\n\n    def _redirect_to_consent(self) -> HttpResponse:\n        state = self.generate_state()\n        qs = urlencode(\n            dict(\n                response_type=\"code\",\n                client_id=settings.SENTRY_OAUTH_CLIENT_ID,\n                scope=\"openid email profile\",\n                state=state,\n            )\n        )\n        redirect_url = f\"{OAUTH_AUTHORIZE_URL}?{qs}\"\n        response = redirect(redirect_url)\n        self.store_to_cookie_utm_tags(response)\n        return response\n\n    def _verify_id_token(self, id_token: str) -> bool:\n        try:\n            id_payload = jwt.decode(\n                id_token,\n                settings.SENTRY_OIDC_SHARED_SECRET,\n                algorithms=[\"HS256\"],\n                audience=settings.SENTRY_OAUTH_CLIENT_ID,\n            )\n\n            if id_payload[\"iss\"] != \"https://sentry.io\":\n                log.warning(\n                    \"Invalid issuer of OIDC ID token\",\n                    exc_info=True,\n                    extra=dict(\n                        id_payload=id_payload,\n                    ),\n                )\n                return False\n\n            return True\n        except jwt.exceptions.InvalidSignatureError:\n            id_payload = jwt.decode(id_token, options={\"verify_signature\": False})\n            log.warning(\n                \"Unable to verify signature of OIDC ID token\",\n                exc_info=True,\n                extra=dict(\n                    id_payload=id_payload,\n                ),\n            )\n            return False\n\n    def _perform_login(self, request: HttpRequest) -> HttpResponse:\n        code = request.GET.get(\"code\")\n        state = request.GET.get(\"state\")\n\n        if not self.verify_state(state):\n            log.warning(\"Invalid state during Sentry OAuth\")\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n        user_data = self._fetch_user_data(code, state)\n        if user_data is None:\n            log.warning(\"Unable to log in due to problem on Sentry\", exc_info=True)\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n        if not self._verify_id_token(user_data[\"id_token\"]):\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n        current_user = self._login_user(request, user_data)\n\n        # TEMPORARY: we're assuming a single owner for the time being since there's\n        # no supporting UI to select which owner you'd like to view\n        owner = current_user.owners.first()\n        self.remove_state(state)\n\n        if owner is not None:\n            service = get_short_service_name(owner.service)\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/{service}\")\n        else:\n            # user has not connected any owners yet\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/sync\")\n\n    def _login_user(self, request: HttpRequest, user_data: dict) -> User:\n        sentry_id = user_data[\"user\"][\"id\"]\n        user_name = user_data[\"user\"].get(\"name\")\n        user_email = user_data[\"user\"].get(\"email\")\n\n        sentry_user = SentryUser.objects.filter(sentry_id=sentry_id).first()\n\n        current_user = None\n        if request.user is not None and not request.user.is_anonymous:\n            # we're already authenticated\n            current_user = request.user\n\n            if sentry_user and sentry_user.user != request.user:\n                log.warning(\n                    \"Sentry account already linked to another user\",\n                    extra=dict(\n                        current_user_id=request.user.pk, sentry_user_id=sentry_user.pk\n                    ),\n                )\n                # Logout the current user and login the user who already\n                # claimed this Sentry account (below)\n                logout(request)\n                current_user = sentry_user.user\n        else:\n            # we're not authenticated\n            if sentry_user:\n                log.info(\n                    \"Existing Sentry user logging in\",\n                    extra=dict(sentry_user_id=sentry_user.pk),\n                )\n                current_user = sentry_user.user\n            else:\n                current_user = User.objects.create(\n                    name=user_name,\n                    email=user_email,\n                )\n\n        if sentry_user is None:\n            sentry_user = SentryUser.objects.create(\n                user=current_user,\n                sentry_id=sentry_id,\n                name=user_name,\n                email=user_email,\n                access_token=user_data[\"access_token\"],\n                refresh_token=user_data[\"refresh_token\"],\n            )\n            log.info(\n                \"Created Sentry user\",\n                extra=dict(sentry_user_id=sentry_user.pk),\n            )\n\n        login(request, current_user)\n        return current_user\n\n    def get(self, request: HttpRequest) -> HttpResponse:\n        if request.GET.get(\"code\"):\n            return self._perform_login(request)\n        else:\n            return self._redirect_to_consent()\n",
+      "total_lines": 184
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 96,
+      "end_line": 124,
+      "excerpt": "    def _perform_login(self, request: HttpRequest) -> HttpResponse:\n        code = request.GET.get(\"code\")\n        state = request.GET.get(\"state\")\n\n        if not self.verify_state(state):\n            log.warning(\"Invalid state during Sentry OAuth\")\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n        user_data = self._fetch_user_data(code, state)\n        if user_data is None:\n            log.warning(\"Unable to log in due to problem on Sentry\", exc_info=True)\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n        if not self._verify_id_token(user_data[\"id_token\"]):\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/login\")\n\n        current_user = self._login_user(request, user_data)\n\n        # TEMPORARY: we're assuming a single owner for the time being since there's\n        # no supporting UI to select which owner you'd like to view\n        owner = current_user.owners.first()\n        self.remove_state(state)\n\n        if owner is not None:\n            service = get_short_service_name(owner.service)\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/{service}\")\n        else:\n            # user has not connected any owners yet\n            return redirect(f\"{settings.CODECOV_DASHBOARD_URL}/sync\")",
+      "symbol_name": "_perform_login",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "codecov_auth/views/sentry.py",
+      "sha": "a05a903c1fcc2d6f3d2492efac0d8a5c53304330",
+      "download_url": "https://raw.githubusercontent.com/codecov/codecov-api/main/codecov_auth/views/sentry.py"
+    },
+    "imports": {
+      "imports": [
+        "logging",
+        "typing:Dict",
+        "typing:Optional",
+        "urllib.parse:urlencode",
+        "jwt",
+        "requests",
+        "django.conf:settings",
+        "django.contrib.auth:login",
+        "django.contrib.auth:logout",
+        "django.http:HttpRequest",
+        "django.http:HttpResponse",
+        "django.shortcuts:redirect",
+        "django.views:View",
+        "codecov_auth.models:SentryUser",
+        "codecov_auth.models:User",
+        "codecov_auth.views.base:LoginMixin",
+        "codecov_auth.views.base:StateMixin",
+        "utils.services:get_short_service_name"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/codecov/codecov-api/main/README.md",
+      "content_excerpt": "# PHASED OUT\n\nThis project has been moved to [the `apps/codecov-api` folder in our `umbrella` repository](https://github.com/codecov/umbrella/tree/main/apps/codecov-api). Please contribute there instead.\n\n## Codecov API\n\n> We believe that everyone should have access to quality software (like Sentry), that’s why we have always offered Codecov for free to open source maintainers.\n>\n> By making our code public, we’re not only joining the community that’s supported us from the start — but also want to make sure that every developer can contribute to and build on the Codecov experience.\n\nA private Django REST Framework API intended to serve Codecov's front end.\n\n## Getting Started\n\n### Building\n\nThis project contains a makefile. To build the docker image:\n\n    make build\n\n`requirements.txt` is used in the base image. If you make changes to `requirements.txt` you will need to rebuild.\n\nNote, you'll need to install Rust to build `ribs` which is a dependency of `shared`. Go here for more info on how to do this: https://www.rust-lang.org/tools/install\n\n### Running Standalone\n\nThis project contains a `docker-compose.yml` file that is intended to run the api standalone. In this configuration it **does not** share codecov.io's development database; so don't expect parity there.\n\nTo start the service, do\n\n`docker-compose up`\n\nUtilizing its own database provides a convenient way for the REST API to provide its own helpful seeds and migrations for active development without potentially destroying/modifying your development database for codecov.io.\n\nOnce running, the api will be available "
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_perform_login test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_perform_login(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "codecov_auth/views",
+      "count": 13,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "codecov_auth/views/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "base.py",
+          "path": "codecov_auth/views/base.py",
+          "type": "file"
+        },
+        {
+          "name": "bitbucket.py",
+          "path": "codecov_auth/views/bitbucket.py",
+          "type": "file"
+        },
+        {
+          "name": "bitbucket_server.py",
+          "path": "codecov_auth/views/bitbucket_server.py",
+          "type": "file"
+        },
+        {
+          "name": "github.py",
+          "path": "codecov_auth/views/github.py",
+          "type": "file"
+        },
+        {
+          "name": "github_enterprise.py",
+          "path": "codecov_auth/views/github_enterprise.py",
+          "type": "file"
+        },
+        {
+          "name": "gitlab.py",
+          "path": "codecov_auth/views/gitlab.py",
+          "type": "file"
+        },
+        {
+          "name": "gitlab_enterprise.py",
+          "path": "codecov_auth/views/gitlab_enterprise.py",
+          "type": "file"
+        },
+        {
+          "name": "logout.py",
+          "path": "codecov_auth/views/logout.py",
+          "type": "file"
+        },
+        {
+          "name": "okta.py",
+          "path": "codecov_auth/views/okta.py",
+          "type": "file"
+        },
+        {
+          "name": "okta_cloud.py",
+          "path": "codecov_auth/views/okta_cloud.py",
+          "type": "file"
+        },
+        {
+          "name": "okta_mixin.py",
+          "path": "codecov_auth/views/okta_mixin.py",
+          "type": "file"
+        },
+        {
+          "name": "sentry.py",
+          "path": "codecov_auth/views/sentry.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "codecov_auth/views/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 3,
+          "excerpt": "1: from codecov_auth.views.github import GithubLoginView\n2: \n3: __all__ = [\"GithubLoginView\"]"
+        },
+        {
+          "name": "base.py",
+          "path": "codecov_auth/views/base.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import logging\n2: import re\n3: import uuid\n4: from functools import reduce\n5: from typing import Any\n6: from urllib.parse import parse_qs, urlencode, urlparse\n7: \n8: from django.conf import settings\n9: from django.contrib.auth import login, logout\n10: from django.contrib.sessions.models import Session as DjangoSession\n11: from django.core.exceptions import PermissionDenied\n12: from django.db import transaction\n13: from django.http.request import HttpRequest"
+        },
+        {
+          "name": "bitbucket.py",
+          "path": "codecov_auth/views/bitbucket.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import base64\n2: import logging\n3: from urllib.parse import urlencode\n4: \n5: from asgiref.sync import async_to_sync\n6: from django.conf import settings\n7: from django.shortcuts import redirect\n8: from django.urls import reverse\n9: from django.views import View\n10: from shared.django_apps.codecov_metrics.service.codecov_metrics import (\n11:     UserOnboardingMetricsService,\n12: )\n13: from shared.torngit import Bitbucket"
+        },
+        {
+          "name": "bitbucket_server.py",
+          "path": "codecov_auth/views/bitbucket_server.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import base64\n2: import logging\n3: import threading\n4: from urllib.parse import urlencode\n5: \n6: from asgiref.sync import async_to_sync\n7: from django.conf import settings\n8: from django.shortcuts import redirect\n9: from django.urls import reverse\n10: from django.views import View\n11: from shared.torngit import BitbucketServer\n12: from shared.torngit.exceptions import TorngitServerFailureError\n13: "
+        },
+        {
+          "name": "github.py",
+          "path": "codecov_auth/views/github.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import logging\n2: from typing import Optional\n3: from urllib.parse import urlencode, urljoin\n4: \n5: from asgiref.sync import async_to_sync\n6: from django.conf import settings\n7: from django.shortcuts import redirect\n8: from django.views import View\n9: from shared.django_apps.codecov_metrics.service.codecov_metrics import (\n10:     UserOnboardingMetricsService,\n11: )\n12: from shared.torngit import Github\n13: from shared.torngit.exceptions import TorngitError"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "codecov_auth/views/sentry.py",
+      "count": 4,
+      "commits": [
+        {
+          "sha": "902a5cb209d7661e4b0939a04397cde68f6edcbf",
+          "html_url": "https://github.com/codecov/codecov-api/commit/902a5cb209d7661e4b0939a04397cde68f6edcbf",
+          "message": "API Improvements: Fix typings for various files pt4 (#1086)",
+          "author": "JerrySentry",
+          "date": "2025-01-08T20:59:41Z"
+        },
+        {
+          "sha": "c9fb1817f4f70c2e931242cfc3fce59c5f7dff90",
+          "html_url": "https://github.com/codecov/codecov-api/commit/c9fb1817f4f70c2e931242cfc3fce59c5f7dff90",
+          "message": "fix: use state for Sentry/Okta oAuth flow (#434)\n\n* Test with states\r\n\r\n* second round\r\n\r\n* Okta stuff\r\n\r\n* quick fix for test\r\n\r\n* fixing tests\r\n\r\n* more tests\r\n\r\n* test: fix query measurements after 30 days test (#442)\r\n\r\n* test: fix query measurements after 30 days test\r\n\r\nThis test started faili",
+          "author": "Rola Abuhasna",
+          "date": "2024-03-13T12:23:25Z"
+        },
+        {
+          "sha": "ec03560f9e8c6225a669ecacc4faa4710d6e1068",
+          "html_url": "https://github.com/codecov/codecov-api/commit/ec03560f9e8c6225a669ecacc4faa4710d6e1068",
+          "message": "feat: Validate OIDC ID token during Sentry OAuth flow (#52)",
+          "author": "scott-codecov",
+          "date": "2023-09-13T15:48:10Z"
+        },
+        {
+          "sha": "ffbd31578d354243026f772209c627f71612cfab",
+          "html_url": "https://github.com/codecov/codecov-api/commit/ffbd31578d354243026f772209c627f71612cfab",
+          "message": "feat: Add Sentry OAuth and current user endpoint",
+          "author": "Scott Nelson",
+          "date": "2023-07-06T16:46:35Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_perform_login TODO verify id_token decoding using",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "codecov_auth/views/sentry.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "902a5cb209d7661e4b0939a04397cde68f6edcbf",
+        "html_url": "https://github.com/codecov/codecov-api/commit/902a5cb209d7661e4b0939a04397cde68f6edcbf",
+        "message": "API Improvements: Fix typings for various files pt4 (#1086)",
+        "author": "JerrySentry",
+        "date": "2025-01-08T20:59:41Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 4,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

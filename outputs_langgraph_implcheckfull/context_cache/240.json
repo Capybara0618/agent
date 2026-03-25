@@ -1,0 +1,456 @@
+{
+  "task_id": "240",
+  "repo_owner": "yelp",
+  "repo_name": "mrjob",
+  "file_path": "mrjob/runner.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T09:12:07+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T09:12:30+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T09:12:35+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "mrjob/runner.py",
+    "original_code": "def _hadoop_streaming_commands(self, step_num):\n    version = self.get_hadoop_version()\n\n    # Hadoop streaming stuff\n    mapper, bash_wrap_mapper = self._render_substep(\n        step_num, 'mapper')\n\n    combiner, bash_wrap_combiner = self._render_substep(\n        step_num, 'combiner')\n\n    reducer, bash_wrap_reducer = self._render_substep(\n        step_num, 'reducer')\n\n    if (combiner is not None and\n        not supports_combiners_in_hadoop_streaming(version)):\n\n        # krazy hack to support combiners on hadoop <0.20\n        bash_wrap_mapper = True\n        mapper = \"%s | sort | %s\" % (mapper, combiner)\n\n        # take the combiner away, hadoop will just be confused\n        combiner = None\n        bash_wrap_combiner = False\n\n    if bash_wrap_mapper:\n        mapper = bash_wrap(mapper)\n\n    if bash_wrap_combiner:\n        combiner = bash_wrap(combiner)\n\n    if bash_wrap_reducer:\n        reducer = bash_wrap(reducer)\n\n    return mapper, combiner, reducer",
+    "original_signature": "def _hadoop_streaming_commands(self, step_num):",
+    "satd_comment": "# krazy hack to support combiners on hadoop <0.20",
+    "target_file": {
+      "ok": true,
+      "path": "mrjob/runner.py",
+      "sha": "4688c038eb6e91107ab165cd4e61c22ce8954143",
+      "download_url": "https://raw.githubusercontent.com/Yelp/mrjob/master/mrjob/runner.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# Copyright 2009-2017 Yelp and Contributors\n# Copyright 2018 Yelp and Google, Inc.\n# Copyright 2019 Yelp\n# Copyright 2020 Affirm, Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Base class for all runners.\"\"\"\nimport copy\nimport datetime\nimport getpass\nimport logging\nimport os\nimport os.path\nimport posixpath\nimport pprint\nimport re\nimport sys\nimport tarfile\nimport tempfile\nfrom shutil import rmtree\n\nfrom mrjob.compat import translate_jobconf\nfrom mrjob.compat import translate_jobconf_dict\nfrom mrjob.compat import translate_jobconf_for_all_versions\nfrom mrjob.conf import ClearedValue\nfrom mrjob.conf import combine_jobconfs\nfrom mrjob.conf import combine_opts\nfrom mrjob.conf import load_opts_from_mrjob_confs\nfrom mrjob.fs.composite import CompositeFilesystem\nfrom mrjob.fs.local import LocalFilesystem\nfrom mrjob.options import _combiners\nfrom mrjob.options import _deprecated_aliases\nfrom mrjob.options import CLEANUP_CHOICES\nfrom mrjob.parse import is_uri\nfrom mrjob.parse import to_uri\nfrom mrjob.py2 import PY2\nfrom mrjob.py2 import string_types\nfrom mrjob.setup import WorkingDirManager\nfrom mrjob.setup import name_uniquely\nfrom mrjob.setup import parse_legacy_hash_path\nfrom mrjob.step import INPUT\nfrom mrjob.step import OUTPUT\nfrom mrjob.step import _is_spark_step_type\nfrom mrjob.step import _is_pyspark_step_type\n\n\nlog = logging.getLogger(__name__)\n\n# use to detect globs and break into the part before and after the glob\nGLOB_RE = re.compile(r'^(.*?)([\\[\\*\\?].*)$')\n\n# buffer for piping files into sort on Windows\n_BUFFER_SIZE = 4096\n\n# jobconf options for implementing SORT_VALUES\n_SORT_VALUES_JOBCONF = {\n    'mapreduce.partition.keypartitioner.options': '-k1,1',\n    'stream.num.map.output.key.fields': 2\n}\n\n# partitioner for sort_values\n_SORT_VALUES_PARTITIONER = \\\n    'org.apache.hadoop.mapred.lib.KeyFieldBasedPartitioner'\n\n\nclass MRJobRunner(object):\n    \"\"\"Abstract base class for all runners\"\"\"\n\n    # this class handles the basic runner framework, options and config files,\n    # arguments to mrjobs, and setting up job working dirs and environments.\n    # this will put files from setup scripts, py_files, and bootstrap_mrjob\n    # into the job's working dir, but won't actually run/import them\n    #\n    # command lines to run substeps (including Spark) are handled by\n    # mrjob.bin.MRJobBinRunner\n\n    #: alias for this runner, used on the command line with ``-r``\n    alias = None\n\n    # libjars is only here because the job can set it; might want to\n    # handle this with a warning from the launcher instead\n    OPT_NAMES = {\n        'bootstrap_mrjob',\n        'check_input_paths',\n        'cleanup',\n        'cleanup_on_failure',\n        'cmdenv',\n        'jobconf',\n        'label',\n        'libjars',\n        'local_tmp_dir',\n        # no max_output_files because it doesn't go in self._opts\n        'owner',\n        'py_files',\n        'read_logs',\n        'setup',\n        'upload_archives',\n        'upload_dirs',\n        'upload_files'\n    }\n\n    # re-define this as a set of step types supported by your runner\n    _STEP_TYPES = None\n\n    ### methods to call from your batch script ###\n\n    def __init__(self, mr_job_script=None, conf_paths=None,\n                 extra_args=None,\n                 hadoop_input_format=None, hadoop_output_format=None,\n                 input_paths=None, output_dir=None, partitioner=None,\n                 sort_values=None, stdin=None, steps=None,\n                 step_output_dir=None,\n                 **opts):\n        \"\"\"All runners take the following keyword arguments:\n\n        :type mr_job_script: str\n        :param mr_job_script: the path of the ``.py`` file containing the\n                              :py:class:`~mrjob.job.MRJob`. If this is None,\n                              you won't actually be able to :py:meth:`run` the\n                              job, but other utilities (e.g. :py:meth:`ls`)\n                              will work.\n        :type conf_paths: None or list\n        :param conf_paths: List of config files to combine and use, or None to\n                           search for mrjob.conf in the default locations.\n        :type extra_args: list of str\n        :param extra_args: a list of extra cmd-line arguments to pass to the\n                           mr_job script. This is a hook to allow jobs to take\n                           additional arguments.\n        :type hadoop_input_format: str\n        :param hadoop_input_format: name of an optional Hadoop ``InputFormat``\n                                    class. Passed to Hadoop along with your\n                                    first step with the ``-inputformat``\n                                    option. Note that if you write your own\n                                    class, you'll need to include it in your\n                                    own custom streaming jar (see\n                                    :mrjob-opt:`hadoop_streaming_jar`).\n        :type hadoop_output_format: str\n        :param hadoop_output_format: name of an optional Hadoop\n                                     ``OutputFormat`` class. Passed to Hadoop\n                                     along with your first step with the\n                                     ``-outputformat`` option. Note that if you\n                                     write your own class, you'll need to\n                                     include it in your own custom streaming\n                                     jar (see\n                                     :mrjob-opt:`hadoop_streaming_jar`).\n        :type input_paths: list of str\n        :param input_paths: Input files for your job. Supports globs and\n                            recursively walks directories (e.g.\n                            ``['data/common/', 'data/training/*.gz']``). If\n                            this is left blank, we'll read from stdin\n        :type output_dir: str\n        :param output_dir: An empty/non-existent directory where Hadoop\n                           should put the final output from the job.\n                           If you don't specify an output directory, we'll\n                           output into a subdirectory of this job's temporary\n                           directory. You can control this from the command\n                           line with ``--output-dir``. This option cannot be\n                           set from configuration files. If used with the\n                           hadoop runner, this path does not need to be fully\n                           qualified with ``hdfs://`` URIs because it's\n                           understood that it has to be on HDFS.\n        :type partitioner: str\n        :param partitioner: Optional name of a Hadoop partitioner class, e.g.\n                            ``'org.apache.hadoop.mapred.lib.HashPartitioner'``.\n                            Hadoop streaming will use this to determine how\n                            mapper output should be sorted and distributed\n                            to reducers.\n        :type sort_values: bool\n        :param sort_values: if true, set partitioners and jobconf variables\n                            so that reducers to receive the values\n                            associated with any key in sorted order (sorted by\n                            their *encoded* value). Also known as secondary\n                            sort.\n        :param stdin: an iterable (can be a ``BytesIO`` or even a list) to use\n                      as stdin. This is a hook for testing; if you set\n                      ``stdin`` via :py:meth:`~mrjob.job.MRJob.sandbox`, it'll\n                      get passed through to the runner. If for some reason\n                      your lines are missing newlines, we'll add them;\n                      this makes it easier to write automated tests.\n        :param steps: a list of descriptions of steps to run (see :doc:`step`\n                      for description formats)\n        :type step_output_dir: str\n        :param step_output_dir: An empty/non-existent directory where Hadoop\n                                should put output from all steps other than\n                                the last one (this only matters for multi-step\n                                jobs). Currently ignored by local runners.\n        \"\"\"\n        self._ran_job = False\n\n        # opts are made from:\n        #\n        # empty defaults (everything set to None)\n        # runner-specific defaults\n        # opts from config file(s)\n        # opts from command line\n        self._opts = self._combine_confs(\n            [(None, {key: None for key in self.OPT_NAMES})] +\n            [(None, self._default_opts())] +\n            load_opts_from_mrjob_confs(self.alias, conf_paths) +\n            [('the command line', opts)]\n        )\n\n        log.debug('Active configuration:')\n        log.debug(pprint.pformat({\n            opt_key: self._obfuscate_opt(opt_key, opt_value)\n            for opt_key, opt_value in self._opts.items()\n        }))\n\n        self._fs = None\n\n        # a local tmp directory that will be cleaned up when we're done\n        # access/make this using self._get_local_tmp_dir()\n        self._local_tmp_dir = None\n\n        if self._emulate_archives_on_spark():\n            # keep Spark from auto-uncompressing tarballs\n            archive_file_suffix = '.file'\n        else:\n            # otherwise, leave as-is, so that --archive will\n            # work properly\n            archive_file_suffix = ''\n\n        self._working_dir_mgr = WorkingDirManager(\n            archive_file_suffix=archive_file_suffix)\n\n        # mapping from dir to path for corresponding archive. we pick\n        # paths during init(), but don't actually create the archives\n        # until self._create_dir_archives() is called\n        self._dir_to_archive_path = {}\n        # dir archive names (the filename minus \".tar.gz\") already taken\n        self._dir_archive_names_taken = set()\n        # set of dir_archives that have actually been created\n        self._dir_archives_created = set()\n\n        # set this to an :py:class:`~mrjob.setup.UploadDirManager` in\n        # runners that upload files to HDFS, S3, etc.\n        #\n        # this manager should not handle files belonging to\n        # self._working_dir_mgr,\n        # which, if they are uploaded, will go into self._wd_upload_dir()\n        self._upload_mgr = None\n\n        self._script_path = mr_job_script\n        if self._script_path:\n            self._working_dir_mgr.add('file', self._script_path)\n\n        # give this job a unique name\n        self._job_key = self._make_unique_job_key()\n\n        # extra args to our job\n        self._extra_args = list(extra_args) if extra_args else []\n        for extra_arg in self._extra_args:\n            if isinstance(extra_arg, dict):\n                if extra_arg.get('type') != 'file':\n                    raise NotImplementedError\n                self._working_dir_mgr.add(**extra_arg)\n\n        # set up uploading\n        for hash_path in self._opts['upload_files']:\n            uf = parse_legacy_hash_path('file', hash_path,\n                                        must_name='upload_files')\n            self._working_dir_mgr.add(**uf)\n\n        for hash_path in self._opts['upload_archives']:\n            ua = parse_legacy_hash_path('archive', hash_path,\n                                        must_name='upload_archives')\n            self._working_dir_mgr.add(**ua)\n\n        for hash_path in self._opts['upload_dirs']:\n         ",
+      "total_lines": 1569
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "anchor_text",
+      "start_line": 1,
+      "end_line": 18,
+      "excerpt": "1: # -*- coding: utf-8 -*-\n2: # Copyright 2009-2017 Yelp and Contributors\n3: # Copyright 2018 Yelp and Google, Inc.\n4: # Copyright 2019 Yelp\n5: # Copyright 2020 Affirm, Inc.\n6: #\n7: # Licensed under the Apache License, Version 2.0 (the \"License\");\n8: # you may not use this file except in compliance with the License.\n9: # You may obtain a copy of the License at\n10: #\n11: # http://www.apache.org/licenses/LICENSE-2.0\n12: #\n13: # Unless required by applicable law or agreed to in writing, software\n14: # distributed under the License is distributed on an \"AS IS\" BASIS,\n15: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n16: # See the License for the specific language governing permissions and\n17: # limitations under the License.\n18: \"\"\"Base class for all runners.\"\"\"",
+      "symbol_name": null,
+      "symbol_type": null,
+      "ok": true,
+      "path": "mrjob/runner.py",
+      "sha": "4688c038eb6e91107ab165cd4e61c22ce8954143",
+      "download_url": "https://raw.githubusercontent.com/Yelp/mrjob/master/mrjob/runner.py"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "datetime",
+        "getpass",
+        "logging",
+        "os",
+        "os.path",
+        "posixpath",
+        "pprint",
+        "re",
+        "sys",
+        "tarfile",
+        "tempfile",
+        "shutil:rmtree",
+        "mrjob.compat:translate_jobconf",
+        "mrjob.compat:translate_jobconf_dict",
+        "mrjob.compat:translate_jobconf_for_all_versions",
+        "mrjob.conf:ClearedValue",
+        "mrjob.conf:combine_jobconfs",
+        "mrjob.conf:combine_opts",
+        "mrjob.conf:load_opts_from_mrjob_confs",
+        "mrjob.fs.composite:CompositeFilesystem",
+        "mrjob.fs.local:LocalFilesystem",
+        "mrjob.options:_combiners",
+        "mrjob.options:_deprecated_aliases",
+        "mrjob.options:CLEANUP_CHOICES",
+        "mrjob.parse:is_uri",
+        "mrjob.parse:to_uri",
+        "mrjob.py2:PY2",
+        "mrjob.py2:string_types",
+        "mrjob.setup:WorkingDirManager"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/Yelp/mrjob/master/README.rst",
+      "content_excerpt": "mrjob: the Python MapReduce library\n===================================\n\n.. image:: https://github.com/Yelp/mrjob/raw/master/docs/logos/logo_medium.png\n\nmrjob is a Python 2.7/3.4+ package that helps you write and run Hadoop\nStreaming jobs.\n\n`Stable version (v0.7.4) documentation <http://mrjob.readthedocs.org/en/stable/>`_\n\n`Development version documentation <http://mrjob.readthedocs.org/en/latest/>`_\n\n.. image:: https://travis-ci.org/Yelp/mrjob.png\n   :target: https://travis-ci.org/Yelp/mrjob\n\nmrjob fully supports Amazon's Elastic MapReduce (EMR) service, which allows you\nto buy time on a Hadoop cluster on an hourly basis. mrjob has basic support for Google Cloud Dataproc (Dataproc)\nwhich allows you to buy time on a Hadoop cluster on a minute-by-minute basis.  It also works with your own\nHadoop cluster.\n\nSome important features:\n\n* Run jobs on EMR, Google Cloud Dataproc, your own Hadoop cluster, or locally (for testing).\n* Write multi-step jobs (one map-reduce step feeds into the next)\n* Easily launch Spark jobs on EMR or your own Hadoop cluster\n* Duplicate your production environment inside Hadoop\n\n  * Upload your source tree and put it in your job's ``$PYTHONPATH``\n  * Run make and other setup scripts\n  * Set environment variables (e.g. ``$TZ``)\n  * Easily install python packages from tarballs (EMR only)\n  * Setup handled transparently by ``mrjob.conf`` config file\n* Automatically interpret error logs\n* SSH tunnel to hadoop job tracker (EMR only)\n* Minimal setup\n\n  * To run on EMR, set ``$AWS_ACCESS_KEY_ID`` and ``$AWS_SECRET_ACCESS_KEY``\n  * To run on Dataproc, set ``$GO"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_hadoop_streaming_commands test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_hadoop_streaming_commands(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "bin.py",
+          "path": "mrjob/bin.py",
+          "sha": "a9b1725fcc971dae3f039ea3fe1cd2df14aebc50",
+          "html_url": "https://github.com/Yelp/mrjob/blob/091572e87bc24cc64be40278dd0f5c3617c98d4b/mrjob/bin.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 354,
+          "end_line": 359,
+          "excerpt": "    def _hadoop_streaming_commands(self, step_num):\n        return (\n            self._render_substep(step_num, 'mapper'),\n            self._render_substep(step_num, 'combiner'),\n            self._render_substep(step_num, 'reducer'),\n        )",
+          "symbol_name": "_hadoop_streaming_commands",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "mrjob",
+      "count": 33,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "mrjob/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "ami.py",
+          "path": "mrjob/ami.py",
+          "type": "file"
+        },
+        {
+          "name": "aws.py",
+          "path": "mrjob/aws.py",
+          "type": "file"
+        },
+        {
+          "name": "bin.py",
+          "path": "mrjob/bin.py",
+          "type": "file"
+        },
+        {
+          "name": "bootstrap",
+          "path": "mrjob/bootstrap",
+          "type": "dir"
+        },
+        {
+          "name": "cat.py",
+          "path": "mrjob/cat.py",
+          "type": "file"
+        },
+        {
+          "name": "cloud.py",
+          "path": "mrjob/cloud.py",
+          "type": "file"
+        },
+        {
+          "name": "cmd.py",
+          "path": "mrjob/cmd.py",
+          "type": "file"
+        },
+        {
+          "name": "compat.py",
+          "path": "mrjob/compat.py",
+          "type": "file"
+        },
+        {
+          "name": "conf.py",
+          "path": "mrjob/conf.py",
+          "type": "file"
+        },
+        {
+          "name": "dataproc.py",
+          "path": "mrjob/dataproc.py",
+          "type": "file"
+        },
+        {
+          "name": "emr.py",
+          "path": "mrjob/emr.py",
+          "type": "file"
+        },
+        {
+          "name": "examples",
+          "path": "mrjob/examples",
+          "type": "dir"
+        },
+        {
+          "name": "fs",
+          "path": "mrjob/fs",
+          "type": "dir"
+        },
+        {
+          "name": "hadoop.py",
+          "path": "mrjob/hadoop.py",
+          "type": "file"
+        },
+        {
+          "name": "iam.py",
+          "path": "mrjob/iam.py",
+          "type": "file"
+        },
+        {
+          "name": "inline.py",
+          "path": "mrjob/inline.py",
+          "type": "file"
+        },
+        {
+          "name": "job.py",
+          "path": "mrjob/job.py",
+          "type": "file"
+        },
+        {
+          "name": "local.py",
+          "path": "mrjob/local.py",
+          "type": "file"
+        },
+        {
+          "name": "logs",
+          "path": "mrjob/logs",
+          "type": "dir"
+        },
+        {
+          "name": "options.py",
+          "path": "mrjob/options.py",
+          "type": "file"
+        },
+        {
+          "name": "parse.py",
+          "path": "mrjob/parse.py",
+          "type": "file"
+        },
+        {
+          "name": "pool.py",
+          "path": "mrjob/pool.py",
+          "type": "file"
+        },
+        {
+          "name": "protocol.py",
+          "path": "mrjob/protocol.py",
+          "type": "file"
+        },
+        {
+          "name": "py2.py",
+          "path": "mrjob/py2.py",
+          "type": "file"
+        },
+        {
+          "name": "retry.py",
+          "path": "mrjob/retry.py",
+          "type": "file"
+        },
+        {
+          "name": "runner.py",
+          "path": "mrjob/runner.py",
+          "type": "file"
+        },
+        {
+          "name": "setup.py",
+          "path": "mrjob/setup.py",
+          "type": "file"
+        },
+        {
+          "name": "sim.py",
+          "path": "mrjob/sim.py",
+          "type": "file"
+        },
+        {
+          "name": "spark",
+          "path": "mrjob/spark",
+          "type": "dir"
+        },
+        {
+          "name": "step.py",
+          "path": "mrjob/step.py",
+          "type": "file"
+        },
+        {
+          "name": "tools",
+          "path": "mrjob/tools",
+          "type": "dir"
+        },
+        {
+          "name": "util.py",
+          "path": "mrjob/util.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "mrjob/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: \n3: # Copyright 2009-2020 Yelp and Contributors\n4: #\n5: # Licensed under the Apache License, Version 2.0 (the \"License\");\n6: # you may not use this file except in compliance with the License.\n7: # You may obtain a copy of the License at\n8: #\n9: # http://www.apache.org/licenses/LICENSE-2.0\n10: #\n11: # Unless required by applicable law or agreed to in writing, software\n12: # distributed under the License is distributed on an \"AS IS\" BASIS,\n13: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+        },
+        {
+          "name": "ami.py",
+          "path": "mrjob/ami.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: # Copyright 2018 Yelp\n3: #\n4: # Licensed under the Apache License, Version 2.0 (the \"License\");\n5: # you may not use this file except in compliance with the License.\n6: # You may obtain a copy of the License at\n7: #\n8: # http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and"
+        },
+        {
+          "name": "aws.py",
+          "path": "mrjob/aws.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: # Copyright 2013 Lyft\n3: # Copyright 2015-2016 Yelp\n4: # Copyright 2017 Yelp and Contributors\n5: # Copyright 2019 Yelp and Contributors\n6: #\n7: # Licensed under the Apache License, Version 2.0 (the \"License\");\n8: # you may not use this file except in compliance with the License.\n9: # You may obtain a copy of the License at\n10: #\n11: # http://www.apache.org/licenses/LICENSE-2.0\n12: #\n13: # Unless required by applicable law or agreed to in writing, software"
+        },
+        {
+          "name": "bin.py",
+          "path": "mrjob/bin.py",
+          "match_reason": "symbol_match",
+          "start_line": 354,
+          "end_line": 359,
+          "excerpt": "    def _hadoop_streaming_commands(self, step_num):\n        return (\n            self._render_substep(step_num, 'mapper'),\n            self._render_substep(step_num, 'combiner'),\n            self._render_substep(step_num, 'reducer'),\n        )"
+        },
+        {
+          "name": "cat.py",
+          "path": "mrjob/cat.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright 2017 Yelp\n2: # Copyright 2018 Google, Inc.\n3: #\n4: # Licensed under the Apache License, Version 2.0 (the \"License\");\n5: # you may not use this file except in compliance with the License.\n6: # You may obtain a copy of the License at\n7: #\n8: # http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: # Unless required by applicable law or agreed to in writing, software\n11: # distributed under the License is distributed on an \"AS IS\" BASIS,\n12: # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n13: # See the License for the specific language governing permissions and"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "mrjob/runner.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "692645aa87241614b46e66e9c2195829e648f2dc",
+          "html_url": "https://github.com/Yelp/mrjob/commit/692645aa87241614b46e66e9c2195829e648f2dc",
+          "message": "mrjob is now always bootstrapped in py_files, as this is the only way\nto get it into Spark/Docker images\n\n(still need to tear out the logic that bootstraps mrjob at bootstrap time)",
+          "author": "Dave Marin",
+          "date": "2020-06-15T22:05:16Z"
+        },
+        {
+          "sha": "98cd05ad41a0e311bbdd6e95925c2192a969cae4",
+          "html_url": "https://github.com/Yelp/mrjob/commit/98cd05ad41a0e311bbdd6e95925c2192a969cae4",
+          "message": "access *cmdenv* opt through _cmdenv() method, so we can instrument it",
+          "author": "Dave Marin",
+          "date": "2020-06-11T19:42:49Z"
+        },
+        {
+          "sha": "8fbcb3b49f551b8afbde18bf5a87b408cf44b137",
+          "html_url": "https://github.com/Yelp/mrjob/commit/8fbcb3b49f551b8afbde18bf5a87b408cf44b137",
+          "message": "updated copyright notices",
+          "author": "Dave Marin",
+          "date": "2020-04-11T04:44:22Z"
+        },
+        {
+          "sha": "fc3f9fe5d6274c34a2ebd954593562d5daff5b02",
+          "html_url": "https://github.com/Yelp/mrjob/commit/fc3f9fe5d6274c34a2ebd954593562d5daff5b02",
+          "message": "fix comment punctuation",
+          "author": "Dave Marin",
+          "date": "2020-03-25T17:46:19Z"
+        },
+        {
+          "sha": "5bb10f4a9195b1baa18547f346e7948d04bb60b9",
+          "html_url": "https://github.com/Yelp/mrjob/commit/5bb10f4a9195b1baa18547f346e7948d04bb60b9",
+          "message": "Merge branch 'master' into emulate-archives",
+          "author": "David Marin",
+          "date": "2019-12-23T19:27:47Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_hadoop_streaming_commands krazy hack support combiners hadoop",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "mrjob/runner.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "692645aa87241614b46e66e9c2195829e648f2dc",
+        "html_url": "https://github.com/Yelp/mrjob/commit/692645aa87241614b46e66e9c2195829e648f2dc",
+        "message": "mrjob is now always bootstrapped in py_files, as this is the only way\nto get it into Spark/Docker images\n\n(still need to tear out the logic that bootstraps mrjob at bootstrap time)",
+        "author": "Dave Marin",
+        "date": "2020-06-15T22:05:16Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

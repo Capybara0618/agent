@@ -1,0 +1,587 @@
+{
+  "task_id": "661",
+  "repo_owner": "adacore",
+  "repo_name": "langkit",
+  "file_path": "langkit/emitter.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T14:21:43+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__init__",
+    "satd_line": 127,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T14:22:18+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T14:22:27+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "langkit/emitter.py",
+    "original_code": "def emit_c_api(self, ctx: CompileCtx) -> None:\n    \"\"\"\n    Generate header and binding body for the external C API.\n    \"\"\"\n    def render(template_name: str) -> str:\n        return ctx.render_template(template_name)\n\n    with names.lower:\n        # TODO (TA20-017: gprinstall bug): generate the header in\n        # \"src\" and add it to the library interface (see disabled code\n        # below).\n        header_filename = '{}.h'.format(ctx.c_api_settings.lib_name)\n        self.write_cpp_file(\n            path.join(self.lib_root, header_filename),\n            render('c_api/header_c'),\n        )\n\n    self.write_ada_module(\n        self.src_dir, 'c_api/pkg_main',\n        ['Implementation', 'C'],\n        in_library=True\n    )",
+    "original_signature": "def emit_c_api(self, ctx: CompileCtx) -> None:",
+    "satd_comment": "# TODO (TA20-017: gprinstall bug): generate the header in\n# \"src\" and add it to the library interface (see disabled code\n# below).",
+    "target_file": {
+      "ok": true,
+      "path": "langkit/emitter.py",
+      "sha": "3546cd047975ef03dc65094126e58c3c7bbff177",
+      "download_url": "https://raw.githubusercontent.com/AdaCore/langkit/master/langkit/emitter.py",
+      "content_excerpt": "\"\"\"\nCode emission for Langkit-generated libraries.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport dataclasses\nimport glob\nimport hashlib\nimport json\nimport os\nimport sys\nfrom typing import Any\n\nfrom langkit.caching import Cache\nfrom langkit.common import ada_printable_bytes\nfrom langkit.compile_context import AdaSourceKind, CompileCtx, Verbosity\nfrom langkit.config import cache_summary\nfrom langkit.coverage import InstrumentationMetadata\nfrom langkit.diagnostics import Location, error\nfrom langkit.generic_api import GenericAPI\nfrom langkit.lexer.regexp import DFACodeGenHolder\nimport langkit.names as names\nfrom langkit.template_utils import Renderer, create_template_lookup\nfrom langkit.utils import Colors, Language, printcol\n\n\n@CompileCtx.register_template_extensions\ndef template_extensions(ctx: CompileCtx) -> dict[str, Any]:\n    return {\"generic_api\": GenericAPI(ctx)}\n\n\n@dataclasses.dataclass(order=True)\nclass BuiltinFile:\n    \"\"\"\n    File that will be considered as a builtin in the generated library.\n\n    This mechanism allows language specs to embed file contents in the\n    generated library to avoid the logistic burden of shipping actual files\n    alongside the generated library.\n\n    Currently, its only use is to store the default unparsing configuration as\n    well as builtin unparsing configuration overridings, but the mechanism is\n    generic enough to be reused in other contexts if need be.\n\n    Builtin files are known inside the generated library with a special name\n    (anything starting with the ``builtin://`` prefix), and relevant file\n    reading logic is then supposed to first check if there is a corresponding\n    builtin file (using generic API internals: see\n    ``Langkit_Support.Internal.Read_File``) before using the host file system\n    to read an actual file.\n\n    In order to register a new file, code emission logic is responsible for\n    calling the ``Emitter.register_builtin_file`` method.\n    \"\"\"\n\n    filename: str\n    \"\"\"\n    Filename for the ``builtin://`` namespace.\n    \"\"\"\n\n    contents: bytes\n    \"\"\"\n    File contents.\n    \"\"\"\n\n    digest: str = dataclasses.field(init=False)\n    \"\"\"\n    MD5 digest for the file contents. Used to generate unique symbols to store\n    the file contents in generated code.\n    \"\"\"\n\n    def __post_init__(self) -> None:\n        m = hashlib.md5()\n        m.update(self.contents)\n        self.digest = m.hexdigest()\n\n    def contents_c_symbol(self, context: CompileCtx) -> str:\n        \"\"\"\n        Return the name of the C symbol that stores this file contents.\n        \"\"\"\n        return context.c_api_settings.get_name(f\"builtin_file_{self.digest}\")\n\n    @property\n    def size(self) -> int:\n        \"\"\"\n        Return the number of bytes contained in this file.\n        \"\"\"\n        return len(self.contents)\n\n\nclass Emitter:\n    \"\"\"\n    Code and data holder for code emission.\n    \"\"\"\n\n    default_unparsing_config_filename: str\n    \"\"\"\n    Filename (in the builtin namespace) of the default unparsing configuration.\n    \"\"\"\n\n    def __init__(self, context: CompileCtx):\n        \"\"\"\n        Generate sources for the analysis library. Also emit a tiny program\n        useful for testing purposes.\n\n        :param context: Compilation context that owns this emitter.\n        \"\"\"\n        config = context.config\n\n        self.context = context\n        self.verbosity = context.verbosity\n\n        self.lib_root = config.emission.library_directory\n        self.cache = Cache(os.path.join(self.lib_root, \"obj\", \"langkit_cache\"))\n        self.output_files: set[str] = set()\n        self.source_post_processors = context.source_post_processors\n\n        # If available, keep track of the set of sources generated during the\n        # last compilation.\n        prev_output_files = self.cache.db.get(\"output_files\")\n        self.prev_output_files: set[str] = (\n            set(prev_output_files)\n            if (\n                isinstance(prev_output_files, list)\n                and all(isinstance(f, str) for f in prev_output_files)\n            )\n            else set()\n        )\n\n        self.root_renderer = Renderer(\n            create_template_lookup([self.context.extensions_dir])\n        )\n        self.generate_auto_dll_dirs = config.emission.generate_auto_dll_dirs\n        self.coverage = config.emission.coverage\n        self.gnatcov = context.gnatcov\n        self.portable_project = config.emission.portable_project\n        self.standalone = self.context.config.library.standalone\n\n        # Automatically add all source files in the \"extensions/src\" directory\n        # to the generated library project.\n        self.extensions_src_dir = None\n        src_dir = os.path.join(self.context.extensions_dir, \"src\")\n        if os.path.isdir(src_dir):\n            self.extensions_src_dir = src_dir\n            for filename in os.listdir(src_dir):\n                filepath = os.path.join(src_dir, filename)\n                if os.path.isfile(filepath) and not filename.startswith(\".\"):\n                    self.context.additional_source_files.append(filepath)\n\n        # Also keep track of the list of extension files, as any change here\n        # should invalidate the code generation cache.\n        self.cache_extension_files = set()\n        if os.path.isdir(self.context.extensions_dir):\n            for path, _, filenames in os.walk(self.context.extensions_dir):\n                for f in filenames:\n                    if not f.startswith(\".\"):\n                        self.cache_extension_files.add(os.path.join(path, f))\n\n        self.main_programs: set[str]\n\n        self.lib_name_low = context.ada_api_settings.lib_name.lower()\n        \"\"\"\n        Lower-case name for the generated library.\n        \"\"\"\n\n        self.lib_name_up = context.ada_api_settings.lib_name.upper()\n        \"\"\"\n        Upper-case name for the generated library.\n        \"\"\"\n\n        # Paths for the various directories in which code is generated\n        self.src_dir = os.path.join(self.lib_root, \"src\")\n        self.src_builtin_files_dir = os.path.join(\n            self.src_dir, \"builtin_files\"\n        )\n        self.src_mains_dir = os.path.join(self.lib_root, \"src-mains\")\n        self.scripts_dir = os.path.join(self.lib_root, \"scripts\")\n        self.python_dir = os.path.join(self.lib_root, \"python\")\n        self.python_pkg_dir = os.path.join(\n            self.python_dir, context.python_api_settings.module_name\n        )\n        self.ocaml_dir = os.path.join(self.lib_root, \"ocaml\")\n\n        self.java_dir = os.path.join(self.lib_root, \"java\")\n        self.java_package = os.path.join(\n            self.java_dir,\n            \"src\",\n            \"main\",\n            \"java\",\n            \"com\",\n            \"adacore\",\n            self.lib_name_low,\n        )\n        self.java_jni = os.path.join(self.java_dir, \"jni\")\n\n        self.lklsp_dir = os.path.join(self.lib_root, \"lklsp\")\n        self.lklsp_package = os.path.join(\n            self.lklsp_dir, \"src\", \"main\", \"java\", \"com\", \"adacore\", \"lklsp\"\n        )\n        self.lklsp_niconfig = os.path.join(\n            self.lklsp_dir,\n            \"src\",\n            \"main\",\n            \"resources\",\n            \"META-INF\",\n            \"native-image\",\n            \"com.adacore\",\n            \"lklsp\",\n        )\n\n        self.lib_project = os.path.join(\n            self.lib_root, f\"{self.lib_name_low}.gpr\"\n        )\n        self.mains_project = os.path.join(self.lib_root, \"mains.gpr\")\n\n        # Get source directories for the mains project file. making them\n        # relative to the generated project file (which is\n        # $BUILD_DIR/mains.gpr).\n        self.main_source_dirs = {\n            os.path.relpath(\n                os.path.join(config.library.root_directory, sdir),\n                os.path.dirname(self.mains_project),\n            )\n            for sdir in config.mains.source_dirs\n        }\n\n        self.dfa_code: DFACodeGenHolder\n        \"\"\"\n        Holder for the data structures used to generate code for the lexer\n        state machine (DFA). As an optimization, it is left to None if we\n        decide not to generate it (i.e. when the already generated sources are\n        up-to-date).\n        \"\"\"\n\n        self._project_file_emitted = False\n        \"\"\"\n        Whether we emitted a project file for the generated library.\n        \"\"\"\n\n        self.project_languages = {\"Ada\", \"C\"}\n        \"\"\"\n        List of GPR names for languages used in the generated library.\n\n        The core library is made of Ada and C sources, so always include them.\n        \"\"\"\n\n        self.library_interfaces: set[str] = set()\n        \"\"\"\n        Set of source file base names for all sources that must appear in the\n        \"Interfaces\" attribute of the generated library project file.\n        \"\"\"\n\n        self.instr_md = InstrumentationMetadata()\n\n        # Add all additional source files to the list of library interfaces and\n        # declare them as such in instrumentation metadata.\n        for f in context.additional_source_files:\n            self.add_library_interface(f)\n            self.instr_md.additional_sources.add(os.path.basename(f))\n\n        self.main_project_file = os.path.join(\n            self.lib_root, f\"{self.lib_name_low}.gpr\"\n        )\n\n        if self.standalone:\n            # Name of replacement for Langkit_Support/AdaSAT\n            self.standalone_support_name = (\n                f\"{self.context.ada_api_settings.lib_name}_Support\"\n            )\n            self.standalone_adasat_name = (\n                f\"{self.context.ada_api_settings.lib_name}_AdaSAT\"\n            )\n\n            # List of source files for both libraries\n            adasat_dir = self.find_adasat_dir()\n            self.standalone_support_files = self.list_library_sources(\n                self.support_dir\n            )\n            self.standalone_adasat_files = self.list_library_sources(\n                adasat_dir\n            )\n\n        self.builtin_files: dict[str, BuiltinFile] = {}\n        \"\"\"\n        Collection of builtin files for the generated library.\n\n        This maps filenames for the ``builtin://`` namespace in the generated\n        library to the builtin file details.\n        \"\"\"\n\n        self.builtin_unparsing_overridings: dict[names.Name, str] = {}\n\n    def register_builtin_file(self, filename: str, contents: bytes) -> str:\n        \"\"\"\n        Register a new builtin file for the generated library.\n\n        :param filename: Filename in the ``builtin://`` namespace.\n        :param contents: File contents.\n        :return: The filename with the ``builtin://`` prefix.\n        \"\"\"\n        assert filename not in self.builtin_files\n        self.builtin_files[filename] = BuiltinFile(filename, contents)\n        return \"builtin://\" + filename\n\n    def register_builtin_unparsing_configs(self, ctx: CompileCtx) -> None:\n        \"\"\"\n        Register the builtin files for unparsing configuration and overridings.\n        \"\"\"\n        # First register a builtin file for the default unparsing configuration\n        unparsing_cfg_filename = ctx.config.library.defaults.unparsing_config\n        if unparsing_cfg_filename is None:\n            unparsing_cfg = b'{\"node_configs\": {}}'\n        else:\n            with open(\n                os.path.join(ctx.extensions_dir, unparsing_cfg_filename), \"rb\"\n            ) as fp:\n                unparsing_cfg = fp.read()\n\n        self.default_unparsing_config_filename = self.register_builtin_file(\n            \"unparsing/default_config.json\", unparsing_cfg\n        )\n\n        # Then register builtin files for each built-in unparsing configuration\n        # overridings.\n        for (\n            name,\n            info,\n        ) in ctx.config.library.builtin_unparsing_overridings.items():\n            with open(\n                os.path.join(ctx.extensions_dir, info.filename), \"rb\"\n            ) as fp:\n                cfg = fp.read()\n            self.builtin_unparsing_overridings[name] = (\n                self.register_builtin_file(\n                    f\"unparsing/overriding_{name.lower}\", cfg\n      ",
+      "total_lines": 1468
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 127,
+      "start_line": 107,
+      "end_line": 147,
+      "matched_line": "            )",
+      "excerpt": "107:         :param context: Compilation context that owns this emitter.\n108:         \"\"\"\n109:         config = context.config\n110: \n111:         self.context = context\n112:         self.verbosity = context.verbosity\n113: \n114:         self.lib_root = config.emission.library_directory\n115:         self.cache = Cache(os.path.join(self.lib_root, \"obj\", \"langkit_cache\"))\n116:         self.output_files: set[str] = set()\n117:         self.source_post_processors = context.source_post_processors\n118: \n119:         # If available, keep track of the set of sources generated during the\n120:         # last compilation.\n121:         prev_output_files = self.cache.db.get(\"output_files\")\n122:         self.prev_output_files: set[str] = (\n123:             set(prev_output_files)\n124:             if (\n125:                 isinstance(prev_output_files, list)\n126:                 and all(isinstance(f, str) for f in prev_output_files)\n127:             )\n128:             else set()\n129:         )\n130: \n131:         self.root_renderer = Renderer(\n132:             create_template_lookup([self.context.extensions_dir])\n133:         )\n134:         self.generate_auto_dll_dirs = config.emission.generate_auto_dll_dirs\n135:         self.coverage = config.emission.coverage\n136:         self.gnatcov = context.gnatcov\n137:         self.portable_project = config.emission.portable_project\n138:         self.standalone = self.context.config.library.standalone\n139: \n140:         # Automatically add all source files in the \"extensions/src\" directory\n141:         # to the generated library project.\n142:         self.extensions_src_dir = None\n143:         src_dir = os.path.join(self.context.extensions_dir, \"src\")\n144:         if os.path.isdir(src_dir):\n145:             self.extensions_src_dir = src_dir\n146:             for filename in os.listdir(src_dir):\n147:                 filepath = os.path.join(src_dir, filename)"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__init__",
+      "start_line": 102,
+      "end_line": 292,
+      "source": "    def __init__(self, context: CompileCtx):\n        \"\"\"\n        Generate sources for the analysis library. Also emit a tiny program\n        useful for testing purposes.\n\n        :param context: Compilation context that owns this emitter.\n        \"\"\"\n        config = context.config\n\n        self.context = context\n        self.verbosity = context.verbosity\n\n        self.lib_root = config.emission.library_directory\n        self.cache = Cache(os.path.join(self.lib_root, \"obj\", \"langkit_cache\"))\n        self.output_files: set[str] = set()\n        self.source_post_processors = context.source_post_processors\n\n        # If available, keep track of the set of sources generated during the\n        # last compilation.\n        prev_output_files = self.cache.db.get(\"output_files\")\n        self.prev_output_files: set[str] = (\n            set(prev_output_files)\n            if (\n                isinstance(prev_output_files, list)\n                and all(isinstance(f, str) for f in prev_output_files)\n            )\n            else set()\n        )\n\n        self.root_renderer = Renderer(\n            create_template_lookup([self.context.extensions_dir])\n        )\n        self.generate_auto_dll_dirs = config.emission.generate_auto_dll_dirs\n        self.coverage = config.emission.coverage\n        self.gnatcov = context.gnatcov\n        self.portable_project = config.emission.portable_project\n        self.standalone = self.context.config.library.standalone\n\n        # Automatically add all source files in the \"extensions/src\" directory\n        # to the generated library project.\n        self.extensions_src_dir = None\n        src_dir = os.path.join(self.context.extensions_dir, \"src\")\n        if os.path.isdir(src_dir):\n            self.extensions_src_dir = src_dir\n            for filename in os.listdir(src_dir):\n                filepath = os.path.join(src_dir, filename)\n                if os.path.isfile(filepath) and not filename.startswith(\".\"):\n                    self.context.additional_source_files.append(filepath)\n\n        # Also keep track of the list of extension files, as any change here\n        # should invalidate the code generation cache.\n        self.cache_extension_files = set()\n        if os.path.isdir(self.context.extensions_dir):\n            for path, _, filenames in os.walk(self.context.extensions_dir):\n                for f in filenames:\n                    if not f.startswith(\".\"):\n                        self.cache_extension_files.add(os.path.join(path, f))\n\n        self.main_programs: set[str]\n\n        self.lib_name_low = context.ada_api_settings.lib_name.lower()\n        \"\"\"\n        Lower-case name for the generated library.\n        \"\"\"\n\n        self.lib_name_up = context.ada_api_settings.lib_name.upper()\n        \"\"\"\n        Upper-case name for the generated library.\n        \"\"\"\n\n        # Paths for the various directories in which code is generated\n        self.src_dir = os.path.join(self.lib_root, \"src\")\n        self.src_builtin_files_dir = os.path.join(\n            self.src_dir, \"builtin_files\"\n        )\n        self.src_mains_dir = os.path.join(self.lib_root, \"src-mains\")\n        self.scripts_dir = os.path.join(self.lib_root, \"scripts\")\n        self.python_dir = os.path.join(self.lib_root, \"python\")\n        self.python_pkg_dir = os.path.join(\n            self.python_dir, context.python_api_settings.module_name\n        )\n        self.ocaml_dir = os.path.join(self.lib_root, \"ocaml\")\n\n        self.java_dir = os.path.join(self.lib_root, \"java\")\n        self.java_package = os.path.join(\n            self.java_dir,\n            \"src\",\n            \"main\",\n            \"java\",\n            \"com\",\n            \"adacore\",\n            self.lib_name_low,\n        )\n        self.java_jni = os.path.join(self.java_dir, \"jni\")\n\n        self.lklsp_dir = os.path.join(self.lib_root, \"lklsp\")\n        self.lklsp_package = os.path.join(\n            self.lklsp_dir, \"src\", \"main\", \"java\", \"com\", \"adacore\", \"lklsp\"\n        )\n        self.lklsp_niconfig = os.path.join(\n            self.lklsp_dir,\n            \"src\",\n            \"main\",\n            \"resources\",\n            \"META-INF\",\n            \"native-image\",\n            \"com.adacore\",\n            \"lklsp\",\n        )\n\n        self.lib_project = os.path.join(\n            self.lib_root, f\"{self.lib_name_low}.gpr\"\n        )\n        self.mains_project = os.path.join(self.lib_root, \"mains.gpr\")\n\n        # Get source directories for the mains project file. making them\n        # relative to the generated project file (which is\n        # $BUILD_DIR/mains.gpr).\n        self.main_source_dirs = {\n            os.path.relpath(\n                os.path.join(config.library.root_directory, sdir),\n                os.path.dirname(self.mains_project),\n            )\n            for sdir in config.mains.source_dirs\n        }\n\n        self.dfa_code: DFACodeGenHolder\n        \"\"\"\n        Holder for the data structures used to generate code for the lexer\n        state machine (DFA). As an optimization, it is left to None if we\n        decide not to generate it (i.e. when the already generated sources are\n        up-to-date).\n        \"\"\"\n\n        self._project_file_emitted = False\n        \"\"\"\n        Whether we emitted a project file for the generated library.\n        \"\"\"\n\n        self.project_languages = {\"Ada\", \"C\"}\n        \"\"\"\n        List of GPR names for languages used in the generated library.\n\n        The core library is made of Ada and C sources, so always include them.\n        \"\"\"\n\n        self.library_interfaces: set[str] = set()\n        \"\"\"\n        Set of source file base names for all sources that must appear in the\n        \"Interfaces\" attribute of the generated library project file.\n        \"\"\"\n\n        self.instr_md = InstrumentationMetadata()\n\n        # Add all additional source files to the list of library interfaces and\n        # declare them as such in instrumentation metadata.\n        for f in context.additional_source_files:\n            self.add_library_interface(f)\n            self.instr_md.additional_sources.add(os.path.basename(f))\n\n        self.main_project_file = os.path.join(\n            self.lib_root, f\"{self.lib_name_low}.gpr\"\n        )\n\n        if self.standalone:\n            # Name of replacement for Langkit_Support/AdaSAT\n            self.standalone_support_name = (\n                f\"{self.context.ada_api_settings.lib_name}_Support\"\n            )\n            self.standalone_adasat_name = (\n                f\"{self.context.ada_api_settings.lib_name}_AdaSAT\"\n            )\n\n            # List of source files for both libraries\n            adasat_dir = self.find_adasat_dir()\n            self.standalone_support_files = self.list_library_sources(\n                self.support_dir\n            )\n            self.standalone_adasat_files = self.list_library_sources(\n                adasat_dir\n            )\n\n        self.builtin_files: dict[str, BuiltinFile] = {}\n        \"\"\"\n        Collection of builtin files for the generated library.\n\n        This maps filenames for the ``builtin://`` namespace in the generated\n        library to the builtin file details.\n        \"\"\"\n\n        self.builtin_unparsing_overridings: dict[names.Name, str] = {}"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 706,
+      "end_line": 743,
+      "excerpt": "            def __init__(\n                self,\n                template_base_name: str,\n                rel_qual_name: str,\n                has_body: bool = True,\n                unparser: bool = False,\n                cached_body: bool = False,\n                is_interface: bool = True,\n            ):\n                \"\"\"\n                :param template_base_name: Common prefix for the name of the\n                    templates to use in order to generate spec/body sources for\n                    this unit.\n\n                :param rel_qual_name: Qualified name for the unit to generate,\n                    without the top-level library name.\n\n                :param unparser: Whether we can avoid generating this unit if\n                    unparsing is disabled.\n\n                :param has_body: Whether this unit has a body (otherwise, it's\n                    just a spec).\n\n                :param cached_body: If true, only register the body as a\n                    library interface, i.e. do not generate it, considering\n                    that it is cached.\n\n                :param is_interface: Whether to include this module in the\n                    generated library interface.\n                \"\"\"\n                self.template_base_name = template_base_name\n                self.qual_name = (\n                    rel_qual_name.split(\".\") if rel_qual_name else []\n                )\n                self.unparser = unparser\n                self.has_body = has_body\n                self.cached_body = cached_body\n                self.is_interface = is_interface",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "langkit/emitter.py",
+      "sha": "3546cd047975ef03dc65094126e58c3c7bbff177",
+      "download_url": "https://raw.githubusercontent.com/AdaCore/langkit/master/langkit/emitter.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "dataclasses",
+        "glob",
+        "hashlib",
+        "json",
+        "os",
+        "sys",
+        "typing:Any",
+        "langkit.caching:Cache",
+        "langkit.common:ada_printable_bytes",
+        "langkit.compile_context:AdaSourceKind",
+        "langkit.compile_context:CompileCtx",
+        "langkit.compile_context:Verbosity",
+        "langkit.config:cache_summary",
+        "langkit.coverage:InstrumentationMetadata",
+        "langkit.diagnostics:Location",
+        "langkit.diagnostics:error",
+        "langkit.generic_api:GenericAPI",
+        "langkit.lexer.regexp:DFACodeGenHolder",
+        "langkit.names",
+        "langkit.template_utils:Renderer",
+        "langkit.template_utils:create_template_lookup",
+        "langkit.utils:Colors",
+        "langkit.utils:Language",
+        "langkit.utils:printcol"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/AdaCore/langkit/master/README.md",
+      "content_excerpt": "Langkit\n=======\n\nLangkit (nickname for language kit) is a tool whose purpose is to make it easy\nto create syntactic and semantic analysis engines. Write a language\nspecification in our Python DSL and Langkit will generate for you an Ada\nlibrary with bindings for the C and Python programming languages.\n\nThe generated library is meant to provide a basis to write tooling, including\ntools working on potentially changing and incorrect code, such as IDEs.\n\nThe currently main Langkit user is\n[Libadalang](https://github.com/AdaCore/libadalang), a high performance\nsemantic engine for the Ada programming language.\n\nDependencies\n------------\n\nTo use Langkit, you will need:\n\n* A Python 3.11 interpreter (or more recent). Python2 is no longer supported.\n* Some Python libraries, including the Mako template system for Python (see\n  `requirements-pypi.txt` and `requirements-github.txt` for the full list).\n* A recent version of the GNAT Ada compiler, either from your OS's packages, or\n  use [Alire](https://alire.ada.dev/docs/#toolchain-management) to get one.\n* The [gnatcoll-core](https://github.com/AdaCore/gnatcoll-core) library.\n* Ada bindings for GMP and Libiconv, from\n  [gnatcoll-bindings](https://github.com/AdaCore/gnatcoll-bindings).\n* The [VSS](https://github.com/AdaCore/VSS) library.\n* The [Prettier-Ada](https://github.com/AdaCore/prettier-ada) library.\n* The [AdaSAT](https://github.com/AdaCore/adasat) library.\n\nFor all Ada libraries (GNATcoll, VSS, Prettier-Ada, AdaSAT), make sure to\ninstall the version that corresponds to the version of Langkit that is built.\nFor instance, build al"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 4,
+      "items": [
+        {
+          "name": "main.py",
+          "path": "testsuite/tests/python_api/unit_providers/main.py",
+          "sha": "956a05b5c95b9ed0ef8aa4babd7a5fa7de045686",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/testsuite/tests/python_api/unit_providers/main.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 7,
+          "end_line": 31,
+          "excerpt": "7: \n8: \n9: print(\"main.py: Running...\")\n10: \n11: sources = {\n12:     \"m0.txt\": b\"{ a b c }\",\n13:     \"m1.txt\": b\"{ a b c }\\n{ a b c }\",\n14:     \"refs.txt\": b\"{ ref m.a ref m.b ref m.c }\",\n15: }\n16: \n17: \n18: class CustomUnitProvider(libfoolang.UnitProvider):\n19:     def __init__(self, mapping):\n20:         self.mapping = mapping\n21: \n22:         self.requested = set()\n23: \n24:     def unit_location(self, name, kind):\n25:         # The implementation around unit providers can do redundant queries. To\n26:         # avoid noisy test baselines, show the request only once.\n27:         key = (name, kind)\n28:         if key not in self.requested:\n29:             print(\"!!! CustomUnitProvider.unit_location\")\n30:             print(f\"    name={name!r}\")\n31:             print(f\"    kind={kind}\")",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test.out",
+          "path": "testsuite/tests/misc/docstrings_lkt_roles/test.out",
+          "sha": "5142b4be26776cbfac34ee36197a3a4c850a05ff",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/testsuite/tests/misc/docstrings_lkt_roles/test.out",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1,
+          "end_line": 15,
+          "excerpt": "1: == foo.lkt ==\n2: Code generation was successful\n3: \n4: == test.py ==\n5: build/src/libfoolang-analysis.ads:\n6:   --  Log this docstring. This is a typeref: :ada:ref:`Foo_Node`.\n7: build/src/libfoolang.h:\n8:   * Log this docstring. This is a typeref: ``foo_foo_node``.\n9: build/ocaml/libfoolang.mli:\n10:   * Log this docstring. This is a typeref: ``foo_node``.\n11: build/python/libfoolang/__init__.py:\n12:   Log this docstring. This is a typeref: :py:class:`FooNode`.\n13: Done\n14: \n15: lkt_compile: Done",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test.py",
+          "path": "testsuite/tests/misc/docstrings_auto_extra/test.py",
+          "sha": "20a866b63a28cb5f20b9136f8642f3efd6c34eec",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/testsuite/tests/misc/docstrings_auto_extra/test.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 28,
+          "end_line": 52,
+          "excerpt": "28:     excerpts += [\n29:         f\":ada:ref:`{t.camel_with_underscores}`\",\n30:         f\":py:class:`{t.camel}`\",\n31:         f\"``foo_{t.lower}``\",\n32:         f\"``{t.lower}``\",\n33:     ]\n34: \n35: # Log docstrings\n36: for path in [\n37:     \"build/src/libfoolang-analysis.ads\",\n38:     \"build/src/libfoolang.h\",\n39:     \"build/ocaml/libfoolang.mli\",\n40:     \"build/python/libfoolang/__init__.py\",\n41: ]:\n42:     with open(path) as f:\n43:         print(\"\")\n44:         print(f\"{path}:\")\n45: \n46:         # In each file, we want to display multiple comment blocks/docstrings.\n47:         # To make the separation between the various docstrings easy to read in\n48:         # the test output, try to detect the separation between these blocks\n49:         # and insert an empty line in the test output when starting a new\n50:         # block.\n51:         in_block = True\n52: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test.out",
+          "path": "testsuite/tests/misc/docstrings_auto_extra/test.out",
+          "sha": "d5de877efc6420e36b255376f217d93e336ad1bd",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/testsuite/tests/misc/docstrings_auto_extra/test.out",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 48,
+          "end_line": 72,
+          "excerpt": "48: \n49:   * Derived nodes: ``derived_list_node``\n50: \n51:   * Derived nodes: ``documented_node_list``\n52: \n53:   * Docstring for ``DocumentedNode``.\n54:   * This node type has no derivation.\n55: \n56:   * Docstring for ``FooNode``.\n57:   * Derived nodes: ``documented_node``, ``foo_node_base_list``,\n58:   * ``undocumented_node``\n59: \n60: build/python/libfoolang/__init__.py:\n61: \n62:   Docstring for ``FooNode``.\n63:   Derived nodes: :py:class:`DocumentedNode`, :py:class:`FooNodeBaseList`,\n64:   :py:class:`UndocumentedNode`\n65: \n66:   Subclass of :py:class:`FooNode`.\n67:   Docstring for ``DocumentedNode``.\n68:   This node type has no derivation.\n69: \n70:   Subclass of :py:class:`FooNode`.\n71:   Derived nodes: :py:class:`DocumentedNodeList`\n72: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "envs.py",
+          "path": "langkit/envs.py",
+          "sha": "4164fb2a2762b6af04da83781c68bad386949570",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/langkit/envs.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 226,
+          "end_line": 228,
+          "excerpt": "    def __init__(self, context: CompileCtx, location: Location) -> None:\n        self.context = context\n        self.location = location",
+          "symbol_name": "__init__",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "passes.py",
+          "path": "langkit/passes.py",
+          "sha": "8af15e00911f3e67116b68e45928beb255929dfa",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/langkit/passes.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 315,
+          "end_line": 316,
+          "excerpt": "    def __init__(self) -> None:\n        super().__init__(\"Embed IPython\")",
+          "symbol_name": "__init__",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "__init__.py",
+          "path": "langkit/utils/__init__.py",
+          "sha": "0f82294626619d2c818e90da6d6757f9a6657062",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/langkit/utils/__init__.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 108,
+          "end_line": 114,
+          "excerpt": "    def __init__(self, loop: Sequence[object]):\n        super().__init__(\n            \"Dependency loop detected: {}\".format(\n                \", \".join(str(item) for item in loop)\n            )\n        )\n        self.loop = loop",
+          "symbol_name": "__init__",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "emitter.py",
+          "path": "langkit/emitter.py",
+          "sha": "3546cd047975ef03dc65094126e58c3c7bbff177",
+          "html_url": "https://github.com/AdaCore/langkit/blob/15f42d5a7bb4f30609c8e9b7987358b8d8cad09b/langkit/emitter.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 706,
+          "end_line": 743,
+          "excerpt": "            def __init__(\n                self,\n                template_base_name: str,\n                rel_qual_name: str,\n                has_body: bool = True,\n                unparser: bool = False,\n                cached_body: bool = False,\n                is_interface: bool = True,\n            ):\n                \"\"\"\n                :param template_base_name: Common prefix for the name of the\n                    templates to use in order to generate spec/body sources for\n                    this unit.\n\n                :param rel_qual_name: Qualified name for the unit to generate,\n                    without the top-level library name.\n\n                :param unparser: Whether we can avoid generating this unit if\n                    unparsing is disabled.\n\n                :param has_body: Whether this unit has a body (otherwise, it's\n                    just a spec).\n\n                :param cached_body: If true, only register the body as a\n                    library interface, i.e. do not generate it, considering\n                    that it is cached.\n\n                :param is_interface: Whether to include this module in the\n                    generated library interface.\n                \"\"\"\n                self.template_base_name = template_base_name\n                self.qual_name = (\n                    rel_qual_name.split(\".\") if rel_qual_name else []\n                )\n                self.unparser = unparser\n                self.has_body = has_body\n                self.cached_body = cached_body\n                self.is_interface = is_interface",
+          "symbol_name": "__init__",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "langkit",
+      "count": 40,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "langkit/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "ada_api.py",
+          "path": "langkit/ada_api.py",
+          "type": "file"
+        },
+        {
+          "name": "c_api.py",
+          "path": "langkit/c_api.py",
+          "type": "file"
+        },
+        {
+          "name": "caching.py",
+          "path": "langkit/caching.py",
+          "type": "file"
+        },
+        {
+          "name": "common.py",
+          "path": "langkit/common.py",
+          "type": "file"
+        },
+        {
+          "name": "compile_context.py",
+          "path": "langkit/compile_context.py",
+          "type": "file"
+        },
+        {
+          "name": "compiled_types.py",
+          "path": "langkit/compiled_types.py",
+          "type": "file"
+        },
+        {
+          "name": "config.py",
+          "path": "langkit/config.py",
+          "type": "file"
+        },
+        {
+          "name": "coverage.css",
+          "path": "langkit/coverage.css",
+          "type": "file"
+        },
+        {
+          "name": "coverage.py",
+          "path": "langkit/coverage.py",
+          "type": "file"
+        },
+        {
+          "name": "debug_info.py",
+          "path": "langkit/debug_info.py",
+          "type": "file"
+        },
+        {
+          "name": "diagnostics.py",
+          "path": "langkit/diagnostics.py",
+          "type": "file"
+        },
+        {
+          "name": "documentation.py",
+          "path": "langkit/documentation.py",
+          "type": "file"
+        },
+        {
+          "name": "emitter.py",
+          "path": "langkit/emitter.py",
+          "type": "file"
+        },
+        {
+          "name": "envs.py",
+          "path": "langkit/envs.py",
+          "type": "file"
+        },
+        {
+          "name": "expressions",
+          "path": "langkit/expressions",
+          "type": "dir"
+        },
+        {
+          "name": "frontend",
+          "path": "langkit/frontend",
+          "type": "dir"
+        },
+        {
+          "name": "gdb",
+          "path": "langkit/gdb",
+          "type": "dir"
+        },
+        {
+          "name": "generic_api.py",
+          "path": "langkit/generic_api.py",
+          "type": "file"
+        },
+        {
+          "name": "generic_interface.py",
+          "path": "langkit/generic_interface.py",
+          "type": "file"
+        },
+        {
+          "name": "java_api.py",
+          "path": "langkit/java_api.py",
+          "type": "file"
+        },
+        {
+          "name": "java_support",
+          "path": "langkit/java_support",
+          "type": "dir"
+        },
+        {
+          "name": "language_api.py",
+          "path": "langkit/language_api.py",
+          "type": "file"
+        },
+        {
+          "name": "lexer",
+          "path": "langkit/lexer",
+          "type": "dir"
+        },
+        {
+          "name": "libmanage.py",
+          "path": "langkit/libmanage.py",
+          "type": "file"
+        },
+        {
+          "name": "names.py",
+          "path": "langkit/names.py",
+          "type": "file"
+        },
+        {
+          "name": "ocaml_api.py",
+          "path": "langkit/ocaml_api.py",
+          "type": "file"
+        },
+        {
+          "name": "packaging.py",
+          "path": "langkit/packaging.py",
+          "type": "file"
+        },
+        {
+          "name": "parsers.py",
+          "path": "langkit/parsers.py",
+          "type": "file"
+        },
+        {
+          "name": "passes.py",
+          "path": "langkit/passes.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "langkit/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "python_api.py",
+          "path": "langkit/python_api.py",
+          "type": "file"
+        },
+        {
+          "name": "railroad_diagrams.py",
+          "path": "langkit/railroad_diagrams.py",
+          "type": "file"
+        },
+        {
+          "name": "scripts",
+          "path": "langkit/scripts",
+          "type": "dir"
+        },
+        {
+          "name": "stylechecks",
+          "path": "langkit/stylechecks",
+          "type": "dir"
+        },
+        {
+          "name": "support",
+          "path": "langkit/support",
+          "type": "dir"
+        },
+        {
+          "name": "template_utils.py",
+          "path": "langkit/template_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "templates",
+          "path": "langkit/templates",
+          "type": "dir"
+        },
+        {
+          "name": "unparsers.py",
+          "path": "langkit/unparsers.py",
+          "type": "file"
+        },
+        {
+          "name": "utils",
+          "path": "langkit/utils",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "langkit/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: def reset() -> None:\n2:     \"\"\"\n3:     Reset global state in Langkit.\n4: \n5:     TODO: this is a hack to workaround another hack. At some point in the\n6:     future, we should get rid of this global state in Langkit.\n7:     \"\"\"\n8: \n9:     import langkit.compile_context\n10:     import langkit.compiled_types\n11:     import langkit.expressions.base\n12:     import langkit.lexer\n13:     import langkit.utils"
+        },
+        {
+          "name": "ada_api.py",
+          "path": "langkit/ada_api.py",
+          "match_reason": "symbol_match",
+          "start_line": 23,
+          "end_line": 24,
+          "excerpt": "    def __init__(self, ctx: CompileCtx) -> None:\n        self.context = ctx"
+        },
+        {
+          "name": "c_api.py",
+          "path": "langkit/c_api.py",
+          "match_reason": "symbol_match",
+          "start_line": 83,
+          "end_line": 98,
+          "excerpt": "    def __init__(self, ctx: CompileCtx) -> None:\n        \"\"\"\n        Create C API generation settings.\n\n        :param ctx: Compile context for this C API.\n\n        \"\"\"\n        self.context = ctx\n\n        self.symbol_prefix = ctx.config.library.language_name.lower\n        \"\"\"\n        Valid C identifier used as a prefix for all top-level declarations in\n        the generated C API.\n        \"\"\"\n\n        self._lib_name = None"
+        },
+        {
+          "name": "caching.py",
+          "path": "langkit/caching.py",
+          "match_reason": "symbol_match",
+          "start_line": 16,
+          "end_line": 23,
+          "excerpt": "    def __init__(self, cache_file: str) -> None:\n        \"\"\"Load the cache from `cache_file`, or create a new cache if new.\n\n        :param cache_file: Name of the file that contains cache data from\n            another run.\n        \"\"\"\n        self.cache_file = cache_file\n        self._load()"
+        },
+        {
+          "name": "common.py",
+          "path": "langkit/common.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: from collections import defaultdict\n4: import itertools\n5: import string\n6: from typing import Iterator, overload\n7: \n8: from langkit import names\n9: \n10: \n11: ada_keywords = set(\n12:     \"\"\"\n13:     abort abs abstract accept access aliased all and array at"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "langkit/emitter.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "8558ff54964223c3d1391f165bae1c37d78c4c34",
+          "html_url": "https://github.com/AdaCore/langkit/commit/8558ff54964223c3d1391f165bae1c37d78c4c34",
+          "message": "lkm generate: remove obsolete generated source files",
+          "author": "Pierre-Marie de Rodat",
+          "date": "2026-02-25T13:13:16Z"
+        },
+        {
+          "sha": "292f6240115c18808c927ef22757fda420b80309",
+          "html_url": "https://github.com/AdaCore/langkit/commit/292f6240115c18808c927ef22757fda420b80309",
+          "message": "Fix classification of generated sources not part of the lib interface\n\nSource files such as `$-unparsers.ads` are not part of the library\ninterface (in the GPR sense), but still they are generated sources.\nHence, they must be registered in\n`InstrumentationMetadata.generated_sources`. Rework classifi",
+          "author": "Pierre-Marie de Rodat",
+          "date": "2026-02-11T21:31:23Z"
+        },
+        {
+          "sha": "8a567994057eb7ee81e12ddf7ae31464391ea55c",
+          "html_url": "https://github.com/AdaCore/langkit/commit/8a567994057eb7ee81e12ddf7ae31464391ea55c",
+          "message": "Remove a gnatcov/gprbuild workaround\n\nThanks to build tool improvements, projects with interfacing clauses\n(for Stand-alone Library Projects) no longer need kludges in order to be\ncompiled in coverage mode. Remove the corresponding hacks in Langkit.",
+          "author": "Pierre-Marie de Rodat",
+          "date": "2026-02-10T13:56:34Z"
+        },
+        {
+          "sha": "e62c8ca3cc037278b37df90602880d6a54094737",
+          "html_url": "https://github.com/AdaCore/langkit/commit/e62c8ca3cc037278b37df90602880d6a54094737",
+          "message": "Unparsing: introduce a mechanism to override a configuration\n\nMake it possible, at unparsing configuration loading time, to pass one\nor several JSON files that will override node configurations for a\nspecific set of nodes. Also make it possible to create builtin files to\nstore such overridings.",
+          "author": "Pierre-Marie de Rodat",
+          "date": "2026-02-13T15:58:03Z"
+        },
+        {
+          "sha": "c5b13a6563f7d8ed109d814983273ea89659a67a",
+          "html_url": "https://github.com/AdaCore/langkit/commit/c5b13a6563f7d8ed109d814983273ea89659a67a",
+          "message": "Introduce a mechanism to store builtin files\n\nUse it to store the default unparsing configuration.",
+          "author": "Pierre-Marie de Rodat",
+          "date": "2026-02-13T13:07:08Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO TA20 gprinstall generate header",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "langkit/emitter.py",
+      "satd_line": 127,
+      "last_commit": {
+        "sha": "8558ff54964223c3d1391f165bae1c37d78c4c34",
+        "html_url": "https://github.com/AdaCore/langkit/commit/8558ff54964223c3d1391f165bae1c37d78c4c34",
+        "message": "lkm generate: remove obsolete generated source files",
+        "author": "Pierre-Marie de Rodat",
+        "date": "2026-02-25T13:13:16Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

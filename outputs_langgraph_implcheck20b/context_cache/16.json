@@ -1,0 +1,483 @@
+{
+  "task_id": "16",
+  "repo_owner": "pytorch",
+  "repo_name": "pytorch",
+  "file_path": "test/test_autograd.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T03:44:47+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "test_inplace_on_view_modify_base",
+    "satd_line": 12999,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T03:45:00+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T03:45:06+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "test/test_autograd.py",
+    "original_code": "def test_cholesky(self):\n    def func(root, upper):\n        x = 0.5 * (root + root.transpose(-1, -2).conj())\n        return torch.cholesky(x, upper)\n\n    def run_test(upper, dims, dtype):\n        root = torch.rand(*dims, dtype=dtype, requires_grad=True)\n        root = root + torch.eye(dims[-1])\n\n        gradcheck(func, [root, upper])\n        # TODO: gradgradcheck does not work correctly yet for complex\n        if not dtype.is_complex:\n            gradgradcheck(func, [root, upper])\n\n        root = torch.rand(*dims, dtype=dtype)\n        root = torch.matmul(root, root.transpose(-1, -2).conj())\n        root.requires_grad_()\n        chol = root.cholesky().sum().backward()\n        self.assertEqual(root.grad, root.grad.transpose(-1, -2).conj())  # Check the gradient is hermitian\n\n    for upper, dims, dtype in product([True, False],\n                                      [(3, 3), (4, 3, 2, 2)],\n                                      [torch.double, torch.cdouble]):\n        run_test(upper, dims, dtype)",
+    "original_signature": "def test_cholesky(self):",
+    "satd_comment": "# TODO: gradgradcheck does not work correctly yet for complex",
+    "target_file": {
+      "ok": true,
+      "path": "test/test_autograd.py",
+      "sha": "a1dcda360f3a508663b173dc456db8a6ba1ae3df",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/test/test_autograd.py",
+      "content_excerpt": "# Owner(s): [\"module: autograd\"]\n# ruff: noqa: F841\n\nimport collections\nimport contextlib\nimport functools\nimport gc\nimport io\nimport math\nimport operator\nimport os\nimport pickle\nimport random\nimport subprocess\nimport sys\nimport tempfile\nimport threading\nimport time\nimport unittest\nimport uuid\nimport warnings\nimport weakref\nfrom collections import OrderedDict\nfrom copy import deepcopy\nfrom functools import partial, reduce\nfrom itertools import product\nfrom operator import mul\nfrom typing import TYPE_CHECKING\n\nimport torch\nimport torch.autograd._functions\nimport torch.autograd.forward_ad as fwAD\nfrom torch import inf, nan, nn\nfrom torch.autograd import (\n    _calculate_shape,\n    detect_anomaly,\n    Function,\n    kineto_available,\n    Variable,\n)\nfrom torch.autograd.function import InplaceFunction, once_differentiable\nfrom torch.autograd.graph import GradientEdge\nfrom torch.autograd.profiler import emit_itt, emit_nvtx, profile, record_function\nfrom torch.autograd.profiler_util import (\n    _format_time,\n    EventList,\n    FunctionEvent,\n    FunctionEventAvg,\n)\nfrom torch.testing import make_tensor\nfrom torch.testing._internal.common_cuda import TEST_CUDA\nfrom torch.testing._internal.common_device_type import (\n    deviceCountAtLeast,\n    dtypes,\n    dtypesIfCUDA,\n    dtypesIfMPS,\n    expectedFailureMPS,\n    instantiate_device_type_tests,\n    onlyCPU,\n    onlyCUDA,\n    skipMeta,\n)\nfrom torch.testing._internal.common_dtype import floating_types_and\nfrom torch.testing._internal.common_methods_invocations import mask_not_all_zeros\nfrom torch.testing._internal.common_utils import (\n    disable_gc,\n    gradcheck,\n    gradgradcheck,\n    instantiate_parametrized_tests,\n    IS_MACOS,\n    IS_WINDOWS,\n    parametrize,\n    run_tests,\n    scoped_load_inline,\n    set_warn_always_context,\n    skipCUDANonDefaultStreamIf,\n    skipIfMPS,\n    skipIfNoLapack,\n    skipIfSlowGradcheckEnv,\n    skipIfTorchDynamo,\n    skipIfWindows,\n    skipIfXpu,\n    slowTest,\n    TEST_WITH_TORCHDYNAMO,\n    TEST_XPU,\n    TestCase,\n)\nfrom torch.utils._mode_utils import no_dispatch\nfrom torch.utils._python_dispatch import TorchDispatchMode\nfrom torch.utils.checkpoint import (\n    checkpoint,\n    checkpoint_sequential,\n    CheckpointPolicy,\n    create_selective_checkpoint_contexts,\n)\nfrom torch.utils.flop_counter import FlopCounterMode\n\n\nif TYPE_CHECKING:\n    from torch.utils.hooks import RemovableHandle\n\n\ndef graph_desc(fn):\n    if fn is None:\n        return \"None\"\n    result = type(fn).__name__ + \"(\"\n    next_functions = fn.next_functions\n    for next_fn, _ in next_functions:\n        result += graph_desc(next_fn)\n        result += \", \"\n    if next_functions:\n        result = result[:-2]\n    return result + \")\"\n\n\nclass TestAutograd(TestCase):\n    def tearDown(self):\n        torch.autograd._force_original_view_tracking(False)\n        super(TestCase, self).tearDown()\n\n    def test_copy_slices_graph_task_updates(self):\n        def f1(x, y):\n            out = x.clone().view(-1)\n            out += y\n            return out\n\n        def f2(x, y):\n            out = x.clone().view(-1)\n            b = out * 2\n            out += y\n            return out + b\n\n        x = torch.rand(2, requires_grad=True)\n        y = torch.rand(2, requires_grad=True)\n\n        y_safe = torch._C._functions.DelayedError(\"Boom!\", 1)(y)\n\n        for f in [f1, f2]:\n            # Ensure that the error Node works\n            out = f(x, y_safe)\n            with self.assertRaisesRegex(RuntimeError, \"Boom!\"):\n                out.sum().backward()\n\n            out = f(x, y_safe)\n            with self.assertRaisesRegex(RuntimeError, \"Boom!\"):\n                torch.autograd.grad(out.sum(), y)\n\n            # Ensure that if we don't ask for y, it doesn't crash\n            out = f(x, y_safe)\n            torch.autograd.grad(out.sum(), x)\n\n            out = f(x, y_safe)\n            torch.autograd.grad(out.sum(), y_safe)\n\n            out = f(x, y_safe)\n            torch.autograd.grad(out.sum(), (x, y_safe))\n\n        # Ensure that we don't run extra view Node\n        def f3(x, y):\n            out = x.clone().view(-1)\n\n            def hook(*args):\n                # This should never be called!\n                self.assertTrue(False)\n\n            out.register_hook(hook)\n\n            b = out + y\n            out += y\n            return out + b, b\n\n        out, b = f3(x, y_safe)\n        torch.autograd.grad(out.sum(), (b, y_safe))\n\n    def test_grad_mode_class_decoration(self):\n        # Decorating class is deprecated and should not be used\n        with self.assertWarnsRegex(FutureWarning, \"Decorating classes is deprecated\"):\n\n            @torch.no_grad()\n            class Foo:\n                def __init__(self) -> None:\n                    if torch.is_grad_enabled():\n                        raise AssertionError(\"expected grad to be disabled\")\n\n                def foo(self):\n                    # Not applied to methods\n                    if not torch.is_grad_enabled():\n                        raise AssertionError(\"expected grad to be enabled\")\n\n            # Show that we can actually construct the class\n            foo = Foo()\n            foo.foo()\n\n        # Decorating functions or methods is fine though\n        with warnings.catch_warnings(record=True) as w:\n\n            @torch.no_grad()\n            def foo():\n                if torch.is_grad_enabled():\n                    raise AssertionError(\"expected grad to be disabled\")\n\n            foo()\n\n            class Foo2:\n                @torch.no_grad()\n                def __init__(self) -> None:\n                    if torch.is_grad_enabled():\n                        raise AssertionError(\"expected grad to be disabled\")\n\n                @torch.no_grad()\n                def foo(self):\n                    if torch.is_grad_enabled():\n                        raise AssertionError(\"expected grad to be disabled\")\n\n            foo2 = Foo2()\n            foo2.foo()\n\n        self.assertEqual(len(w), 0)\n\n    def test_tensor_grad_warnings(self):\n        dummy = torch.empty(1)\n\n        with warnings.catch_warnings(record=True) as w:\n            # Accessing .grad on leaf\n            dummy.requires_grad_()\n            foo = dummy.grad\n            self.assertEqual(len(w), 0)\n\n            # Accessing .grad on non-leaf\n            dummy = dummy.clone()\n            foo = dummy.grad\n            self.assertEqual(len(w), 1)\n\n            # Accessing .grad on non-leaf that retains gradients\n            dummy.retain_grad()\n            foo = dummy.grad\n            self.assertEqual(len(w), 1)\n\n    def _function_test(self, cls):\n        x = torch.randn(5, 5, requires_grad=True)\n        y = torch.randn(5, 5, requires_grad=True)\n        result = cls.apply(x, 2, y)\n        go = torch.ones((), requires_grad=True)\n        result.sum().backward(go, create_graph=True)\n\n        self.assertEqual(x.grad, y + torch.ones(5, 5))\n        self.assertEqual(y.grad, x + torch.ones(5, 5) * 2)\n        self.assertIsNotNone(x.grad.grad_fn)\n        self.assertIsNotNone(y.grad.grad_fn)\n\n        return x, y\n\n    def test_function(self):\n        class MyFunction(Function):\n            @staticmethod\n            def forward(ctx, tensor1, pyscalar, tensor2):\n                ctx.pyscalar = pyscalar\n                ctx.save_for_backward(tensor1, tensor2)\n                return tensor1 + pyscalar * tensor2 + tensor1 * tensor2\n\n            @staticmethod\n            def backward(ctx, grad_output):\n                var1, var2 = ctx.saved_tensors\n                # NOTE: self is the test case here\n                self.assertIsInstance(var1, torch.Tensor)\n                self.assertIsInstance(var2, torch.Tensor)\n                self.assertIsInstance(grad_output, torch.Tensor)\n                return (\n                    grad_output + grad_output * var2,\n                    None,\n                    grad_output * ctx.pyscalar + grad_output * var1,\n                )\n\n        x, y = self._function_test(MyFunction)\n\n        x_grad_desc = graph_desc(x.grad.grad_fn)\n        y_grad_desc = graph_desc(y.grad.grad_fn)\n        self.assertExpected(x_grad_desc, \"x_grad_desc\")\n        self.assertExpected(y_grad_desc, \"y_grad_desc\")\n\n        # Avoid leaking memory\n        x.grad = None\n        y.grad = None\n\n    def test_once_differentiable(self):\n        class MyFunction(Function):\n            @staticmethod\n            def forward(ctx, tensor1, pyscalar, tensor2):\n                ctx.pyscalar = pyscalar\n                ctx.save_for_backward(tensor1, tensor2)\n                return tensor1 + pyscalar * tensor2 + tensor1 * tensor2\n\n            @staticmethod\n            @once_differentiable\n            def backward(ctx, grad_output):\n                self.assertFalse(torch.is_grad_enabled())\n                t1, t2 = ctx.saved_tensors\n                return (\n                    grad_output + grad_output * t2,\n                    None,\n                    grad_output * ctx.pyscalar + grad_output * t1,\n                )\n\n        x, y = self._function_test(MyFunction)\n        self.assertEqual(\n            graph_desc(x.grad.grad_fn),\n            \"CopyBackwards(None, Error(AccumulateGrad(), None, AccumulateGrad()))\",\n        )\n        self.assertEqual(\n            graph_desc(y.grad.grad_fn),\n            \"CopyBackwards(None, Error(AccumulateGrad(), None, AccumulateGrad()))\",\n        )\n\n        # Avoid leaking memory\n        x.grad = None\n        y.grad = None\n\n    def test_function_returns_input(self):\n        class MyFunction(Function):\n            @staticmethod\n            def forward(ctx, x):\n                return x\n\n            @staticmethod\n            def backward(ctx, grad):\n                return grad * 2\n\n        for shape in [(1,), ()]:\n            v = torch.ones(shape, requires_grad=True)\n            MyFunction.apply(v).backward()\n            self.assertEqual(v.grad, torch.full(shape, 2.0))\n\n            with torch.no_grad():\n                v.grad.zero_()\n            MyFunction.apply(v.clone()).backward()\n            self.assertEqual(v.grad, torch.full(shape, 2.0))\n\n    def test_function_returns_undefined_tensor(self):\n        class MyFunction(Function):\n            @staticmethod\n            def forward(ctx, x):\n                return x * 2\n\n            @staticmethod\n            def backward(ctx, grad):\n                return None\n\n        # Test that undefined tensors returned from custom backward function\n        # are propagated as undefined and not tensor full of zeroes\n        x = torch.ones(1, requires_grad=True)\n\n        MyFunction.apply(x).backward()\n        self.assertIsNone(x.grad)\n\n        MyFunction.apply(x**2).backward()\n        self.assertIsNone(x.grad)\n\n        MyFunction.apply(x).sum().backward()\n        self.assertIsNone(x.grad)\n\n        self.assertIsNone(\n            torch.autograd.grad(MyFunction.apply(x), x, allow_unused=True)[0]\n        )\n\n    def test_materialize_grads(self):\n        class MyFunction(Function):\n            @staticmethod\n            def forward(ctx, x):\n                return x\n\n            @staticmethod\n            def backward(ctx, grad):\n                self.assertEqual(grad, torch.zeros(1))\n                return grad\n\n        x = torch.ones(1, requires_grad=True)\n        torch._C._functions.UndefinedGrad()(MyFunction.apply(x)).backward()\n\n    def test_dont_materialize_grads(self):\n        class MyFunction(Function):\n            @staticmethod\n            def forward(ctx, x):\n                ctx.set_materialize_grads(False)\n                return x\n\n            @staticmethod\n            def backward(ctx, grad):\n                self.assertIsNone(grad)\n                return grad\n\n        x = torch.ones(1, requires_grad=True)\n        torch._C._functions.UndefinedGrad()(MyFunction.apply(x)).backward()\n\n    @skipIfTorchDynamo(\"compile tested in test/dynamo/test_autograd_function.py\")\n    def test_set_materialize_non_diff_grads(self):\n        class Func(torch.autograd.Function):\n            @staticmethod\n            def forward(ctx, x):\n                out0 = x.clo",
+      "total_lines": 15948
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 12999,
+      "start_line": 12979,
+      "end_line": 13019,
+      "matched_line": "        # correctly",
+      "excerpt": "12979: \n12980:         gradcheck(func, [a, b], raise_exception=True)\n12981:         go = torch.randn(\n12982:             a.size(), dtype=torch.double, device=device, requires_grad=True\n12983:         )\n12984:         gradgradcheck(func, (a, b), (go,))\n12985: \n12986:     def test_inplace_on_view_backprop_view(self, device):\n12987:         # modify view and backprop through view\n12988:         a = torch.tensor([2.0, 5.0], device=device, requires_grad=False)\n12989:         b = torch.tensor([3.0], device=device, requires_grad=True)\n12990:         res = a.narrow(0, 1, 1).mul_(b)\n12991:         res.sum().backward()\n12992:         self.assertEqual(b.grad.tolist(), [5])\n12993:         self.assertIsNone(a.grad)\n12994: \n12995:     @skipIfMPS  # the test doesn't work on MPS as double types are not supported\n12996:     def test_inplace_on_view_modify_base(self, device):\n12997:         # Test that an in-place operation on a base that forced it to require\n12998:         # grad also forces any previous views to require grad and backprop\n12999:         # correctly\n13000:         r = torch.ones(1, dtype=torch.double, device=device, requires_grad=True)\n13001: \n13002:         def fn(r):\n13003:             x = torch.ones(5, dtype=torch.double, device=device)\n13004:             v = x.select(0, 1)\n13005:             self.assertFalse(v.requires_grad)\n13006:             self.assertIsNone(v.grad_fn)\n13007:             x.add_(r)  # v is now dependent on r due to the in-place op on x\n13008:             self.assertTrue(v.requires_grad)\n13009:             return v\n13010: \n13011:         gradcheck(fn, [r])\n13012:         gradgradcheck(fn, [r])\n13013: \n13014:     @skipIfMPS  # the test doesn't work on MPS as double types are not supported\n13015:     def test_inplace_on_view_python(self, device):\n13016:         # in-place modifications of Python-autograd created view\n13017:         a = torch.randn(4, 4, dtype=torch.double, device=device, requires_grad=True)\n13018:         b = torch.randn(2, 2, dtype=torch.double, device=device, requires_grad=True)\n13019: "
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "test_inplace_on_view_modify_base",
+      "start_line": 12996,
+      "end_line": 13012,
+      "source": "    def test_inplace_on_view_modify_base(self, device):\n        # Test that an in-place operation on a base that forced it to require\n        # grad also forces any previous views to require grad and backprop\n        # correctly\n        r = torch.ones(1, dtype=torch.double, device=device, requires_grad=True)\n\n        def fn(r):\n            x = torch.ones(5, dtype=torch.double, device=device)\n            v = x.select(0, 1)\n            self.assertFalse(v.requires_grad)\n            self.assertIsNone(v.grad_fn)\n            x.add_(r)  # v is now dependent on r due to the in-place op on x\n            self.assertTrue(v.requires_grad)\n            return v\n\n        gradcheck(fn, [r])\n        gradgradcheck(fn, [r])"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 12996,
+      "end_line": 13012,
+      "excerpt": "    def test_inplace_on_view_modify_base(self, device):\n        # Test that an in-place operation on a base that forced it to require\n        # grad also forces any previous views to require grad and backprop\n        # correctly\n        r = torch.ones(1, dtype=torch.double, device=device, requires_grad=True)\n\n        def fn(r):\n            x = torch.ones(5, dtype=torch.double, device=device)\n            v = x.select(0, 1)\n            self.assertFalse(v.requires_grad)\n            self.assertIsNone(v.grad_fn)\n            x.add_(r)  # v is now dependent on r due to the in-place op on x\n            self.assertTrue(v.requires_grad)\n            return v\n\n        gradcheck(fn, [r])\n        gradgradcheck(fn, [r])",
+      "symbol_name": "test_inplace_on_view_modify_base",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "test/test_autograd.py",
+      "sha": "a1dcda360f3a508663b173dc456db8a6ba1ae3df",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/test/test_autograd.py"
+    },
+    "imports": {
+      "imports": [
+        "collections",
+        "contextlib",
+        "functools",
+        "gc",
+        "io",
+        "math",
+        "operator",
+        "os",
+        "pickle",
+        "random",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "threading",
+        "time",
+        "unittest",
+        "uuid",
+        "warnings",
+        "weakref",
+        "collections:OrderedDict",
+        "copy:deepcopy",
+        "functools:partial",
+        "functools:reduce",
+        "itertools:product",
+        "operator:mul",
+        "typing:TYPE_CHECKING",
+        "torch",
+        "torch.autograd._functions",
+        "torch.autograd.forward_ad",
+        "torch:inf"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pytorch/pytorch/main/README.md",
+      "content_excerpt": "![PyTorch Logo](https://github.com/pytorch/pytorch/raw/main/docs/source/_static/img/pytorch-logo-dark.png)\n\n--------------------------------------------------------------------------------\n\nPyTorch is a Python package that provides two high-level features:\n- Tensor computation (like NumPy) with strong GPU acceleration\n- Deep neural networks built on a tape-based autograd system\n\nYou can reuse your favorite Python packages such as NumPy, SciPy, and Cython to extend PyTorch when needed.\n\nOur trunk health (Continuous Integration signals) can be found at [hud.pytorch.org](https://hud.pytorch.org/ci/pytorch/pytorch/main).\n\n<!-- toc -->\n\n- [More About PyTorch](#more-about-pytorch)\n  - [A GPU-Ready Tensor Library](#a-gpu-ready-tensor-library)\n  - [Dynamic Neural Networks: Tape-Based Autograd](#dynamic-neural-networks-tape-based-autograd)\n  - [Python First](#python-first)\n  - [Imperative Experiences](#imperative-experiences)\n  - [Fast and Lean](#fast-and-lean)\n  - [Extensions Without Pain](#extensions-without-pain)\n- [Installation](#installation)\n  - [Binaries](#binaries)\n    - [NVIDIA Jetson Platforms](#nvidia-jetson-platforms)\n  - [From Source](#from-source)\n    - [Prerequisites](#prerequisites)\n      - [NVIDIA CUDA Support](#nvidia-cuda-support)\n      - [AMD ROCm Support](#amd-rocm-support)\n      - [Intel GPU Support](#intel-gpu-support)\n    - [Get the PyTorch Source](#get-the-pytorch-source)\n    - [Install Dependencies](#install-dependencies)\n    - [Install PyTorch](#install-pytorch)\n      - [Adjust Build Options (Optional)](#adjust-build-options-optional)\n  - [Docker Image](#d"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "test_inplace_on_view_modify_base test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"test_inplace_on_view_modify_base(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "test",
+      "count": 40,
+      "entries": [
+        {
+          "name": "HowToWriteTestsUsingFileCheck.md",
+          "path": "test/HowToWriteTestsUsingFileCheck.md",
+          "type": "file"
+        },
+        {
+          "name": "_test_bazel.py",
+          "path": "test/_test_bazel.py",
+          "type": "file"
+        },
+        {
+          "name": "allowlist_for_publicAPI.json",
+          "path": "test/allowlist_for_publicAPI.json",
+          "type": "file"
+        },
+        {
+          "name": "ao",
+          "path": "test/ao",
+          "type": "dir"
+        },
+        {
+          "name": "autograd",
+          "path": "test/autograd",
+          "type": "dir"
+        },
+        {
+          "name": "backends",
+          "path": "test/backends",
+          "type": "dir"
+        },
+        {
+          "name": "bench_mps_ops.py",
+          "path": "test/bench_mps_ops.py",
+          "type": "file"
+        },
+        {
+          "name": "benchmark_utils",
+          "path": "test/benchmark_utils",
+          "type": "dir"
+        },
+        {
+          "name": "compiled_autograd_skips",
+          "path": "test/compiled_autograd_skips",
+          "type": "dir"
+        },
+        {
+          "name": "complex_tensor",
+          "path": "test/complex_tensor",
+          "type": "dir"
+        },
+        {
+          "name": "conftest.py",
+          "path": "test/conftest.py",
+          "type": "file"
+        },
+        {
+          "name": "cpp",
+          "path": "test/cpp",
+          "type": "dir"
+        },
+        {
+          "name": "cpp_api_parity",
+          "path": "test/cpp_api_parity",
+          "type": "dir"
+        },
+        {
+          "name": "cpp_extensions",
+          "path": "test/cpp_extensions",
+          "type": "dir"
+        },
+        {
+          "name": "create_dummy_torchscript_model.py",
+          "path": "test/create_dummy_torchscript_model.py",
+          "type": "file"
+        },
+        {
+          "name": "custom_backend",
+          "path": "test/custom_backend",
+          "type": "dir"
+        },
+        {
+          "name": "custom_operator",
+          "path": "test/custom_operator",
+          "type": "dir"
+        },
+        {
+          "name": "distributed",
+          "path": "test/distributed",
+          "type": "dir"
+        },
+        {
+          "name": "distributions",
+          "path": "test/distributions",
+          "type": "dir"
+        },
+        {
+          "name": "dynamo",
+          "path": "test/dynamo",
+          "type": "dir"
+        },
+        {
+          "name": "dynamo_expected_failures",
+          "path": "test/dynamo_expected_failures",
+          "type": "dir"
+        },
+        {
+          "name": "dynamo_skips",
+          "path": "test/dynamo_skips",
+          "type": "dir"
+        },
+        {
+          "name": "error_messages",
+          "path": "test/error_messages",
+          "type": "dir"
+        },
+        {
+          "name": "expect",
+          "path": "test/expect",
+          "type": "dir"
+        },
+        {
+          "name": "export",
+          "path": "test/export",
+          "type": "dir"
+        },
+        {
+          "name": "forward_backward_compatibility",
+          "path": "test/forward_backward_compatibility",
+          "type": "dir"
+        },
+        {
+          "name": "functorch",
+          "path": "test/functorch",
+          "type": "dir"
+        },
+        {
+          "name": "fx",
+          "path": "test/fx",
+          "type": "dir"
+        },
+        {
+          "name": "higher_order_ops",
+          "path": "test/higher_order_ops",
+          "type": "dir"
+        },
+        {
+          "name": "inductor",
+          "path": "test/inductor",
+          "type": "dir"
+        },
+        {
+          "name": "inductor_expected_failures",
+          "path": "test/inductor_expected_failures",
+          "type": "dir"
+        },
+        {
+          "name": "inductor_skips",
+          "path": "test/inductor_skips",
+          "type": "dir"
+        },
+        {
+          "name": "jit",
+          "path": "test/jit",
+          "type": "dir"
+        },
+        {
+          "name": "jit_hooks",
+          "path": "test/jit_hooks",
+          "type": "dir"
+        },
+        {
+          "name": "lazy",
+          "path": "test/lazy",
+          "type": "dir"
+        },
+        {
+          "name": "linear.py",
+          "path": "test/linear.py",
+          "type": "file"
+        },
+        {
+          "name": "load_torchscript_model.py",
+          "path": "test/load_torchscript_model.py",
+          "type": "file"
+        },
+        {
+          "name": "minioptest_failures_dict.json",
+          "path": "test/minioptest_failures_dict.json",
+          "type": "file"
+        },
+        {
+          "name": "mkl_verbose.py",
+          "path": "test/mkl_verbose.py",
+          "type": "file"
+        },
+        {
+          "name": "mkldnn_verbose.py",
+          "path": "test/mkldnn_verbose.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "HowToWriteTestsUsingFileCheck.md",
+          "path": "test/HowToWriteTestsUsingFileCheck.md",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # How to write tests using FileCheck\n2: \n3: ## What is FileCheck\n4: \n5: FileCheck can be seen as an advanced version of grep. We use it for writing\n6: small annotated unit tests for optimization passes. FileCheck used in PyTorch is\n7: inspired by [LLVM FileCheck\n8: Tool](https://llvm.org/docs/CommandGuide/FileCheck.html), but is not the same.\n9: FileCheck is available for writing both C++ and python tests.\n10: \n11: ## How does it work\n12: \n13: Let's look at a test written with FileCheck. The following test verifies that"
+        },
+        {
+          "name": "_test_bazel.py",
+          "path": "test/_test_bazel.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Owner(s): [\"module: bazel\"]\n2: \n3: \"\"\"\n4: This test module contains a minimalistic \"smoke tests\" for the bazel build.\n5: \n6: Currently it doesn't use any testing framework (i.e. pytest)\n7: TODO: integrate this into the existing pytorch testing framework.\n8: \n9: The name uses underscore `_test_bazel.py` to avoid globbing into other non-bazel configurations.\n10: \"\"\"\n11: \n12: import torch\n13: "
+        },
+        {
+          "name": "allowlist_for_publicAPI.json",
+          "path": "test/allowlist_for_publicAPI.json",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: {\n2:   \"being_migrated\": {\n3:     \"torch.nn.intrinsic\": \"torch.ao.nn.intrinsic\",\n4:     \"torch.nn.intrinsic.modules\": \"torch.ao.nn.intrinsic.modules\",\n5:     \"torch.nn.intrinsic.modules.fused\": \"torch.ao.nn.intrinsic.modules.fused\",\n6:     \"torch.nn.intrinsic.qat\": \"torch.ao.nn.intrinsic.qat\",\n7:     \"torch.nn.intrinsic.qat.modules\": \"torch.ao.nn.intrinsic.qat.modules\",\n8:     \"torch.nn.intrinsic.qat.modules.conv_fused\": \"torch.ao.nn.intrinsic.qat.modules.conv_fused\",\n9:     \"torch.nn.intrinsic.qat.modules.linear_fused\": \"torch.ao.nn.intrinsic.qat.modules.linear_fused\",\n10:     \"torch.nn.intrinsic.qat.modules.linear_relu\": \"torch.ao.nn.intrinsic.qat.modules.linear_relu\",\n11:     \"torch.nn.intrinsic.quantized\": \"torch.ao.nn.intrinsic.quantized\",\n12:     \"torch.nn.intrinsic.quantized.modules\": \"torch.ao.nn.intrinsic.quantized.modules\",\n13:     \"torch.nn.intrinsic.quantized.modules.bn_relu\": \"torch.ao.nn.intrinsic.quantized.modules.bn_relu\","
+        },
+        {
+          "name": "bench_mps_ops.py",
+          "path": "test/bench_mps_ops.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Owner(s): [\"module: mps\"]\n2: # Collection of op level benchmarks for MPS\n3: # Useful as reference tool when migrating ops from MPS to Metal\n4: import itertools\n5: import sys\n6: import timeit\n7: import warnings\n8: \n9: import torch\n10: from torch.utils.benchmark import Compare, Measurement, Timer\n11: \n12: \n13: def bench_unary_op(func, x, label) -> Measurement:"
+        },
+        {
+          "name": "conftest.py",
+          "path": "test/conftest.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import copy\n2: import functools\n3: import json\n4: import os\n5: import re\n6: import sys\n7: import xml.etree.ElementTree as ET\n8: from collections import defaultdict\n9: from types import MethodType\n10: from typing import Any, TYPE_CHECKING\n11: \n12: import pytest\n13: from _pytest.config import Config, filename_arg"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "test/test_autograd.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "044c88c19860e9b76e51aa01922dad2312bd7b8f",
+          "html_url": "https://github.com/pytorch/pytorch/commit/044c88c19860e9b76e51aa01922dad2312bd7b8f",
+          "message": "[XPU] Enable skipped inductor test on Intel GPU - enable xpu in eager tests that are reused by inductor tests (#174055)\n\nSome eager test classes are used by inductor test:\n\n1. test_autograd.TestAutograd: test/inductor/test_compiled_autograd.py\n2. test_custom_ops.TestCustomOp: test/inductor/test_comp",
+          "author": "Deng, Daisy",
+          "date": "2026-03-21T14:07:13Z"
+        },
+        {
+          "sha": "eb325859c4baab835befe30fbfd2bd557c259dbf",
+          "html_url": "https://github.com/pytorch/pytorch/commit/eb325859c4baab835befe30fbfd2bd557c259dbf",
+          "message": "Fix _force_original_view_tracking decorator state leak (#177676)\n\nFix #147849\n\n## Summary\n\n1. Root cause\n`_force_original_view_tracking` changes the view replay flag in `__init__`, so using it as `@decorator` mutates the global state as soon as the function is defined instead of when the wrapped fun",
+          "author": "Bob Ren",
+          "date": "2026-03-20T16:34:23Z"
+        },
+        {
+          "sha": "f8e48d2b50cf3b51aa83738a1f1c115a00cfa728",
+          "html_url": "https://github.com/pytorch/pytorch/commit/f8e48d2b50cf3b51aa83738a1f1c115a00cfa728",
+          "message": "Revert \"[autograd] Explicitly error when layer_norm computes 3rd order derivatives (#176234)\"\n\nThis reverts commit cd17970cd801e42068d0f85b0f54939a83984909.\n\nReverted https://github.com/pytorch/pytorch/pull/176234 on behalf of https://github.com/pytorch-auto-revert due to Reverted automatically by p",
+          "author": "PyTorch MergeBot",
+          "date": "2026-03-17T13:22:42Z"
+        },
+        {
+          "sha": "cd17970cd801e42068d0f85b0f54939a83984909",
+          "html_url": "https://github.com/pytorch/pytorch/commit/cd17970cd801e42068d0f85b0f54939a83984909",
+          "message": "[autograd] Explicitly error when layer_norm computes 3rd order derivatives (#176234)\n\nThe saved mean and invstd tensors passed to layer_norm_double_backward\nhave no autograd history connecting them to the input (they come from\nthe forward kernel).  The double backward formula analytically accounts\nf",
+          "author": "soulitzer",
+          "date": "2026-03-16T20:55:42Z"
+        },
+        {
+          "sha": "331aebd66a1e71bee3ce085c0fde562d9ebf0f48",
+          "html_url": "https://github.com/pytorch/pytorch/commit/331aebd66a1e71bee3ce085c0fde562d9ebf0f48",
+          "message": "[Dynamo][AC]Add cache entries error test cases and show how to conduct the error fix in test (#177391)\n\nThis provide example on how automatic dynamic can trigger AC issue. And how use ``mark_dynamic()`` on the specific dim that turned into ``SymInt`` can fix the issue. The other option on using ``to",
+          "author": "Xiao Fu",
+          "date": "2026-03-13T22:06:09Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "test_inplace_on_view_modify_base TODO gradgradcheck does work correctly",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "test/test_autograd.py",
+      "satd_line": 12999,
+      "last_commit": {
+        "sha": "044c88c19860e9b76e51aa01922dad2312bd7b8f",
+        "html_url": "https://github.com/pytorch/pytorch/commit/044c88c19860e9b76e51aa01922dad2312bd7b8f",
+        "message": "[XPU] Enable skipped inductor test on Intel GPU - enable xpu in eager tests that are reused by inductor tests (#174055)\n\nSome eager test classes are used by inductor test:\n\n1. test_autograd.TestAutograd: test/inductor/test_compiled_autograd.py\n2. test_custom_ops.TestCustomOp: test/inductor/test_comp",
+        "author": "Deng, Daisy",
+        "date": "2026-03-21T14:07:13Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "gradcheck",
+        "gradgradcheck"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "test_inplace_on_view_modify_base",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

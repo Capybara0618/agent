@@ -1,0 +1,446 @@
+{
+  "task_id": "754",
+  "repo_owner": "edgedb",
+  "repo_name": "edgedb",
+  "file_path": "edb/server/server.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T15:40:05+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T15:40:35+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T15:40:40+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "edb/server/server.py",
+    "original_code": "def release_pgcon(self, dbname, conn, *, discard=False):\n    if not conn.is_healthy_to_go_back_to_pool():\n        # TODO: Add warning. This shouldn't happen.\n        discard = True\n    self._pg_pool.release(dbname, conn, discard=discard)",
+    "original_signature": "def release_pgcon(self, dbname, conn, *, discard=False):",
+    "satd_comment": "# TODO: Add warning. This shouldn't happen.",
+    "target_file": {
+      "ok": true,
+      "path": "edb/server/server.py",
+      "sha": "ebc9a6a1f2335b146496003c3c455ed7fbd08fb7",
+      "download_url": "https://raw.githubusercontent.com/geldata/gel/master/edb/server/server.py",
+      "content_excerpt": "# mypy: check-untyped-defs\n\n#\n# This source file is part of the EdgeDB open source project.\n#\n# Copyright 2016-present MagicStack Inc. and the EdgeDB authors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n\n\nfrom __future__ import annotations\nimport re\nfrom typing import (\n    Any,\n    Callable,\n    Optional,\n    Hashable,\n    Iterator,\n    Mapping,\n    Sequence,\n    TYPE_CHECKING,\n)\n\nimport asyncio\nimport collections\nimport ipaddress\nimport itertools\nimport json\nimport logging\nimport os\nimport pathlib\nimport pickle\nimport socket\nimport ssl\nimport stat\nimport time\nimport uuid\n\nimport immutables\n\nfrom edb import buildmeta\nfrom edb import errors\n\nfrom edb.common import devmode\nfrom edb.common import lru\nfrom edb.common import secretkey\nfrom edb.common import windowedsum\nfrom edb.common.log import current_tenant\n\nfrom edb.schema import reflection as s_refl\nfrom edb.schema import schema as s_schema\n\nfrom edb.server import auth\nfrom edb.server import args as srvargs\nfrom edb.server import cache\nfrom edb.server import config\nfrom edb.server import compiler_pool\nfrom edb.server import daemon\nfrom edb.server import defines\nfrom edb.server import instdata\nfrom edb.server import protocol\nfrom edb.server import net_worker\nfrom edb.server import tenant as edbtenant\nfrom edb.server.protocol import binary  # type: ignore\nfrom edb.server.protocol import pg_ext  # type: ignore\nfrom edb.server.protocol import ui_ext  # type: ignore\nfrom edb.server.protocol.auth_ext import pkce\nfrom edb.server import metrics\nfrom edb.server import pgcon\n\nfrom edb.pgsql import patches as pg_patches\n\nfrom . import compiler as edbcompiler\nfrom .compiler import sertypes\n\nif TYPE_CHECKING:\n    import asyncio.base_events\n\n    from edb.pgsql import params as pgparams\n\n    from . import bootstrap\n\n\nADMIN_PLACEHOLDER = \"<edgedb:admin>\"\nlogger = logging.getLogger('edb.server')\nlog_metrics = logging.getLogger('edb.server.metrics')\n\n\nclass StartupError(Exception):\n    pass\n\n\nclass BaseServer:\n    _sys_queries: Mapping[str, bytes]\n    _local_intro_query: bytes\n    _global_intro_query: bytes\n    _report_config_typedesc: dict[defines.ProtocolVersion, bytes]\n    _use_monitor_fs: bool\n    _file_watch_handles: list[asyncio.Handle]\n\n    _std_schema: s_schema.Schema\n    _refl_schema: s_schema.Schema\n    _schema_class_layout: s_refl.SchemaClassLayout\n\n    _servers: Mapping[str, asyncio.AbstractServer]\n\n    _testmode: bool\n\n    # We maintain an OrderedDict of all active client connections.\n    # We use an OrderedDict because it allows to move keys to either\n    # end of the dict. That's used to keep all active client connections\n    # grouped at the right end of the dict. The idea is that we can then\n    # have a periodically run coroutine to GC all inactive connections.\n    # This should be more economical than maintaining a TimerHandle for\n    # every open connection. Also, this way, we can react to the\n    # `session_idle_timeout` config setting changed mid-flight.\n    _binary_conns: collections.OrderedDict[binary.EdgeConnection, bool]\n    _pgext_conns: dict[str, pg_ext.PgConnection]\n    _idle_gc_handler: asyncio.TimerHandle | None = None\n    _stmt_cache_size: int | None = None\n\n    _compiler_pool: compiler_pool.AbstractPool | None\n    compilation_config_serializer: sertypes.CompilationConfigSerializer\n    _http_request_logger: asyncio.Task | None\n    _auth_gc: asyncio.Task | None\n    _net_worker_http: asyncio.Task | None\n    _net_worker_http_gc: asyncio.Task | None\n\n    def __init__(\n        self,\n        *,\n        runstate_dir: pathlib.Path,\n        internal_runstate_dir: pathlib.Path,\n        compiler_pool_size: int,\n        compiler_worker_branch_limit,\n        compiler_pool_mode: srvargs.CompilerPoolMode,\n        compiler_pool_addr: tuple[str, int],\n        nethosts: Sequence[str],\n        netport: int,\n        compiler_worker_max_rss: Optional[int] = None,\n        listen_sockets: tuple[socket.socket, ...] = (),\n        testmode: bool = False,\n        daemonized: bool = False,\n        pidfile_dir: Optional[pathlib.Path] = None,\n        binary_endpoint_security: srvargs.ServerEndpointSecurityMode = (\n            srvargs.ServerEndpointSecurityMode.Tls),\n        http_endpoint_security: srvargs.ServerEndpointSecurityMode = (\n            srvargs.ServerEndpointSecurityMode.Tls),\n        auto_shutdown_after: float = -1,\n        echo_runtime_info: bool = False,\n        status_sinks: Sequence[Callable[[str], None]] = (),\n        default_auth_method: srvargs.ServerAuthMethods = (\n            srvargs.DEFAULT_AUTH_METHODS),\n        admin_ui: bool = False,\n        cors_always_allowed_origins: Optional[str] = None,\n        disable_dynamic_system_config: bool = False,\n        compiler_state: edbcompiler.CompilerState,\n        use_monitor_fs: bool = False,\n        net_worker_mode: srvargs.NetWorkerMode = srvargs.NetWorkerMode.Default,\n    ):\n        self.__loop = asyncio.get_running_loop()\n        self._use_monitor_fs = use_monitor_fs\n\n        self._schema_class_layout = compiler_state.schema_class_layout\n        self._config_settings = compiler_state.config_spec\n        self._refl_schema = compiler_state.refl_schema\n        self._std_schema = compiler_state.std_schema\n        assert compiler_state.global_intro_query is not None\n        self._global_intro_query = (\n            compiler_state.global_intro_query.encode(\"utf-8\"))\n        assert compiler_state.local_intro_query is not None\n        self._local_intro_query = (\n            compiler_state.local_intro_query.encode(\"utf-8\"))\n\n        # Used to tag PG notifications to later disambiguate them.\n        self._server_id = str(uuid.uuid4())\n\n        self._daemonized = daemonized\n        self._pidfile_dir = pidfile_dir\n        self._runstate_dir = runstate_dir\n        self._internal_runstate_dir = internal_runstate_dir\n        self._compiler_pool = None\n        self._compiler_pool_size = compiler_pool_size\n        self._compiler_worker_branch_limit = compiler_worker_branch_limit\n        self._compiler_pool_mode = compiler_pool_mode\n        self._compiler_pool_addr = compiler_pool_addr\n        self._compiler_worker_max_rss = compiler_worker_max_rss\n        self._system_compile_cache = lru.LRUMapping(\n            maxsize=defines._MAX_QUERIES_CACHE_SYSTEM\n        )\n        self._system_compile_cache_locks: dict[Any, Any] = {}\n\n        self._listen_sockets = listen_sockets\n        if listen_sockets:\n            nethosts = tuple(s.getsockname()[0] for s in listen_sockets)\n            netport = listen_sockets[0].getsockname()[1]\n\n        self._listen_hosts = nethosts\n        self._listen_port = netport\n\n        # Shutdown the server after the last management\n        # connection has disconnected\n        # and there have been no new connections for n seconds\n        self._auto_shutdown_after = auto_shutdown_after\n        self._auto_shutdown_handler: Any = None\n        self._keepalive_tokens: set = set()\n\n        self._echo_runtime_info = echo_runtime_info\n        self._status_sinks = status_sinks\n\n        self._sys_queries = immutables.Map()\n\n        self._devmode = devmode.is_in_dev_mode()\n        self._testmode = testmode\n\n        self._binary_proto_id_counter = 0\n        self._binary_conns = collections.OrderedDict()\n        self._pgext_conns = {}\n\n        self._servers = {}\n\n        self._http_query_cache = cache.StatementsCache(\n            maxsize=defines.HTTP_PORT_QUERY_CACHE_SIZE)\n\n        self._http_last_minute_requests = windowedsum.WindowedSum()\n        self._http_request_logger = None\n        self._auth_gc = None\n        self._net_worker_http = None\n        self._net_worker_http_gc = None\n        self._net_worker_mode = net_worker_mode\n\n        self._stop_evt = asyncio.Event()\n        self._tls_cert_file: str | Any = None\n        self._tls_cert_newly_generated = False\n        self._sslctx: ssl.SSLContext | Any = None\n        self._sslctx_pgext: ssl.SSLContext | Any = None\n\n        self._jws_key: auth.JWKSet | None = None\n        self._jws_keys_newly_generated = False\n\n        self._default_auth_method_spec = default_auth_method\n        self._default_auth_methods = self._get_auth_method_types(\n            default_auth_method)\n        self._binary_endpoint_security = binary_endpoint_security\n        self._http_endpoint_security = http_endpoint_security\n\n        self._idle_gc_handler = None\n\n        self._admin_ui = admin_ui\n\n        self._cors_always_allowed_origins = [\n            re.compile(\n                '^' + origin\n                    .replace('.', '\\\\.')\n                    .replace('*', '.*') + '$'\n            ) if '*' in origin else origin\n            for origin in cors_always_allowed_origins.split(',')\n        ] if cors_always_allowed_origins else []\n\n        self._file_watch_handles = []\n        self._tls_certs_reload_retry_handle: Any | asyncio.TimerHandle = None\n\n        self._disable_dynamic_system_config = disable_dynamic_system_config\n        self._report_config_typedesc = {}\n\n    def _get_auth_method_types(\n        self,\n        auth_methods_spec: srvargs.ServerAuthMethods,\n    ) -> dict[srvargs.ServerConnTransport, list[config.CompositeConfigType]]:\n        mapping = {}\n        for transport, methods in auth_methods_spec.items():\n            result = []\n            for method in methods:\n                auth_type = self.config_settings.get_type_by_name(\n                    f'cfg::{method.value}'\n                )\n                result.append(auth_type())\n            mapping[transport] = result\n\n        return mapping\n\n    async def _request_stats_logger(self):\n        last_seen = -1\n        while True:\n            current = int(self._http_last_minute_requests)\n            if current != last_seen:\n                log_metrics.info(\n                    \"HTTP requests in last minute: %d\",\n                    current,\n                )\n                last_seen = current\n\n            await asyncio.sleep(30)\n\n    def get_server_id(self):\n        return self._server_id\n\n    def get_listen_hosts(self):\n        return self._listen_hosts\n\n    def get_listen_port(self):\n        return self._listen_port\n\n    def get_loop(self):\n        return self.__loop\n\n    def in_dev_mode(self):\n        return self._devmode\n\n    def in_test_mode(self):\n        return self._testmode\n\n    def is_admin_ui_enabled(self):\n        return self._admin_ui\n\n    def get_cors_always_allowed_origins(self):\n        return self._cors_always_allowed_origins\n\n    def on_binary_client_created(self) -> str:\n        self._binary_proto_id_counter += 1\n        return str(self._binary_proto_id_counter)\n\n    def on_binary_client_connected(self, conn):\n        self._binary_conns[conn] = True\n        metrics.current_client_connections.inc(\n            1.0, conn.get_tenant_label()\n        )\n\n    def on_binary_client_authed(self, conn):\n        self._report_connections(event='opened')\n        metrics.total_client_connections.inc(\n            1.0, conn.get_tenant_label()\n        )\n\n    def on_binary_client_after_idling(self, conn):\n        try:\n            self._binary_conns.move_to_end(conn, last=True)\n        except KeyError:\n            # Shouldn't happen, but just in case some weird async twist\n            # gets us here we don't want to crash the connection with\n            # this error.\n            metrics.background_errors.inc(\n                1.0, conn.get_tenant_label(), 'client_after_idling'\n            )\n\n    def on_binary_client_disconnected(self, conn):\n        self._binary_conns.pop(conn, None)\n        self._",
+      "total_lines": 1951
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "anchor_text",
+      "start_line": 1,
+      "end_line": 15,
+      "excerpt": "1: # mypy: check-untyped-defs\n2: \n3: #\n4: # This source file is part of the EdgeDB open source project.\n5: #\n6: # Copyright 2016-present MagicStack Inc. and the EdgeDB authors.\n7: #\n8: # Licensed under the Apache License, Version 2.0 (the \"License\");\n9: # you may not use this file except in compliance with the License.\n10: # You may obtain a copy of the License at\n11: #\n12: #     http://www.apache.org/licenses/LICENSE-2.0\n13: #\n14: # Unless required by applicable law or agreed to in writing, software\n15: # distributed under the License is distributed on an \"AS IS\" BASIS,",
+      "symbol_name": null,
+      "symbol_type": null,
+      "ok": true,
+      "path": "edb/server/server.py",
+      "sha": "ebc9a6a1f2335b146496003c3c455ed7fbd08fb7",
+      "download_url": "https://raw.githubusercontent.com/geldata/gel/master/edb/server/server.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "re",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Optional",
+        "typing:Hashable",
+        "typing:Iterator",
+        "typing:Mapping",
+        "typing:Sequence",
+        "typing:TYPE_CHECKING",
+        "asyncio",
+        "collections",
+        "ipaddress",
+        "itertools",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "pickle",
+        "socket",
+        "ssl",
+        "stat",
+        "time",
+        "uuid",
+        "immutables",
+        "edb:buildmeta",
+        "edb:errors",
+        "edb.common:devmode",
+        "edb.common:lru",
+        "edb.common:secretkey"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/geldata/gel/master/README.md",
+      "content_excerpt": "<!--<p align=\"center\">\n  <a href=\"https://www.geldata.com\">\n    <img src=\"https://www.geldata.com/github_banner.png\">\n  </a>\n</p>-->\n\n<div align=\"center\">\n  <h1>Gel</h1>\n  <a href=\"https://github.com/geldata/gel\" rel=\"nofollow\">\n    <img src=\"https://img.shields.io/github/stars/geldata/gel\" alt=\"Stars\">\n  </a>\n  <a href=\"https://github.com/geldata/gel/actions\">\n    <img src=\"https://github.com/geldata/gel/workflows/Tests/badge.svg?event=push&branch=master\" />\n  </a>\n  <a href=\"https://github.com/geldata/gel/blob/master/LICENSE\">\n    <img alt=\"license\" src=\"https://img.shields.io/badge/license-Apache%202.0-blue\" />\n  </a>\n  <a href=\"https://discord.gg/umUueND6ag\">\n    <img alt=\"discord\" src=\"https://img.shields.io/discord/841451783728529451?color=5865F2&label=discord&logo=discord&logoColor=8a9095\">\n  </a>\n  <br />\n  <br />\n  <a href=\"https://docs.geldata.com/learn/quickstart/overview/nextjs\">Learn: build an app with Gel</a>\n  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>\n  <a href=\"https://www.geldata.com\">Website</a>\n  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>\n  <a href=\"https://docs.geldata.com\">Docs</a>\n  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>\n  <a href=\"https://www.geldata.com/blog\">Blog</a>\n  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>\n  <a href=\"https://discord.gg/gel\">Discord</a>\n  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>\n  <a href=\"https://twitter.com/geldata\">Twitter</a>\n  <br />\n\n</div>\n\n<br />\n<br />\n\n<br/>\n<div align=\"center\">\n  <h2>What is Gel?</h2>\n  <p style=\"max-width: 450px;\">\n    Gel is a new kind of database\n    <br/>\n    that takes the best parts of\n    <br/>\n    relation"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "release_pgcon test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"release_pgcon(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "edb/server",
+      "count": 34,
+      "entries": [
+        {
+          "name": ".gitignore",
+          "path": "edb/server/.gitignore",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "edb/server/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_rust_native",
+          "path": "edb/server/_rust_native",
+          "type": "dir"
+        },
+        {
+          "name": "args.py",
+          "path": "edb/server/args.py",
+          "type": "file"
+        },
+        {
+          "name": "auth.py",
+          "path": "edb/server/auth.py",
+          "type": "file"
+        },
+        {
+          "name": "bootstrap.py",
+          "path": "edb/server/bootstrap.py",
+          "type": "file"
+        },
+        {
+          "name": "cache",
+          "path": "edb/server/cache",
+          "type": "dir"
+        },
+        {
+          "name": "compiler",
+          "path": "edb/server/compiler",
+          "type": "dir"
+        },
+        {
+          "name": "compiler_pool",
+          "path": "edb/server/compiler_pool",
+          "type": "dir"
+        },
+        {
+          "name": "config",
+          "path": "edb/server/config",
+          "type": "dir"
+        },
+        {
+          "name": "connpool",
+          "path": "edb/server/connpool",
+          "type": "dir"
+        },
+        {
+          "name": "consul.py",
+          "path": "edb/server/consul.py",
+          "type": "file"
+        },
+        {
+          "name": "daemon",
+          "path": "edb/server/daemon",
+          "type": "dir"
+        },
+        {
+          "name": "dbview",
+          "path": "edb/server/dbview",
+          "type": "dir"
+        },
+        {
+          "name": "defines.py",
+          "path": "edb/server/defines.py",
+          "type": "file"
+        },
+        {
+          "name": "ha",
+          "path": "edb/server/ha",
+          "type": "dir"
+        },
+        {
+          "name": "http.py",
+          "path": "edb/server/http.py",
+          "type": "file"
+        },
+        {
+          "name": "inplace_upgrade.py",
+          "path": "edb/server/inplace_upgrade.py",
+          "type": "file"
+        },
+        {
+          "name": "instdata.py",
+          "path": "edb/server/instdata.py",
+          "type": "file"
+        },
+        {
+          "name": "logsetup.py",
+          "path": "edb/server/logsetup.py",
+          "type": "file"
+        },
+        {
+          "name": "main.py",
+          "path": "edb/server/main.py",
+          "type": "file"
+        },
+        {
+          "name": "metrics.py",
+          "path": "edb/server/metrics.py",
+          "type": "file"
+        },
+        {
+          "name": "multitenant.py",
+          "path": "edb/server/multitenant.py",
+          "type": "file"
+        },
+        {
+          "name": "net_worker.py",
+          "path": "edb/server/net_worker.py",
+          "type": "file"
+        },
+        {
+          "name": "pgcluster.py",
+          "path": "edb/server/pgcluster.py",
+          "type": "file"
+        },
+        {
+          "name": "pgcon",
+          "path": "edb/server/pgcon",
+          "type": "dir"
+        },
+        {
+          "name": "pgconnparams.py",
+          "path": "edb/server/pgconnparams.py",
+          "type": "file"
+        },
+        {
+          "name": "pgproto",
+          "path": "edb/server/pgproto",
+          "type": "file"
+        },
+        {
+          "name": "protocol",
+          "path": "edb/server/protocol",
+          "type": "dir"
+        },
+        {
+          "name": "rust_async_channel.py",
+          "path": "edb/server/rust_async_channel.py",
+          "type": "file"
+        },
+        {
+          "name": "server.py",
+          "path": "edb/server/server.py",
+          "type": "file"
+        },
+        {
+          "name": "service_manager.py",
+          "path": "edb/server/service_manager.py",
+          "type": "file"
+        },
+        {
+          "name": "smtp.py",
+          "path": "edb/server/smtp.py",
+          "type": "file"
+        },
+        {
+          "name": "tenant.py",
+          "path": "edb/server/tenant.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": ".gitignore",
+          "path": "edb/server/.gitignore",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 2,
+          "excerpt": "1: *.c\n2: *.html"
+        },
+        {
+          "name": "__init__.py",
+          "path": "edb/server/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 8,
+          "excerpt": "1: ##\n2: # Copyright (c) 2008-present MagicStack Inc.\n3: # All rights reserved.\n4: #\n5: # See LICENSE for details.\n6: ##\n7: \n8: from __future__ import annotations"
+        },
+        {
+          "name": "args.py",
+          "path": "edb/server/args.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #\n2: # This source file is part of the EdgeDB open source project.\n3: #\n4: # Copyright 2016-present MagicStack Inc. and the EdgeDB authors.\n5: #\n6: # Licensed under the Apache License, Version 2.0 (the \"License\");\n7: # you may not use this file except in compliance with the License.\n8: # You may obtain a copy of the License at\n9: #\n10: #     http://www.apache.org/licenses/LICENSE-2.0\n11: #\n12: # Unless required by applicable law or agreed to in writing, software\n13: # distributed under the License is distributed on an \"AS IS\" BASIS,"
+        },
+        {
+          "name": "auth.py",
+          "path": "edb/server/auth.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import datetime\n2: import pathlib\n3: \n4: from typing import TYPE_CHECKING, Iterable, Optional, Any\n5: \n6: if TYPE_CHECKING:\n7:     class SigningCtx:\n8:         def __init__(self) -> None: ...\n9:         def set_issuer(self, issuer: str) -> None: ...\n10:         def set_audience(self, audience: str) -> None: ...\n11:         def set_expiry(self, expiry: int) -> None: ...\n12:         def set_not_before(self, not_before: int) -> None: ...\n13: "
+        },
+        {
+          "name": "bootstrap.py",
+          "path": "edb/server/bootstrap.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #\n2: # This source file is part of the EdgeDB open source project.\n3: #\n4: # Copyright 2016-present MagicStack Inc. and the EdgeDB authors.\n5: #\n6: # Licensed under the Apache License, Version 2.0 (the \"License\");\n7: # you may not use this file except in compliance with the License.\n8: # You may obtain a copy of the License at\n9: #\n10: #     http://www.apache.org/licenses/LICENSE-2.0\n11: #\n12: # Unless required by applicable law or agreed to in writing, software\n13: # distributed under the License is distributed on an \"AS IS\" BASIS,"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "edb/server/server.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "70ce41340dd084c5c0becb6c0fe164c2fc408b63",
+          "html_url": "https://github.com/geldata/gel/commit/70ce41340dd084c5c0becb6c0fe164c2fc408b63",
+          "message": "Configurable query cache size (#9104)",
+          "author": "Aljaž Mur Eržen",
+          "date": "2025-11-03T15:37:48Z"
+        },
+        {
+          "sha": "16800131d3e4f6d2bf26afebd3bccfac17ece446",
+          "html_url": "https://github.com/geldata/gel/commit/16800131d3e4f6d2bf26afebd3bccfac17ece446",
+          "message": "Minimize FlatSchema interface (#9016)\n\nGoal of this PR is twofold:\n- improve performance of `s_schema.Schema` data structure,\n- minimize its interface,\n\nThe idea is to move as much behavior out of the data structure itself\ninto helper functions around it. For example:\n- `def get()` performs name res",
+          "author": "Aljaž Mur Eržen",
+          "date": "2025-10-27T06:51:36Z"
+        },
+        {
+          "sha": "ddf10d86b78bf74050229a94bb80de737a1ef825",
+          "html_url": "https://github.com/geldata/gel/commit/ddf10d86b78bf74050229a94bb80de737a1ef825",
+          "message": "Add a few type annotations & simplify reflection reader (#9003)\n\nThis PR:\n- adds a few type annotations to server code\n- removes an argument to `schema.reflection.parse_into()`, because it\nwas always set to an empty schema.\n\nThe latter change allows two more simplification that don't have\neffects, t",
+          "author": "Aljaž Mur Eržen",
+          "date": "2025-09-12T07:33:50Z"
+        },
+        {
+          "sha": "dd14037e03cb03359b5be5380433d62d57dca22c",
+          "html_url": "https://github.com/geldata/gel/commit/dd14037e03cb03359b5be5380433d62d57dca22c",
+          "message": "server: add cached branch limit to the compiler pool (#8621)\n\nThis PR adds a new option to the Gel server:\n\n```\n  --compiler-worker-branch-limit NUM\n                                  The maximum NUM of branches each compiler\n                                  worker could cache up to, default is 5.  ",
+          "author": "Fantix King",
+          "date": "2025-04-28T23:10:33Z"
+        },
+        {
+          "sha": "4f73b8ba8f13eb640cc5edda3c2f482631cbeab9",
+          "html_url": "https://github.com/geldata/gel/commit/4f73b8ba8f13eb640cc5edda3c2f482631cbeab9",
+          "message": "server: add --compiler-worker-max-rss (#8627)\n\nThis PR adds an option to set a memory limit for compiler workers. The\nworkers using more than the configured memory will be terminated\ngracefully, and the supervisor will respawn a new process.",
+          "author": "Fantix King",
+          "date": "2025-04-25T01:15:33Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "release_pgcon TODO warning This shouldn happen",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "edb/server/server.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "70ce41340dd084c5c0becb6c0fe164c2fc408b63",
+        "html_url": "https://github.com/geldata/gel/commit/70ce41340dd084c5c0becb6c0fe164c2fc408b63",
+        "message": "Configurable query cache size (#9104)",
+        "author": "Aljaž Mur Eržen",
+        "date": "2025-11-03T15:37:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

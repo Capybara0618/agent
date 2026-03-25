@@ -1,0 +1,348 @@
+{
+  "task_id": "380",
+  "repo_owner": "computational-cell-analytics",
+  "repo_name": "micro-sam",
+  "file_path": "micro_sam/evaluation/model_comparison.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T10:41:40+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 2,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 2,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T10:42:05+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T10:42:13+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "micro_sam/evaluation/model_comparison.py",
+    "original_code": "def _overlay_mask(image, mask):\n    # TODO add support for RGB inptus\n    assert image.ndim == 2\n    # overlay the mask\n    overlay = np.stack(\n        [image, image, image]\n    ).transpose((1, 2, 0))\n    mask_overlay = np.zeros_like(overlay)\n    mask_overlay[mask == 1] = [255, 0, 0]\n    alpha = 0.6\n    overlay = alpha * overlay + (1.0 - alpha) * mask_overlay\n    return overlay.astype(\"uint8\")",
+    "original_signature": "def _overlay_mask(image, mask):",
+    "satd_comment": "# TODO add support for RGB inptus",
+    "target_file": {
+      "ok": true,
+      "path": "micro_sam/evaluation/model_comparison.py",
+      "sha": "d401f79da87a464b048e9bf915db90b50a480902",
+      "download_url": "https://raw.githubusercontent.com/computational-cell-analytics/micro-sam/master/micro_sam/evaluation/model_comparison.py",
+      "content_excerpt": "\"\"\"Functionality for qualitative comparison of Segment Anything models on microscopy data.\n\"\"\"\n\nimport os\nfrom glob import glob\nfrom tqdm import tqdm\nfrom pathlib import Path\nfrom functools import partial\nfrom typing import Optional, Union, Dict, Any\n\nimport h5py\nimport numpy as np\nimport pandas as pd\nimport matplotlib.pyplot as plt\nimport skimage.draw as draw\nfrom skimage import exposure\nfrom scipy.ndimage import binary_dilation\nfrom skimage.segmentation import relabel_sequential, find_boundaries\n\nimport torch\n\nfrom .. import util\nfrom ..prompt_generators import PointAndBoxPromptGenerator\nfrom ..prompt_based_segmentation import segment_from_box, segment_from_points\n\n\n#\n# Compute all required data for the model comparison\n#\n\n\ndef _predict_models_with_loader(loader, n_samples, prompt_generator, predictor1, predictor2, predictor3, output_folder):\n    i = 0\n    os.makedirs(output_folder, exist_ok=True)\n\n    for x, y in tqdm(loader, total=n_samples):\n        out_path = os.path.join(output_folder, f\"sample_{i}.h5\")\n\n        im = x.numpy().squeeze()\n        if im.ndim == 3 and im.shape[0] == 3:\n            im = im.transpose((1, 2, 0))\n\n        gt = y.numpy().squeeze().astype(\"uint32\")\n        gt = relabel_sequential(gt)[0]\n\n        emb1 = util.precompute_image_embeddings(predictor1, im, ndim=2)\n        util.set_precomputed(predictor1, emb1)\n\n        emb2 = util.precompute_image_embeddings(predictor2, im, ndim=2)\n        util.set_precomputed(predictor2, emb2)\n\n        if predictor3 is not None:\n            emb3 = util.precompute_image_embeddings(predictor3, im, ndim=2)\n            util.set_precomputed(predictor3, emb3)\n\n        with h5py.File(out_path, \"a\") as f:\n            f.create_dataset(\"image\", data=im, compression=\"gzip\")\n\n        gt_ids = np.unique(gt)[1:]\n        centers, boxes = util.get_centers_and_bounding_boxes(gt)\n        centers = [centers[gt_id] for gt_id in gt_ids]\n        boxes = [boxes[gt_id] for gt_id in gt_ids]\n\n        object_masks = util.segmentation_to_one_hot(gt.astype(\"int64\"), gt_ids)\n        coords, labels, boxes, _ = prompt_generator(\n            segmentation=object_masks,\n            bbox_coordinates=boxes,\n            center_coordinates=centers,\n        )\n\n        for idx, gt_id in tqdm(enumerate(gt_ids), total=len(gt_ids)):\n\n            # Box prompts:\n            # Reorder the coordinates so that they match the normal python convention.\n            box = boxes[idx][[1, 0, 3, 2]]\n            mask1_box = segment_from_box(predictor1, box)\n            mask2_box = segment_from_box(predictor2, box)\n            mask1_box, mask2_box = mask1_box.squeeze(), mask2_box.squeeze()\n\n            if predictor3 is not None:\n                mask3_box = segment_from_box(predictor3, box)\n                mask3_box = mask3_box.squeeze()\n\n            # Point prompts:\n            # Reorder the coordinates so that they match the normal python convention.\n            point_coords, point_labels = np.array(coords[idx])[:, ::-1], np.array(labels[idx])\n            mask1_points = segment_from_points(predictor1, point_coords, point_labels)\n            mask2_points = segment_from_points(predictor2, point_coords, point_labels)\n            mask1_points, mask2_points = mask1_points.squeeze(), mask2_points.squeeze()\n\n            if predictor3 is not None:\n                mask3_points = segment_from_points(predictor3, point_coords, point_labels)\n                mask3_points = mask3_points.squeeze()\n\n            gt_mask = gt == gt_id\n            with h5py.File(out_path, \"a\") as f:\n                g = f.create_group(str(gt_id))\n                g.attrs[\"point_coords\"] = point_coords\n                g.attrs[\"point_labels\"] = point_labels\n                g.attrs[\"box\"] = box\n\n                g.create_dataset(\"gt_mask\", data=gt_mask, compression=\"gzip\")\n                g.create_dataset(\"box/mask1\", data=mask1_box.astype(\"uint8\"), compression=\"gzip\")\n                g.create_dataset(\"box/mask2\", data=mask2_box.astype(\"uint8\"), compression=\"gzip\")\n                g.create_dataset(\"points/mask1\", data=mask1_points.astype(\"uint8\"), compression=\"gzip\")\n                g.create_dataset(\"points/mask2\", data=mask2_points.astype(\"uint8\"), compression=\"gzip\")\n\n                if predictor3 is not None:\n                    g.create_dataset(\"box/mask3\", data=mask3_box.astype(\"uint8\"), compression=\"gzip\")\n                    g.create_dataset(\"points/mask3\", data=mask3_points.astype(\"uint8\"), compression=\"gzip\")\n\n        i += 1\n        if i >= n_samples:\n            return\n\n\ndef generate_data_for_model_comparison(\n    loader: torch.utils.data.DataLoader,\n    output_folder: Union[str, os.PathLike],\n    model_type1: str,\n    model_type2: str,\n    n_samples: int,\n    model_type3: Optional[str] = None,\n    checkpoint1: Optional[Union[str, os.PathLike]] = None,\n    checkpoint2: Optional[Union[str, os.PathLike]] = None,\n    checkpoint3: Optional[Union[str, os.PathLike]] = None,\n    peft_kwargs1: Optional[Dict[str, Any]] = None,\n    peft_kwargs2: Optional[Dict[str, Any]] = None,\n    peft_kwargs3: Optional[Dict[str, Any]] = None,\n) -> None:\n    \"\"\"Generate samples for qualitative model comparison.\n\n    This precomputes the input for `model_comparison` and `model_comparison_with_napari`.\n\n    Args:\n        loader: The torch dataloader from which samples are drawn.\n        output_folder: The folder where the samples will be saved.\n        model_type1: The first model to use for comparison.\n            The value needs to be a valid model_type for `micro_sam.util.get_sam_model`.\n        model_type2: The second model to use for comparison.\n            The value needs to be a valid model_type for `micro_sam.util.get_sam_model`.\n        n_samples: The number of samples to draw from the dataloader.\n        checkpoint1: Optional checkpoint for the first model.\n        checkpoint2: Optional checkpoint for the second model.\n        checkpoint3: Optional checkpoint for the third model.\n    \"\"\"\n    prompt_generator = PointAndBoxPromptGenerator(\n        n_positive_points=1,\n        n_negative_points=0,\n        dilation_strength=3,\n        get_point_prompts=True,\n        get_box_prompts=True,\n    )\n\n    predictor1 = util.get_sam_model(model_type=model_type1, checkpoint_path=checkpoint1, peft_kwargs=peft_kwargs1)\n    predictor2 = util.get_sam_model(model_type=model_type2, checkpoint_path=checkpoint2, peft_kwargs=peft_kwargs2)\n\n    if model_type3 is not None:\n        predictor3 = util.get_sam_model(model_type=model_type3, checkpoint_path=checkpoint3, peft_kwargs=peft_kwargs3)\n    else:\n        predictor3 = None\n\n    _predict_models_with_loader(loader, n_samples, prompt_generator, predictor1, predictor2, predictor3, output_folder)\n\n\n#\n# Visual evaluation according to metrics\n#\n\n\ndef _evaluate_samples(f, prefix, min_size):\n    eval_result = {\n        \"gt_id\": [],\n        \"score1\": [],\n        \"score2\": [],\n    }\n    for name, group in f.items():\n        if name == \"image\":\n            continue\n\n        gt_mask = group[\"gt_mask\"][:]\n\n        size = gt_mask.sum()\n        if size < min_size:\n            continue\n\n        m1 = group[f\"{prefix}/mask1\"][:]\n        m2 = group[f\"{prefix}/mask2\"][:]\n\n        score1 = util.compute_iou(gt_mask, m1)\n        score2 = util.compute_iou(gt_mask, m2)\n\n        eval_result[\"gt_id\"].append(name)\n        eval_result[\"score1\"].append(score1)\n        eval_result[\"score2\"].append(score2)\n\n    eval_result = pd.DataFrame.from_dict(eval_result)\n    eval_result[\"advantage1\"] = eval_result[\"score1\"] - eval_result[\"score2\"]\n    eval_result[\"advantage2\"] = eval_result[\"score2\"] - eval_result[\"score1\"]\n    return eval_result\n\n\ndef _overlay_mask(image, mask, alpha=0.6):\n    assert image.ndim in (2, 3)\n    # overlay the mask\n    if image.ndim == 2:\n        overlay = np.stack([image, image, image]).transpose((1, 2, 0))\n    else:\n        overlay = image\n    assert overlay.shape[-1] == 3\n    mask_overlay = np.zeros_like(overlay)\n    mask_overlay[mask == 1] = [255, 0, 0]\n    alpha = alpha\n    overlay = alpha * overlay + (1.0 - alpha) * mask_overlay\n    return overlay.astype(\"uint8\")\n\n\ndef _enhance_image(im, do_norm=True):\n    # apply CLAHE to improve the image quality\n    if do_norm:\n        im -= im.min(axis=(0, 1), keepdims=True)\n        im /= (im.max(axis=(0, 1), keepdims=True) + 1e-6)\n    im = exposure.equalize_adapthist(im)\n    im *= 255\n    return im\n\n\ndef _overlay_outline(im, mask, outline_dilation):\n    outline = find_boundaries(mask)\n    if outline_dilation > 0:\n        outline = binary_dilation(outline, iterations=outline_dilation)\n    overlay = im.copy()\n    overlay[outline] = [255, 255, 0]\n    return overlay\n\n\ndef _overlay_box(im, prompt, outline_dilation):\n    start, end = prompt\n    rr, cc = draw.rectangle_perimeter(start, end=end, shape=im.shape[:2])\n\n    box_outline = np.zeros(im.shape[:2], dtype=\"bool\")\n    box_outline[rr, cc] = 1\n    if outline_dilation > 0:\n        box_outline = binary_dilation(box_outline, iterations=outline_dilation)\n\n    overlay = im.copy()\n    overlay[box_outline] = [0, 255, 255]\n\n    return overlay\n\n\n# NOTE: we currently only support a single point\ndef _overlay_points(im, prompt, radius):\n    coords, labels = prompt\n    # make sure we have a single positive prompt, other options are\n    # currently not supported\n    assert coords.shape[0] == labels.shape[0] == 1\n    assert labels[0] == 1\n\n    rr, cc = draw.disk(coords[0], radius, shape=im.shape[:2])\n    overlay = im.copy()\n    draw.set_color(overlay, (rr, cc), [0, 255, 255], alpha=1.0)\n\n    return overlay\n\n\ndef _compare_eval(\n    f, eval_result, advantage_column, n_images_per_sample, prefix, sample_name,\n    plot_folder, point_radius, outline_dilation, have_model3, enhance_image,\n):\n    result = eval_result.sort_values(advantage_column, ascending=False).iloc[:n_images_per_sample]\n    n_rows = result.shape[0]\n\n    image = f[\"image\"][:]\n    is_box_prompt = prefix == \"box\"\n    overlay_prompts = partial(_overlay_box, outline_dilation=outline_dilation) if is_box_prompt else\\\n        partial(_overlay_points, radius=point_radius)\n\n    def make_square(bb, shape):\n        box_shape = [b.stop - b.start for b in bb]\n        longest_side = max(box_shape)\n        padding = [(longest_side - sh) // 2 for sh in box_shape]\n        bb = tuple(\n            slice(max(b.start - pad, 0), min(b.stop + pad, sh)) for b, pad, sh in zip(bb, padding, shape)\n        )\n        return bb\n\n    def plot_ax(axis, i, row):\n        g = f[row.gt_id]\n\n        gt = g[\"gt_mask\"][:]\n        mask1 = g[f\"{prefix}/mask1\"][:]\n        mask2 = g[f\"{prefix}/mask2\"][:]\n\n        # The mask3 is just for comparison purpose, we just plot the crops as it is.\n        if have_model3:\n            mask3 = g[f\"{prefix}/mask3\"][:]\n\n        fg_mask = (gt + mask1 + mask2) > 0\n        # if this is a box prompt we dilate the mask so that the bounding box\n        # can be seen\n        if is_box_prompt:\n            fg_mask = binary_dilation(fg_mask, iterations=5)\n        bb = np.where(fg_mask)\n        bb = tuple(\n            slice(int(b.min()), int(b.max() + 1)) for b in bb\n        )\n        bb = make_square(bb, fg_mask.shape)\n\n        offset = np.array([b.start for b in bb])\n        if is_box_prompt:\n            prompt = g.attrs[\"box\"]\n            prompt = np.array(\n                [prompt[:2], prompt[2:]]\n            ) - offset\n        else:\n            prompt = (g.attrs[\"point_coords\"] - offset, g.attrs[\"point_labels\"])\n\n        if enhance_image:\n            im = _enhance_image(image[bb])\n        else:\n            im = image[bb]\n\n        gt, mask1, mask2 = gt[bb], mask1[bb], mask2[bb]\n\n        if have_model3:\n            mask3 = mask3[bb]\n\n        im1 = _overlay_mask(im, mask1)\n        im1 = _overlay_outline(im1, gt, outline_dilation)\n        im1 = overlay_prompts(im1, prompt)\n        ax = axis[0] if i is None else axis[i, 0]\n        ax.axis(\"off\")\n        ax.imshow(im1)\n\n        # We put the third set of comparsion point in between\n        # so that the comparison looks -> default, gener",
+      "total_lines": 501
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 203,
+      "end_line": 215,
+      "excerpt": "def _overlay_mask(image, mask, alpha=0.6):\n    assert image.ndim in (2, 3)\n    # overlay the mask\n    if image.ndim == 2:\n        overlay = np.stack([image, image, image]).transpose((1, 2, 0))\n    else:\n        overlay = image\n    assert overlay.shape[-1] == 3\n    mask_overlay = np.zeros_like(overlay)\n    mask_overlay[mask == 1] = [255, 0, 0]\n    alpha = alpha\n    overlay = alpha * overlay + (1.0 - alpha) * mask_overlay\n    return overlay.astype(\"uint8\")",
+      "symbol_name": "_overlay_mask",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "micro_sam/evaluation/model_comparison.py",
+      "sha": "d401f79da87a464b048e9bf915db90b50a480902",
+      "download_url": "https://raw.githubusercontent.com/computational-cell-analytics/micro-sam/master/micro_sam/evaluation/model_comparison.py"
+    },
+    "imports": {
+      "imports": [
+        "os",
+        "glob:glob",
+        "tqdm:tqdm",
+        "pathlib:Path",
+        "functools:partial",
+        "typing:Optional",
+        "typing:Union",
+        "typing:Dict",
+        "typing:Any",
+        "h5py",
+        "numpy",
+        "pandas",
+        "matplotlib.pyplot",
+        "skimage.draw",
+        "skimage:exposure",
+        "scipy.ndimage:binary_dilation",
+        "skimage.segmentation:relabel_sequential",
+        "skimage.segmentation:find_boundaries",
+        "torch",
+        ":util",
+        "prompt_generators:PointAndBoxPromptGenerator",
+        "prompt_based_segmentation:segment_from_box",
+        "prompt_based_segmentation:segment_from_points",
+        "napari"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/computational-cell-analytics/micro-sam/master/README.md",
+      "content_excerpt": "[![DOC](https://shields.mitmproxy.org/badge/docs-pdoc.dev-brightgreen.svg)](https://computational-cell-analytics.github.io/micro-sam/)\n[![Conda](https://anaconda.org/conda-forge/micro_sam/badges/version.svg)](https://anaconda.org/conda-forge/micro_sam)\n[![codecov](https://codecov.io/gh/computational-cell-analytics/micro-sam/graph/badge.svg?token=7ETPP5CABP)](https://codecov.io/gh/computational-cell-analytics/micro-sam)\n[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7919746.svg)](https://doi.org/10.5281/zenodo.7919746)\n\n# Segment Anything for Microscopy\n\n<a href=\"https://github.com/computational-cell-analytics/micro-sam\"><img src=\"https://github.com/computational-cell-analytics/micro-sam/blob/master/doc/logo/logo_and_text.png\" width=\"300\" align=\"right\">\n\nTools for segmentation and tracking in microscopy build on top of [Segment Anything](https://segment-anything.com/).\nSegment and track objects in microscopy images interactively with a few clicks!\n\nWe implement napari applications for:\n- interactive 2d segmentation (Left: interactive cell segmentation)\n- interactive 3d segmentation (Middle: interactive mitochondria segmentation in EM)\n- interactive tracking of 2d image data (Right: interactive cell tracking)\n\n<img src=\"https://github.com/computational-cell-analytics/micro-sam/assets/4263537/d04cb158-9f5b-4460-98cd-023c4f19cccd\" width=\"256\">\n<img src=\"https://github.com/computational-cell-analytics/micro-sam/assets/4263537/dfca3d9b-dba5-440b-b0f9-72a0683ac410\" width=\"256\">\n<img src=\"https://github.com/computational-cell-analytics/micro-sam/assets/4263537/aefbf99f-e73a-41"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_overlay_mask test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_overlay_mask(\"",
+      "count": 2,
+      "items": [
+        {
+          "name": "model_comparison.py",
+          "path": "micro_sam/evaluation/model_comparison.py",
+          "sha": "d401f79da87a464b048e9bf915db90b50a480902",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/blob/e5fbd0ba16cbe85243035031241962e07f1577fe/micro_sam/evaluation/model_comparison.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 203,
+          "end_line": 215,
+          "excerpt": "def _overlay_mask(image, mask, alpha=0.6):\n    assert image.ndim in (2, 3)\n    # overlay the mask\n    if image.ndim == 2:\n        overlay = np.stack([image, image, image]).transpose((1, 2, 0))\n    else:\n        overlay = image\n    assert overlay.shape[-1] == 3\n    mask_overlay = np.zeros_like(overlay)\n    mask_overlay[mask == 1] = [255, 0, 0]\n    alpha = alpha\n    overlay = alpha * overlay + (1.0 - alpha) * mask_overlay\n    return overlay.astype(\"uint8\")",
+          "symbol_name": "_overlay_mask",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "compare_benchmarks.py",
+          "path": "scripts/qualitative_comparison/compare_benchmarks.py",
+          "sha": "cf083cba9c227a6ebebed576519c83858c424afa",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/blob/e5fbd0ba16cbe85243035031241962e07f1577fe/scripts/qualitative_comparison/compare_benchmarks.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 68,
+          "end_line": 92,
+          "excerpt": "68:     sscores = np.array(all_res[\"score\"]).argsort()[::-1]\n69:     best_image_ids = [all_res.iloc[sscore][\"name\"] for sscore in sscores]\n70: \n71:     for image_path, gt_path in zip(all_images, all_gt):\n72:         image_id = os.path.split(image_path)[-1]\n73:         if Path(image_id).stem not in best_image_ids:\n74:             continue\n75: \n76:         gt = imageio.imread(gt_path)\n77: \n78:         image = imageio.imread(image_path)\n79:         image = _enhance_image(image, do_norm=True if dataset_name == \"covid_if\" else False)\n80:         image = _overlay_mask(image, gt, alpha=0.95)\n81:         image = _overlay_outline(image, gt, 0)\n82: \n83:         amg_vanilla = imageio.imread(os.path.join(amg_vanilla_root, image_id))\n84:         amg_spec = imageio.imread(os.path.join(amg_spec_root, image_id))\n85:         ais_spec = imageio.imread(os.path.join(ais_spec_root, image_id))\n86: \n87:         cellpose_seg = imageio.imread(\n88:             os.path.join(\n89:                 cellpose_root, image_id if dataset_name == \"livecell\" else f\"covid_if_{Path(image_id).stem}_00001.tif\"\n90:             )\n91:         )\n92: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "micro_sam/evaluation",
+      "count": 9,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "micro_sam/evaluation/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "benchmark_datasets.py",
+          "path": "micro_sam/evaluation/benchmark_datasets.py",
+          "type": "file"
+        },
+        {
+          "name": "evaluation.py",
+          "path": "micro_sam/evaluation/evaluation.py",
+          "type": "file"
+        },
+        {
+          "name": "experiments.py",
+          "path": "micro_sam/evaluation/experiments.py",
+          "type": "file"
+        },
+        {
+          "name": "inference.py",
+          "path": "micro_sam/evaluation/inference.py",
+          "type": "file"
+        },
+        {
+          "name": "instance_segmentation.py",
+          "path": "micro_sam/evaluation/instance_segmentation.py",
+          "type": "file"
+        },
+        {
+          "name": "livecell.py",
+          "path": "micro_sam/evaluation/livecell.py",
+          "type": "file"
+        },
+        {
+          "name": "model_comparison.py",
+          "path": "micro_sam/evaluation/model_comparison.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_dimensional_segmentation.py",
+          "path": "micro_sam/evaluation/multi_dimensional_segmentation.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "micro_sam/evaluation/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"Functionality for evaluating Segment Anything models on microscopy data.\n2: \"\"\"\n3: \n4: from .instance_segmentation import (\n5:     run_instance_segmentation_inference,\n6:     run_instance_segmentation_grid_search,\n7:     run_instance_segmentation_grid_search_and_inference,\n8: )\n9: from .evaluation import (\n10:     run_evaluation,\n11:     run_evaluation_for_iterative_prompting,\n12: )\n13: from .inference import ("
+        },
+        {
+          "name": "benchmark_datasets.py",
+          "path": "micro_sam/evaluation/benchmark_datasets.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import os\n2: import time\n3: from glob import glob\n4: from tqdm import tqdm\n5: from natsort import natsorted\n6: from typing import Union, Optional, List, Literal\n7: \n8: import numpy as np\n9: import pandas as pd\n10: import imageio.v3 as imageio\n11: from skimage.measure import label as connected_components\n12: \n13: from nifty.tools import blocking"
+        },
+        {
+          "name": "evaluation.py",
+          "path": "micro_sam/evaluation/evaluation.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"Evaluation functionality for segmentation predictions from `micro_sam.evaluation.automatic_mask_generation`\n2: and `micro_sam.evaluation.inference`.\n3: \"\"\"\n4: \n5: import os\n6: from glob import glob\n7: from tqdm import tqdm\n8: from pathlib import Path\n9: from natsort import natsorted\n10: from typing import List, Optional, Union\n11: \n12: import numpy as np\n13: import pandas as pd"
+        },
+        {
+          "name": "experiments.py",
+          "path": "micro_sam/evaluation/experiments.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"Predefined experiment settings for experiments with different prompt strategies.\n2: \"\"\"\n3: \n4: from typing import Dict, List, Optional\n5: \n6: \n7: # TODO fully define the dict type\n8: ExperimentSetting = Dict\n9: ExperimentSettings = List[ExperimentSetting]\n10: \"\"\"@private\"\"\"\n11: \n12: \n13: def full_experiment_settings("
+        },
+        {
+          "name": "inference.py",
+          "path": "micro_sam/evaluation/inference.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"Inference with Segment Anything models and different prompt strategies.\n2: \"\"\"\n3: \n4: import os\n5: import pickle\n6: import numpy as np\n7: from tqdm import tqdm\n8: from copy import deepcopy\n9: from typing import Any, Dict, List, Optional, Union, Tuple\n10: \n11: import imageio.v3 as imageio\n12: from skimage.segmentation import relabel_sequential\n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "micro_sam/evaluation/model_comparison.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "031d9fb1967de4738ffd7ce8ff35e766e93a6bfc",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/commit/031d9fb1967de4738ffd7ce8ff35e766e93a6bfc",
+          "message": "Minor update to support peft kwargs in qualitative comparsion scripts (#845)\n\nMake qualitative comparison scripts flexible!",
+          "author": "Anwai Archit",
+          "date": "2025-01-29T13:56:08Z"
+        },
+        {
+          "sha": "f20416f927703b3765dc49dc5820bd2e0247bfcc",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/commit/f20416f927703b3765dc49dc5820bd2e0247bfcc",
+          "message": "Make minor code semantics changes in core module (#823)\n\nUpdate to doc strings and type annotations",
+          "author": "Anwai Archit",
+          "date": "2025-01-02T22:13:54Z"
+        },
+        {
+          "sha": "8add576465b21048522b00e5f3680a85d52d04cb",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/commit/8add576465b21048522b00e5f3680a85d52d04cb",
+          "message": "Update docstrings to document recent functionalities (#664)\n\nUpdate docstrings",
+          "author": "Anwai Archit",
+          "date": "2024-07-24T07:29:34Z"
+        },
+        {
+          "sha": "464da5b274d10d1116aec161319630522d384677",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/commit/464da5b274d10d1116aec161319630522d384677",
+          "message": "Update plots for the paper (#415)\n\nScripts for qualitative and quantitative plotting",
+          "author": "Anwai Archit",
+          "date": "2024-04-17T16:02:06Z"
+        },
+        {
+          "sha": "e1365a76c2282da964aca760a3313a43a7a102ef",
+          "html_url": "https://github.com/computational-cell-analytics/micro-sam/commit/e1365a76c2282da964aca760a3313a43a7a102ef",
+          "message": "New model updates (#509)\n\nAdd bioimage.io model export and prepare new model uploads",
+          "author": "Constantin Pape",
+          "date": "2024-04-12T17:57:21Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_overlay_mask TODO support inptus",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "micro_sam/evaluation/model_comparison.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "031d9fb1967de4738ffd7ce8ff35e766e93a6bfc",
+        "html_url": "https://github.com/computational-cell-analytics/micro-sam/commit/031d9fb1967de4738ffd7ce8ff35e766e93a6bfc",
+        "message": "Minor update to support peft kwargs in qualitative comparsion scripts (#845)\n\nMake qualitative comparison scripts flexible!",
+        "author": "Anwai Archit",
+        "date": "2025-01-29T13:56:08Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "existing function _overlay_mask with clear input/output",
+        "repository contains updated _overlay_mask supporting RGB",
+        "no complex dependencies or side effects",
+        "unit test framework present in repo (though no direct test found for this function)",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 2,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

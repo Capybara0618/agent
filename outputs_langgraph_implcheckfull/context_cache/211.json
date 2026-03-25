@@ -1,0 +1,381 @@
+{
+  "task_id": "211",
+  "repo_owner": "catchpoint",
+  "repo_name": "WebPageTest.agent",
+  "file_path": "internal/support/trace_parser.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T08:54:34+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T08:55:03+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T08:55:14+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "internal/support/trace_parser.py",
+    "original_code": "def ProcessTimelineEvent(self, timeline_event, parent):\n    start = timeline_event['s'] - self.start_time\n    end = timeline_event['e'] - self.start_time\n    if end > start:\n        elapsed = end - start\n        thread = timeline_event['t']\n        name = self.event_name_lookup[timeline_event['n']]\n\n        # Keep track of periods on the main thread where at least 500ms are\n        # available with no tasks longer than 50ms\n        if 'main_thread' in self.cpu and thread == self.cpu['main_thread']:\n            if elapsed > 50000:\n                if start - self.interactive_start > 500000:\n                    self.interactive.append(\n                        [int(math.ceil(self.interactive_start / 1000.0)),\n                         int(math.floor(start / 1000.0))])\n                self.interactive_start = end\n                self.interactive_end = None\n            else:\n                self.interactive_end = end\n\n        if 'js' in timeline_event:\n            script = timeline_event['js']\n            js_start = start / 1000.0\n            js_end = end / 1000.0\n            if self.scripts is None:\n                self.scripts = {}\n            if 'main_thread' not in self.scripts and 'main_thread' in self.cpu:\n                self.scripts['main_thread'] = self.cpu['main_thread']\n            if thread not in self.scripts:\n                self.scripts[thread] = {}\n            if script not in self.scripts[thread]:\n                self.scripts[thread][script] = {}\n            if name not in self.scripts[thread][script]:\n                self.scripts[thread][script][name] = []\n            # make sure the script duration isn't already covered by a\n            # parent event\n            # TODO: Optimize this lookup, it is a very hot/slow spot\n            new_duration = True\n            if len(self.scripts[thread][script][name]):\n                for period in self.scripts[thread][script][name]:\n                    if len(period) >= 2 and js_start >= period[0] and js_end <= period[1]:\n                        new_duration = False\n                        break\n            if new_duration:\n                self.scripts[thread][script][name].append([js_start, js_end])\n\n        slice_usecs = self.cpu['slice_usecs']\n        first_slice = int(float(start) / float(slice_usecs))\n        last_slice = int(float(end) / float(slice_usecs))\n        for slice_number in xrange(first_slice, last_slice + 1):\n            slice_start = slice_number * slice_usecs\n            slice_end = slice_start + slice_usecs\n            used_start = max(slice_start, start)\n            used_end = min(slice_end, end)\n            slice_elapsed = used_end - used_start\n            self.AdjustTimelineSlice(\n                thread, slice_number, name, parent, slice_elapsed)\n\n        # Recursively process any child events\n        if 'c' in timeline_event:\n            for child in timeline_event['c']:\n                self.ProcessTimelineEvent(child, name)",
+    "original_signature": "def ProcessTimelineEvent(self, timeline_event, parent):",
+    "satd_comment": "# TODO: Optimize this lookup, it is a very hot/slow spot",
+    "target_file": {
+      "ok": true,
+      "path": "internal/support/trace_parser.py",
+      "sha": "027694c09feee32b78e28d65d52c2e00a1846f67",
+      "download_url": "https://raw.githubusercontent.com/catchpoint/WebPageTest.agent/master/internal/support/trace_parser.py",
+      "content_excerpt": "#!/usr/bin/env python\n\"\"\"\nCopyright 2019 WebPageTest LLC.\nCopyright 2016 Google Inc.\nCopyright 2020 Catchpoint Systems Inc.\nUse of this source code is governed by the Polyform Shield 1.0.0 license that can be\nfound in the LICENSE.md file.\n\"\"\"\nimport gzip\nimport logging\nimport math\nimport os\nimport re\nimport sys\nimport time\nif (sys.version_info >= (3, 0)):\n    from urllib.parse import urlparse # pylint: disable=import-error\n    unicode = str\n    GZIP_TEXT = 'wt'\n    GZIP_READ_TEXT = 'rt'\nelse:\n    from urlparse import urlparse # pylint: disable=import-error\n    GZIP_TEXT = 'w'\n    GZIP_READ_TEXT = 'r'\n\n# try a fast json parser if it is installed\ntry:\n    import ujson as json\nexcept BaseException:\n    import json\n\n##########################################################################\n#   Trace processing\n##########################################################################\nclass Trace():\n    \"\"\"Main class\"\"\"\n    def __init__(self):\n        self.thread_stack = {}\n        self.ignore_threads = {}\n        self.threads = {}\n        self.user_timing = []\n        self.event_names = {}\n        self.event_name_lookup = {}\n        self.scripts = None\n        self.timeline_events = []\n        self.timeline_requests = {}\n        self.trace_events = []\n        self.interactive = None\n        self.long_tasks = None\n        self.interactive_start = 0\n        self.interactive_end = None\n        self.start_time = None\n        self.marked_start_time = None\n        self.end_time = None\n        self.cpu = {'main_thread': None, 'main_threads':[], 'subframes': [], 'valid': False}\n        self.page_data = {'values': {}, 'times': {}}\n        self.feature_usage = None\n        self.feature_usage_start_time = None\n        self.netlog = {'bytes_in': 0, 'bytes_out': 0, 'next_request_id': 1000000}\n        self.netlog_requests = None\n        self.netlog_event_types = {}\n        self.v8stats = None\n        self.v8stack = {}\n        self.PRIORITY_MAP = {\n            \"VeryHigh\": \"Highest\",\n            \"HIGHEST\": \"Highest\",\n            \"MEDIUM\": \"High\",\n            \"LOW\": \"Medium\",\n            \"LOWEST\": \"Low\",\n            \"IDLE\": \"Lowest\",\n            \"VeryLow\": \"Lowest\"\n        }\n        return\n\n    ##########################################################################\n    #   Output Logging\n    ##########################################################################\n    def write_json(self, out_file, json_data):\n        \"\"\"Write out one of the internal structures as a json blob\"\"\"\n        try:\n            _, ext = os.path.splitext(out_file)\n            if ext.lower() == '.gz':\n                with gzip.open(out_file, GZIP_TEXT) as f:\n                    json.dump(json_data, f)\n            else:\n                with open(out_file, 'w') as f:\n                    json.dump(json_data, f)\n        except BaseException:\n            logging.exception(\"Error writing to \" + out_file)\n\n    def WriteUserTiming(self, out_file, dom_tree=None, performance_timing=None):\n        self.post_process_netlog_events()\n        out = self.post_process_user_timing(dom_tree, performance_timing)\n        if out is not None:\n            self.write_json(out_file, out)\n\n    def WriteCPUSlices(self, out_file):\n        if self.cpu['valid']:\n            self.write_json(out_file, self.cpu)\n\n    def WriteScriptTimings(self, out_file):\n        if self.scripts is not None:\n            self.write_json(out_file, self.scripts)\n\n    def WriteFeatureUsage(self, out_file):\n        self.post_process_netlog_events()\n        out = self.post_process_feature_usage()\n        if out is not None:\n            self.write_json(out_file, out)\n    \n    def WritePageData(self, out_file):\n        if len(self.page_data) and self.start_time is not None:\n            out = {}\n            for key in self.page_data['values']:\n                out[key] = self.page_data['values'][key]\n            for key in self.page_data['times']:\n                value = self.page_data['times'][key]\n                if value >= self.start_time:\n                    out[key] = int(round(float(value - self.start_time) / 1000.0))\n            if len(out):\n                self.write_json(out_file, out)\n\n    def WriteInteractive(self, out_file):\n        # Generate the interactive periods from the long-task data\n        if self.end_time and self.start_time and self.long_tasks is not None:\n            interactive = []\n            end_time = int(math.ceil(float(self.end_time - self.start_time) / 1000.0))\n            if not self.long_tasks:\n                interactive.append([0, end_time])\n            else:\n                last_end = 0\n                for task in self.long_tasks:\n                    elapsed = task[0] - last_end\n                    if elapsed > 0:\n                        interactive.append([last_end, task[0]])\n                    last_end = task[1]\n                elapsed = end_time - last_end\n                if elapsed > 0:\n                    interactive.append([last_end, end_time])\n            self.write_json(out_file, interactive)\n    \n    def WriteLongTasks(self, out_file):\n        if self.long_tasks is not None:\n            self.write_json(out_file, self.long_tasks)\n\n    def WriteNetlog(self, out_file):\n        out = self.post_process_netlog_events()\n        if out is not None:\n            self.write_json(out_file, out)\n    \n    def WriteTimelineRequests(self, out_file):\n        if self.timeline_requests:\n            self.write_json(out_file, self.timeline_requests)\n\n    def WriteV8Stats(self, out_file):\n        if self.v8stats is not None:\n            self.v8stats[\"main_thread\"] = self.cpu['main_thread']\n            self.v8stats[\"main_threads\"] = self.cpu['main_threads']\n            self.write_json(out_file, self.v8stats)\n\n    ##########################################################################\n    #   Top-level processing\n    ##########################################################################\n    def Process(self, trace):\n        f = None\n        line_mode = False\n        self.__init__()\n        logging.debug(\"Loading trace: %s\", trace)\n        try:\n            _, ext = os.path.splitext(trace)\n            if ext.lower() == '.gz':\n                f = gzip.open(trace, GZIP_READ_TEXT)\n            else:\n                f = open(trace, 'r')\n            for line in f:\n                try:\n                    trace_event = json.loads(line.strip(\"\\r\\n\\t ,\"))\n                    if not line_mode and 'traceEvents' in trace_event:\n                        for sub_event in trace_event['traceEvents']:\n                            self.FilterTraceEvent(sub_event)\n                    else:\n                        line_mode = True\n                        self.FilterTraceEvent(trace_event)\n                except BaseException:\n                    logging.exception('Error processing trace line')\n        except BaseException:\n            logging.exception(\"Error processing trace \" + trace)\n        if f is not None:\n            f.close()\n        self.ProcessTraceEvents()\n\n    def ProcessTimeline(self, timeline):\n        self.__init__()\n        self.cpu['main_thread'] = '0'\n        self.threads['0'] = {}\n        events = None\n        f = None\n        try:\n            _, ext = os.path.splitext(timeline)\n            if ext.lower() == '.gz':\n                f = gzip.open(timeline, GZIP_READ_TEXT)\n            else:\n                f = open(timeline, 'r')\n            events = json.load(f)\n            if events:\n                # convert the old format timeline events into our internal\n                # representation\n                for event in events:\n                    if 'method' in event and 'params' in event:\n                        if self.start_time is None:\n                            if event['method'] == 'Network.requestWillBeSent' and \\\n                                    'timestamp' in event['params']:\n                                self.start_time = event['params']['timestamp'] * 1000000.0\n                                self.end_time = event['params']['timestamp'] * 1000000.0\n                        else:\n                            if 'timestamp' in event['params']:\n                                t = event['params']['timestamp'] * 1000000.0\n                                if t > self.end_time:\n                                    self.end_time = t\n                            if event['method'] == 'Timeline.eventRecorded' and \\\n                                    'record' in event['params']:\n                                e = self.ProcessOldTimelineEvent(\n                                    event['params']['record'], None)\n                                if e is not None:\n                                    self.timeline_events.append(e)\n                self.ProcessTimelineEvents()\n        except BaseException:\n            logging.exception(\"Error processing timeline \" + timeline)\n        if f is not None:\n            f.close()\n\n    def FilterTraceEvent(self, trace_event):\n        cat = trace_event['cat']\n        if cat == 'toplevel' or cat == 'ipc,toplevel':\n            return\n        if cat == 'devtools.timeline' or \\\n                cat == '__metadata' or \\\n                cat.find('devtools.timeline') >= 0 or \\\n                cat.find('blink.feature_usage') >= 0 or \\\n                cat.find('blink.user_timing') >= 0 or \\\n                cat.find('blink.resource') >= 0 or \\\n                cat.find('loading') >= 0 or \\\n                cat.find('navigation') >= 0 or \\\n                cat.find('rail') >= 0 or \\\n                cat.find('netlog') >= 0 or \\\n                cat.find('v8') >= 0:\n            self.trace_events.append(trace_event)\n\n    def ProcessTraceEvents(self):\n        # sort the raw trace events by timestamp and then process them\n        if len(self.trace_events):\n            logging.debug(\"Sorting %d trace events\", len(self.trace_events))\n            self.trace_events.sort(key=lambda trace_event: trace_event['ts'])\n            logging.debug(\"Processing trace events\")\n            for trace_event in self.trace_events:\n                self.ProcessTraceEvent(trace_event)\n            self.trace_events = []\n\n        # Post-process the netlog events (may shift the start time)\n        logging.debug(\"Processing netlog events\")\n        self.post_process_netlog_events()\n        # Do the post-processing on timeline events\n        logging.debug(\"Processing timeline events\")\n        self.ProcessTimelineEvents()\n        logging.debug(\"Done processing trace events\")      \n\n    def ProcessTraceEvent(self, trace_event):\n        cat = trace_event['cat']\n        if 'ts' in trace_event:\n            trace_event['ts'] = int(trace_event['ts'])\n        if cat.find('blink.user_timing') >= 0 or cat.find('rail') >= 0 or \\\n                cat.find('loading') >= 0 or cat.find('navigation') >= 0:\n            keep = False\n            if 'args' in trace_event and \\\n                    'data' in trace_event['args'] and \\\n                    'inMainFrame' in trace_event['args']['data'] and \\\n                    trace_event['args']['data']['inMainFrame']:\n                keep = True\n            elif 'args' in trace_event and 'frame' in trace_event['args']:\n                keep = True\n            elif 'name' in trace_event and trace_event['name'] in [\n                    'navigationStart', 'unloadEventStart', 'redirectStart', 'domLoading']:\n                keep = True\n            if keep:\n                self.user_timing.append(trace_event)\n            if self.marked_start_time is None and \\\n                    'name' in trace_event and \\\n                    trace_event['name'].find('navigationStart') >= 0:\n                if self.start_time is None or trace_event['ts'] < self.start_time:\n                    self.start_time = trace_event['ts']\n            if self.cpu['main_thread'] is None and 'name' in trace_event and \\\n                    trace_event['name'] in ['navigationStart', 'fetchStart']:\n                thread = '{0}:{1}'.format(trace_event['pid'], trace_event['tid",
+      "total_lines": 6807
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 759,
+      "end_line": 854,
+      "excerpt": "    def ProcessTimelineEvent(self, timeline_event, parent, stack=None):\n        start = timeline_event['s'] - self.start_time\n        end = timeline_event['e'] - self.start_time\n        if self.long_tasks is None:\n            self.long_tasks = []\n        self.cpu['valid'] = True\n        if stack is None:\n            stack = {}\n        if end > start:\n            elapsed = end - start\n            thread = timeline_event['t']\n            name = self.event_name_lookup[timeline_event['n']]\n\n            # Keep track of periods on the main thread where at least 500ms are\n            # available with no tasks longer than 50ms\n            if 'main_thread' in self.cpu and thread == self.cpu['main_thread']:\n                if elapsed > 50000:\n                    if start - self.interactive_start > 500000:\n                        self.interactive.append(\n                            [int(math.ceil(self.interactive_start / 1000.0)),\n                             int(math.floor(start / 1000.0))])\n                    self.interactive_start = end\n                    self.interactive_end = None\n                else:\n                    self.interactive_end = end\n            \n            # Keep track of the long-duration top-level tasks\n            if parent is None and elapsed > 50000 and thread in self.cpu['main_threads']:\n                # make sure this isn't contained within an existing event\n                ms_start = int(math.floor(start / 1000.0))\n                ms_end = int(math.ceil(end / 1000.0))\n                if not self.long_tasks:\n                    # Empty list of long tasks\n                    self.long_tasks.append([ms_start, ms_end])\n                else:\n                    last_start = self.long_tasks[-1][0]\n                    last_end = self.long_tasks[-1][1]\n                    if ms_start >= last_end:\n                        # This task is entirely after the last long task we know about\n                        self.long_tasks.append([ms_start, ms_end])\n                    elif ms_end > last_end:\n                        # task extends beyond the previous end of the long tasks but overlaps\n                        del self.long_tasks[-1]\n                  ",
+      "symbol_name": "ProcessTimelineEvent",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "internal/support/trace_parser.py",
+      "sha": "027694c09feee32b78e28d65d52c2e00a1846f67",
+      "download_url": "https://raw.githubusercontent.com/catchpoint/WebPageTest.agent/master/internal/support/trace_parser.py"
+    },
+    "imports": {
+      "imports": [
+        "gzip",
+        "logging",
+        "math",
+        "os",
+        "re",
+        "sys",
+        "time",
+        "urllib.parse:urlparse",
+        "urlparse:urlparse",
+        "ujson",
+        "argparse",
+        "json"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/catchpoint/WebPageTest.agent/master/README.md",
+      "content_excerpt": "# `wptagent`\n\nCross-platform WebPageTest agent\n\n- 🥡 [Installation instructons](docs/install.md)\n- 🐋 [Docker instructions](docs/docker.md)\n\n## Contributing\n\nThere are separate lines of development under different licenses (pull requests accepted to either):\n\n- The `master` branch where most active development occurs has the [Polyform Shield 1.0.0 license](LICENSE.md)\n- The `apache` branch has the more permissive [Apache 2.0 license](https://opensource.org/licenses/Apache-2.0)\n\n## Supported Platforms/Browsers\n\n- Chromium-based browsers are the only ones that currently support manipulating requests (changing headers, blocking requests, etc). Firefox and Safari do not currently support capturing response bodies and running optimization checks.\n- All browsers should support basic page loading, scripts, and video capture on all platforms.\n- Traffic-shaping is supported on all platforms.\n\n### ⚠️ Known Issues\n\n- Internet Explorer does not support manipulating requests (adding headers, blocking requests, etc)\n\n### Linux (with display, or headless with [Xvfb])\n\n- Chrome: Stable, Beta, and Unstable\n- Firefox: Stable and Nightly\n- Opera: Stable, Beta, and Developer\n- Brave: Stable, Beta, Dev, and Nightly\n- Microsoft Edge: Dev\n- Epiphany: Ubuntu 20.04+\n- Vivaldi\n\n### Windows\n\n- Chrome: Stable, Beta, Dev and Canary\n- Firefox: Stable, ESR, Developer Edition, Beta, and Nightly\n- Microsoft Edge: Legacy and Chromium-based\n- Internet Explorer\n- Opera: Stable, Beta and Developer\n- Brave: Stable, Beta, Dev and Nightly\n\n### MacOS (Intel and Apple Silicon)\n\n- Chrome: Stable and Canary\n- Firefox: "
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "ProcessTimelineEvent test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"ProcessTimelineEvent(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "trace_parser.py",
+          "path": "internal/support/trace_parser.py",
+          "sha": "027694c09feee32b78e28d65d52c2e00a1846f67",
+          "html_url": "https://github.com/catchpoint/WebPageTest.agent/blob/560e4d5a5ca10b479c925e90a6f19cfbc655f5b7/internal/support/trace_parser.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 759,
+          "end_line": 854,
+          "excerpt": "    def ProcessTimelineEvent(self, timeline_event, parent, stack=None):\n        start = timeline_event['s'] - self.start_time\n        end = timeline_event['e'] - self.start_time\n        if self.long_tasks is None:\n            self.long_tasks = []\n        self.cpu['valid'] = True\n        if stack is None:\n            stack = {}\n        if end > start:\n            elapsed = end - start\n            thread = timeline_event['t']\n            name = self.event_name_lookup[timeline_event['n']]\n\n            # Keep track of periods on the main thread where at least 500ms are\n            # available with no tasks longer than 50ms\n            if 'main_thread' in self.cpu and thread == self.cpu['main_thread']:\n                if elapsed > 50000:\n                    if start - self.interactive_start > 500000:\n                        self.interactive.append(\n                            [int(math.ceil(self.interactive_start / 1000.0)),\n                             int(math.floor(start / 1000.0))])\n                    self.interactive_start = end\n                    self.interactive_end = None\n                else:\n                    self.interactive_end = end\n            \n            # Keep track of the long-duration top-level tasks\n            if parent is None and elapsed > 50000 and thread in self.cpu['main_threads']:\n                # make sure this isn't contained within an existing event\n                ms_start = int(math.floor(start / 1000.0))\n                ms_end = int(math.ceil(end / 1000.0))\n                if not self.long_tasks:\n                    # Empty list of long tasks\n                    self.long_tasks.append([ms_start, ms_end])\n                else:\n                    last_start = self.long_tasks[-1][0]\n                    last_end = self.long_tasks[-1][1]\n                    if ms_start >= last_end:\n                        # This task is entirely after the last long task we know about\n                        self.long_tasks.append([ms_start, ms_end])\n                    elif ms_end > last_end:\n                        # task extends beyond the previous end of the long tasks but overlaps\n                        del self.long_tasks[-1]\n                  ",
+          "symbol_name": "ProcessTimelineEvent",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "internal/support",
+      "count": 21,
+      "entries": [
+        {
+          "name": "Firefox",
+          "path": "internal/support/Firefox",
+          "type": "dir"
+        },
+        {
+          "name": "IE",
+          "path": "internal/support/IE",
+          "type": "dir"
+        },
+        {
+          "name": "Wappalyzer",
+          "path": "internal/support/Wappalyzer",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "internal/support/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "adblock",
+          "path": "internal/support/adblock",
+          "type": "dir"
+        },
+        {
+          "name": "android",
+          "path": "internal/support/android",
+          "type": "dir"
+        },
+        {
+          "name": "axe",
+          "path": "internal/support/axe",
+          "type": "dir"
+        },
+        {
+          "name": "chrome",
+          "path": "internal/support/chrome",
+          "type": "dir"
+        },
+        {
+          "name": "devtools_parser.py",
+          "path": "internal/support/devtools_parser.py",
+          "type": "file"
+        },
+        {
+          "name": "ec2",
+          "path": "internal/support/ec2",
+          "type": "dir"
+        },
+        {
+          "name": "edge",
+          "path": "internal/support/edge",
+          "type": "dir"
+        },
+        {
+          "name": "firefox_log_parser.py",
+          "path": "internal/support/firefox_log_parser.py",
+          "type": "file"
+        },
+        {
+          "name": "keys.json",
+          "path": "internal/support/keys.json",
+          "type": "file"
+        },
+        {
+          "name": "netlog.py",
+          "path": "internal/support/netlog.py",
+          "type": "file"
+        },
+        {
+          "name": "osx",
+          "path": "internal/support/osx",
+          "type": "dir"
+        },
+        {
+          "name": "pcap-parser.py",
+          "path": "internal/support/pcap-parser.py",
+          "type": "file"
+        },
+        {
+          "name": "trace_parser.py",
+          "path": "internal/support/trace_parser.py",
+          "type": "file"
+        },
+        {
+          "name": "visualmetrics.py",
+          "path": "internal/support/visualmetrics.py",
+          "type": "file"
+        },
+        {
+          "name": "wasm-stats",
+          "path": "internal/support/wasm-stats",
+          "type": "dir"
+        },
+        {
+          "name": "windows",
+          "path": "internal/support/windows",
+          "type": "dir"
+        },
+        {
+          "name": "winshaper",
+          "path": "internal/support/winshaper",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "internal/support/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "devtools_parser.py",
+          "path": "internal/support/devtools_parser.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: \"\"\"\n3: Copyright 2019 WebPageTest LLC.\n4: Copyright 2016 Google Inc.\n5: Copyright 2020 Catchpoint Systems Inc.\n6: Use of this source code is governed by the Polyform Shield 1.0.0 license that can be\n7: found in the LICENSE.md file.\n8: \"\"\"\n9: import gzip\n10: import logging\n11: import os\n12: import re\n13: import sys"
+        },
+        {
+          "name": "firefox_log_parser.py",
+          "path": "internal/support/firefox_log_parser.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: \"\"\"\n3: Copyright 2019 WebPageTest LLC.\n4: Copyright 2016 Google Inc.\n5: Copyright 2020 Catchpoint Systems Inc.\n6: Use of this source code is governed by the Polyform Shield 1.0.0 license that can be\n7: found in the LICENSE.md file.\n8: \"\"\"\n9: import glob\n10: import gzip\n11: import logging\n12: import os\n13: import re"
+        },
+        {
+          "name": "keys.json",
+          "path": "internal/support/keys.json",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: {\n2:     \"0\": { \"keyCode\": 48, \"key\": \"0\", \"code\": \"Digit0\" },\n3:     \"1\": { \"keyCode\": 49, \"key\": \"1\", \"code\": \"Digit1\" },\n4:     \"2\": { \"keyCode\": 50, \"key\": \"2\", \"code\": \"Digit2\" },\n5:     \"3\": { \"keyCode\": 51, \"key\": \"3\", \"code\": \"Digit3\" },\n6:     \"4\": { \"keyCode\": 52, \"key\": \"4\", \"code\": \"Digit4\" },\n7:     \"5\": { \"keyCode\": 53, \"key\": \"5\", \"code\": \"Digit5\" },\n8:     \"6\": { \"keyCode\": 54, \"key\": \"6\", \"code\": \"Digit6\" },\n9:     \"7\": { \"keyCode\": 55, \"key\": \"7\", \"code\": \"Digit7\" },\n10:     \"8\": { \"keyCode\": 56, \"key\": \"8\", \"code\": \"Digit8\" },\n11:     \"9\": { \"keyCode\": 57, \"key\": \"9\", \"code\": \"Digit9\" },\n12:     \"Power\": { \"key\": \"Power\", \"code\": \"Power\" },\n13:     \"Eject\": { \"key\": \"Eject\", \"code\": \"Eject\" },"
+        },
+        {
+          "name": "netlog.py",
+          "path": "internal/support/netlog.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python3\n2: \"\"\"\n3: Copyright 2019 WebPageTest LLC.\n4: Copyright 2022 Google Inc.\n5: Copyright 2022 Catchpoint Systems Inc.\n6: Use of this source code is governed by the Polyform Shield 1.0.0 license that can be\n7: found in the LICENSE.md file.\n8: \"\"\"\n9: import base64\n10: import gzip\n11: import logging\n12: import os\n13: import re"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "internal/support/trace_parser.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "12da79c86b41a0ac3413ed42c2956c5f679faf5e",
+          "html_url": "https://github.com/catchpoint/WebPageTest.agent/commit/12da79c86b41a0ac3413ed42c2956c5f679faf5e",
+          "message": "Update Chrome feature names",
+          "author": "Patrick Meenan",
+          "date": "2023-07-06T15:54:53Z"
+        },
+        {
+          "sha": "d16455fb34e1b09b3a741232963f5e11eca6dd2e",
+          "html_url": "https://github.com/catchpoint/WebPageTest.agent/commit/d16455fb34e1b09b3a741232963f5e11eca6dd2e",
+          "message": "Updated Chrome feature name mapping",
+          "author": "Patrick Meenan",
+          "date": "2023-06-01T15:02:46Z"
+        },
+        {
+          "sha": "d7bae5e46c77a79fff61725216b7f2c22185a273",
+          "html_url": "https://github.com/catchpoint/WebPageTest.agent/commit/d7bae5e46c77a79fff61725216b7f2c22185a273",
+          "message": "Updated Chrome features",
+          "author": "Patrick Meenan",
+          "date": "2023-03-27T14:45:03Z"
+        },
+        {
+          "sha": "9fa8bd244cca11f82efbdb7ee1a9bf3dc53fd38e",
+          "html_url": "https://github.com/catchpoint/WebPageTest.agent/commit/9fa8bd244cca11f82efbdb7ee1a9bf3dc53fd38e",
+          "message": "Updated Chrome feature mappings",
+          "author": "Patrick Meenan",
+          "date": "2023-01-23T15:50:30Z"
+        },
+        {
+          "sha": "7120f255c98c4b796e1bc609102359d9d9543a7f",
+          "html_url": "https://github.com/catchpoint/WebPageTest.agent/commit/7120f255c98c4b796e1bc609102359d9d9543a7f",
+          "message": "Updated Chrome frature names",
+          "author": "Patrick Meenan",
+          "date": "2022-12-26T15:54:31Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "ProcessTimelineEvent TODO Optimize this lookup very",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "internal/support/trace_parser.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "12da79c86b41a0ac3413ed42c2956c5f679faf5e",
+        "html_url": "https://github.com/catchpoint/WebPageTest.agent/commit/12da79c86b41a0ac3413ed42c2956c5f679faf5e",
+        "message": "Update Chrome feature names",
+        "author": "Patrick Meenan",
+        "date": "2023-07-06T15:54:53Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "performance profiling data",
+        "unit tests for ProcessTimelineEvent",
+        "benchmark results",
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

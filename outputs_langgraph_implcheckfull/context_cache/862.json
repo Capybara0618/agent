@@ -1,0 +1,376 @@
+{
+  "task_id": "862",
+  "repo_owner": "tensorpack",
+  "repo_name": "tensorpack",
+  "file_path": "tensorpack/tfutils/summary.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T03:00:38+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T03:00:51+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T03:00:56+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "tensorpack/tfutils/summary.py",
+    "original_code": "def add_activation_summary(x, name=None):\n    \"\"\"\n    Add summary for an activation tensor x.  If name is None, use x.name.\n\n    Args:\n        x (tf.Tensor): the tensor to summary.\n    \"\"\"\n    ctx = get_current_tower_context()\n    if ctx is not None and not ctx.is_main_training_tower:\n        return\n    ndim = x.get_shape().ndims\n    # TODO use scalar if found ndim == 1\n    assert ndim >= 2, \\\n        \"Summary a scalar with histogram? Maybe use scalar instead. FIXME!\"\n    if name is None:\n        name = x.name\n    with tf.name_scope('activation-summary'):\n        tf.summary.histogram(name, x)\n        tf.summary.scalar(name + '-sparsity', tf.nn.zero_fraction(x))\n        tf.summary.scalar(name + '-rms', rms(x))",
+    "original_signature": "def add_activation_summary(x, name=None):",
+    "satd_comment": "# TODO use scalar if found ndim == 1",
+    "target_file": {
+      "ok": true,
+      "path": "tensorpack/tfutils/summary.py",
+      "sha": "3face8a06a27e2c65eeb674afb3f31afba97fe01",
+      "download_url": "https://raw.githubusercontent.com/tensorpack/tensorpack/master/tensorpack/tfutils/summary.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# File: summary.py\n\n\nimport re\nfrom contextlib import contextmanager\nimport six\nfrom six.moves import range\nfrom tensorflow.python.training import moving_averages\n\nfrom ..compat import tfv1 as tf\nfrom ..utils import logger\nfrom ..utils.argtools import graph_memoized\nfrom ..utils.naming import MOVING_SUMMARY_OPS_KEY\nfrom .scope_utils import cached_name_scope\nfrom .symbolic_functions import rms\nfrom .tower import get_current_tower_context\n\n__all__ = ['add_tensor_summary', 'add_param_summary',\n           'add_activation_summary', 'add_moving_summary',\n           ]\n\n\n# some scope stuff to use internally...\n@graph_memoized\ndef _get_cached_vs(name):\n    with tf.variable_scope(name) as scope:\n        return scope\n\n\n@contextmanager\ndef _enter_vs_reuse_ns(name):\n    vs = _get_cached_vs(name)\n    # XXX Not good to enter the cached vs directly, because this will clean-up custom getter\n    # with tf.variable_scope(name, reuse=tf.AUTO_REUSE):    # available in 1.4 only\n    with tf.variable_scope(vs):\n        with tf.name_scope(vs.original_name_scope):\n            yield vs\n\n\ndef create_scalar_summary(name, v):\n    \"\"\"\n    Args:\n        name (str):\n        v (float): scalar value\n    Returns:\n        tf.Summary: a tf.Summary object with name and simple scalar value v.\n    \"\"\"\n    assert isinstance(name, six.string_types), type(name)\n    v = float(v)\n    s = tf.Summary()\n    s.value.add(tag=name, simple_value=v)\n    return s\n\n\ndef create_image_summary(name, val):\n    \"\"\"\n    Args:\n        name(str):\n        val(np.ndarray): 4D tensor of NHWC. assume RGB if C==3.\n            Can be either float or uint8. Range has to be [0,255].\n\n    Returns:\n        tf.Summary:\n    \"\"\"\n    assert isinstance(name, six.string_types), type(name)\n    n, h, w, c = val.shape\n    val = val.astype('uint8')\n    s = tf.Summary()\n    imparams = [cv2.IMWRITE_PNG_COMPRESSION, 9]\n    for k in range(n):\n        arr = val[k]\n        # CV2 will only write correctly in BGR chanel order\n        if c == 3:\n            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)\n        elif c == 4:\n            arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)\n        tag = name if n == 1 else '{}/{}'.format(name, k)\n        retval, img_str = cv2.imencode('.png', arr, imparams)\n        if not retval:\n            # Encoding has failed.\n            continue\n        img_str = img_str.tostring()\n\n        img = tf.Summary.Image()\n        img.height = h\n        img.width = w\n        # 1 - grayscale 3 - RGB 4 - RGBA\n        img.colorspace = c\n        img.encoded_image_string = img_str\n        s.value.add(tag=tag, image=img)\n    return s\n\n\ndef add_tensor_summary(x, types, name=None, collections=None,\n                       main_tower_only=True):\n    \"\"\"\n    Summarize a tensor by different methods.\n\n    Args:\n        x (tf.Tensor): a tensor to summarize\n        types (list[str]): summary types, can be scalar/histogram/sparsity/mean/rms\n        name (str): summary name. Defaults to be the op name.\n        collections (list[str]): collections of the summary ops.\n        main_tower_only (bool): Only run under main training tower. If\n            set to True, calling this function under other TowerContext\n            has no effect.\n\n    Example:\n\n    .. code-block:: python\n\n        with tf.name_scope('mysummaries'):  # to not mess up tensorboard\n            add_tensor_summary(\n                tensor, ['histogram', 'rms', 'sparsity'], name='mytensor')\n    \"\"\"\n    types = set(types)\n    if name is None:\n        name = x.op.name\n    ctx = get_current_tower_context()\n    if main_tower_only and ctx is not None and not ctx.is_main_training_tower:\n        return\n\n    SUMMARY_TYPES_DIC = {\n        'scalar': lambda: tf.summary.scalar(name + '-summary', x, collections=collections),\n        'histogram': lambda: tf.summary.histogram(name + '-histogram', x, collections=collections),\n        'sparsity': lambda: tf.summary.scalar(\n            name + '-sparsity', tf.nn.zero_fraction(x),\n            collections=collections),\n        'mean': lambda: tf.summary.scalar(\n            name + '-mean', tf.reduce_mean(x),\n            collections=collections),\n        'rms': lambda: tf.summary.scalar(\n            name + '-rms', rms(x), collections=collections)\n    }\n    for typ in types:\n        SUMMARY_TYPES_DIC[typ]()\n\n\ndef add_activation_summary(x, types=None, name=None, collections=None):\n    \"\"\"\n    Call :func:`add_tensor_summary` under a reused 'activation-summary' name scope.\n    This function is a no-op if not calling from main training tower.\n\n    Args:\n        x (tf.Tensor): the tensor to summary.\n        types (list[str]): summary types, defaults to ``['sparsity', 'rms', 'histogram']``.\n        name (str): if is None, use x.name.\n        collections (list[str]): collections of the summary ops.\n    \"\"\"\n    ndim = x.get_shape().ndims\n    if ndim < 2:\n        logger.warn(\"Cannot summarize scalar activation {}\".format(x.name))\n        return\n    if types is None:\n        types = ['sparsity', 'rms', 'histogram']\n    with cached_name_scope('activation-summary'):\n        add_tensor_summary(x, types, name=name, collections=collections)\n\n\ndef add_param_summary(*summary_lists, **kwargs):\n    \"\"\"\n    Add summary ops for all trainable variables matching the regex, under a\n    reused 'param-summary' name scope.\n    This function is a no-op if not calling from main training tower.\n\n    Args:\n        summary_lists (list): each is (regex, [list of summary type]).\n            Summary type is defined in :func:`add_tensor_summary`.\n        collections (list[str]): collections of the summary ops.\n\n    Example:\n\n    .. code-block:: python\n\n        add_param_summary(\n            ('.*/W', ['histogram', 'rms']),\n            ('.*/gamma', ['scalar']),\n        )\n    \"\"\"\n    collections = kwargs.pop('collections', None)\n    assert len(kwargs) == 0, \"Unknown kwargs: \" + str(kwargs)\n    ctx = get_current_tower_context()\n    if ctx is not None and not ctx.is_main_training_tower:\n        return\n\n    params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)\n    with cached_name_scope('param-summary'):\n        for p in params:\n            name = p.op.name\n            for rgx, actions in summary_lists:\n                if not rgx.endswith('$'):\n                    rgx = rgx + '$'\n                if re.match(rgx, name):\n                    add_tensor_summary(p, actions, name=name, collections=collections)\n\n\ndef add_moving_summary(*args, **kwargs):\n    \"\"\"\n    Summarize the moving average for scalar tensors.\n    This function is a no-op if not calling from main training tower.\n    See tutorial at https://tensorpack.readthedocs.io/tutorial/summary.html\n\n    Args:\n        args: scalar tensors to summarize\n        decay (float): the decay rate. Defaults to 0.95.\n        collection (str or None): the name of the collection to add EMA-maintaining ops.\n            The default will work together with the default\n            :class:`MovingAverageSummary` callback.\n        summary_collections ([str]): the names of collections to add the\n            summary op. Default is TF's default (`tf.GraphKeys.SUMMARIES`).\n\n    Returns:\n        [tf.Tensor]:\n            list of tensors returned by assign_moving_average,\n            which can be used to maintain the EMA.\n    \"\"\"\n    decay = kwargs.pop('decay', 0.95)\n    coll = kwargs.pop('collection', MOVING_SUMMARY_OPS_KEY)\n    summ_coll = kwargs.pop('summary_collections', None)\n    assert len(kwargs) == 0, \"Unknown arguments: \" + str(kwargs)\n\n    ctx = get_current_tower_context()\n    # allow ctx to be none\n    if ctx is not None and not ctx.is_main_training_tower:\n        return []\n\n    graph = tf.get_default_graph()\n    try:\n        control_flow_ctx = graph._get_control_flow_context()\n        # XLA does not support summaries anyway\n        # However, this function will generate unnecessary dependency edges,\n        # which makes the tower function harder to compile under XLA, so we skip it\n        if control_flow_ctx is not None and control_flow_ctx.IsXLAContext():\n            return\n    except Exception:\n        pass\n\n    if tf.get_variable_scope().reuse is True:\n        logger.warn(\"add_moving_summary() called under reuse=True scope, ignored.\")\n        return []\n\n    for x in args:\n        assert isinstance(x, (tf.Tensor, tf.Variable)), x\n        assert x.get_shape().ndims == 0, \\\n            \"add_moving_summary() only accepts scalar tensor! Got one with {}\".format(x.get_shape())\n\n    from ..graph_builder.utils import override_to_local_variable\n    ema_ops = []\n    for c in args:\n        name = re.sub('tower[0-9]+/', '', c.op.name)\n        with tf.name_scope(None), override_to_local_variable(True):\n            if not c.dtype.is_floating:\n                c = tf.cast(c, tf.float32)\n            # assign_moving_average creates variables with op names, therefore clear ns first.\n            with _enter_vs_reuse_ns('EMA') as vs:\n                ema_var = tf.get_variable(name, shape=c.shape, dtype=c.dtype,\n                                          initializer=tf.constant_initializer(),\n                                          trainable=False)\n                ns = vs.original_name_scope\n            with tf.name_scope(ns):     # reuse VS&NS so that EMA_1 won't appear\n                ema_op = moving_averages.assign_moving_average(\n                    ema_var, c, decay,\n                    zero_debias=True, name=name + '_EMA_apply')\n            ema_ops.append(ema_op)\n        with tf.name_scope(None):\n            tf.summary.scalar(\n                name + '-summary', ema_op,\n                collections=summ_coll)    # write the EMA value as a summary\n    if coll is not None:\n        for op in ema_ops:\n            tf.add_to_collection(coll, op)\n    return ema_ops\n\n\ntry:\n    import cv2\nexcept ImportError:\n    from ..utils.develop import create_dummy_func\n    create_image_summary = create_dummy_func('create_image_summary', 'cv2')  # noqa\n",
+      "total_lines": 280
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 140,
+      "end_line": 158,
+      "excerpt": "def add_activation_summary(x, types=None, name=None, collections=None):\n    \"\"\"\n    Call :func:`add_tensor_summary` under a reused 'activation-summary' name scope.\n    This function is a no-op if not calling from main training tower.\n\n    Args:\n        x (tf.Tensor): the tensor to summary.\n        types (list[str]): summary types, defaults to ``['sparsity', 'rms', 'histogram']``.\n        name (str): if is None, use x.name.\n        collections (list[str]): collections of the summary ops.\n    \"\"\"\n    ndim = x.get_shape().ndims\n    if ndim < 2:\n        logger.warn(\"Cannot summarize scalar activation {}\".format(x.name))\n        return\n    if types is None:\n        types = ['sparsity', 'rms', 'histogram']\n    with cached_name_scope('activation-summary'):\n        add_tensor_summary(x, types, name=name, collections=collections)",
+      "symbol_name": "add_activation_summary",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "tensorpack/tfutils/summary.py",
+      "sha": "3face8a06a27e2c65eeb674afb3f31afba97fe01",
+      "download_url": "https://raw.githubusercontent.com/tensorpack/tensorpack/master/tensorpack/tfutils/summary.py"
+    },
+    "imports": {
+      "imports": [
+        "re",
+        "contextlib:contextmanager",
+        "six",
+        "six.moves:range",
+        "tensorflow.python.training:moving_averages",
+        "compat:tfv1",
+        "utils:logger",
+        "utils.argtools:graph_memoized",
+        "utils.naming:MOVING_SUMMARY_OPS_KEY",
+        "scope_utils:cached_name_scope",
+        "symbolic_functions:rms",
+        "tower:get_current_tower_context",
+        "graph_builder.utils:override_to_local_variable",
+        "cv2",
+        "utils.develop:create_dummy_func"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/tensorpack/tensorpack/master/README.md",
+      "content_excerpt": "![Tensorpack](https://github.com/tensorpack/tensorpack/raw/master/.github/tensorpack.png)\n\nTensorpack is a neural network training interface based on graph-mode TensorFlow.\n\n[![ReadTheDoc](https://readthedocs.org/projects/tensorpack/badge/?version=latest)](http://tensorpack.readthedocs.io)\n[![Gitter chat](https://img.shields.io/badge/chat-on%20gitter-46bc99.svg)](https://gitter.im/tensorpack/users)\n[![model-zoo](https://img.shields.io/badge/model-zoo-brightgreen.svg)](http://models.tensorpack.com)\n## Features:\n\nIt's Yet Another TF high-level API, with the following highlights:\n\n1. Focus on __training speed__.\n  + Speed comes for free with Tensorpack -- it uses TensorFlow in the __efficient way__ with no extra overhead.\n    On common CNNs, it runs training [1.2~5x faster](https://github.com/tensorpack/benchmarks/tree/master/other-wrappers) than the equivalent Keras code.\n    Your training can probably gets faster if written with Tensorpack.\n\n  + Scalable data-parallel multi-GPU / distributed training strategy is off-the-shelf to use.\n    See [tensorpack/benchmarks](https://github.com/tensorpack/benchmarks) for more benchmarks.\n\n2. Squeeze the best data loading performance of Python with [`tensorpack.dataflow`](https://github.com/tensorpack/dataflow).\n  + Symbolic programming (e.g. `tf.data`) [does not](https://tensorpack.readthedocs.io/tutorial/philosophy/dataflow.html#alternative-data-loading-solutions)\n    offer the data processing flexibility needed in research.\n    Tensorpack squeezes the most performance out of __pure Python__ with various autoparallelization strategies"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "add_activation_summary test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"add_activation_summary(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "summary.py",
+          "path": "tensorpack/tfutils/summary.py",
+          "sha": "3face8a06a27e2c65eeb674afb3f31afba97fe01",
+          "html_url": "https://github.com/tensorpack/tensorpack/blob/1547a54e8546494614ca31c984a1bfd1d0e24b77/tensorpack/tfutils/summary.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 140,
+          "end_line": 158,
+          "excerpt": "def add_activation_summary(x, types=None, name=None, collections=None):\n    \"\"\"\n    Call :func:`add_tensor_summary` under a reused 'activation-summary' name scope.\n    This function is a no-op if not calling from main training tower.\n\n    Args:\n        x (tf.Tensor): the tensor to summary.\n        types (list[str]): summary types, defaults to ``['sparsity', 'rms', 'histogram']``.\n        name (str): if is None, use x.name.\n        collections (list[str]): collections of the summary ops.\n    \"\"\"\n    ndim = x.get_shape().ndims\n    if ndim < 2:\n        logger.warn(\"Cannot summarize scalar activation {}\".format(x.name))\n        return\n    if types is None:\n        types = ['sparsity', 'rms', 'histogram']\n    with cached_name_scope('activation-summary'):\n        add_tensor_summary(x, types, name=name, collections=collections)",
+          "symbol_name": "add_activation_summary",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "tensorpack/tfutils",
+      "count": 20,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "tensorpack/tfutils/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "argscope.py",
+          "path": "tensorpack/tfutils/argscope.py",
+          "type": "file"
+        },
+        {
+          "name": "collect_env.py",
+          "path": "tensorpack/tfutils/collect_env.py",
+          "type": "file"
+        },
+        {
+          "name": "collection.py",
+          "path": "tensorpack/tfutils/collection.py",
+          "type": "file"
+        },
+        {
+          "name": "common.py",
+          "path": "tensorpack/tfutils/common.py",
+          "type": "file"
+        },
+        {
+          "name": "dependency.py",
+          "path": "tensorpack/tfutils/dependency.py",
+          "type": "file"
+        },
+        {
+          "name": "distributed.py",
+          "path": "tensorpack/tfutils/distributed.py",
+          "type": "file"
+        },
+        {
+          "name": "export.py",
+          "path": "tensorpack/tfutils/export.py",
+          "type": "file"
+        },
+        {
+          "name": "gradproc.py",
+          "path": "tensorpack/tfutils/gradproc.py",
+          "type": "file"
+        },
+        {
+          "name": "model_utils.py",
+          "path": "tensorpack/tfutils/model_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "optimizer.py",
+          "path": "tensorpack/tfutils/optimizer.py",
+          "type": "file"
+        },
+        {
+          "name": "scope_utils.py",
+          "path": "tensorpack/tfutils/scope_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "sesscreate.py",
+          "path": "tensorpack/tfutils/sesscreate.py",
+          "type": "file"
+        },
+        {
+          "name": "sessinit.py",
+          "path": "tensorpack/tfutils/sessinit.py",
+          "type": "file"
+        },
+        {
+          "name": "summary.py",
+          "path": "tensorpack/tfutils/summary.py",
+          "type": "file"
+        },
+        {
+          "name": "symbolic_functions.py",
+          "path": "tensorpack/tfutils/symbolic_functions.py",
+          "type": "file"
+        },
+        {
+          "name": "tower.py",
+          "path": "tensorpack/tfutils/tower.py",
+          "type": "file"
+        },
+        {
+          "name": "unit_tests.py",
+          "path": "tensorpack/tfutils/unit_tests.py",
+          "type": "file"
+        },
+        {
+          "name": "varmanip.py",
+          "path": "tensorpack/tfutils/varmanip.py",
+          "type": "file"
+        },
+        {
+          "name": "varreplace.py",
+          "path": "tensorpack/tfutils/varreplace.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "tensorpack/tfutils/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #  -*- coding: utf-8 -*-\n2: #  File: __init__.py\n3: \n4: \n5: from .tower import get_current_tower_context, TowerContext\n6: \n7: # https://github.com/celery/kombu/blob/7d13f9b95d0b50c94393b962e6def928511bfda6/kombu/__init__.py#L34-L36\n8: STATICA_HACK = True\n9: globals()['kcah_acitats'[::-1].upper()] = False\n10: if STATICA_HACK:\n11:     from .common import *\n12:     from .sessinit import *\n13:     from .argscope import *"
+        },
+        {
+          "name": "argscope.py",
+          "path": "tensorpack/tfutils/argscope.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: # File: argscope.py\n3: \n4: import copy\n5: from collections import defaultdict\n6: from contextlib import contextmanager\n7: from functools import wraps\n8: from inspect import getmembers, isfunction\n9: import tensorflow as tf\n10: \n11: from ..compat import is_tfv2\n12: from ..utils import logger\n13: from .model_utils import get_shape_str"
+        },
+        {
+          "name": "collect_env.py",
+          "path": "tensorpack/tfutils/collect_env.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \n2: import os\n3: import sys\n4: import psutil\n5: import tensorflow as tf\n6: import numpy as np\n7: from collections import defaultdict, OrderedDict\n8: from tabulate import tabulate\n9: \n10: import tensorpack\n11: from ..compat import tfv1\n12: from ..utils.utils import find_library_full_path as find_library\n13: from ..utils.nvml import NVMLContext"
+        },
+        {
+          "name": "collection.py",
+          "path": "tensorpack/tfutils/collection.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: # File: collection.py\n3: \n4: \n5: from contextlib import contextmanager\n6: from copy import copy\n7: import six\n8: \n9: from ..compat import tfv1 as tf\n10: \n11: from ..utils import logger\n12: from ..utils.argtools import memoized\n13: "
+        },
+        {
+          "name": "common.py",
+          "path": "tensorpack/tfutils/common.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: # File: common.py\n3: \n4: import tensorflow as tf\n5: \n6: from ..compat import tfv1\n7: from ..utils.argtools import graph_memoized\n8: from .collect_env import collect_env_info\n9: \n10: \n11: __all__ = ['get_default_sess_config',\n12:            'get_global_step_value',\n13:            'get_global_step_var',"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "tensorpack/tfutils/summary.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "02e53f72a70ac2ceb8dc5798b046277610418cf1",
+          "html_url": "https://github.com/tensorpack/tensorpack/commit/02e53f72a70ac2ceb8dc5798b046277610418cf1",
+          "message": "make add_moving_summary use local variables, so they are not broadcasted",
+          "author": "Yuxin Wu",
+          "date": "2020-08-25T06:10:49Z"
+        },
+        {
+          "sha": "399a74dfa594ec891c1da5553394b8155f64453d",
+          "html_url": "https://github.com/tensorpack/tensorpack/commit/399a74dfa594ec891c1da5553394b8155f64453d",
+          "message": "update sphinx==3.0",
+          "author": "Yuxin Wu",
+          "date": "2020-04-11T22:58:36Z"
+        },
+        {
+          "sha": "80a68c5942d5de507012b4bbef38ed7f86798c5a",
+          "html_url": "https://github.com/tensorpack/tensorpack/commit/80a68c5942d5de507012b4bbef38ed7f86798c5a",
+          "message": "update docs",
+          "author": "Yuxin Wu",
+          "date": "2019-05-23T02:26:08Z"
+        },
+        {
+          "sha": "505e28eb88d74b6a554a5db1586999f188c20f1e",
+          "html_url": "https://github.com/tensorpack/tensorpack/commit/505e28eb88d74b6a554a5db1586999f188c20f1e",
+          "message": "Backport TensorSpec; tf=tf.compat.v1 in many files.",
+          "author": "Yuxin Wu",
+          "date": "2019-03-17T08:44:46Z"
+        },
+        {
+          "sha": "55f640f70e19d538e5082a4712241ee966fcb201",
+          "html_url": "https://github.com/tensorpack/tensorpack/commit/55f640f70e19d538e5082a4712241ee966fcb201",
+          "message": "fix #1046",
+          "author": "Yuxin Wu",
+          "date": "2019-01-12T09:39:36Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "add_activation_summary TODO scalar found ndim",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "tensorpack/tfutils/summary.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "02e53f72a70ac2ceb8dc5798b046277610418cf1",
+        "html_url": "https://github.com/tensorpack/tensorpack/commit/02e53f72a70ac2ceb8dc5798b046277610418cf1",
+        "message": "make add_moving_summary use local variables, so they are not broadcasted",
+        "author": "Yuxin Wu",
+        "date": "2020-08-25T06:10:49Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

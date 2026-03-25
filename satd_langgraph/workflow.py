@@ -141,9 +141,45 @@ class LangGraphSATDWorkflow:
             return "drop"
         if latest_review.approved:
             return "accept"
-        if state["round_id"] < state["max_rounds"]:
+        if self._should_retry_after_review(state):
             return "repair"
         return "drop"
+
+    def _should_retry_after_review(self, state: GraphState) -> bool:
+        latest_review = state.get("latest_review")
+        if latest_review is None or latest_review.approved:
+            return False
+        if state["round_id"] >= state["max_rounds"]:
+            return False
+        reject_type = (latest_review.reject_type or "").strip().lower()
+        advice = (latest_review.revision_advice or "").strip().lower()
+        if reject_type in {"missing_evidence", "context_gap", "targeted_context_needed"} or "retrieve:" in advice:
+            return True
+
+        analysis = state.get("analysis")
+        if analysis is None:
+            return False
+
+        local_retry_candidate = (
+            analysis.scope_radius in {"line", "function", "class", "file"}
+            and analysis.risk_level in {"low", "medium"}
+            and analysis.analyze_score >= 0.60
+            and latest_review.review_score >= 0.50
+        )
+        if not local_retry_candidate:
+            return False
+
+        retry_keywords = (
+            "api shape",
+            "api change",
+            "overwritten",
+            "no_change",
+            "borderline_review_confidence",
+            "comment_only_change",
+            "comment_change",
+        )
+        reject_signal = f"{reject_type} {advice}"
+        return any(keyword in reject_signal for keyword in retry_keywords)
 
     def run_record(self, record: SATDRecord):
         self._log(f"[task {record.task_id}] start project={record.project} file={record.file_path}")
@@ -235,13 +271,21 @@ class LangGraphSATDWorkflow:
         self._write_context_cache_csv(output_dir / "context_cache.csv", traces)
         self._write_summary_csv(output_dir / "summary.csv", summary)
 
+    def _trace_context_metadata(self, trace) -> tuple[dict, dict]:
+        context = trace.github_context or {}
+        if not isinstance(context, dict):
+            return {}, {}
+        metadata = context.get("metadata", {})
+        return context, metadata if isinstance(metadata, dict) else {}
+
     def _write_trajectory_overview_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "project", "file_path", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
+            "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -250,10 +294,12 @@ class LangGraphSATDWorkflow:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for trace in traces:
-                writer.writerow(self._trajectory_row(trace))
+                row = self._trajectory_row(trace)
+                writer.writerow(self._select_fields(row, fieldnames))
 
     def _trajectory_row(self, trace) -> dict:
         analysis = trace.analysis or {}
+        _, metadata = self._trace_context_metadata(trace)
         repairs = {item.get("round_id"): item for item in trace.repairs}
         reviews = {item.get("round_id"): item for item in trace.reviews}
         row = {
@@ -291,6 +337,11 @@ class LangGraphSATDWorkflow:
             "analysis_drop_reason": analysis.get("drop_reason"),
             "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch"),
             "analysis_github_evidence_strength": analysis.get("github_evidence_strength"),
+            "analysis_snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
+            "repair_evidence_mode": metadata.get("repair_evidence_mode"),
+            "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
+            "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
+            "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
             "repair_context_used": trace.repair_context_used,
             "review_strict_gate_result": trace.review_strict_gate_result,
             "original_code": trace.original_code,
@@ -315,6 +366,9 @@ class LangGraphSATDWorkflow:
             row[f"round_{round_id}_review_issues"] = " | ".join(review.get("issues", [])) if review else None
             row[f"round_{round_id}_revision_advice"] = review.get("revision_advice")
         return row
+
+    def _select_fields(self, row: dict, fieldnames: list[str]) -> dict:
+        return {field: row.get(field) for field in fieldnames}
 
     def _trajectory_summary(self, trace) -> str:
         steps = []
@@ -347,7 +401,8 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
+            "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -356,45 +411,7 @@ class LangGraphSATDWorkflow:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for trace in traces:
-                analysis = trace.analysis or {}
-                writer.writerow({
-                    "task_id": trace.task_id,
-                    "project": trace.project,
-                    "file_path": trace.file_path,
-                    "satd_comment": trace.satd_comment,
-                    "status": trace.status,
-                    "rounds_used": trace.rounds_used,
-                    "em_label": trace.em_label,
-                    "exact_match": trace.exact_match,
-                    "analysis_decision": analysis.get("decision"),
-                    "analysis_repairable": analysis.get("repairable"),
-                    "analysis_repairability_score": analysis.get("repairability_score"),
-                    "analysis_confidence": analysis.get("confidence"),
-                    "analysis_satd_type": analysis.get("satd_type"),
-                    "analysis_risk_level": analysis.get("risk_level"),
-                    "analysis_scope_radius": analysis.get("scope_radius"),
-                    "analysis_intent_clarity": analysis.get("intent_clarity"),
-                    "analysis_change_locality": analysis.get("change_locality"),
-                    "analysis_semantic_risk": analysis.get("semantic_risk"),
-                    "analysis_context_sufficiency": analysis.get("context_sufficiency"),
-                    "analysis_verifiability": analysis.get("verifiability"),
-                    "analysis_analyze_score": analysis.get("analyze_score"),
-                    "analysis_context_score": analysis.get("context_score"),
-                    "analysis_clarity_score": analysis.get("clarity_score"),
-                    "analysis_validation_signals": json.dumps(analysis.get("validation_signals", []), ensure_ascii=False),
-                    "analysis_context_gaps": json.dumps(analysis.get("context_gaps", []), ensure_ascii=False),
-                    "analysis_followup_context_requests": json.dumps(analysis.get("followup_context_requests", []), ensure_ascii=False),
-                    "analysis_evidence_summary": analysis.get("evidence_summary") or analysis.get("reason"),
-                    "analysis_repair_strategy": analysis.get("repair_strategy"),
-                    "analysis_drop_reason": analysis.get("drop_reason"),
-                    "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch"),
-                    "analysis_github_evidence_strength": analysis.get("github_evidence_strength"),
-                    "repair_context_used": trace.repair_context_used,
-                    "review_strict_gate_result": trace.review_strict_gate_result,
-                    "original_code": trace.original_code,
-                    "processed_manual_code": trace.processed_manual_code,
-                    "processed_final_repaired_code": trace.processed_final_repaired_code,
-                })
+                writer.writerow(self._select_fields(self._trajectory_row(trace), fieldnames))
 
     def _write_repairs_csv(self, path: Path, traces: list) -> None:
         fieldnames = ["task_id", "round_id", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
@@ -420,22 +437,23 @@ class LangGraphSATDWorkflow:
 
     def _write_github_context_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "repo_owner", "repo_name", "file_path", "historical_snapshot_mismatch", "github_evidence_strength", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
-            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "base_context_json", "repair_context_json", "review_context_json",
+            "task_id", "repo_owner", "repo_name", "file_path", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
+            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "base_context_json", "repair_context_json", "review_context_json",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for trace in traces:
-                context = trace.github_context or {}
-                metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+                context, metadata = self._trace_context_metadata(trace)
                 writer.writerow({
                     "task_id": trace.task_id,
-                    "repo_owner": context.get("repo_owner") if isinstance(context, dict) else None,
-                    "repo_name": context.get("repo_name") if isinstance(context, dict) else None,
-                    "file_path": context.get("file_path") if isinstance(context, dict) else None,
+                    "repo_owner": context.get("repo_owner"),
+                    "repo_name": context.get("repo_name"),
+                    "file_path": context.get("file_path"),
                     "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                     "github_evidence_strength": metadata.get("github_evidence_strength"),
+                    "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
+                    "repair_evidence_mode": metadata.get("repair_evidence_mode"),
                     "target_file_ok": metadata.get("target_file_ok"),
                     "satd_window_found": metadata.get("satd_window_found"),
                     "enclosing_symbol_found": metadata.get("enclosing_symbol_found"),
@@ -445,6 +463,9 @@ class LangGraphSATDWorkflow:
                     "call_sites_count": metadata.get("call_sites_count"),
                     "commits_count": metadata.get("commits_count"),
                     "similar_history_count": metadata.get("similar_history_count"),
+                    "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
+                    "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
+                    "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
                     "base_context_json": json.dumps(context.get("base_context", {}), ensure_ascii=False),
                     "repair_context_json": json.dumps(context.get("repair_context", {}), ensure_ascii=False),
                     "review_context_json": json.dumps(context.get("review_context", {}), ensure_ascii=False),
@@ -453,14 +474,13 @@ class LangGraphSATDWorkflow:
     def _write_context_cache_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
-            "historical_snapshot_mismatch", "github_evidence_strength", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count",
+            "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for trace in traces:
-                context = trace.github_context or {}
-                metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+                _, metadata = self._trace_context_metadata(trace)
                 writer.writerow({
                     "task_id": trace.task_id,
                     "cache_file": str(self._context_cache_file(trace.task_id)),
@@ -475,6 +495,8 @@ class LangGraphSATDWorkflow:
                     "review_context_fetched_at": metadata.get("review_context_fetched_at"),
                     "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                     "github_evidence_strength": metadata.get("github_evidence_strength"),
+                    "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
+                    "repair_evidence_mode": metadata.get("repair_evidence_mode"),
                     "target_file_ok": metadata.get("target_file_ok"),
                     "satd_window_found": metadata.get("satd_window_found"),
                     "enclosing_symbol_found": metadata.get("enclosing_symbol_found"),
@@ -482,6 +504,9 @@ class LangGraphSATDWorkflow:
                     "call_sites_count": metadata.get("call_sites_count"),
                     "commits_count": metadata.get("commits_count"),
                     "similar_history_count": metadata.get("similar_history_count"),
+                    "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
+                    "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
+                    "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
                 })
 
     def _append_outputs(self, output_dir: Path, traces: list) -> None:
@@ -509,7 +534,8 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
+            "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -523,44 +549,13 @@ class LangGraphSATDWorkflow:
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength",
+            "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
+            "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
         ]
         rows = []
         for trace in traces:
-            analysis = trace.analysis or {}
-            rows.append({
-                "task_id": trace.task_id,
-                "project": trace.project,
-                "file_path": trace.file_path,
-                "satd_comment": trace.satd_comment,
-                "status": trace.status,
-                "rounds_used": trace.rounds_used,
-                "em_label": trace.em_label,
-                "exact_match": trace.exact_match,
-                "analysis_decision": analysis.get("decision"),
-                "analysis_repairable": analysis.get("repairable"),
-                "analysis_repairability_score": analysis.get("repairability_score"),
-                "analysis_confidence": analysis.get("confidence"),
-                "analysis_satd_type": analysis.get("satd_type"),
-                "analysis_risk_level": analysis.get("risk_level"),
-                "analysis_scope_radius": analysis.get("scope_radius"),
-                "analysis_context_score": analysis.get("context_score"),
-                "analysis_clarity_score": analysis.get("clarity_score"),
-                "analysis_validation_signals": json.dumps(analysis.get("validation_signals", []), ensure_ascii=False),
-                "analysis_context_gaps": json.dumps(analysis.get("context_gaps", []), ensure_ascii=False),
-                "analysis_followup_context_requests": json.dumps(analysis.get("followup_context_requests", []), ensure_ascii=False),
-                "analysis_evidence_summary": analysis.get("evidence_summary") or analysis.get("reason"),
-                "analysis_repair_strategy": analysis.get("repair_strategy"),
-                "analysis_drop_reason": analysis.get("drop_reason"),
-                "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch"),
-                "analysis_github_evidence_strength": analysis.get("github_evidence_strength"),
-                "repair_context_used": trace.repair_context_used,
-                "review_strict_gate_result": trace.review_strict_gate_result,
-                "original_code": trace.original_code,
-                "processed_manual_code": trace.processed_manual_code,
-                "processed_final_repaired_code": trace.processed_final_repaired_code,
-            })
+            rows.append(self._select_fields(self._trajectory_row(trace), fieldnames))
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_repairs_csv(self, path: Path, traces: list) -> None:
@@ -585,20 +580,21 @@ class LangGraphSATDWorkflow:
 
     def _append_github_context_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "repo_owner", "repo_name", "file_path", "historical_snapshot_mismatch", "github_evidence_strength", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
-            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "base_context_json", "repair_context_json", "review_context_json",
+            "task_id", "repo_owner", "repo_name", "file_path", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
+            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "base_context_json", "repair_context_json", "review_context_json",
         ]
         rows = []
         for trace in traces:
-            context = trace.github_context or {}
-            metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+            context, metadata = self._trace_context_metadata(trace)
             rows.append({
                 "task_id": trace.task_id,
-                "repo_owner": context.get("repo_owner") if isinstance(context, dict) else None,
-                "repo_name": context.get("repo_name") if isinstance(context, dict) else None,
-                "file_path": context.get("file_path") if isinstance(context, dict) else None,
+                "repo_owner": context.get("repo_owner"),
+                "repo_name": context.get("repo_name"),
+                "file_path": context.get("file_path"),
                 "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                 "github_evidence_strength": metadata.get("github_evidence_strength"),
+                "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
+                "repair_evidence_mode": metadata.get("repair_evidence_mode"),
                 "target_file_ok": metadata.get("target_file_ok"),
                 "satd_window_found": metadata.get("satd_window_found"),
                 "enclosing_symbol_found": metadata.get("enclosing_symbol_found"),
@@ -608,6 +604,9 @@ class LangGraphSATDWorkflow:
                 "call_sites_count": metadata.get("call_sites_count"),
                 "commits_count": metadata.get("commits_count"),
                 "similar_history_count": metadata.get("similar_history_count"),
+                "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
+                "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
+                "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
                 "base_context_json": json.dumps(context.get("base_context", {}), ensure_ascii=False),
                 "repair_context_json": json.dumps(context.get("repair_context", {}), ensure_ascii=False),
                 "review_context_json": json.dumps(context.get("review_context", {}), ensure_ascii=False),
@@ -617,12 +616,11 @@ class LangGraphSATDWorkflow:
     def _append_context_cache_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
-            "historical_snapshot_mismatch", "github_evidence_strength", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count",
+            "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
         ]
         rows = []
         for trace in traces:
-            context = trace.github_context or {}
-            metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+            _, metadata = self._trace_context_metadata(trace)
             rows.append({
                 "task_id": trace.task_id,
                 "cache_file": str(self._context_cache_file(trace.task_id)),
@@ -637,6 +635,8 @@ class LangGraphSATDWorkflow:
                 "review_context_fetched_at": metadata.get("review_context_fetched_at"),
                 "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                 "github_evidence_strength": metadata.get("github_evidence_strength"),
+                "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
+                "repair_evidence_mode": metadata.get("repair_evidence_mode"),
                 "target_file_ok": metadata.get("target_file_ok"),
                 "satd_window_found": metadata.get("satd_window_found"),
                 "enclosing_symbol_found": metadata.get("enclosing_symbol_found"),
@@ -644,6 +644,9 @@ class LangGraphSATDWorkflow:
                 "call_sites_count": metadata.get("call_sites_count"),
                 "commits_count": metadata.get("commits_count"),
                 "similar_history_count": metadata.get("similar_history_count"),
+                "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
+                "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
+                "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
             })
         self._append_csv_rows(path, fieldnames, rows)
 

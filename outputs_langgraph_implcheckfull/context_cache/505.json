@@ -1,0 +1,323 @@
+{
+  "task_id": "505",
+  "repo_owner": "openstack",
+  "repo_name": "tacker",
+  "file_path": "tacker/sol_refactored/controller/vnflcm_view.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T12:14:31+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T12:14:55+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T12:14:59+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "tacker/sol_refactored/controller/vnflcm_view.py",
+    "original_code": "def parse_attr(self, attr):\n    def tilde_unescape(string):\n        def repl(m):\n            if m.group(1) == '1':\n                return '/'\n            elif m.group(1) == 'a':\n                return ','\n            elif m.group(1) == 'b':\n                return '@'\n\n        s1 = self.tildeEscape_re.sub(repl, string)\n        return re.sub('~0', '~', s1)\n\n    attrs = attr.split('/')\n    # TODO(toshii): handle \"@key\"\n    return [tilde_unescape(a) for a in attrs]",
+    "original_signature": "def parse_attr(self, attr):",
+    "satd_comment": "# TODO(toshii): handle \"@key\"",
+    "target_file": {
+      "ok": true,
+      "path": "tacker/sol_refactored/controller/vnflcm_view.py",
+      "sha": "bd70ab6be381f1befd03413ca366d238b4eb05a0",
+      "download_url": "https://raw.githubusercontent.com/openstack/tacker/master/tacker/sol_refactored/controller/vnflcm_view.py",
+      "content_excerpt": "# Copyright (C) 2021 Nippon Telegraph and Telephone Corporation\n# All Rights Reserved.\n#\n#    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n#    not use this file except in compliance with the License. You may obtain\n#    a copy of the License at\n#\n#         http://www.apache.org/licenses/LICENSE-2.0\n#\n#    Unless required by applicable law or agreed to in writing, software\n#    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n#    License for the specific language governing permissions and limitations\n#    under the License.\n\nfrom datetime import datetime\nimport re\n\nfrom dateutil import parser\n\nfrom oslo_log import log as logging\n\nfrom tacker.sol_refactored.common import config\nfrom tacker.sol_refactored.common import exceptions as sol_ex\nfrom tacker.sol_refactored.common import lcm_op_occ_utils as lcmocc_utils\nfrom tacker.sol_refactored.common import subscription_utils as subsc_utils\nfrom tacker.sol_refactored.common import vnf_instance_utils as inst_utils\nfrom tacker.sol_refactored import objects\nfrom tacker.sol_refactored.objects.v2 import vnf_instance\nfrom tacker.sol_refactored.objects.v2 import vnf_lcm_op_occ\n\n\nLOG = logging.getLogger(__name__)\nCONF = config.CONF\n\n\nclass KeyAttribute(object):\n    \"\"\"A placeholder class for handling @key in filter attribute names\"\"\"\n\n    def __str__(self):\n        return \"@key\"\n\n\nclass FilterExpr(object):\n    def __init__(self, op, attr, values):\n        self.op = op\n        self.attr = attr\n        self.values = values\n\n    def match_eq(self, val):\n        return val == self.values[0]\n\n    def match_neq(self, val):\n        return val != self.values[0]\n\n    def match_in(self, val):\n        return val in self.values\n\n    def match_nin(self, val):\n        return val not in self.values\n\n    def match_gt(self, val):\n        return val > self.values[0]\n\n    def match_gte(self, val):\n        return val >= self.values[0]\n\n    def match_lt(self, val):\n        return val < self.values[0]\n\n    def match_lte(self, val):\n        return val <= self.values[0]\n\n    def match_cont(self, val):\n        for v in self.values:\n            if v in val:\n                return True\n        return False\n\n    def match_ncont(self, val):\n        return not self.match_cont(val)\n\n    def match(self, val):\n        try:\n            for a in self.attr:\n                # NOTE(toshii): The attribute specified by \"@key\"\n                # must be a dict, not a list of dicts. SOL013 isn't\n                # very clear on this topic and the current implementation\n                # doesn't support the latter.\n                if isinstance(a, KeyAttribute):\n                    val = list(val.keys())\n                else:\n                    val = val[a]\n        except KeyError:\n            LOG.debug(\"Attr %s not found in %s\", self.attr, val)\n            return False\n        except (AttributeError, TypeError):\n            raise sol_ex.InvalidAttributeFilter(\n                sol_detail=\"AttrName %s is invalid\" % '/'.join([\n                    str(x) for x in self.attr]))\n        # If not str, assume type conversion is already done.\n        # Note: It is assumed that the type doesn't change between calls,\n        # which can be problematic with KeyValuePairs.\n        if isinstance(self.values[0], str):\n            if isinstance(val, datetime):\n                self.values[0] = parser.isoparse(self.values[0])\n            elif isinstance(val, bool):\n                if self.values[0] == 'true':\n                    self.values[0] = True\n                elif self.values[0] == 'false':\n                    self.values[0] = False\n                else:\n                    raise sol_ex.InvalidAttributeFilter(\n                        sol_detail=\"invalid value for boolean\")\n            elif isinstance(val, int):\n                self.values = [int(v) for v in self.values]\n            elif isinstance(val, float):\n                self.values = [float(v) for v in self.values]\n\n        # NOTE: This might not be SOL013 compliant when there are\n        # multiple filters with a same attribute prefix.\n        match_fn = getattr(self, \"match_\" + self.op)\n        if isinstance(val, list):\n            for v in val:\n                if match_fn(v):\n                    return True\n            return False\n        else:\n            return match_fn(val)\n\n\nclass AttributeSelector(object):\n    def __init__(self, default_exclude_list, all_fields=None, fields=None,\n                 exclude_fields=None, exclude_default=None):\n        self.exclude_fields = []\n        self.fields = []\n        if all_fields is not None:\n            if fields is not None or exclude_fields is not None or \\\n               exclude_default is not None:\n                raise sol_ex.InvalidAttributeSelector()\n            # Nothing to do\n        elif fields is not None:\n            if exclude_fields is not None:\n                raise sol_ex.InvalidAttributeSelector()\n            self.fields = fields.split(',')\n            if exclude_default is not None:\n                self.exclude_fields = [v for v in default_exclude_list\n                                       if v not in self.fields]\n        elif exclude_fields is not None:\n            if exclude_default is not None:\n                raise sol_ex.InvalidAttributeSelector()\n            self.exclude_fields = exclude_fields.split(',')\n        else:\n            self.exclude_fields = default_exclude_list\n\n    def filter(self, obj, odict):\n        deleted = {}\n        if self.exclude_fields:\n            excl_fields = self.exclude_fields\n        else:\n            if not self.fields:\n                # Implies all_fields\n                return odict\n            excl_fields = [k for k in odict.keys() if k not in self.fields]\n\n        for attr in excl_fields:\n            klist = attr.split('/')\n\n            # Check if the specified attribute has a lower cardinality bound\n            # of 0. (SOL013 5.3.2.1)\n            obj1 = obj\n            for key in klist[:-1]:\n                obj1 = getattr(obj1, key)\n            if not obj1.fields[klist[-1]].nullable:\n                continue\n\n            val = odict\n            deleted_ptr = deleted\n            try:\n                for i, k1 in enumerate(klist, start=1):\n                    if i == len(klist):\n                        deleted_ptr[k1] = val[k1]\n                        del val[k1]\n                    else:\n                        val = val[k1]\n                        if k1 not in deleted_ptr:\n                            deleted_ptr[k1] = {}\n                        deleted_ptr = deleted_ptr[k1]\n            except (KeyError, TypeError):\n                pass\n        if not self.fields:\n            return odict\n\n        # Readd partial dictionary content\n        for attr in self.fields:\n            klist = attr.split('/')\n            val = odict\n            deleted_ptr = deleted\n            try:\n                for i, k1 in enumerate(klist, start=1):\n                    if i == len(klist):\n                        val[k1] = deleted_ptr[k1]\n                    else:\n                        if k1 not in val:\n                            val[k1] = {}\n                        val = val[k1]\n                        deleted_ptr = deleted_ptr[k1]\n            except KeyError:\n                LOG.debug(\"Key %s not found in %s or %s\", k1, val, deleted_ptr)\n        return odict\n\n\nclass EnhanceAttributeSelector(object):\n    def __init__(self, all_attrs, mandatory_attrs, default_exclude_attrs,\n                 all_fields=None, fields=None, exclude_fields=None,\n                 exclude_default=None):\n        self.all_attrs = all_attrs\n        self.return_attrs = set()\n        self.exclude_fields = set()\n        self.fields = set()\n        self.extra_attrs = set()\n        if all_fields is not None:\n            if fields is not None or exclude_fields is not None or \\\n               exclude_default is not None:\n                raise sol_ex.InvalidAttributeSelector()\n            self.return_attrs = all_attrs.copy()\n        elif fields is not None:\n            if exclude_fields is not None:\n                raise sol_ex.InvalidAttributeSelector()\n            if exclude_default is not None:\n                self.return_attrs = all_attrs - default_exclude_attrs\n            else:\n                self.return_attrs = mandatory_attrs.copy()\n            for field in fields.split(','):\n                if '/' in field:\n                    self.fields.add(field)\n                self.return_attrs.add(field.split('/')[0])\n        elif exclude_fields is not None:\n            if exclude_default is not None:\n                raise sol_ex.InvalidAttributeSelector()\n            self.return_attrs = all_attrs.copy()\n            for field in exclude_fields.split(','):\n                if '/' in field:\n                    self.exclude_fields.add(field)\n                else:\n                    self.return_attrs.remove(field)\n        else:\n            self.return_attrs = all_attrs - default_exclude_attrs\n\n    def add_extra_attrs(self, attrs):\n        self.extra_attrs |= attrs - self.return_attrs\n\n    def filter(self, odict):\n        for attr in self.extra_attrs:\n            if attr in odict:\n                del odict[attr]\n\n        for attr in self.exclude_fields:\n            klist = attr.split('/')\n            if len(klist) == 1:\n                # not occur. just consistency check\n                continue\n            sub_dict = odict\n            for key in klist[:-1]:\n                sub_dict = sub_dict.get(key, {})\n            if sub_dict.get(klist[-1]) is not None:\n                del sub_dict[klist[-1]]\n\n        saved = {}\n        for attr in self.fields:\n            klist = attr.split('/')\n            if len(klist) == 1:\n                # not occur. just consistency check\n                continue\n            if klist[0] not in saved:\n                saved[klist[0]] = odict[klist[0]]\n                del odict[klist[0]]\n\n            # construct\n            sub_dict = odict\n            saved_sub_dict = saved\n            # first check path is valid\n            for key in klist[:-1]:\n                saved_sub_dict = saved_sub_dict.get(key, {})\n            val = saved_sub_dict.get(klist[-1])\n            if val is None:\n                continue\n            for key in klist[:-1]:\n                sub_dict = sub_dict.setdefault(key, {})\n            sub_dict[klist[-1]] = val\n\n        return odict\n\n\nclass BaseViewBuilder(object):\n    value_regexp = r\"([^',)]+|('[^']*')+)\"\n    value_re = re.compile(value_regexp)\n    simpleFilterExpr_re = re.compile(r\"\\(([a-z]+),([^,]+)(,\" +\n                                     value_regexp + r\")+\\)\")\n    tildeEscape_re = re.compile(r\"~([1ab])\")\n    opOne = ['eq', 'neq', 'gt', 'gte', 'lt', 'lte']\n    opMulti = ['in', 'nin', 'cont', 'ncont']\n\n    def __init__(self, endpoint, page_size):\n        self.endpoint = endpoint\n        self.page_size = page_size\n\n    def parse_attr(self, attr):\n        def tilde_unescape(string):\n            def repl(m):\n                if m.group(1) == '1':\n                    return '/'\n                elif m.group(1) == 'a':\n                    return ','\n                elif m.group(1) == 'b':\n                    return '@'\n\n            if string == '@key':\n                return KeyAttribute()\n            s1 = self.tildeEscape_re.sub(repl, string)\n            return re.sub('~0', '~', s1)\n\n        attrs = attr.split('/')\n        return [tilde_unescape(a) for a in attrs]\n\n    def parse_values(self, values):\n        loc = 0\n        res = []\n        while loc < len(values):\n            if values[loc] != \",\":\n                LOG.debug(\"comma expected, %s at loc %d\", values, loc)\n                raise sol_ex.InvalidAttributeFilter(\n                    sol_detail=(\"value parse error. comma expected, %s\" %\n                                values))\n            loc += 1\n            m = self.value_re.match(values[loc:])\n      ",
+      "total_lines": 660
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 308,
+      "end_line": 324,
+      "excerpt": "    def parse_attr(self, attr):\n        def tilde_unescape(string):\n            def repl(m):\n                if m.group(1) == '1':\n                    return '/'\n                elif m.group(1) == 'a':\n                    return ','\n                elif m.group(1) == 'b':\n                    return '@'\n\n            if string == '@key':\n                return KeyAttribute()\n            s1 = self.tildeEscape_re.sub(repl, string)\n            return re.sub('~0', '~', s1)\n\n        attrs = attr.split('/')\n        return [tilde_unescape(a) for a in attrs]",
+      "symbol_name": "parse_attr",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "tacker/sol_refactored/controller/vnflcm_view.py",
+      "sha": "bd70ab6be381f1befd03413ca366d238b4eb05a0",
+      "download_url": "https://raw.githubusercontent.com/openstack/tacker/master/tacker/sol_refactored/controller/vnflcm_view.py"
+    },
+    "imports": {
+      "imports": [
+        "datetime:datetime",
+        "re",
+        "dateutil:parser",
+        "oslo_log:log",
+        "tacker.sol_refactored.common:config",
+        "tacker.sol_refactored.common:exceptions",
+        "tacker.sol_refactored.common:lcm_op_occ_utils",
+        "tacker.sol_refactored.common:subscription_utils",
+        "tacker.sol_refactored.common:vnf_instance_utils",
+        "tacker.sol_refactored:objects",
+        "tacker.sol_refactored.objects.v2:vnf_instance",
+        "tacker.sol_refactored.objects.v2:vnf_lcm_op_occ"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack/tacker/master/README.rst",
+      "content_excerpt": "======\nTacker\n======\n\n.. image:: https://governance.openstack.org/tc/badges/tacker.svg\n    :target: https://governance.openstack.org/tc/reference/tags/index.html\n\n.. Change things from this point on\n\nWelcome!\n========\n\nTacker is an OpenStack based NFV Orchestrator service with built-in general\npurpose VNF Manager to deploy and operate Virtual Network Functions (VNFs)\non an OpenStack based NFV Platform. It is based on ETSI MANO Architectural\nFramework and provides a fully functional stack to orchestrate VNFs end-to-end.\n\nInstallation:\n=============\n\nInstallation instructions and user guides can be found at:\nhttps://docs.openstack.org/tacker/\n\nTacker code base supports OpenStack master and other releases. Please\nfollow the instructions in the above address for a successful installation of\ncorresponding release.\n\nCode:\n=====\n\nTacker code is available in following repositories:\n\n* **Tacker server:** https://opendev.org/openstack/tacker\n* **Tacker Python client:** https://opendev.org/openstack/python-tackerclient\n* **Tacker Horizon UI:** https://opendev.org/openstack/tacker-horizon\n\nBugs:\n=====\n\nPlease report bugs at: https://bugs.launchpad.net/tacker\n\nExternal Resources:\n===================\n\n* Tacker Wiki: https://wiki.openstack.org/wiki/Tacker\n\n* Tacker Blueprints: https://blueprints.launchpad.net/tacker\n\n* For help on usage and hacking of Tacker, please send an email to\n  OpenStack-dev Mailing List <mailto:openstack-discuss@lists.openstack.org>\n  with **[openstack-dev] [Tacker]** tag.\n\n* To get release notes: `Tacker Release Notes\n  <https://docs.openstack.org/releasenotes/ta"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "parse_attr test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"parse_attr(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "vnflcm_view.py",
+          "path": "tacker/sol_refactored/controller/vnflcm_view.py",
+          "sha": "bd70ab6be381f1befd03413ca366d238b4eb05a0",
+          "html_url": "https://github.com/openstack/tacker/blob/98a82a5c99bef19f8d5a6a4b3712873c64229688/tacker/sol_refactored/controller/vnflcm_view.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 308,
+          "end_line": 324,
+          "excerpt": "    def parse_attr(self, attr):\n        def tilde_unescape(string):\n            def repl(m):\n                if m.group(1) == '1':\n                    return '/'\n                elif m.group(1) == 'a':\n                    return ','\n                elif m.group(1) == 'b':\n                    return '@'\n\n            if string == '@key':\n                return KeyAttribute()\n            s1 = self.tildeEscape_re.sub(repl, string)\n            return re.sub('~0', '~', s1)\n\n        attrs = attr.split('/')\n        return [tilde_unescape(a) for a in attrs]",
+          "symbol_name": "parse_attr",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "tacker/sol_refactored/controller",
+      "count": 10,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "tacker/sol_refactored/controller/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "prometheus_plugin_controller.py",
+          "path": "tacker/sol_refactored/controller/prometheus_plugin_controller.py",
+          "type": "file"
+        },
+        {
+          "name": "server_notification.py",
+          "path": "tacker/sol_refactored/controller/server_notification.py",
+          "type": "file"
+        },
+        {
+          "name": "vnffm_v1.py",
+          "path": "tacker/sol_refactored/controller/vnffm_v1.py",
+          "type": "file"
+        },
+        {
+          "name": "vnffm_view.py",
+          "path": "tacker/sol_refactored/controller/vnffm_view.py",
+          "type": "file"
+        },
+        {
+          "name": "vnflcm_v2.py",
+          "path": "tacker/sol_refactored/controller/vnflcm_v2.py",
+          "type": "file"
+        },
+        {
+          "name": "vnflcm_versions.py",
+          "path": "tacker/sol_refactored/controller/vnflcm_versions.py",
+          "type": "file"
+        },
+        {
+          "name": "vnflcm_view.py",
+          "path": "tacker/sol_refactored/controller/vnflcm_view.py",
+          "type": "file"
+        },
+        {
+          "name": "vnfpm_v2.py",
+          "path": "tacker/sol_refactored/controller/vnfpm_v2.py",
+          "type": "file"
+        },
+        {
+          "name": "vnfpm_view.py",
+          "path": "tacker/sol_refactored/controller/vnfpm_view.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "tacker/sol_refactored/controller/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "prometheus_plugin_controller.py",
+          "path": "tacker/sol_refactored/controller/prometheus_plugin_controller.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (C) 2022 Fujitsu\n2: # All Rights Reserved.\n3: #\n4: #    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n5: #    not use this file except in compliance with the License. You may obtain\n6: #    a copy of the License at\n7: #\n8: #         http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: #    Unless required by applicable law or agreed to in writing, software\n11: #    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n12: #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n13: #    License for the specific language governing permissions and limitations"
+        },
+        {
+          "name": "server_notification.py",
+          "path": "tacker/sol_refactored/controller/server_notification.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (C) 2022 Fujitsu\n2: # All Rights Reserved.\n3: #\n4: #    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n5: #    not use this file except in compliance with the License. You may obtain\n6: #    a copy of the License at\n7: #\n8: #         http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: #    Unless required by applicable law or agreed to in writing, software\n11: #    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n12: #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n13: #    License for the specific language governing permissions and limitations"
+        },
+        {
+          "name": "vnffm_v1.py",
+          "path": "tacker/sol_refactored/controller/vnffm_v1.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (C) 2022 Fujitsu\n2: # All Rights Reserved.\n3: #\n4: #    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n5: #    not use this file except in compliance with the License. You may obtain\n6: #    a copy of the License at\n7: #\n8: #         http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: #    Unless required by applicable law or agreed to in writing, software\n11: #    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n12: #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n13: #    License for the specific language governing permissions and limitations"
+        },
+        {
+          "name": "vnffm_view.py",
+          "path": "tacker/sol_refactored/controller/vnffm_view.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright (C) 2022 Fujitsu\n2: # All Rights Reserved.\n3: #\n4: #    Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n5: #    not use this file except in compliance with the License. You may obtain\n6: #    a copy of the License at\n7: #\n8: #         http://www.apache.org/licenses/LICENSE-2.0\n9: #\n10: #    Unless required by applicable law or agreed to in writing, software\n11: #    distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n12: #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n13: #    License for the specific language governing permissions and limitations"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "tacker/sol_refactored/controller/vnflcm_view.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "6b0aec634cb14a9e033daf43ce43a665d4fb2b3a",
+          "html_url": "https://github.com/openstack/tacker/commit/6b0aec634cb14a9e033daf43ce43a665d4fb2b3a",
+          "message": "Performance enhancement of v2 list APIs\n\nThis patch enhances performance of the following APIs.\n* GET /vnflcm/v2/vnf_instances\n* GET /vnflcm/v2/vnf_lcm_op_occs\n\nPreviously a DB object was converted into a tacker object and\nthen it was converted into dict, but each conversion took quite\nlong time. Th",
+          "author": "Itsuro Oda",
+          "date": "2024-05-19T23:06:43Z"
+        },
+        {
+          "sha": "27d0a035ef6a019931690341dcd509422290576b",
+          "html_url": "https://github.com/openstack/tacker/commit/27d0a035ef6a019931690341dcd509422290576b",
+          "message": "Support External Keymanager for auth credential\n\nThis patch provides to the encryption and decryption methods for\nauthentication credentials in Tacker by using an external key\nmanager service such as OpenStack Key Manager (barbican).\n\nImpletemts: blueprint support-external-keymanager\nChange-Id: I130",
+          "author": "Yusuke Niimi",
+          "date": "2023-04-24T13:35:19Z"
+        },
+        {
+          "sha": "0c69e122b2562fb7c07a872f32c399052e4a8429",
+          "html_url": "https://github.com/openstack/tacker/commit/0c69e122b2562fb7c07a872f32c399052e4a8429",
+          "message": "Refactor for Performance Improvement\n\nIn order to improve the performance of Tacker in commercial systems,\nThis patch provides the following code refactoring to improve system\nperformance.\n\n1. Reduce transaction of getting OpenStack resource from Heat\n   (for Tacker v2 API)\n2. Support subscription f",
+          "author": "Shuwen Cai",
+          "date": "2022-09-01T01:23:23Z"
+        },
+        {
+          "sha": "e0e7b538eec2552b152725554f2fa460e9b50de2",
+          "html_url": "https://github.com/openstack/tacker/commit/e0e7b538eec2552b152725554f2fa460e9b50de2",
+          "message": "Support handling of large query results\n\nThis patch implements paged responses defined in ETSI NFV-SOL013\n5.4.2.3. If the result of a query is large, tacker-server now\nreturns the result as a paged response, which includes the next page\nmarker as a LINK header.\n\nImplements: blueprint paging-query-re",
+          "author": "Ken Fujimoto",
+          "date": "2022-04-07T06:37:15Z"
+        },
+        {
+          "sha": "158f05e4734904872fd7378c1bd5f43fe3aa05d9",
+          "html_url": "https://github.com/openstack/tacker/commit/158f05e4734904872fd7378c1bd5f43fe3aa05d9",
+          "message": "Handle invalid attrName in v2 API AttributeFilter\n\nWhen an invalid attrName was passed to AttributeFilter, it caused\na 500 error.  This commit makes AttributeFilter to return a\nmore-appropriate 400 error.\n\nImplements: blueprint support-nfv-solv3-query-vnf-instances\nImplements: blueprint support-nfv-",
+          "author": "IWAMOTO Toshihiro",
+          "date": "2022-01-27T01:38:46Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "parse_attr TODO toshii handle",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "tacker/sol_refactored/controller/vnflcm_view.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "6b0aec634cb14a9e033daf43ce43a665d4fb2b3a",
+        "html_url": "https://github.com/openstack/tacker/commit/6b0aec634cb14a9e033daf43ce43a665d4fb2b3a",
+        "message": "Performance enhancement of v2 list APIs\n\nThis patch enhances performance of the following APIs.\n* GET /vnflcm/v2/vnf_instances\n* GET /vnflcm/v2/vnf_lcm_op_occs\n\nPreviously a DB object was converted into a tacker object and\nthen it was converted into dict, but each conversion took quite\nlong time. Th",
+        "author": "Itsuro Oda",
+        "date": "2024-05-19T23:06:43Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

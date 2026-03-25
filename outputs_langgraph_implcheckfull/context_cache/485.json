@@ -1,0 +1,523 @@
+{
+  "task_id": "485",
+  "repo_owner": "monarch-initiative",
+  "repo_name": "dipper",
+  "file_path": "dipper/sources/ZFIN.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T11:56:21+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_load_zp_mappings",
+    "satd_line": 2796,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 1,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 3,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T11:56:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T11:56:54+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "dipper/sources/ZFIN.py",
+    "original_code": "def _process_wildtypes(self, limit=None):\n    \"\"\"\n    This table provides the genotype IDs, name, and abbreviation of the wildtype genotypes.\n    These are the typical genomic backgrounds...there's about 20 of them.\n\n    Triples created:\n    <genotype id> a GENO:wildtype\n    <genotype id> rdfs:label genotype_abbreviation\n    <genotype id> dc:description genotype_name\n\n    :param limit:\n    :return:\n    \"\"\"\n    if self.testMode:\n        g = self.testgraph\n    else:\n        g = self.graph\n    logger.info(\"Processing wildtype genotypes\")\n    line_counter = 0\n    geno = Genotype(g)\n    raw = '/'.join((self.rawdir, self.files['wild']['file']))\n    with open(raw, 'r', encoding=\"iso-8859-1\") as csvfile:\n        filereader = csv.reader(csvfile, delimiter='\\t', quotechar='\\\"')\n        for row in filereader:\n            line_counter += 1\n            (genotype_id, genotype_name, genotype_abbreviation, empty) = row\n\n            genotype_id = 'ZFIN:' + genotype_id.strip()\n\n            # Add genotype to graph with label and description, as a genomic_background genotype\n            geno.addGenotype(genotype_id, genotype_abbreviation,\n                             geno.genoparts['genomic_background'], genotype_name)\n\n            # FIXME why is this here? [nlw]\n            if self.label_hash['background_label'].get(genotype_id) is None:\n                self.label_hash['background_label'][genotype_id] = genotype_name\n\n            if self.label_hash['genotype_label'].get(genotype_id) is None:\n                self.label_hash['genotype_label'][genotype_id] = '['+genotype_name+']'\n\n            # Build the hash for the wild type genotypes.\n            if self.wildtype_hash['id'].get(genotype_name) is None:\n                self.wildtype_hash['id'][genotype_name] = genotype_id\n                self.wildtype_hash['symbol'][genotype_name] = genotype_abbreviation\n\n            if not self.testMode and limit is not None and line_counter > limit:\n                break\n\n    logger.info(\"Done with wildtype genotypes\")\n    return",
+    "original_signature": "def _process_wildtypes(self, limit=None):",
+    "satd_comment": "# FIXME why is this here? [nlw]",
+    "target_file": {
+      "ok": true,
+      "path": "dipper/sources/ZFIN.py",
+      "sha": "06d76d0329c99ab3562f659e95844f77781e8656",
+      "download_url": "https://raw.githubusercontent.com/monarch-initiative/dipper/master/dipper/sources/ZFIN.py",
+      "content_excerpt": "import csv\nimport re\nimport logging\nimport os\nimport yaml\n\nfrom intermine.webservice import Service\nfrom dipper.sources.Source import Source\nfrom dipper.models.assoc.Association import Assoc\nfrom dipper.models.Genotype import Genotype\nfrom dipper.models.assoc.OrthologyAssoc import OrthologyAssoc\nfrom dipper.models.assoc.G2PAssoc import G2PAssoc\nfrom dipper.models.Environment import Environment\nfrom dipper.models.GenomicFeature import makeChromID\nfrom dipper.models.GenomicFeature import Feature\nfrom dipper.models.Reference import Reference\nfrom dipper.models.Model import Model\nfrom dipper.models.BiolinkVocabulary import BioLinkVocabulary as blv\n\nLOG = logging.getLogger(__name__)\nZFDL = 'http://zfin.org/downloads'\nZPCURATION = 'http://purl.obolibrary.org/obo/zp/'\n\n\nclass ZFIN(Source):\n    \"\"\"\n    This is the parser for the\n    [Zebrafish Model Organism Database (ZFIN)](http://www.zfin.org),\n    from which we process genotype and phenotype data for laboratory zebrafish.\n\n    We generate the zfin graph to include the following information:\n    * genes\n    * sequence alterations\n    (includes SNPs/del/ins/indel and large chromosomal rearrangements)\n    * transgenic constructs\n    * morpholinos, talens, crisprs as expression-affecting reagents\n    * genotypes, and their components\n    * fish (as comprised of intrinsic and extrinsic genotypes)\n    * publications (and their mapping to PMIDs, if available)\n    * genotype-to-phenotype associations\n    (including environments and stages at which they are assayed)\n    * environmental components\n    * orthology to human genes\n    * genetic positional information for genes and sequence alterations\n    * fish-to-disease model associations\n\n    Genotypes leverage the GENO genotype model and include\n    both intrinsic and extrinsic genotypes.\n    Where necessary, we create anonymous nodes of the genotype partonomy\n    (such as for variant single locus complements,\n    genomic variation complements, variant loci, extrinsic genotypes,\n    and extrinsic genotype parts).\n\n    Genotype labels are output as ZFIN genotype name + \"[background]\".\n    We also process the genotype components to build labels\n    in a monarch-style, and these are added as synonyms. The monarch-style\n    genotype label includes:\n    *  all genes targeted by reagents (morphants, crisprs, etc),\n    in addition to the ones that the reagent was designed against.\n    *  all affected genes within deficiencies\n    *  complex hets being listed as gene<mutation1>/gene<mutation2>\n    rather than gene<mutation1>/+; gene<mutation2>/+\n\n\n    see: resources/zfin/README for column extraction from downloads page\n\n    \"\"\"\n\n    files = {\n        'geno': {\n            'file': 'genotype_features.txt',\n            'url': ZFDL + '/genotype_features.txt',\n            'columns': [\n                'Genotype ID',\n                'Genotype Name',\n                'Genotye Unique Name',\n                'Allele ID',\n                'Allele Name',\n                'Allele Abbreviation',\n                'Allele Type',\n                'Allele Display Type',\n                'Gene or Construct Symbol',\n                'Corresponding ZFIN Gene ID/Construct ID',\n                'Allele Zygosity',\n                'Construct Name',\n                'Construct ZdbId',\n            ]},\n\n        'pheno': {\n            'file': 'phenotype_fish.txt',\n            'url': ZFDL + '/phenotype_fish.txt',\n            'columns': [\n                'Fish ID',\n                'Fish Name',\n                'Start Stage ID',\n                'Start Stage Name',\n                'End Stage ID',\n                'End Stage Name',\n                'Affected Structure or Process 1 subterm ID',\n                'Affected Structure or Process 1 subterm Name',\n                'Post-composed Relationship ID',\n                'Post-composed Relationship Name',\n                'Affected Structure or Process 1 superterm ID',\n                'Affected Structure or Process 1 superterm Name',\n                'Phenotype Keyword ID',\n                'Phenotype Keyword Name',\n                'Phenotype Tag',\n                'Affected Structure or Process 2 subterm ID',\n                'Affected Structure or Process 2 subterm name',\n                'Post-composed Relationship (rel) ID',\n                'Post-composed Relationship (rel) Name',\n                'Affected Structure or Process 2 superterm ID',\n                'Affected Structure or Process 2 superterm name',\n                'Publication ID',\n                'Environment ID',\n            ]},\n        'pubs': {\n            'file': 'zfinpubs.txt',\n            'url': ZFDL + '/zfinpubs.txt',\n            'columns': [\n                'Publication ID',\n                'pubMed ID (none or blank when not available)',\n                'Authors',\n                'Title',\n                'Journal',\n                'Year',\n                'Volume',\n                'Pages',\n            ]},\n        'zpmap': {  # this is a zp mapping file generated by Nico\n            'file': 'id_map_zfin.tsv',\n            'url': ZPCURATION + '/id_map_zfin.tsv',\n            'columns': [\n                'iri',\n                'id',\n            ]},\n        'morph': {\n            'file': 'Morpholinos.txt',\n            'url': ZFDL + '/Morpholinos.txt',\n            'columns': [\n                'Gene ID',\n                'Gene SO ID',\n                'Gene Symbol',\n                'Morpholino ID',\n                'Morpholino SO ID',\n                'Morpholino Symbol',\n                'Morpholino Sequence',\n                'Publication(s)',\n                'Note',\n            ]},\n        # 'enviro': {'file': 'pheno_environment.txt',\n        #            'url': ZFDL + '/pheno_environment.txt','columns': []},\n        'enviro': {\n            'file': 'pheno_environment_fish.txt',\n            'url': ZFDL + '/pheno_environment_fish.txt',\n            'columns': [\n                'Environment ID',\n                'ZECO Term Name',\n                'ZECO Term ID (ZECO:ID)',\n                'Chebi Term Name',\n                'Chebi Term ID (Chebi:ID)',\n                'ZFA Term Name',\n                'ZFA Term ID (ZFA:ID)',\n                'Affected Structure Subterm Name',\n                'Affected Structure Subterm ID (GO-CC:ID)',\n                'NCBI Taxon Name',\n                'NCBI Taxon ID (NCBI Taxon:ID)',\n            ]},\n        'stage': {\n            'file': 'stage_ontology.txt',\n            'url': 'http://zfin.org/Downloads/stage_ontology.txt',\n            'columns': [\n                'Stage ID',\n                'Stage OBO ID',\n                'Stage Name',\n                'Begin Hours',\n                'End Hours',\n            ]},\n        # 'wild_expression': {\n        #   'file': 'wildtype-expression.txt',\n        #   'url': ZFDL + '/wildtype-expression.txt','columns': []},\n        'mappings': {\n            'file': 'mappings.txt',\n            'url': ZFDL + '/mappings.txt',\n            'columns': [\n                'ZFIN ID',\n                'Symbol',\n                'SO_id',\n                'Panel Symbol',\n                'Chromosome',\n                'Location',\n                'Metric',\n            ]},\n        'backgrounds': {\n            'file': 'genotype_backgrounds.txt',\n            'url': ZFDL + '/genotype_backgrounds.txt',\n            'columns': [\n                'Genotype ID',\n                'Genotype Name',\n                'Background',\n                'Background Name',\n            ]},\n        'genbank': {\n            'file': 'genbank.txt',\n            'url': ZFDL + '/genbank.txt',\n            'columns': [\n                'ZFIN ID',\n                'SO ID',\n                'Name',\n                'GenBank ID',\n            ]},\n        'uniprot': {\n            'file': 'uniprot.txt',\n            'url': ZFDL + '/uniprot.txt',\n            'columns': [\n                'ZFIN ID',\n                'SO ID',\n                'Symbol',\n                'UniProt ID',\n            ]},\n        'gene': {\n            'file': 'gene.txt',\n            'url': 'http://zfin.org/downloads/gene.txt',\n            'columns': [\n                'ZFIN ID',\n                'SO ID',\n                'Symbol',\n                'NCBI Gene ID',\n            ]},\n\n        'wild': {\n            'file': 'wildtypes.txt',\n            'url': ZFDL + '/wildtypes_fish.txt',\n            'columns': [\n                'Fish ID',\n                'Fish Name',\n                'Fish Abbreviation',\n                'Genotype ID',\n            ]},\n        'human_orthos': {\n            'file': 'human_orthos.txt',\n            'url': ZFDL + '/human_orthos.txt',\n            'columns': [\n                'ZFIN ID',\n                'ZFIN Symbol',\n                'ZFIN Name',\n                'Human Symbol',\n                'Human Name',\n                'OMIM ID',\n                'Gene ID',\n                'HGNC ID',\n                'Evidence',\n                'Pub ID',\n            ]},\n        'features': {\n            'file': 'features.txt',\n            'url': ZFDL + '/features.txt',\n            'columns': [\n                'Genomic Feature ID',\n                'Feature SO ID',\n                'Genomic Feature Abbreviation',\n                'Genomic Feature Name',\n                'Genomic Feature Type',\n                'Mutagen',\n                'Mutagee',\n                'Construct ID',\n                'Construct name',\n                'Construct SO ID',\n                'TALEN/CRISPR ID',\n                'TALEN/CRISPR Name',\n            ]},\n        'feature_affected_gene': {\n            'file': 'features-affected-genes.txt',\n            'url': ZFDL + '/features-affected-genes.txt',\n            'columns': [\n                'Genomic Feature ID',\n                'Feature SO ID',\n                'Genomic Feature Abbreviation',\n                'Gene Symbol',\n                'Gene ID',\n                'Gene SO ID',\n                'Genomic Feature - Marker Relationship',\n                'Feature Type',\n                'DNA/cDNA Change SO ID',\n                'Reference Nucleotide',\n                'Mutant Nucleotide',\n                'Base Pairs Added',\n                'Base Pairs Removed',\n                'DNA/cDNA Change Position Start',\n                'DNA/cDNA Change Position End',\n                'DNA/cDNA Reference Sequence',\n                'DNA/cDNA Change Localization',\n                'DNA/cDNA Change Localization SO ID',\n                'DNA/cDNA Change Localization Exon',\n                'DNA/cDNA Change Localization Intron',\n                'Transcript Consequence',\n                'Transcript Consequence SO ID',\n                'Transcript Consequence Exon',\n                'Transcript Consequence Intron',\n                'Protein Consequence',\n                'Protein Consequence SO ID',\n                'Reference Amino Acid',\n                'Mutant Amino Acid',\n                'Amino Acids Added',\n                'Amino Acids Removed',\n                'Protein Consequence Position Start',\n                'Protein Consequence Position End',\n                'Protein Reference Sequence',\n            ]},\n        'gene_marker_rel': {\n            'file': 'gene_marker_relationship.txt',\n            'url': ZFDL + '/gene_marker_relationship.txt',\n            'columns': [\n                'Gene ID',\n                'Gene SO ID',\n                'Gene Symbol',\n                'Marker ID',\n                'Marker SO ID',\n                'Marker Symbol',\n                'Relationship',\n            ]},\n        'crispr': {\n            'file': 'CRISPR.txt',\n            'url': ZFDL + '/CRISPR.txt',\n            'columns': [\n                'Gene ID',\n                'Gene SO ID',\n                'Gene Symbol',\n                'CRISPR ID',\n                'CRISPR SO ID',\n                'CRISPR Symbol',\n                'CRISPR Target Sequence',\n                'Publication(s)',\n                'Note',\n            ]},\n        'talen': {\n            'file': 'TALEN.txt',\n            'url': ZFDL + ",
+      "total_lines": 3121
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 2796,
+      "start_line": 2776,
+      "end_line": 2816,
+      "matched_line": "        ]",
+      "excerpt": "2776:         Given a file that defines the mapping between\n2777:         ZFIN-specific EQ definitions and the automatically derived ZP ids,\n2778:         create a mapping here.\n2779:         :return:\n2780:         dict zp_map with\n2781:         \"\"\"\n2782:         #  'zpmap'\n2783:         zp_file = '/'.join((self.rawdir, self.files[src_key]['file']))\n2784:         zp_map = {}\n2785:         col = self.files[src_key]['columns']\n2786:         kol = [\n2787:             'zp_id',\n2788:             'subterm1_id',\n2789:             'post_composed_relationship_id_1',\n2790:             'superterm1_id',\n2791:             'quality_id',\n2792:             'subterm2_id'\n2793:             'post_composed_relationship_id_2',\n2794:             'superterm2_id',\n2795:             'modifier'\n2796:         ]\n2797:         # id_map_zfin.tsv only contains data for abnormal phenotypes\n2798:         modifier = self.globaltt['abnormal']\n2799:         LOG.info(\"Loading ZP-to-EQ mappings from %s\", zp_file)\n2800:         with open(zp_file, 'r', encoding=\"utf-8\") as csvfile:\n2801:             reader = csv.reader(csvfile, delimiter='\\t', quotechar='\\\"')\n2802:             row = next(reader)\n2803:             if not self.check_fileheader(col, row):\n2804:                 pass\n2805:             for row in reader:\n2806:                 zp_id = row[col.index('iri')]\n2807:                 # the 'id' column is a hyphen separated list of 7 items.\n2808:                 val = row[col.index('id')].split('-')\n2809:                 val.append(modifier)\n2810:                 key = self._make_zpkey(val)\n2811:                 val.insert(0, zp_id)\n2812:                 zp_map[key] = dict(zip(kol, val))\n2813: \n2814:         LOG.info(\"Loaded %s zp terms\", zp_map.__len__())\n2815: \n2816:         return zp_map"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_load_zp_mappings",
+      "start_line": 2774,
+      "end_line": 2816,
+      "source": "    def _load_zp_mappings(self, src_key):\n        \"\"\"\n        Given a file that defines the mapping between\n        ZFIN-specific EQ definitions and the automatically derived ZP ids,\n        create a mapping here.\n        :return:\n        dict zp_map with\n        \"\"\"\n        #  'zpmap'\n        zp_file = '/'.join((self.rawdir, self.files[src_key]['file']))\n        zp_map = {}\n        col = self.files[src_key]['columns']\n        kol = [\n            'zp_id',\n            'subterm1_id',\n            'post_composed_relationship_id_1',\n            'superterm1_id',\n            'quality_id',\n            'subterm2_id'\n            'post_composed_relationship_id_2',\n            'superterm2_id',\n            'modifier'\n        ]\n        # id_map_zfin.tsv only contains data for abnormal phenotypes\n        modifier = self.globaltt['abnormal']\n        LOG.info(\"Loading ZP-to-EQ mappings from %s\", zp_file)\n        with open(zp_file, 'r', encoding=\"utf-8\") as csvfile:\n            reader = csv.reader(csvfile, delimiter='\\t', quotechar='\\\"')\n            row = next(reader)\n            if not self.check_fileheader(col, row):\n                pass\n            for row in reader:\n                zp_id = row[col.index('iri')]\n                # the 'id' column is a hyphen separated list of 7 items.\n                val = row[col.index('id')].split('-')\n                val.append(modifier)\n                key = self._make_zpkey(val)\n                val.insert(0, zp_id)\n                zp_map[key] = dict(zip(kol, val))\n\n        LOG.info(\"Loaded %s zp terms\", zp_map.__len__())\n\n        return zp_map"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 2774,
+      "end_line": 2816,
+      "excerpt": "    def _load_zp_mappings(self, src_key):\n        \"\"\"\n        Given a file that defines the mapping between\n        ZFIN-specific EQ definitions and the automatically derived ZP ids,\n        create a mapping here.\n        :return:\n        dict zp_map with\n        \"\"\"\n        #  'zpmap'\n        zp_file = '/'.join((self.rawdir, self.files[src_key]['file']))\n        zp_map = {}\n        col = self.files[src_key]['columns']\n        kol = [\n            'zp_id',\n            'subterm1_id',\n            'post_composed_relationship_id_1',\n            'superterm1_id',\n            'quality_id',\n            'subterm2_id'\n            'post_composed_relationship_id_2',\n            'superterm2_id',\n            'modifier'\n        ]\n        # id_map_zfin.tsv only contains data for abnormal phenotypes\n        modifier = self.globaltt['abnormal']\n        LOG.info(\"Loading ZP-to-EQ mappings from %s\", zp_file)\n        with open(zp_file, 'r', encoding=\"utf-8\") as csvfile:\n            reader = csv.reader(csvfile, delimiter='\\t', quotechar='\\\"')\n            row = next(reader)\n            if not self.check_fileheader(col, row):\n                pass\n            for row in reader:\n                zp_id = row[col.index('iri')]\n                # the 'id' column is a hyphen separated list of 7 items.\n                val = row[col.index('id')].split('-')\n                val.append(modifier)\n                key = self._make_zpkey(val)\n                val.insert(0, zp_id)\n                zp_map[key] = dict(zip(kol, val))\n\n        LOG.info(\"Loaded %s zp terms\", zp_map.__len__())\n\n        return zp_map",
+      "symbol_name": "_load_zp_mappings",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "dipper/sources/ZFIN.py",
+      "sha": "06d76d0329c99ab3562f659e95844f77781e8656",
+      "download_url": "https://raw.githubusercontent.com/monarch-initiative/dipper/master/dipper/sources/ZFIN.py"
+    },
+    "imports": {
+      "imports": [
+        "csv",
+        "re",
+        "logging",
+        "os",
+        "yaml",
+        "intermine.webservice:Service",
+        "dipper.sources.Source:Source",
+        "dipper.models.assoc.Association:Assoc",
+        "dipper.models.Genotype:Genotype",
+        "dipper.models.assoc.OrthologyAssoc:OrthologyAssoc",
+        "dipper.models.assoc.G2PAssoc:G2PAssoc",
+        "dipper.models.Environment:Environment",
+        "dipper.models.GenomicFeature:makeChromID",
+        "dipper.models.GenomicFeature:Feature",
+        "dipper.models.Reference:Reference",
+        "dipper.models.Model:Model",
+        "dipper.models.BiolinkVocabulary:BioLinkVocabulary"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "dipper/sources/README.md",
+      "download_url": "https://raw.githubusercontent.com/monarch-initiative/dipper/master/dipper/sources/README.md",
+      "content_excerpt": "# Best Practices for writing source ingests as part of the Dipper system\n\n## Overview\nEach Source should typically have the following basic things defined:\n\n  fetch()\n\n  parse()\n\n\n## Writing the fetcher()\n* This method is intended to fetch data from the remote locations\n(if it is newer than the local copy).  \n* You can add a dictionary of files with a structure like:\n\n    ```python\n    files = {\n        'somekey': {  \n            'file': 'filename.omg',  \n            'url': 'http://example.org/filename.omg'  \n        }, \n        ...  \n    }  \n    ```\nthen call the built-in file fetching method in Source.py ```get_files()```\nto get them all.\n\n\n## Writing the parser()\n\nTypically these are written by looping through the series of files that were\nobtained by the  method fetch().\nThe goal is to process each file minimally,\nadding classes and individuals as necessary,\nand adding triples to the sources' graph.  \n\nThere are certain conventions that we follow here:\n  1. Genes are a special case of genomic feature that are added as (OWL) Classes.\n    But all other genomic features are added as individuals of an owl class\n  2. If a source references an external identifier then,\n     assume that it has been processed in a another Source script,\n     and only add the identifier (but not the label) to it within this Source's file.\n    This will help prevent label collisions related\n    to slightly different versions of the source data when integrating downstream.\n  3. You can instantiate a class or individual as many times as you want;\n  they will get merged in the graph and will only sh"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "_load_zp_mappings test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_zfin.py",
+          "path": "tests/test_zfin.py",
+          "sha": "dfe9c1450aa9e041678495513d4c49a0d7dddae9",
+          "html_url": "https://github.com/monarch-initiative/dipper/blob/bf0a86c4472a2406919f96eee10afe156fe62951/tests/test_zfin.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 20,
+          "end_line": 44,
+          "excerpt": "20:     def tearDown(self):\n21:         self.source = None\n22: \n23:     def test_mapping_of_phenotypes_to_zp_ids(self):\n24:         \"\"\"\n25:         test that code correctly uses zp_map to map phenotypes to zp ids\n26:         :return:\n27: \n28:         \"\"\"\n29:         mapping_file = \"./resources/zfin/zp-mapping-test-map.txt\"\n30:         pheno_file = \"./resources/zfin/zp-mapping-test-phenotype.txt\"\n31: \n32:         self.source.zp_map = self.source._load_zp_mappings(mapping_file)\n33:         pheno_dat = open(pheno_file).read().split('\\t')\n34: \n35:         (fish_num, fish_name, start_stage_id, start_stage_name, end_stage_id,\n36:          end_stage_name, subterm1_id, subterm1_name, postcomp1_rel_id,\n37:          postcomp1_rel_name, superterm1_id, superterm1_name, quality_id,\n38:          quality_name, modifier, subterm2_id, subterm2_name, postcomp2_rel_id,\n39:          postcomp2_rel_name, superterm2_id, superterm2_name, pub_id, env_id) = \\\n40:             pheno_dat\n41: \n42:         self.assertEqual(\n43:             self.source._map_octuple_to_phenotype(subterm1_id, postcomp1_rel_id,\n44:                                                   superterm1_id, quality_id,",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_load_zp_mappings(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "ZFIN.py",
+          "path": "dipper/sources/ZFIN.py",
+          "sha": "06d76d0329c99ab3562f659e95844f77781e8656",
+          "html_url": "https://github.com/monarch-initiative/dipper/blob/bf0a86c4472a2406919f96eee10afe156fe62951/dipper/sources/ZFIN.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 2774,
+          "end_line": 2816,
+          "excerpt": "    def _load_zp_mappings(self, src_key):\n        \"\"\"\n        Given a file that defines the mapping between\n        ZFIN-specific EQ definitions and the automatically derived ZP ids,\n        create a mapping here.\n        :return:\n        dict zp_map with\n        \"\"\"\n        #  'zpmap'\n        zp_file = '/'.join((self.rawdir, self.files[src_key]['file']))\n        zp_map = {}\n        col = self.files[src_key]['columns']\n        kol = [\n            'zp_id',\n            'subterm1_id',\n            'post_composed_relationship_id_1',\n            'superterm1_id',\n            'quality_id',\n            'subterm2_id'\n            'post_composed_relationship_id_2',\n            'superterm2_id',\n            'modifier'\n        ]\n        # id_map_zfin.tsv only contains data for abnormal phenotypes\n        modifier = self.globaltt['abnormal']\n        LOG.info(\"Loading ZP-to-EQ mappings from %s\", zp_file)\n        with open(zp_file, 'r', encoding=\"utf-8\") as csvfile:\n            reader = csv.reader(csvfile, delimiter='\\t', quotechar='\\\"')\n            row = next(reader)\n            if not self.check_fileheader(col, row):\n                pass\n            for row in reader:\n                zp_id = row[col.index('iri')]\n                # the 'id' column is a hyphen separated list of 7 items.\n                val = row[col.index('id')].split('-')\n                val.append(modifier)\n                key = self._make_zpkey(val)\n                val.insert(0, zp_id)\n                zp_map[key] = dict(zip(kol, val))\n\n        LOG.info(\"Loaded %s zp terms\", zp_map.__len__())\n\n        return zp_map",
+          "symbol_name": "_load_zp_mappings",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "ZFINSlim.py",
+          "path": "dipper/sources/ZFINSlim.py",
+          "sha": "ea1917ddfbff58570aa50ca4b3e773df584e1646",
+          "html_url": "https://github.com/monarch-initiative/dipper/blob/bf0a86c4472a2406919f96eee10afe156fe62951/dipper/sources/ZFINSlim.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 75,
+          "end_line": 99,
+          "excerpt": "75:         )\n76:         self.dataset.set_citation(\n77:             'https://wiki.zfin.org/display/general/ZFIN+db+information')\n78: \n79:     def fetch(self, is_dl_forced=False):\n80:         self.get_files(is_dl_forced)\n81: \n82:     def parse(self, limit=None):\n83:         zfin_parser = ZFIN(self.graph_type, self.are_bnodes_skized)\n84:         model = Model(self.graph)\n85: \n86:         src_key = 'zpmap'  # keep same-as zfin.files[key]\n87:         zfin_parser.zp_map = zfin_parser._load_zp_mappings(src_key)\n88: \n89:         src_key = 'g2p_clean'\n90:         raw = '/'.join((self.rawdir, self.files[src_key]['file']))\n91:         LOG.info(\"Processing clean Geno to Pheno from file: %s\", raw)\n92:         col = self.files[src_key]['columns']\n93:         collen = len(col)\n94:         with open(raw, 'r', encoding=\"utf8\") as csvfile:\n95:             reader = csv.reader(csvfile, delimiter='\\t', quotechar='\\\"')\n96:             for row in reader:\n97:                 if len(row) != collen:\n98:                     LOG.warning('Row: %i has unexpected format', reader.line_num)\n99:                 # internal_id = row[col.index('ID')]",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_zfin.py",
+          "path": "tests/test_zfin.py",
+          "sha": "dfe9c1450aa9e041678495513d4c49a0d7dddae9",
+          "html_url": "https://github.com/monarch-initiative/dipper/blob/bf0a86c4472a2406919f96eee10afe156fe62951/tests/test_zfin.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 20,
+          "end_line": 44,
+          "excerpt": "20:     def tearDown(self):\n21:         self.source = None\n22: \n23:     def test_mapping_of_phenotypes_to_zp_ids(self):\n24:         \"\"\"\n25:         test that code correctly uses zp_map to map phenotypes to zp ids\n26:         :return:\n27: \n28:         \"\"\"\n29:         mapping_file = \"./resources/zfin/zp-mapping-test-map.txt\"\n30:         pheno_file = \"./resources/zfin/zp-mapping-test-phenotype.txt\"\n31: \n32:         self.source.zp_map = self.source._load_zp_mappings(mapping_file)\n33:         pheno_dat = open(pheno_file).read().split('\\t')\n34: \n35:         (fish_num, fish_name, start_stage_id, start_stage_name, end_stage_id,\n36:          end_stage_name, subterm1_id, subterm1_name, postcomp1_rel_id,\n37:          postcomp1_rel_name, superterm1_id, superterm1_name, quality_id,\n38:          quality_name, modifier, subterm2_id, subterm2_name, postcomp2_rel_id,\n39:          postcomp2_rel_name, superterm2_id, superterm2_name, pub_id, env_id) = \\\n40:             pheno_dat\n41: \n42:         self.assertEqual(\n43:             self.source._map_octuple_to_phenotype(subterm1_id, postcomp1_rel_id,\n44:                                                   superterm1_id, quality_id,",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "dipper/sources",
+      "count": 40,
+      "entries": [
+        {
+          "name": "AnimalQTLdb.py",
+          "path": "dipper/sources/AnimalQTLdb.py",
+          "type": "file"
+        },
+        {
+          "name": "Bgee.py",
+          "path": "dipper/sources/Bgee.py",
+          "type": "file"
+        },
+        {
+          "name": "BioGrid.py",
+          "path": "dipper/sources/BioGrid.py",
+          "type": "file"
+        },
+        {
+          "name": "CTD.py",
+          "path": "dipper/sources/CTD.py",
+          "type": "file"
+        },
+        {
+          "name": "ClinVar.py",
+          "path": "dipper/sources/ClinVar.py",
+          "type": "file"
+        },
+        {
+          "name": "Coriell.py",
+          "path": "dipper/sources/Coriell.py",
+          "type": "file"
+        },
+        {
+          "name": "Decipher.py",
+          "path": "dipper/sources/Decipher.py",
+          "type": "file"
+        },
+        {
+          "name": "EBIGene2Phen.py",
+          "path": "dipper/sources/EBIGene2Phen.py",
+          "type": "file"
+        },
+        {
+          "name": "EOM.py",
+          "path": "dipper/sources/EOM.py",
+          "type": "file"
+        },
+        {
+          "name": "Ensembl.py",
+          "path": "dipper/sources/Ensembl.py",
+          "type": "file"
+        },
+        {
+          "name": "FlyBase.py",
+          "path": "dipper/sources/FlyBase.py",
+          "type": "file"
+        },
+        {
+          "name": "GWASCatalog.py",
+          "path": "dipper/sources/GWASCatalog.py",
+          "type": "file"
+        },
+        {
+          "name": "GeneOntology.py",
+          "path": "dipper/sources/GeneOntology.py",
+          "type": "file"
+        },
+        {
+          "name": "GeneReviews.py",
+          "path": "dipper/sources/GeneReviews.py",
+          "type": "file"
+        },
+        {
+          "name": "HGNC.py",
+          "path": "dipper/sources/HGNC.py",
+          "type": "file"
+        },
+        {
+          "name": "HPOAnnotations.py",
+          "path": "dipper/sources/HPOAnnotations.py",
+          "type": "file"
+        },
+        {
+          "name": "IMPC.py",
+          "path": "dipper/sources/IMPC.py",
+          "type": "file"
+        },
+        {
+          "name": "KEGG.py",
+          "path": "dipper/sources/KEGG.py",
+          "type": "file"
+        },
+        {
+          "name": "MGI.py",
+          "path": "dipper/sources/MGI.py",
+          "type": "file"
+        },
+        {
+          "name": "MGISlim.py",
+          "path": "dipper/sources/MGISlim.py",
+          "type": "file"
+        },
+        {
+          "name": "MMRRC.py",
+          "path": "dipper/sources/MMRRC.py",
+          "type": "file"
+        },
+        {
+          "name": "MPD.py",
+          "path": "dipper/sources/MPD.py",
+          "type": "file"
+        },
+        {
+          "name": "Monarch.py",
+          "path": "dipper/sources/Monarch.py",
+          "type": "file"
+        },
+        {
+          "name": "Monochrom.py",
+          "path": "dipper/sources/Monochrom.py",
+          "type": "file"
+        },
+        {
+          "name": "MyChem.py",
+          "path": "dipper/sources/MyChem.py",
+          "type": "file"
+        },
+        {
+          "name": "MyDrug.py",
+          "path": "dipper/sources/MyDrug.py",
+          "type": "file"
+        },
+        {
+          "name": "NCBIGene.py",
+          "path": "dipper/sources/NCBIGene.py",
+          "type": "file"
+        },
+        {
+          "name": "OMIA.py",
+          "path": "dipper/sources/OMIA.py",
+          "type": "file"
+        },
+        {
+          "name": "OMIM.py",
+          "path": "dipper/sources/OMIM.py",
+          "type": "file"
+        },
+        {
+          "name": "OMIMSource.py",
+          "path": "dipper/sources/OMIMSource.py",
+          "type": "file"
+        },
+        {
+          "name": "Orphanet.py",
+          "path": "dipper/sources/Orphanet.py",
+          "type": "file"
+        },
+        {
+          "name": "Panther.py",
+          "path": "dipper/sources/Panther.py",
+          "type": "file"
+        },
+        {
+          "name": "PostgreSQLSource.py",
+          "path": "dipper/sources/PostgreSQLSource.py",
+          "type": "file"
+        },
+        {
+          "name": "README.md",
+          "path": "dipper/sources/README.md",
+          "type": "file"
+        },
+        {
+          "name": "RGD.py",
+          "path": "dipper/sources/RGD.py",
+          "type": "file"
+        },
+        {
+          "name": "Reactome.py",
+          "path": "dipper/sources/Reactome.py",
+          "type": "file"
+        },
+        {
+          "name": "SGD.py",
+          "path": "dipper/sources/SGD.py",
+          "type": "file"
+        },
+        {
+          "name": "Source.py",
+          "path": "dipper/sources/Source.py",
+          "type": "file"
+        },
+        {
+          "name": "StringDB.py",
+          "path": "dipper/sources/StringDB.py",
+          "type": "file"
+        },
+        {
+          "name": "UCSCBands.py",
+          "path": "dipper/sources/UCSCBands.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "AnimalQTLdb.py",
+          "path": "dipper/sources/AnimalQTLdb.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import csv\n2: import logging\n3: import re\n4: import gzip\n5: \n6: from dipper.sources.Source import Source\n7: from dipper.models.Model import Model\n8: from dipper.models.assoc.G2PAssoc import G2PAssoc\n9: from dipper.models.Genotype import Genotype\n10: from dipper.models.Reference import Reference\n11: from dipper.models.GenomicFeature import Feature, makeChromID\n12: from dipper.models.BiolinkVocabulary import BioLinkVocabulary as blv\n13: "
+        },
+        {
+          "name": "Bgee.py",
+          "path": "dipper/sources/Bgee.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import logging\n2: import os\n3: import re\n4: import time\n5: import ftplib\n6: import gzip\n7: from datetime import datetime\n8: from stat import ST_SIZE\n9: \n10: import pandas as pd\n11: from dipper.sources.Source import Source\n12: from dipper.models.Model import Model\n13: from dipper.models.assoc.Association import Assoc"
+        },
+        {
+          "name": "BioGrid.py",
+          "path": "dipper/sources/BioGrid.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import os\n2: import logging\n3: import re\n4: from typing import Union, Optional\n5: \n6: from zipfile import ZipFile\n7: \n8: from dipper.sources.Source import Source\n9: from dipper.models.Model import Model\n10: from dipper.models.assoc.InteractionAssoc import InteractionAssoc\n11: \n12: __author__ = 'nicole'\n13: "
+        },
+        {
+          "name": "CTD.py",
+          "path": "dipper/sources/CTD.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import csv\n2: import re\n3: import gzip\n4: import os\n5: import logging\n6: import urllib\n7: import urllib.parse\n8: import urllib.request\n9: \n10: from dipper.sources.Source import Source\n11: from dipper.models.Model import Model\n12: from dipper.models.Genotype import Genotype\n13: from dipper.models.Pathway import Pathway"
+        },
+        {
+          "name": "ClinVar.py",
+          "path": "dipper/sources/ClinVar.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #! /usr/bin/env python3\n2: \n3: \"\"\"\n4:     Converts ClinVar XML into\n5:     RDF triples to be ingested by SciGraph.\n6:     These triples conform to the core of the\n7:     SEPIO Evidence & Provenance model\n8: \n9:     We also use the clinvar curated gene to disease\n10:     mappings to discern the functional consequence of\n11:     a variant on a gene in cases where this is ambiguous.\n12:     For example, some variants are located in two\n13:     genes overlapping on different strands, and may"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "dipper/sources/ZFIN.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "3882b6e6f7fbd4b5030e039c5cee1d17b53abc79",
+          "html_url": "https://github.com/monarch-initiative/dipper/commit/3882b6e6f7fbd4b5030e039c5cee1d17b53abc79",
+          "message": "update term label",
+          "author": "TomConlin",
+          "date": "2020-10-17T20:46:24Z"
+        },
+        {
+          "sha": "c812cadf03a0f6c6397106f677b5e8007cf8c340",
+          "html_url": "https://github.com/monarch-initiative/dipper/commit/c812cadf03a0f6c6397106f677b5e8007cf8c340",
+          "message": "digest bnode ids; some refactoring",
+          "author": "TomConlin",
+          "date": "2020-10-09T09:42:46Z"
+        },
+        {
+          "sha": "aaba3fe1b2b7fffbfc9c38a1dbbd397723d64658",
+          "html_url": "https://github.com/monarch-initiative/dipper/commit/aaba3fe1b2b7fffbfc9c38a1dbbd397723d64658",
+          "message": "digest bnode ids",
+          "author": "TomConlin",
+          "date": "2020-10-08T04:37:53Z"
+        },
+        {
+          "sha": "edd5aea8c18ac6d010013b6d1adeda7221480112",
+          "html_url": "https://github.com/monarch-initiative/dipper/commit/edd5aea8c18ac6d010013b6d1adeda7221480112",
+          "message": "dcterms to dc",
+          "author": "TomConlin",
+          "date": "2020-10-07T08:25:44Z"
+        },
+        {
+          "sha": "9bc6e9b74b6c9e7649cd14681f72bbf68aacc4f7",
+          "html_url": "https://github.com/monarch-initiative/dipper/commit/9bc6e9b74b6c9e7649cd14681f72bbf68aacc4f7",
+          "message": "guard against empty synonyms",
+          "author": "TomConlin",
+          "date": "2020-09-07T21:36:35Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_load_zp_mappings FIXME this here",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "dipper/sources/ZFIN.py",
+      "satd_line": 2796,
+      "last_commit": {
+        "sha": "3882b6e6f7fbd4b5030e039c5cee1d17b53abc79",
+        "html_url": "https://github.com/monarch-initiative/dipper/commit/3882b6e6f7fbd4b5030e039c5cee1d17b53abc79",
+        "message": "update term label",
+        "author": "TomConlin",
+        "date": "2020-10-17T20:46:24Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 1,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_load_zp_mappings",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

@@ -1,0 +1,280 @@
+{
+  "task_id": "108",
+  "repo_owner": "pantsbuild",
+  "repo_name": "pants",
+  "file_path": "src/python/pants/backend/scala/bsp/rules.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T07:04:51+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T07:05:02+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T07:05:08+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/python/pants/backend/scala/bsp/rules.py",
+    "original_code": "async def bsp_resolve_one_scala_build_target(\n    request: ResolveScalaBSPBuildTargetRequest,\n    jvm: JvmSubsystem,\n    scala: ScalaSubsystem,\n    union_membership: UnionMembership,\n) -> BuildTarget:\n    resolve = request.target[JvmResolveField].normalized_value(jvm)\n    scala_version = scala.version_for_resolve(resolve)\n\n    dep_addrs = await Get(Addresses, DependenciesRequest(request.target[Dependencies]))\n    impls = union_membership.get(BSPCompileFieldSet)\n\n    reported_deps = []\n    for dep_addr in dep_addrs:\n        if dep_addr == request.target.address:\n            continue\n\n        wrapped_dep_tgt = await Get(WrappedTarget, Address, dep_addr)\n        dep_tgt = wrapped_dep_tgt.target\n        for impl in impls:\n            if impl.is_applicable(dep_tgt):\n                reported_deps.append(BuildTargetIdentifier.from_address(dep_tgt.address))\n                break\n\n    return BuildTarget(\n        id=BuildTargetIdentifier.from_address(request.target.address),\n        display_name=str(request.target.address),\n        base_directory=None,\n        tags=(),\n        capabilities=BuildTargetCapabilities(\n            can_compile=True,\n        ),\n        language_ids=(LANGUAGE_ID,),\n        dependencies=tuple(reported_deps),\n        data_kind=\"scala\",\n        data=ScalaBuildTarget(\n            scala_organization=\"unknown\",\n            scala_version=scala_version,\n            scala_binary_version=\".\".join(scala_version.split(\".\")[0:2]),\n            platform=ScalaPlatform.JVM,\n            # TODO: These are the jars for the scalac tool.\n            jars=(),\n        ),\n    )",
+    "original_signature": "async def bsp_resolve_one_scala_build_target(",
+    "satd_comment": "# TODO: These are the jars for the scalac tool.",
+    "target_file": {
+      "ok": true,
+      "path": "src/python/pants/backend/scala/bsp/rules.py",
+      "sha": "3f9fb52650c0ab5d9504c1b76aa893d2ba05968c",
+      "download_url": "https://raw.githubusercontent.com/pantsbuild/pants/main/src/python/pants/backend/scala/bsp/rules.py",
+      "content_excerpt": "# Copyright 2022 Pants project contributors (see CONTRIBUTORS.md).\n# Licensed under the Apache License, Version 2.0 (see LICENSE).\nfrom __future__ import annotations\n\nimport logging\nimport textwrap\nfrom collections.abc import Callable\nfrom dataclasses import dataclass\nfrom pathlib import Path\n\nfrom pants.backend.scala.bsp.spec import (\n    ScalaBuildTarget,\n    ScalacOptionsItem,\n    ScalacOptionsParams,\n    ScalacOptionsResult,\n    ScalaMainClassesParams,\n    ScalaMainClassesResult,\n    ScalaPlatform,\n    ScalaTestClassesParams,\n    ScalaTestClassesResult,\n)\nfrom pants.backend.scala.compile.scalac_plugins import (\n    ScalaPluginsForTargetRequest,\n    ScalaPluginsRequest,\n    fetch_plugins,\n    resolve_scala_plugins_for_target,\n)\nfrom pants.backend.scala.subsystems.scala import ScalaSubsystem\nfrom pants.backend.scala.subsystems.scalac import Scalac\nfrom pants.backend.scala.target_types import ScalaFieldSet, ScalaSourceField\nfrom pants.backend.scala.util_rules.versions import (\n    ScalaArtifactsForVersionRequest,\n    ScalaVersion,\n    resolve_scala_artifacts_for_version,\n)\nfrom pants.base.build_root import BuildRoot\nfrom pants.bsp.protocol import BSPHandlerMapping\nfrom pants.bsp.spec.base import BuildTargetIdentifier\nfrom pants.bsp.spec.targets import DependencyModule\nfrom pants.bsp.util_rules.lifecycle import BSPLanguageSupport\nfrom pants.bsp.util_rules.queries import compute_handler_query_rules\nfrom pants.bsp.util_rules.targets import (\n    BSPBuildTargetsMetadataRequest,\n    BSPBuildTargetsMetadataResult,\n    BSPCompileRequest,\n    BSPCompileResult,\n    BSPDependencyModulesRequest,\n    BSPDependencyModulesResult,\n    BSPResourcesRequest,\n    BSPResourcesResult,\n    resolve_bsp_build_target_addresses,\n)\nfrom pants.core.util_rules.system_binaries import BashBinary, ReadlinkBinary\nfrom pants.engine.addresses import Addresses\nfrom pants.engine.fs import AddPrefix, CreateDigest, Digest, FileContent, MergeDigests, Workspace\nfrom pants.engine.internals.graph import resolve_coarsened_targets as coarsened_targets_get\nfrom pants.engine.internals.native_engine import Snapshot\nfrom pants.engine.internals.selectors import concurrently\nfrom pants.engine.intrinsics import add_prefix, create_digest, digest_to_snapshot, merge_digests\nfrom pants.engine.process import Process, execute_process_or_raise\nfrom pants.engine.rules import _uncacheable_rule, collect_rules, implicitly, rule\nfrom pants.engine.target import CoarsenedTarget, FieldSet\nfrom pants.engine.unions import UnionRule\nfrom pants.jvm.bsp.compile import _jvm_bsp_compile, jvm_classes_directory\nfrom pants.jvm.bsp.compile import rules as jvm_compile_rules\nfrom pants.jvm.bsp.resources import _jvm_bsp_resources\nfrom pants.jvm.bsp.resources import rules as jvm_resources_rules\nfrom pants.jvm.bsp.spec import JvmBuildTarget, MavenDependencyModule, MavenDependencyModuleArtifact\nfrom pants.jvm.compile import (\n    ClasspathEntry,\n    ClasspathEntryRequest,\n    ClasspathEntryRequestFactory,\n    get_fallible_classpath_entry,\n    required_classfiles,\n)\nfrom pants.jvm.jdk_rules import DefaultJdk, JdkRequest, prepare_jdk_environment\nfrom pants.jvm.resolve.common import ArtifactRequirement, ArtifactRequirements\nfrom pants.jvm.resolve.coordinate import Coordinate\nfrom pants.jvm.resolve.coursier_fetch import (\n    CoursierLockfileEntry,\n    CoursierResolvedLockfile,\n    ToolClasspathRequest,\n    get_coursier_lockfile_for_resolve,\n    materialize_classpath_for_tool,\n    select_coursier_resolve_for_targets,\n)\nfrom pants.jvm.resolve.key import CoursierResolveKey\nfrom pants.jvm.subsystems import JvmSubsystem\nfrom pants.jvm.target_types import JvmArtifactFieldSet, JvmJdkField, JvmResolveField\nfrom pants.util.logging import LogLevel\n\nLANGUAGE_ID = \"scala\"\n\n_logger = logging.getLogger(__name__)\n\n\nclass ScalaBSPLanguageSupport(BSPLanguageSupport):\n    language_id = LANGUAGE_ID\n    can_compile = True\n    can_provide_resources = True\n\n\n@dataclass(frozen=True)\nclass ScalaMetadataFieldSet(FieldSet):\n    required_fields = (ScalaSourceField, JvmResolveField, JvmJdkField)\n\n    source: ScalaSourceField\n    resolve: JvmResolveField\n    jdk: JvmJdkField\n\n\nclass ScalaBSPBuildTargetsMetadataRequest(BSPBuildTargetsMetadataRequest):\n    language_id = LANGUAGE_ID\n    can_merge_metadata_from = (\"java\",)\n    field_set_type = ScalaMetadataFieldSet\n\n    resolve_prefix = \"jvm\"\n    resolve_field = JvmResolveField\n\n\n@dataclass(frozen=True)\nclass ThirdpartyModulesRequest:\n    addresses: Addresses\n\n\n@dataclass(frozen=True)\nclass ThirdpartyModules:\n    resolve: CoursierResolveKey\n    entries: dict[CoursierLockfileEntry, ClasspathEntry]\n    merged_digest: Digest\n\n\n@rule\nasync def collect_thirdparty_modules(\n    request: ThirdpartyModulesRequest,\n    classpath_entry_request: ClasspathEntryRequestFactory,\n) -> ThirdpartyModules:\n    coarsened_targets = await coarsened_targets_get(**implicitly(request.addresses))\n    resolve = await select_coursier_resolve_for_targets(coarsened_targets, **implicitly())\n    lockfile = await get_coursier_lockfile_for_resolve(resolve)\n\n    applicable_lockfile_entries: dict[CoursierLockfileEntry, CoarsenedTarget] = {}\n    for ct in coarsened_targets.coarsened_closure():\n        for tgt in ct.members:\n            if not JvmArtifactFieldSet.is_applicable(tgt):\n                continue\n\n            artifact_requirement = ArtifactRequirement.from_jvm_artifact_target(tgt)\n            entry = get_entry_for_coord(lockfile, artifact_requirement.coordinate)\n            if not entry:\n                _logger.warning(\n                    f\"No lockfile entry for {artifact_requirement.coordinate} in resolve {resolve.name}.\"\n                )\n                continue\n            applicable_lockfile_entries[entry] = ct\n\n    fallible_classpath_entries = await concurrently(\n        get_fallible_classpath_entry(\n            **implicitly(\n                {\n                    classpath_entry_request.for_targets(\n                        component=target, resolve=resolve\n                    ): ClasspathEntryRequest\n                }\n            )\n        )\n        for target in applicable_lockfile_entries.values()\n    )\n    classpath_entries = await concurrently(\n        required_classfiles(fce) for fce in fallible_classpath_entries\n    )\n\n    resolve_digest = await merge_digests(MergeDigests(cpe.digest for cpe in classpath_entries))\n\n    return ThirdpartyModules(\n        resolve,\n        dict(zip(applicable_lockfile_entries, classpath_entries)),\n        resolve_digest,\n    )\n\n\nasync def _materialize_scala_runtime_jars(scala_version: ScalaVersion) -> Snapshot:\n    scala_artifacts = await resolve_scala_artifacts_for_version(\n        ScalaArtifactsForVersionRequest(scala_version)\n    )\n\n    tool_classpath = await materialize_classpath_for_tool(\n        ToolClasspathRequest(\n            artifact_requirements=ArtifactRequirements.from_coordinates(\n                scala_artifacts.all_coordinates\n            ),\n        ),\n    )\n\n    return await digest_to_snapshot(\n        **implicitly(AddPrefix(tool_classpath.content.digest, f\"jvm/scala-runtime/{scala_version}\"))\n    )\n\n\n@rule\nasync def bsp_resolve_scala_metadata(\n    request: ScalaBSPBuildTargetsMetadataRequest,\n    bash: BashBinary,\n    jvm: JvmSubsystem,\n    scala: ScalaSubsystem,\n    build_root: BuildRoot,\n    readlink: ReadlinkBinary,\n) -> BSPBuildTargetsMetadataResult:\n    resolves = {fs.resolve.normalized_value(jvm) for fs in request.field_sets}\n    jdk_versions = {fs.jdk for fs in request.field_sets}\n    if len(resolves) > 1:\n        raise ValueError(\n            \"Cannot provide Scala metadata for multiple resolves. Please set the \"\n            \"`resolve = jvm:$resolve` field in your `[experimental-bsp].groups_config_files` to \"\n            \"select the relevant resolve to use.\"\n        )\n    (resolve,) = resolves\n\n    scala_version = scala.version_for_resolve(resolve)\n    scala_runtime = await _materialize_scala_runtime_jars(scala_version)\n\n    #\n    # Extract the JDK paths from an lawful-evil process so we can supply it to the IDE.\n    #\n    # Why lawful-evil?\n    # This script relies on implementation details of the Pants JVM execution environment,\n    # namely that the Coursier Archive Cache (i.e. where JDKs are extracted to after download)\n    # is stored into a predictable location on disk and symlinked into the sandbox on process\n    # startup. The script reads the symlink of the cache directory, and outputs the linked\n    # location of the JDK (according to Coursier), and we use that to calculate the permanent\n    # location of the JDK.\n    #\n    # Please don't do anything like this except as a last resort.\n    #\n\n    # The maximum JDK version will be compatible with all the specified targets\n    jdk_requests = [JdkRequest.from_field(version) for version in jdk_versions]\n    jdk_request = max(jdk_requests, key=_jdk_request_sort_key(jvm))\n    jdk = await prepare_jdk_environment(**implicitly({jdk_request: JdkRequest}))\n\n    if any(i.version == DefaultJdk.SYSTEM for i in jdk_requests):\n        system_jdk = await prepare_jdk_environment(**implicitly({JdkRequest.SYSTEM: JdkRequest}))\n        if system_jdk.jre_major_version > jdk.jre_major_version:\n            jdk = system_jdk\n\n    cmd = \"leak_paths.sh\"\n    leak_jdk_sandbox_paths = textwrap.dedent(  # noqa: PNT20\n        f\"\"\"\\\n        # Script to leak JDK cache paths out of Coursier sandbox so that BSP can use them.\n\n        {readlink.path} {jdk.coursier.cache_dir}\n        {jdk.java_home_command}\n        \"\"\"\n    )\n    leak_sandbox_path_digest = await create_digest(\n        CreateDigest(\n            [\n                FileContent(\n                    cmd,\n                    leak_jdk_sandbox_paths.encode(\"utf-8\"),\n                    is_executable=True,\n                ),\n            ]\n        )\n    )\n\n    leaked_paths = await execute_process_or_raise(\n        **implicitly(\n            Process(\n                [\n                    bash.path,\n                    cmd,\n                ],\n                input_digest=leak_sandbox_path_digest,\n                immutable_input_digests=jdk.immutable_input_digests,\n                env=jdk.env,\n                use_nailgun=(),\n                description=\"Report JDK cache paths for BSP\",\n                append_only_caches=jdk.append_only_caches,\n                level=LogLevel.TRACE,\n            )\n        )\n    )\n\n    cache_dir, jdk_home = leaked_paths.stdout.decode().strip().split(\"\\n\")\n\n    _, sep, suffix = jdk_home.partition(jdk.coursier.cache_dir)\n    if sep:\n        coursier_java_home = cache_dir + suffix\n    else:\n        # Partition failed. Probably a system JDK instead\n        coursier_java_home = jdk_home\n\n    scala_jar_uris = tuple(\n        # TODO: Why is this hardcoded and not under pants_workdir?\n        build_root.pathlib_path.joinpath(\".pants.d\", \"bsp\", p).as_uri()\n        for p in scala_runtime.files\n    )\n\n    jvm_build_target = JvmBuildTarget(\n        java_home=Path(coursier_java_home).as_uri(),\n        java_version=f\"1.{jdk.jre_major_version}\",\n    )\n\n    return BSPBuildTargetsMetadataResult(\n        metadata=ScalaBuildTarget(\n            scala_organization=\"org.scala-lang\",\n            scala_version=str(scala_version),\n            scala_binary_version=scala_version.binary,\n            platform=ScalaPlatform.JVM,\n            jars=scala_jar_uris,\n            jvm_build_target=jvm_build_target,\n        ),\n        digest=scala_runtime.digest,\n    )\n\n\ndef _jdk_request_sort_key(\n    jvm: JvmSubsystem,\n) -> Callable[\n    [\n        JdkRequest,\n    ],\n    tuple[int, ...],\n]:\n    def sort_key_function(request: JdkRequest) -> tuple[int, ...]:\n        if request == JdkRequest.SYSTEM:\n            return (-1,)\n\n        version_str = request.version if isinstance(request.version, str) else jvm.jdk\n        _, version = version_str.split(\":\")\n\n        return tuple(int(i) for i in version.split(\".\"))\n\n    return sort_key_function\n\n\n# -----------------------------------------------------------------------------------------------\n# ",
+      "total_lines": 580
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "anchor_text",
+      "start_line": 210,
+      "end_line": 234,
+      "excerpt": "210:     jdk_versions = {fs.jdk for fs in request.field_sets}\n211:     if len(resolves) > 1:\n212:         raise ValueError(\n213:             \"Cannot provide Scala metadata for multiple resolves. Please set the \"\n214:             \"`resolve = jvm:$resolve` field in your `[experimental-bsp].groups_config_files` to \"\n215:             \"select the relevant resolve to use.\"\n216:         )\n217:     (resolve,) = resolves\n218: \n219:     scala_version = scala.version_for_resolve(resolve)\n220:     scala_runtime = await _materialize_scala_runtime_jars(scala_version)\n221: \n222:     #\n223:     # Extract the JDK paths from an lawful-evil process so we can supply it to the IDE.\n224:     #\n225:     # Why lawful-evil?\n226:     # This script relies on implementation details of the Pants JVM execution environment,\n227:     # namely that the Coursier Archive Cache (i.e. where JDKs are extracted to after download)\n228:     # is stored into a predictable location on disk and symlinked into the sandbox on process\n229:     # startup. The script reads the symlink of the cache directory, and outputs the linked\n230:     # location of the JDK (according to Coursier), and we use that to calculate the permanent\n231:     # location of the JDK.\n232:     #\n233:     # Please don't do anything like this except as a last resort.\n234:     #",
+      "symbol_name": null,
+      "symbol_type": null,
+      "ok": true,
+      "path": "src/python/pants/backend/scala/bsp/rules.py",
+      "sha": "3f9fb52650c0ab5d9504c1b76aa893d2ba05968c",
+      "download_url": "https://raw.githubusercontent.com/pantsbuild/pants/main/src/python/pants/backend/scala/bsp/rules.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "logging",
+        "textwrap",
+        "collections.abc:Callable",
+        "dataclasses:dataclass",
+        "pathlib:Path",
+        "pants.backend.scala.bsp.spec:ScalaBuildTarget",
+        "pants.backend.scala.bsp.spec:ScalacOptionsItem",
+        "pants.backend.scala.bsp.spec:ScalacOptionsParams",
+        "pants.backend.scala.bsp.spec:ScalacOptionsResult",
+        "pants.backend.scala.bsp.spec:ScalaMainClassesParams",
+        "pants.backend.scala.bsp.spec:ScalaMainClassesResult",
+        "pants.backend.scala.bsp.spec:ScalaPlatform",
+        "pants.backend.scala.bsp.spec:ScalaTestClassesParams",
+        "pants.backend.scala.bsp.spec:ScalaTestClassesResult",
+        "pants.backend.scala.compile.scalac_plugins:ScalaPluginsForTargetRequest",
+        "pants.backend.scala.compile.scalac_plugins:ScalaPluginsRequest",
+        "pants.backend.scala.compile.scalac_plugins:fetch_plugins",
+        "pants.backend.scala.compile.scalac_plugins:resolve_scala_plugins_for_target",
+        "pants.backend.scala.subsystems.scala:ScalaSubsystem",
+        "pants.backend.scala.subsystems.scalac:Scalac",
+        "pants.backend.scala.target_types:ScalaFieldSet",
+        "pants.backend.scala.target_types:ScalaSourceField",
+        "pants.backend.scala.util_rules.versions:ScalaArtifactsForVersionRequest",
+        "pants.backend.scala.util_rules.versions:ScalaVersion",
+        "pants.backend.scala.util_rules.versions:resolve_scala_artifacts_for_version",
+        "pants.base.build_root:BuildRoot",
+        "pants.bsp.protocol:BSPHandlerMapping",
+        "pants.bsp.spec.base:BuildTargetIdentifier",
+        "pants.bsp.spec.targets:DependencyModule"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pantsbuild/pants/main/README.md",
+      "content_excerpt": "# Pants Build System\n\n[![Coverage Status](https://coveralls.io/repos/github/pantsbuild/pants/badge.svg?branch=main)](https://coveralls.io/github/pantsbuild/pants?branch=main)\n\nPants is a scalable build system for _monorepos_: codebases containing \nmultiple projects, often using multiple programming languages and frameworks, \nin a single unified code repository.\n\nSome noteworthy features include:\n\n* Explicit dependency modeling.\n* Fine-grained invalidation.\n* Shared result caching.\n* Concurrent execution.\n* Remote execution.\n* Unified interface for multiple tools and languages.\n* Extensibility and customizability via a plugin API.\n\nDocumentation: [www.pantsbuild.org](https://www.pantsbuild.org/).\n\n# Getting started\n\nSee the [getting started](https://www.pantsbuild.org/stable/docs/getting-started) documentation.\n\n# Credits\n\nmacOS CI resources provided by [MacStadium](https://www.macstadium.com/).\n\n<img width=\"150\" height=\"61\" src=\"https://uploads-ssl.webflow.com/5ac3c046c82724970fc60918/5c019d917bba312af7553b49_MacStadium-developerlogo.png\">\n\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "bsp_resolve_one_scala_build_target test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"bsp_resolve_one_scala_build_target(\"",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/python/pants/backend/scala/bsp",
+      "count": 4,
+      "entries": [
+        {
+          "name": "BUILD",
+          "path": "src/python/pants/backend/scala/bsp/BUILD",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/python/pants/backend/scala/bsp/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "rules.py",
+          "path": "src/python/pants/backend/scala/bsp/rules.py",
+          "type": "file"
+        },
+        {
+          "name": "spec.py",
+          "path": "src/python/pants/backend/scala/bsp/spec.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 3,
+      "items": [
+        {
+          "name": "BUILD",
+          "path": "src/python/pants/backend/scala/bsp/BUILD",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 4,
+          "excerpt": "1: # Copyright 2022 Pants project contributors (see CONTRIBUTORS.md).\n2: # Licensed under the Apache License, Version 2.0 (see LICENSE).\n3: \n4: python_sources()"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/python/pants/backend/scala/bsp/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "spec.py",
+          "path": "src/python/pants/backend/scala/bsp/spec.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Copyright 2022 Pants project contributors (see CONTRIBUTORS.md).\n2: # Licensed under the Apache License, Version 2.0 (see LICENSE).\n3: from __future__ import annotations\n4: \n5: from dataclasses import dataclass\n6: from typing import Any\n7: \n8: from pants.bsp.spec.base import BSPData, BuildTargetIdentifier, Uri\n9: from pants.jvm.bsp.spec import JvmBuildTarget\n10: \n11: # -----------------------------------------------------------------------------------------------\n12: # Scala-specific Build Target\n13: # See https://build-server-protocol.github.io/docs/extensions/scala.html#scala-build-target"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/python/pants/backend/scala/bsp/rules.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "5de771af762b2a6ad2cc40dc0de9711526c1a020",
+          "html_url": "https://github.com/pantsbuild/pants/commit/5de771af762b2a6ad2cc40dc0de9711526c1a020",
+          "message": "Port remaining JVM-related files to call-by-name (#22650)",
+          "author": "Benjy Weinberger",
+          "date": "2025-09-16T01:25:37Z"
+        },
+        {
+          "sha": "b57ce97a0c90eff98cfd7475f9e71425291fc7c0",
+          "html_url": "https://github.com/pantsbuild/pants/commit/b57ce97a0c90eff98cfd7475f9e71425291fc7c0",
+          "message": "Port several JVM-related files to call-by-name. (#22589)",
+          "author": "Benjy Weinberger",
+          "date": "2025-08-27T03:41:18Z"
+        },
+        {
+          "sha": "4f8f8b94ec0173f08bd9b4c3a4323ddc821991b4",
+          "html_url": "https://github.com/pantsbuild/pants/commit/4f8f8b94ec0173f08bd9b4c3a4323ddc821991b4",
+          "message": "support for compiling into both scala2 and scala3 (#22419)\n\nWhen trying to configure a pants project that compiles into both scala3\nand scala2 I ran into an issue that I needed to configure different\nscalac args for each version.\nI've added the options to configure an args per resolve similar to the",
+          "author": "Shaked Kaplan",
+          "date": "2025-07-01T21:02:28Z"
+        },
+        {
+          "sha": "b1e3573a422eeda53fddfb11e84b5ce86befcbf6",
+          "html_url": "https://github.com/pantsbuild/pants/commit/b1e3573a422eeda53fddfb11e84b5ce86befcbf6",
+          "message": "[Call-by-name] migrate BSP backends (#22271)\n\nMigrate the BSP backends to call-by-name syntax:\n\n- `pants.backend.experimental.bsp`\n- `pants.backend.experimental.java.bsp`\n- `pants.backend.experimental.scala.bsp`",
+          "author": "Tom Dyas",
+          "date": "2025-05-14T01:45:01Z"
+        },
+        {
+          "sha": "d09a673b4664766c96f42c092ffc1c40c969cff3",
+          "html_url": "https://github.com/pantsbuild/pants/commit/d09a673b4664766c96f42c092ffc1c40c969cff3",
+          "message": "Run pyupgrade to 3.11 (#21903)\n\nAs we have upgraded the Pants Python to 3.11, makes sense to update pyupgrade to that too.\n- `typing` to `collections.abc`\n- `Dict` to `dict`\n- `Tuple` to `tuple`\n- `Optional` to pipe\n- etc",
+          "author": "SJ",
+          "date": "2025-02-19T22:30:37Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "bsp_resolve_one_scala_build_target TODO These jars scalac tool",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/python/pants/backend/scala/bsp/rules.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "5de771af762b2a6ad2cc40dc0de9711526c1a020",
+        "html_url": "https://github.com/pantsbuild/pants/commit/5de771af762b2a6ad2cc40dc0de9711526c1a020",
+        "message": "Port remaining JVM-related files to call-by-name (#22650)",
+        "author": "Benjy Weinberger",
+        "date": "2025-09-16T01:25:37Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

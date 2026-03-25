@@ -1,0 +1,267 @@
+{
+  "task_id": "465",
+  "repo_owner": "budabot",
+  "repo_name": "tyrbot",
+  "file_path": "modules/standard/online/online_controller.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T11:43:20+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T11:43:33+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T11:43:37+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "modules/standard/online/online_controller.py",
+    "original_code": "def private_channel_send_logon_event(self, event_type, event_data):\n    # TODO add conn\n    self.bot.send_private_message(event_data.char_id, self.get_online_output())",
+    "original_signature": "def private_channel_send_logon_event(self, event_type, event_data):",
+    "satd_comment": "# TODO add conn",
+    "target_file": {
+      "ok": true,
+      "path": "modules/standard/online/online_controller.py",
+      "sha": "1f4bf2cb9aa172135518df9e7f92a15ea5344103",
+      "download_url": "https://raw.githubusercontent.com/Budabot/Tyrbot/master/modules/standard/online/online_controller.py",
+      "content_excerpt": "from core.command_param_types import Any, Const, NamedFlagParameters\nfrom core.conn import Conn\nfrom core.db import DB\nfrom core.decorators import instance, command, event\nfrom core.alts_service import AltsService\nfrom core.chat_blob import ChatBlob\nfrom core.private_channel_service import PrivateChannelService\nfrom core.public_channel_service import PublicChannelService\nimport time\nimport re\n\nfrom modules.core.org_members.org_member_controller import OrgMemberController\n\n\n@instance()\nclass OnlineController:\n    ORG_CHANNEL = \"Org\"\n    PRIVATE_CHANNEL = \"Private\"\n\n    def __init__(self):\n        self.afk_regex = re.compile(\"^(afk|brb) ?(.*)$\", re.IGNORECASE)\n        self.channels = [(self.ORG_CHANNEL, 0), (self.PRIVATE_CHANNEL, 1)]\n\n    def inject(self, registry):\n        self.bot = registry.get_instance(\"bot\")\n        self.db: DB = registry.get_instance(\"db\")\n        self.text = registry.get_instance(\"text\")\n        self.util = registry.get_instance(\"util\")\n        self.pork_service = registry.get_instance(\"pork_service\")\n        self.character_service = registry.get_instance(\"character_service\")\n        self.command_alias_service = registry.get_instance(\"command_alias_service\")\n        self.alts_service = registry.get_instance(\"alts_service\")\n        self.alts_controller = registry.get_instance(\"alts_controller\")\n\n    def start(self):\n        self.db.exec(\"DROP TABLE IF EXISTS online\")\n        self.db.exec(\"CREATE TABLE online (char_id INT NOT NULL, afk_dt INT NOT NULL, afk_reason VARCHAR(255) DEFAULT '', channel CHAR(50) NOT NULL, dt INT NOT NULL, UNIQUE(char_id, channel))\")\n\n        self.command_alias_service.add_alias(\"o\", \"online\")\n\n    @command(command=\"online\", params=[], access_level=\"member\",\n             description=\"Show the list of online characters\")\n    def online_cmd(self, request):\n        return self.get_online_output()\n\n    @command(command=\"online\", params=[Any(\"profession\"), NamedFlagParameters([\"include_offline_alts\"])], access_level=\"member\",\n             description=\"Show the list of online characters with alts of a certain profession\")\n    def online_profession_cmd(self, request, prof, flag_params):\n        profession = self.util.get_profession(prof)\n        if not profession:\n            return \"Error! Unknown profession <highlight>%s</highlight>.\" % prof\n\n        num_org_bots = len(self.bot.get_conns(lambda x: x.is_main and x.org_id))\n\n        blob = \"\"\n        blob += self.text.make_tellcmd(\"Include offline alts\", f\"online {profession} --include_offline_alts\") + \"\\n\\n\"\n        count = 0\n        for channel, _ in self.channels:\n            online_list = self.get_online_alts(channel, profession, flag_params.include_offline_alts)\n            if len(online_list) > 0:\n                blob += \"<header2>%s Channel</header2>\\n\" % channel\n\n                current_main = \"\"\n                for row in online_list:\n                    if current_main != row.main:\n                        count += 1\n                        blob += \"\\n%s\\n\" % row.main\n                        current_main = row.main\n\n                    org_info = \"\"\n                    if channel == self.PRIVATE_CHANNEL or num_org_bots > 1:\n                        if row.org_name:\n                            org_info = \", %s (%s)\" % (row.org_name, row.org_rank_name)\n\n                    blob += \"  <highlight>%s</highlight> (%d/<green>%d</green>) %s%s\" % (row.name, row.level or 0, row.ai_level or 0, row.profession, org_info)\n                    if row.online:\n                        blob += \" [<green>Online</green>]\"\n                    blob += \"\\n\"\n                blob += \"\\n\\n\"\n\n        return ChatBlob(\"Online %s (%d)\" % (profession, count), blob)\n\n    @command(command=\"count\", params=[], access_level=\"member\",\n             description=\"Show counts of players by title level, profession, and organization\")\n    def count_cmd(self, request):\n        data = self.db.query(\"SELECT p.*, o.channel, COALESCE(p.name, o.char_id) AS name FROM online o LEFT JOIN player p ON o.char_id = p.char_id ORDER BY channel ASC\")\n\n        title_levels = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}\n        profs = {\"Adventurer\": 0, \"Agent\": 0, \"Bureaucrat\": 0, \"Doctor\": 0, \"Enforcer\": 0, \"Engineer\": 0, \"Fixer\": 0, \"Keeper\": 0,\n                 \"Martial Artist\": 0, \"Meta-Physicist\": 0, \"Nano-Technician\": 0, \"Soldier\": 0, \"Trader\": 0, \"Shade\": 0, \"Unknown\": 0}\n        orgs = {}\n\n        # populate counts\n        for row in data:\n            prof_name = row.profession if row.profession else \"Unknown\"\n            profs[prof_name] += 1\n\n            title_levels[self.util.get_title_level(row.level)] += 1\n\n            org_name = row.org_name if row.org_name else \"&lt;None&gt;\"\n            org_count = orgs.get(org_name, 0)\n            orgs[org_name] = org_count + 1\n\n        blob = \"\"\n        blob += \"<header>Title Levels</header>\\n\"\n        for title_level, count in title_levels.items():\n            if count > 0:\n                blob += \"%d: %d\\n\" % (title_level, count)\n\n        blob += \"\\n\\n<header>Professions</header>\\n\"\n        for prof, count in profs.items():\n            if count > 0:\n                blob += \"%s: %d\\n\" % (prof, count)\n\n        blob += \"\\n\\n<header>Organizations</header>\\n\"\n        for org, count in orgs.items():\n            if count > 0:\n                blob += \"%s: %d\\n\" % (org, count)\n\n        return ChatBlob(\"Count (%d)\" % len(data), blob)\n    \n    @command(command=\"activity\", params=[Const(\"set\"), Any(name=\"activity\")], access_level=\"guest\",\n             description=\"Sets the player's activity.\")\n    def activity_set_cmd(self, request, set, activity):\n        self.set_afk(request.sender.char_id, int(time.time()), activity)\n        request.reply(\"Activity has been set.\")\n    \n    @command(command=\"activity\", params=[Const(\"clear\")], access_level=\"guest\",\n             description=\"Removes the player's activity\")\n    def activity_clear_cmd(self, request, clear):\n        self.set_afk(request.sender.char_id, 0, \"\")\n        request.reply(\"Activity has been removed.\")\n\n    def get_online_characters(self, channel):\n        sql = \"SELECT \" \\\n                \"p1.*, \" \\\n                \"o.afk_dt, \" \\\n                \"o.afk_reason, \" \\\n                \"COALESCE(p2.name, p1.name, o.char_id) AS main, \" \\\n                \"COALESCE(p1.name, o.char_id) AS name \" \\\n              \"FROM online o \" \\\n              \"LEFT JOIN alts a1 ON o.char_id = a1.char_id \" \\\n              \"LEFT JOIN player p1 ON o.char_id = p1.char_id \" \\\n              \"LEFT JOIN alts a2 ON a1.group_id = a2.group_id AND a2.status = ? \" \\\n              \"LEFT JOIN player p2 ON a2.char_id = p2.char_id \" \\\n              \"WHERE channel = ? \" \\\n              \"ORDER BY COALESCE(p2.name, p1.name, o.char_id) ASC, COALESCE(p1.name, o.char_id) ASC\"\n\n        return self.db.query(sql, [AltsService.MAIN, channel])\n\n    @event(PrivateChannelService.JOINED_PRIVATE_CHANNEL_EVENT, \"Record in database when someone joins private channel\", is_system=True)\n    def private_channel_joined_event(self, event_type, event_data):\n        self.pork_service.load_character_info(event_data.char_id)\n        self.db.exec(\"INSERT INTO online (char_id, afk_dt, afk_reason, channel, dt) VALUES (?, ?, ?, ?, ?)\",\n                     [event_data.char_id, 0, \"\", self.PRIVATE_CHANNEL, int(time.time())])\n\n    @event(PrivateChannelService.LEFT_PRIVATE_CHANNEL_EVENT, \"Record in database when someone leaves private channel\", is_system=True)\n    def private_channel_left_event(self, event_type, event_data):\n        self.db.exec(\"DELETE FROM online WHERE char_id = ? AND channel = ?\",\n                     [event_data.char_id, self.PRIVATE_CHANNEL])\n\n    @event(OrgMemberController.ORG_MEMBER_LOGON_EVENT, \"Record in database when org member logs on\", is_system=True)\n    def org_member_logon_record_event(self, event_type, event_data):\n        self.pork_service.load_character_info(event_data.char_id)\n        self.db.exec(\"INSERT INTO online (char_id, afk_dt, afk_reason, channel, dt) VALUES (?, ?, ?, ?, ?)\",\n                     [event_data.char_id, 0, \"\", self.ORG_CHANNEL, int(time.time())])\n\n    @event(OrgMemberController.ORG_MEMBER_LOGOFF_EVENT, \"Record in database when org member logs off\", is_system=True)\n    def org_member_logoff_record_event(self, event_type, event_data):\n        self.db.exec(\"DELETE FROM online WHERE char_id = ? AND channel = ?\",\n                     [event_data.char_id, self.ORG_CHANNEL])\n\n    @event(PrivateChannelService.PRIVATE_CHANNEL_MESSAGE_EVENT, \"Check for afk messages in private channel\")\n    def afk_check_private_channel_event(self, event_type, event_data):\n        if not self.bot.get_conn_by_char_id(event_data.char_id):\n            self.afk_check(event_data.char_id, event_data.message, lambda msg: self.bot.send_private_channel_message(msg, conn=event_data.conn))\n\n    @event(PublicChannelService.ORG_CHANNEL_MESSAGE_EVENT, \"Check for afk messages in org channel\")\n    def afk_check_org_channel_event(self, event_type, event_data):\n        if not self.bot.get_conn_by_char_id(event_data.char_id):\n            self.afk_check(event_data.char_id, event_data.message, lambda msg: self.bot.send_org_message(msg, conn=event_data.conn))\n\n    @event(OrgMemberController.ORG_MEMBER_LOGON_EVENT, \"Send online list to org members logging in\")\n    def org_member_send_logon_event(self, event_type, event_data):\n        if self.bot.is_ready():\n            self.bot.send_private_message(event_data.char_id, self.get_online_output(), conn=event_data.conn)\n\n    @event(PrivateChannelService.JOINED_PRIVATE_CHANNEL_EVENT, \"Send online list to characters joining the private channel\")\n    def private_channel_send_logon_event(self, event_type, event_data):\n        self.bot.send_private_message(event_data.char_id, self.get_online_output(), conn=event_data.conn)\n\n    def afk_check(self, char_id, message, channel_reply):\n        matches = self.afk_regex.search(message)\n        if matches:\n            char_name = self.character_service.resolve_char_to_name(char_id)\n            self.set_afk(char_id, int(time.time()), message)\n            # channel_reply(\"<highlight>%s</highlight> is now afk.\" % char_name)\n        else:\n            # will handle multiple rows since set_afk() will update multiple\n            row = self.db.query_single(\"SELECT * FROM online WHERE char_id = ? AND afk_dt > 0\", [char_id])\n            # only set characters back, if they are afk/brb and not if they have a different activity set\n            if row and self.afk_regex.match(row.afk_reason):\n                self.set_afk(char_id, 0, \"\")\n                char_name = self.character_service.resolve_char_to_name(char_id)\n                time_string = self.util.time_to_readable(int(time.time()) - row.afk_dt)\n                channel_reply(\"<highlight>%s</highlight> is back after %s.\" % (char_name, time_string))\n\n    def set_afk(self, char_id, dt, reason):\n        self.db.exec(\"UPDATE online SET afk_dt = ?, afk_reason = ? WHERE char_id = ?\", [dt, reason, char_id])\n\n    def get_online_output(self):\n        num_org_bots = len(self.bot.get_conns(lambda x: x.is_main and x.org_id))\n\n        blob = \"\"\n        count = 0\n        for channel, _ in self.channels:\n            online_list = self.get_online_characters(channel)\n            if len(online_list) == 0:\n                continue\n\n            blob += \"<header2>%s Channel</header2>\\n\" % channel\n\n            current_main = \"\"\n            for row in online_list:\n                if current_main != row.main:\n                    count += 1\n                    blob += \"\\n<pagebreak>%s\\n\" % self.text.make_tellcmd(row.main, \"alts %s\" % row.main)\n                    current_main = row.main\n\n                afk = \"\"\n                if row.afk_dt > 0:\n                    afk = \" - <highlight>%s (%s ago)</highlight>\" % (row.afk_reason, self.util.time_to_readable(int(time.time()) - row.afk_dt))\n\n                org_info = \"\"\n                if channel == self.PRIVATE_CHANNEL or num_org_bots > 1:\n             ",
+      "total_lines": 303
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 189,
+      "end_line": 190,
+      "excerpt": "    def private_channel_send_logon_event(self, event_type, event_data):\n        self.bot.send_private_message(event_data.char_id, self.get_online_output(), conn=event_data.conn)",
+      "symbol_name": "private_channel_send_logon_event",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "modules/standard/online/online_controller.py",
+      "sha": "1f4bf2cb9aa172135518df9e7f92a15ea5344103",
+      "download_url": "https://raw.githubusercontent.com/Budabot/Tyrbot/master/modules/standard/online/online_controller.py"
+    },
+    "imports": {
+      "imports": [
+        "core.command_param_types:Any",
+        "core.command_param_types:Const",
+        "core.command_param_types:NamedFlagParameters",
+        "core.conn:Conn",
+        "core.db:DB",
+        "core.decorators:instance",
+        "core.decorators:command",
+        "core.decorators:event",
+        "core.alts_service:AltsService",
+        "core.chat_blob:ChatBlob",
+        "core.private_channel_service:PrivateChannelService",
+        "core.public_channel_service:PublicChannelService",
+        "time",
+        "re",
+        "modules.core.org_members.org_member_controller:OrgMemberController"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/Budabot/Tyrbot/master/README.md",
+      "content_excerpt": "# Tyrbot\n\nTyrbot is an in-game chatbot for the MMORPG Anarchy Online released by Funcom in 2001.\n\nThis is a rewrite of [Budabot](https://github.com/Budabot/Budabot) in Python 3.\n\n## Quickstart\n\n1. Download the bot: https://github.com/Budabot/Tyrbot/archive/master.zip\n1. Unzip the bot to a location on your computer\n1. Run `start.bat`\n1. The first time you run the bot it will ask some questions. You will need four pieces of information: username, password, character name, and superadmin. For any other question you can simply press &lt;Enter&gt; to use the default value. \n\n## Requirements\n\nTyrbot has been tested on Python 3.12. You may run into issues with other versions of Python.\n\n## Installation\n\nCurrently there are no releases for Tyrbot but you can download the bot from here which will always have the very latest changes: https://github.com/Budabot/Tyrbot/archive/master.zip\n\nThen simply unzip the bot somewhere before starting it.\n\n## Upgrade\n\nIf you are already running Tyrbot and simply want to upgrade to the latest version, follow these steps:\n\n1. Download the latest version from here: https://github.com/Budabot/Tyrbot/archive/master.zip\n1. Unzip the bot to a new location (do not just unzip it over the top of the old installation)\n1. From the old installation, copy the `./conf`, `./data`, and optionally, the `./logs` directories to the new installation\n1. If you have any custom modules, copy the `./modules/custom/` directory over as well\n1. Start the bot and verify that everything works and that all of your data has carried over\n1. In a few rare cases, the bot may not st"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "private_channel_send_logon_event test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"private_channel_send_logon_event(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "online_controller.py",
+          "path": "modules/standard/online/online_controller.py",
+          "sha": "1f4bf2cb9aa172135518df9e7f92a15ea5344103",
+          "html_url": "https://github.com/Budabot/Tyrbot/blob/b26cca604a584f79a5125f287b587763928a2bcb/modules/standard/online/online_controller.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 189,
+          "end_line": 190,
+          "excerpt": "    def private_channel_send_logon_event(self, event_type, event_data):\n        self.bot.send_private_message(event_data.char_id, self.get_online_output(), conn=event_data.conn)",
+          "symbol_name": "private_channel_send_logon_event",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "modules/standard/online",
+      "count": 3,
+      "entries": [
+        {
+          "name": "last_seen_controller.py",
+          "path": "modules/standard/online/last_seen_controller.py",
+          "type": "file"
+        },
+        {
+          "name": "log_controller.py",
+          "path": "modules/standard/online/log_controller.py",
+          "type": "file"
+        },
+        {
+          "name": "online_controller.py",
+          "path": "modules/standard/online/online_controller.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 2,
+      "items": [
+        {
+          "name": "last_seen_controller.py",
+          "path": "modules/standard/online/last_seen_controller.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import time\n2: \n3: from core.buddy_service import BuddyService\n4: from core.chat_blob import ChatBlob\n5: from core.command_param_types import Character, NamedFlagParameters\n6: from core.decorators import instance, command, event\n7: from core.logger import Logger\n8: \n9: \n10: @instance()\n11: class LastSeenController:\n12:     def __init__(self):\n13:         self.logger = Logger(__name__)"
+        },
+        {
+          "name": "log_controller.py",
+          "path": "modules/standard/online/log_controller.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import time\n2: \n3: from core.command_param_types import Any, Const\n4: from core.command_request import CommandRequest\n5: from core.db import DB\n6: from core.decorators import instance, command\n7: \n8: \n9: @instance()\n10: class LogController:\n11: \n12:     def inject(self, registry):\n13:         self.db: DB = registry.get_instance(\"db\")"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "modules/standard/online/online_controller.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "ebe5aaed7ae6ab0aee455508eef2af7349cfb968",
+          "html_url": "https://github.com/Budabot/Tyrbot/commit/ebe5aaed7ae6ab0aee455508eef2af7349cfb968",
+          "message": "implemented activities besides afk (#143)",
+          "author": "Florian Pattke",
+          "date": "2024-06-15T17:30:46Z"
+        },
+        {
+          "sha": "b5266cb514e9bcd31b55c8f4606d59ab54b97668",
+          "html_url": "https://github.com/Budabot/Tyrbot/commit/b5266cb514e9bcd31b55c8f4606d59ab54b97668",
+          "message": "added link for including offline alts in !online prof",
+          "author": "Tyrence",
+          "date": "2022-02-06T20:24:34Z"
+        },
+        {
+          "sha": "742c40aaa050e0b50fc3f375491b90eec1d913f4",
+          "html_url": "https://github.com/Budabot/Tyrbot/commit/742c40aaa050e0b50fc3f375491b90eec1d913f4",
+          "message": "fix for !online prof",
+          "author": "Tyrence",
+          "date": "2022-01-30T20:58:58Z"
+        },
+        {
+          "sha": "f5c9e3330716703edc9a936c6fc2cc9e117bd34a",
+          "html_url": "https://github.com/Budabot/Tyrbot/commit/f5c9e3330716703edc9a936c6fc2cc9e117bd34a",
+          "message": "!online prof no longer shows offline alts by default",
+          "author": "Tyrence",
+          "date": "2022-01-29T22:35:43Z"
+        },
+        {
+          "sha": "c407cf746b07322a3e631600dc1ffe3105904ddb",
+          "html_url": "https://github.com/Budabot/Tyrbot/commit/c407cf746b07322a3e631600dc1ffe3105904ddb",
+          "message": "update format of !online when searching for alts of a certain profession",
+          "author": "Tyrence",
+          "date": "2021-12-14T16:34:04Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "private_channel_send_logon_event TODO conn",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "modules/standard/online/online_controller.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "ebe5aaed7ae6ab0aee455508eef2af7349cfb968",
+        "html_url": "https://github.com/Budabot/Tyrbot/commit/ebe5aaed7ae6ab0aee455508eef2af7349cfb968",
+        "message": "implemented activities besides afk (#143)",
+        "author": "Florian Pattke",
+        "date": "2024-06-15T17:30:46Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

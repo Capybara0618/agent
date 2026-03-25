@@ -1,0 +1,627 @@
+{
+  "task_id": "929",
+  "repo_owner": "scikit-learn",
+  "repo_name": "scikit-learn",
+  "file_path": "sklearn/decomposition/_dict_learning.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T03:49:06+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 4,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 2,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T03:49:30+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T03:49:36+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "sklearn/decomposition/_dict_learning.py",
+    "original_code": "def _transform(self, X, dictionary):\n    \"\"\"Private method allowing to accommodate both DictionaryLearning and\n    SparseCoder.\"\"\"\n    X = self._validate_data(X, reset=False)\n\n    # transform_alpha has to be changed in _transform\n    # this is done for consistency with the value of alpha\n    if (\n        hasattr(self, \"alpha\")\n        and self.alpha != 1.0\n        and self.transform_alpha is None\n    ):\n        warnings.warn(\n            \"By default transform_alpha will be equal to\"\n            \"alpha instead of 1.0 starting from version 1.2\",\n            FutureWarning,\n        )\n        transform_alpha = 1.0  # TODO change to self.alpha in 1.2\n    else:\n        transform_alpha = self.transform_alpha\n\n    code = sparse_encode(\n        X,\n        dictionary,\n        algorithm=self.transform_algorithm,\n        n_nonzero_coefs=self.transform_n_nonzero_coefs,\n        alpha=transform_alpha,\n        max_iter=self.transform_max_iter,\n        n_jobs=self.n_jobs,\n        positive=self.positive_code,\n    )\n\n    if self.split_sign:\n        # feature vector is split into a positive and negative side\n        n_samples, n_features = code.shape\n        split_code = np.empty((n_samples, 2 * n_features))\n        split_code[:, :n_features] = np.maximum(code, 0)\n        split_code[:, n_features:] = -np.minimum(code, 0)\n        code = split_code\n\n    return code",
+    "original_signature": "def _transform(self, X, dictionary):",
+    "satd_comment": "# TODO change to self.alpha in 1.2",
+    "target_file": {
+      "ok": true,
+      "path": "sklearn/decomposition/_dict_learning.py",
+      "sha": "2a32ad92de83e6628fa078c03a17fd2b86756844",
+      "download_url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/main/sklearn/decomposition/_dict_learning.py",
+      "content_excerpt": "\"\"\"Dictionary learning.\"\"\"\n\n# Authors: The scikit-learn developers\n# SPDX-License-Identifier: BSD-3-Clause\n\nimport itertools\nimport sys\nimport time\nfrom numbers import Integral, Real\n\nimport numpy as np\nfrom joblib import effective_n_jobs\nfrom scipy import linalg\n\nfrom sklearn.base import (\n    BaseEstimator,\n    ClassNamePrefixFeaturesOutMixin,\n    TransformerMixin,\n    _fit_context,\n)\nfrom sklearn.linear_model import Lars, Lasso, LassoLars, orthogonal_mp_gram\nfrom sklearn.utils import check_array, check_random_state, gen_batches, gen_even_slices\nfrom sklearn.utils._param_validation import Interval, StrOptions, validate_params\nfrom sklearn.utils.extmath import _randomized_svd, row_norms, svd_flip\nfrom sklearn.utils.parallel import Parallel, delayed\nfrom sklearn.utils.validation import check_is_fitted, validate_data\n\n\ndef _check_positive_coding(method, positive):\n    if positive and method in [\"omp\", \"lars\"]:\n        raise ValueError(\n            \"Positive constraint not supported for '{}' coding method.\".format(method)\n        )\n\n\ndef _sparse_encode_precomputed(\n    X,\n    dictionary,\n    *,\n    gram=None,\n    cov=None,\n    algorithm=\"lasso_lars\",\n    regularization=None,\n    copy_cov=True,\n    init=None,\n    max_iter=1000,\n    verbose=0,\n    positive=False,\n):\n    \"\"\"Generic sparse coding with precomputed Gram and/or covariance matrices.\n\n    Each row of the result is the solution to a Lasso problem.\n\n    Parameters\n    ----------\n    X : ndarray of shape (n_samples, n_features)\n        Data matrix.\n\n    dictionary : ndarray of shape (n_components, n_features)\n        The dictionary matrix against which to solve the sparse coding of\n        the data. Some of the algorithms assume normalized rows.\n\n    gram : ndarray of shape (n_components, n_components), default=None\n        Precomputed Gram matrix, `dictionary * dictionary'`\n        gram can be `None` if method is 'threshold'.\n\n    cov : ndarray of shape (n_components, n_samples), default=None\n        Precomputed covariance, `dictionary * X'`.\n\n    algorithm : {'lasso_lars', 'lasso_cd', 'lars', 'omp', 'threshold'}, \\\n            default='lasso_lars'\n        The algorithm used:\n\n        * `'lars'`: uses the least angle regression method\n          (`linear_model.lars_path`);\n        * `'lasso_lars'`: uses Lars to compute the Lasso solution;\n        * `'lasso_cd'`: uses the coordinate descent method to compute the\n          Lasso solution (`linear_model.Lasso`). lasso_lars will be faster if\n          the estimated components are sparse;\n        * `'omp'`: uses orthogonal matching pursuit to estimate the sparse\n          solution;\n        * `'threshold'`: squashes to zero all coefficients less than\n          regularization from the projection `dictionary * data'`.\n\n    regularization : int or float, default=None\n        The regularization parameter. It corresponds to alpha when\n        algorithm is `'lasso_lars'`, `'lasso_cd'` or `'threshold'`.\n        Otherwise it corresponds to `n_nonzero_coefs`.\n\n    init : ndarray of shape (n_samples, n_components), default=None\n        Initialization value of the sparse code. Only used if\n        `algorithm='lasso_cd'`.\n\n    max_iter : int, default=1000\n        Maximum number of iterations to perform if `algorithm='lasso_cd'` or\n        `'lasso_lars'`.\n\n    copy_cov : bool, default=True\n        Whether to copy the precomputed covariance matrix; if `False`, it may\n        be overwritten.\n\n    verbose : int, default=0\n        Controls the verbosity; the higher, the more messages.\n\n    positive: bool, default=False\n        Whether to enforce a positivity constraint on the sparse code.\n\n        .. versionadded:: 0.20\n\n    Returns\n    -------\n    code : ndarray of shape (n_components, n_features)\n        The sparse codes.\n    \"\"\"\n    n_samples, n_features = X.shape\n    n_components = dictionary.shape[0]\n\n    if algorithm == \"lasso_lars\":\n        alpha = float(regularization) / n_features  # account for scaling\n        try:\n            err_mgt = np.seterr(all=\"ignore\")\n\n            # Not passing in verbose=max(0, verbose-1) because Lars.fit already\n            # corrects the verbosity level.\n            lasso_lars = LassoLars(\n                alpha=alpha,\n                fit_intercept=False,\n                verbose=verbose,\n                precompute=gram,\n                fit_path=False,\n                positive=positive,\n                max_iter=max_iter,\n            )\n            lasso_lars.fit(dictionary.T, X.T, Xy=cov)\n            new_code = lasso_lars.coef_\n        finally:\n            np.seterr(**err_mgt)\n\n    elif algorithm == \"lasso_cd\":\n        alpha = float(regularization) / n_features  # account for scaling\n\n        # TODO: Make verbosity argument for Lasso?\n        # sklearn.linear_model.coordinate_descent.enet_path has a verbosity\n        # argument that we could pass in from Lasso.\n        clf = Lasso(\n            alpha=alpha,\n            fit_intercept=False,\n            precompute=gram,\n            tol=1e-8,  # TODO: This parameter should be exposed.\n            max_iter=max_iter,\n            warm_start=True,\n            positive=positive,\n        )\n\n        if init is not None:\n            # In some workflows using coordinate descent algorithms:\n            #  - users might provide NumPy arrays with read-only buffers\n            #  - `joblib` might memmap arrays making their buffer read-only\n            # TODO: move this handling (which is currently too broad)\n            # closer to the actual private function which need buffers to be writable.\n            if not init.flags[\"WRITEABLE\"]:\n                init = np.array(init)\n            clf.coef_ = init\n\n        clf.fit(dictionary.T, X.T, check_input=False)\n        new_code = clf.coef_\n\n    elif algorithm == \"lars\":\n        try:\n            err_mgt = np.seterr(all=\"ignore\")\n\n            # Not passing in verbose=max(0, verbose-1) because Lars.fit already\n            # corrects the verbosity level.\n            lars = Lars(\n                fit_intercept=False,\n                verbose=verbose,\n                precompute=gram,\n                n_nonzero_coefs=int(regularization),\n                fit_path=False,\n            )\n            lars.fit(dictionary.T, X.T, Xy=cov)\n            new_code = lars.coef_\n        finally:\n            np.seterr(**err_mgt)\n\n    elif algorithm == \"threshold\":\n        new_code = (np.sign(cov) * np.maximum(np.abs(cov) - regularization, 0)).T\n        if positive:\n            np.clip(new_code, 0, None, out=new_code)\n\n    elif algorithm == \"omp\":\n        new_code = orthogonal_mp_gram(\n            Gram=gram,\n            Xy=cov,\n            n_nonzero_coefs=int(regularization),\n            tol=None,\n            norms_squared=row_norms(X, squared=True),\n            copy_Xy=copy_cov,\n        ).T\n\n    return new_code.reshape(n_samples, n_components)\n\n\n@validate_params(\n    {\n        \"X\": [\"array-like\"],\n        \"dictionary\": [\"array-like\"],\n        \"gram\": [\"array-like\", None],\n        \"cov\": [\"array-like\", None],\n        \"algorithm\": [\n            StrOptions({\"lasso_lars\", \"lasso_cd\", \"lars\", \"omp\", \"threshold\"})\n        ],\n        \"n_nonzero_coefs\": [Interval(Integral, 1, None, closed=\"left\"), None],\n        \"alpha\": [Interval(Real, 0, None, closed=\"left\"), None],\n        \"copy_cov\": [\"boolean\"],\n        \"init\": [\"array-like\", None],\n        \"max_iter\": [Interval(Integral, 0, None, closed=\"left\")],\n        \"n_jobs\": [Integral, None],\n        \"check_input\": [\"boolean\"],\n        \"verbose\": [\"verbose\"],\n        \"positive\": [\"boolean\"],\n    },\n    prefer_skip_nested_validation=True,\n)\n# XXX : could be moved to the linear_model module\ndef sparse_encode(\n    X,\n    dictionary,\n    *,\n    gram=None,\n    cov=None,\n    algorithm=\"lasso_lars\",\n    n_nonzero_coefs=None,\n    alpha=None,\n    copy_cov=True,\n    init=None,\n    max_iter=1000,\n    n_jobs=None,\n    check_input=True,\n    verbose=0,\n    positive=False,\n):\n    \"\"\"Sparse coding.\n\n    Each row of the result is the solution to a sparse coding problem.\n    The goal is to find a sparse array `code` such that::\n\n        X ~= code * dictionary\n\n    Read more in the :ref:`User Guide <SparseCoder>`.\n\n    Parameters\n    ----------\n    X : array-like of shape (n_samples, n_features)\n        Data matrix.\n\n    dictionary : array-like of shape (n_components, n_features)\n        The dictionary matrix against which to solve the sparse coding of\n        the data. Some of the algorithms assume normalized rows for meaningful\n        output.\n\n    gram : array-like of shape (n_components, n_components), default=None\n        Precomputed Gram matrix, `dictionary * dictionary'`.\n\n    cov : array-like of shape (n_components, n_samples), default=None\n        Precomputed covariance, `dictionary' * X`.\n\n    algorithm : {'lasso_lars', 'lasso_cd', 'lars', 'omp', 'threshold'}, \\\n            default='lasso_lars'\n        The algorithm used:\n\n        * `'lars'`: uses the least angle regression method\n          (`linear_model.lars_path`);\n        * `'lasso_lars'`: uses Lars to compute the Lasso solution;\n        * `'lasso_cd'`: uses the coordinate descent method to compute the\n          Lasso solution (`linear_model.Lasso`). lasso_lars will be faster if\n          the estimated components are sparse;\n        * `'omp'`: uses orthogonal matching pursuit to estimate the sparse\n          solution;\n        * `'threshold'`: squashes to zero all coefficients less than\n          regularization from the projection `dictionary * data'`.\n\n    n_nonzero_coefs : int, default=None\n        Number of nonzero coefficients to target in each column of the\n        solution. This is only used by `algorithm='lars'` and `algorithm='omp'`\n        and is overridden by `alpha` in the `omp` case. If `None`, then\n        `n_nonzero_coefs=int(n_features / 10)`.\n\n    alpha : float, default=None\n        If `algorithm='lasso_lars'` or `algorithm='lasso_cd'`, `alpha` is the\n        penalty applied to the L1 norm.\n        If `algorithm='threshold'`, `alpha` is the absolute value of the\n        threshold below which coefficients will be squashed to zero.\n        If `algorithm='omp'`, `alpha` is the tolerance parameter: the value of\n        the reconstruction error targeted. In this case, it overrides\n        `n_nonzero_coefs`.\n        If `None`, default to 1.\n\n    copy_cov : bool, default=True\n        Whether to copy the precomputed covariance matrix; if `False`, it may\n        be overwritten.\n\n    init : ndarray of shape (n_samples, n_components), default=None\n        Initialization value of the sparse codes. Only used if\n        `algorithm='lasso_cd'`.\n\n    max_iter : int, default=1000\n        Maximum number of iterations to perform if `algorithm='lasso_cd'` or\n        `'lasso_lars'`.\n\n    n_jobs : int, default=None\n        Number of parallel jobs to run.\n        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.\n        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`\n        for more details.\n\n    check_input : bool, default=True\n        If `False`, the input arrays X and dictionary will not be checked.\n\n    verbose : int, default=0\n        Controls the verbosity; the higher, the more messages.\n\n    positive : bool, default=False\n        Whether to enforce positivity when finding the encoding.\n\n        .. versionadded:: 0.20\n\n    Returns\n    -------\n    code : ndarray of shape (n_samples, n_components)\n        The sparse codes.\n\n    See Also\n    --------\n    sklearn.linear_model.lars_path : Compute Least Angle Regression or Lasso\n        path using LARS algorithm.\n    sklearn.linear_model.orthogonal_mp : Solves Orthogonal Matching Pursuit problems.\n    sklearn.linear_model.Lasso : Train Linear Model with L1 prior as regularizer.\n    SparseCoder : Find a sparse representation of data from a fixed precomputed\n        dictionary.\n\n    Examples\n    --------\n    >>> import numpy as np\n    >>> from sklearn.decomposition import sparse_encode\n    >>> X = np.array([[-1, -1, -1], [0, 0, 3]])\n    >>> di",
+      "total_lines": 2341
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 1092,
+      "end_line": 1121,
+      "excerpt": "    def _transform(self, X, dictionary):\n        \"\"\"Private method allowing to accommodate both DictionaryLearning and\n        SparseCoder.\"\"\"\n        X = validate_data(self, X, reset=False)\n\n        if hasattr(self, \"alpha\") and self.transform_alpha is None:\n            transform_alpha = self.alpha\n        else:\n            transform_alpha = self.transform_alpha\n\n        code = sparse_encode(\n            X,\n            dictionary,\n            algorithm=self.transform_algorithm,\n            n_nonzero_coefs=self.transform_n_nonzero_coefs,\n            alpha=transform_alpha,\n            max_iter=self.transform_max_iter,\n            n_jobs=self.n_jobs,\n            positive=self.positive_code,\n        )\n\n        if self.split_sign:\n            # feature vector is split into a positive and negative side\n            n_samples, n_features = code.shape\n            split_code = np.empty((n_samples, 2 * n_features))\n            split_code[:, :n_features] = np.maximum(code, 0)\n            split_code[:, n_features:] = -np.minimum(code, 0)\n            code = split_code\n\n        return code",
+      "symbol_name": "_transform",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "sklearn/decomposition/_dict_learning.py",
+      "sha": "2a32ad92de83e6628fa078c03a17fd2b86756844",
+      "download_url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/main/sklearn/decomposition/_dict_learning.py"
+    },
+    "imports": {
+      "imports": [
+        "itertools",
+        "sys",
+        "time",
+        "numbers:Integral",
+        "numbers:Real",
+        "numpy",
+        "joblib:effective_n_jobs",
+        "scipy:linalg",
+        "sklearn.base:BaseEstimator",
+        "sklearn.base:ClassNamePrefixFeaturesOutMixin",
+        "sklearn.base:TransformerMixin",
+        "sklearn.base:_fit_context",
+        "sklearn.linear_model:Lars",
+        "sklearn.linear_model:Lasso",
+        "sklearn.linear_model:LassoLars",
+        "sklearn.linear_model:orthogonal_mp_gram",
+        "sklearn.utils:check_array",
+        "sklearn.utils:check_random_state",
+        "sklearn.utils:gen_batches",
+        "sklearn.utils:gen_even_slices",
+        "sklearn.utils._param_validation:Interval",
+        "sklearn.utils._param_validation:StrOptions",
+        "sklearn.utils._param_validation:validate_params",
+        "sklearn.utils.extmath:_randomized_svd",
+        "sklearn.utils.extmath:row_norms",
+        "sklearn.utils.extmath:svd_flip",
+        "sklearn.utils.parallel:Parallel",
+        "sklearn.utils.parallel:delayed",
+        "sklearn.utils.validation:check_is_fitted",
+        "sklearn.utils.validation:validate_data"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/main/README.rst",
+      "content_excerpt": ".. -*- mode: rst -*-\n\n|GitHubActions| |Codecov| |CircleCI| |Nightly wheels| |Ruff| |PythonVersion| |PyPI| |DOI| |Benchmark|\n\n\n.. |GitHubActions| image:: https://github.com/scikit-learn/scikit-learn/actions/workflows/unit-tests.yml/badge.svg\n   :target: https://github.com/scikit-learn/scikit-learn/actions/workflows/unit-tests.yml?query=branch%3Amain\n\n.. |CircleCI| image:: https://circleci.com/gh/scikit-learn/scikit-learn/tree/main.svg?style=shield\n   :target: https://circleci.com/gh/scikit-learn/scikit-learn\n\n.. |Codecov| image:: https://codecov.io/gh/scikit-learn/scikit-learn/branch/main/graph/badge.svg?token=Pk8G9gg3y9\n   :target: https://codecov.io/gh/scikit-learn/scikit-learn\n\n.. |Nightly wheels| image:: https://github.com/scikit-learn/scikit-learn/actions/workflows/wheels.yml/badge.svg?event=schedule\n   :target: https://github.com/scikit-learn/scikit-learn/actions?query=workflow%3A%22Wheel+builder%22+event%3Aschedule\n\n.. |Ruff| image:: https://img.shields.io/badge/code%20style-ruff-000000.svg\n   :target: https://github.com/astral-sh/ruff\n\n.. |PythonVersion| image:: https://img.shields.io/pypi/pyversions/scikit-learn.svg\n   :target: https://pypi.org/project/scikit-learn/\n\n.. |PyPI| image:: https://img.shields.io/pypi/v/scikit-learn\n   :target: https://pypi.org/project/scikit-learn\n\n.. |DOI| image:: https://zenodo.org/badge/21369/scikit-learn/scikit-learn.svg\n   :target: https://zenodo.org/badge/latestdoi/21369/scikit-learn/scikit-learn\n\n.. |Benchmark| image:: https://img.shields.io/badge/Benchmarked%20by-asv-blue\n   :target: https://scikit-learn.org/scikit-learn-benchmar"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_transform test",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_common.py",
+          "path": "sklearn/tests/test_common.py",
+          "sha": "ccff345ddb10e505f70db1a5c7600b0f4b2e00e0",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/tests/test_common.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 40,
+          "end_line": 64,
+          "excerpt": "40:     _tested_estimators,\n41:     _yield_instances_for_check,\n42: )\n43: from sklearn.utils._testing import (\n44:     SkipTest,\n45:     ignore_warnings,\n46: )\n47: from sklearn.utils.estimator_checks import (\n48:     check_all_zero_sample_weights_error,\n49:     check_dataframe_column_names_consistency,\n50:     check_estimator,\n51:     check_get_feature_names_out_error,\n52:     check_global_output_transform_pandas,\n53:     check_global_set_output_transform_polars,\n54:     check_inplace_ensure_writeable,\n55:     check_param_validation,\n56:     check_set_output_transform,\n57:     check_set_output_transform_pandas,\n58:     check_set_output_transform_polars,\n59:     check_transformer_get_feature_names_out,\n60:     check_transformer_get_feature_names_out_pandas,\n61:     parametrize_with_checks,\n62: )\n63: from sklearn.utils.validation import has_fit_parameter\n64: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_sparse.py",
+          "path": "sklearn/utils/tests/test_sparse.py",
+          "sha": "32d6a1666d49346019cc828f7323703a4692ec17",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/utils/tests/test_sparse.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 32,
+          "end_line": 56,
+          "excerpt": "32:     ],\n33: )\n34: def test_ndarray_align_api_if_sparse(sparse_interface, x, result_type):\n35:     with sklearn.config_context(sparse_interface=sparse_interface):\n36:         result = sklearn.utils._align_api_if_sparse(x)\n37:         assert isinstance(result, result_type)\n38: \n39: \n40: @pytest.mark.parametrize(\n41:     [\"sparse_interface\", \"result_type\"],\n42:     [(\"sparray\", csr_array), (\"spmatrix\", csr_matrix)],\n43: )\n44: def test_transform_returns_sparse(sparse_interface, result_type):\n45:     corpus = [\n46:         \"This is the first document.\",\n47:         \"This document is the second document.\",\n48:         \"And this is the third one.\",\n49:         \"Is this the first document?\",\n50:     ]\n51:     with sklearn.config_context(sparse_interface=sparse_interface):\n52:         vectorizer = sklearn.feature_extraction.text.CountVectorizer()\n53:         X = vectorizer.fit_transform(corpus)\n54:         assert isinstance(X, result_type)\n55: \n56: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_birch.py",
+          "path": "sklearn/cluster/tests/test_birch.py",
+          "sha": "fc1c702d1f462b877ea70dcaa43667bdf446b589",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/cluster/tests/test_birch.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 180,
+          "end_line": 204,
+          "excerpt": "180: \n181: def test_feature_names_out():\n182:     \"\"\"Check `get_feature_names_out` for `Birch`.\"\"\"\n183:     X, _ = make_blobs(n_samples=80, n_features=4, random_state=0)\n184:     brc = Birch(n_clusters=4)\n185:     brc.fit(X)\n186:     n_clusters = brc.subcluster_centers_.shape[0]\n187: \n188:     names_out = brc.get_feature_names_out()\n189:     assert_array_equal([f\"birch{i}\" for i in range(n_clusters)], names_out)\n190: \n191: \n192: def test_transform_match_across_dtypes(global_random_seed):\n193:     X, _ = make_blobs(n_samples=80, n_features=4, random_state=global_random_seed)\n194:     brc = Birch(n_clusters=4, threshold=1.1)\n195:     Y_64 = brc.fit_transform(X)\n196:     Y_32 = brc.fit_transform(X.astype(np.float32))\n197: \n198:     assert_allclose(Y_64, Y_32, atol=1e-6)\n199: \n200: \n201: def test_subcluster_dtype(global_dtype):\n202:     X = make_blobs(n_samples=80, n_features=4, random_state=0)[0].astype(\n203:         global_dtype, copy=False\n204:     )",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_nca.py",
+          "path": "sklearn/neighbors/tests/test_nca.py",
+          "sha": "ebfb01d12e3acbbb31d79a3a0573f39884cac6bb",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/neighbors/tests/test_nca.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 66,
+          "end_line": 90,
+          "excerpt": "66:     input_dim = 5\n67:     two_points = rng.randn(2, input_dim)\n68:     X = np.vstack([two_points, two_points.mean(axis=0)[np.newaxis, :]])\n69:     y = [0, 0, 1]\n70: \n71:     class LossStorer:\n72:         def __init__(self, X, y):\n73:             self.loss = np.inf  # initialize the loss to very high\n74:             # Initialize a fake NCA and variables needed to compute the loss:\n75:             self.fake_nca = NeighborhoodComponentsAnalysis()\n76:             self.fake_nca.n_iter_ = np.inf\n77:             self.X, y = validate_data(self.fake_nca, X, y, ensure_min_samples=2)\n78:             y = LabelEncoder().fit_transform(y)\n79:             self.same_class_mask = y[:, np.newaxis] == y[np.newaxis, :]\n80: \n81:         def callback(self, transformation, n_iter):\n82:             \"\"\"Stores the last value of the loss function\"\"\"\n83:             self.loss, _ = self.fake_nca._loss_grad_lbfgs(\n84:                 transformation, self.X, self.same_class_mask, -1.0\n85:             )\n86: \n87:     loss_storer = LossStorer(X, y)\n88:     nca = NeighborhoodComponentsAnalysis(random_state=42, callback=loss_storer.callback)\n89:     X_t = nca.fit_transform(X, y)\n90:     print(X_t)",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_transform(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "_target_encoder.py",
+          "path": "sklearn/preprocessing/_target_encoder.py",
+          "sha": "c83ac38b3091ad367e0394a4ef64b997becb93d0",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/preprocessing/_target_encoder.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 49,
+          "end_line": 73,
+          "excerpt": "49:     as another category and encodes them like any other category. Categories\n50:     that are not seen during :meth:`fit` are encoded with the target mean, i.e.\n51:     `target_mean_`.\n52: \n53:     For a demo on the importance of the `TargetEncoder` internal :term:`cross fitting`,\n54:     see\n55:     :ref:`sphx_glr_auto_examples_preprocessing_plot_target_encoder_cross_val.py`.\n56:     For a comparison of different encoders, refer to\n57:     :ref:`sphx_glr_auto_examples_preprocessing_plot_target_encoder.py`. Read\n58:     more in the :ref:`User Guide <target_encoder>`.\n59: \n60:     .. note::\n61:         `fit(X, y).transform(X)` does not equal `fit_transform(X, y)` because a\n62:         :term:`cross fitting` scheme is used in `fit_transform` for encoding.\n63:         See the :ref:`User Guide <target_encoder>` for details.\n64: \n65:     .. versionadded:: 1.3\n66: \n67:     Parameters\n68:     ----------\n69:     categories : \"auto\" or list of shape (n_features,) of array-like, default=\"auto\"\n70:         Categories (unique values) per feature:\n71: \n72:         - `\"auto\"` : Determine categories automatically from the training data.\n73:         - list : `categories[i]` holds the categories expected in the i-th column. The",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "_encode.py",
+          "path": "sklearn/utils/_encode.py",
+          "sha": "ee00dd811ec12998b116e5541adc2d35ea84e633",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/utils/_encode.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 206,
+          "end_line": 230,
+          "excerpt": "206: \n207:     Parameters\n208:     ----------\n209:     values : ndarray\n210:         Values to encode.\n211:     uniques : ndarray\n212:         The unique values in `values`. If the dtype is not object, then\n213:         `uniques` needs to be sorted.\n214:     check_unknown : bool, default=True\n215:         If True, check for values in `values` that are not in `unique`\n216:         and raise an error. This is ignored for object dtype, and treated as\n217:         True in this case. This parameter is useful for\n218:         _BaseEncoder._transform() to avoid calling _check_unknown()\n219:         twice.\n220: \n221:     Returns\n222:     -------\n223:     encoded : ndarray\n224:         Encoded values\n225:     \"\"\"\n226:     xp, _ = get_namespace(values, uniques)\n227:     if not xp.isdtype(values.dtype, \"numeric\"):\n228:         try:\n229:             return _map_to_integer(values, uniques)\n230:         except KeyError as e:",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "_encoders.py",
+          "path": "sklearn/preprocessing/_encoders.py",
+          "sha": "c6223612ba4bb4e00e90614c8343051a8dc61989",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/sklearn/preprocessing/_encoders.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 194,
+          "end_line": 265,
+          "excerpt": "    def _transform(\n        self,\n        X,\n        handle_unknown=\"error\",\n        ensure_all_finite=True,\n        warn_on_unknown=False,\n        ignore_category_indices=None,\n    ):\n        X_list, n_samples, n_features = self._check_X(\n            X, ensure_all_finite=ensure_all_finite\n        )\n        validate_data(self, X=X, reset=False, skip_check_array=True)\n\n        X_int = np.zeros((n_samples, n_features), dtype=int)\n        X_mask = np.ones((n_samples, n_features), dtype=bool)\n\n        columns_with_unknown = []\n        for i in range(n_features):\n            Xi = X_list[i]\n            diff, valid_mask = _check_unknown(Xi, self.categories_[i], return_mask=True)\n\n            if not np.all(valid_mask):\n                if handle_unknown == \"error\":\n                    msg = (\n                        \"Found unknown categories {0} in column {1}\"\n                        \" during transform\".format(diff, i)\n                    )\n                    raise ValueError(msg)\n                else:\n                    if warn_on_unknown:\n                        columns_with_unknown.append(i)\n                    # Set the problematic rows to an acceptable value and\n                    # continue `The rows are marked `X_mask` and will be\n                    # removed later.\n                    X_mask[:, i] = valid_mask\n                    # cast Xi into the largest string type necessary\n                    # to handle different lengths of numpy strings\n                    if (\n                        self.categories_[i].dtype.kind in (\"U\", \"S\")\n                        and self.categories_[i].itemsize > Xi.itemsize\n                    ):\n                        Xi = Xi.astype(self.categories_[i].dtype)\n                    elif self.categories_[i].dtype.kind == \"O\" and Xi.dtype.kind == \"U\":\n                        # categories are objects and Xi are numpy strings.\n                        # Cast Xi to an object dtype to prevent truncation\n                        # when setting invalid values.\n                        Xi = Xi.astype(\"O\")\n                    else:\n                        Xi = Xi.copy()\n\n                    Xi[~valid_mask] = self.categories_[i][0]\n          ",
+          "symbol_name": "_transform",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "preprocessing_targets.rst",
+          "path": "doc/modules/preprocessing_targets.rst",
+          "sha": "c0d3769b69263ed35219412eedf6d24a4b0fb4bc",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/blob/cb4ce6d5257378052fbe664b710084b2bb39fd56/doc/modules/preprocessing_targets.rst",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 52,
+          "end_line": 76,
+          "excerpt": "52: non zero elements, corresponds to the subset of labels for that sample. An array\n53: such as ``np.array([[1, 0, 0], [0, 1, 1], [0, 0, 0]])`` represents label 0 in the\n54: first sample, labels 1 and 2 in the second sample, and no labels in the third\n55: sample.\n56: \n57: Producing multilabel data as a list of sets of labels may be more intuitive.\n58: The :class:`MultiLabelBinarizer <sklearn.preprocessing.MultiLabelBinarizer>`\n59: transformer can be used to convert between a collection of collections of\n60: labels and the indicator format::\n61: \n62:     >>> from sklearn.preprocessing import MultiLabelBinarizer\n63:     >>> y = [[2, 3, 4], [2], [0, 1, 3], [0, 1, 2, 3, 4], [0, 1, 2]]\n64:     >>> MultiLabelBinarizer().fit_transform(y)\n65:     array([[0, 0, 1, 1, 1],\n66:            [0, 0, 1, 0, 0],\n67:            [1, 1, 0, 1, 0],\n68:            [1, 1, 1, 1, 1],\n69:            [1, 1, 1, 0, 0]])\n70: \n71: For more information about multilabel classification, refer to\n72: :ref:`multilabel_classification`.\n73: \n74: Label encoding\n75: ==============\n76: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "sklearn/decomposition",
+      "count": 16,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "sklearn/decomposition/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_base.py",
+          "path": "sklearn/decomposition/_base.py",
+          "type": "file"
+        },
+        {
+          "name": "_cdnmf_fast.pyx",
+          "path": "sklearn/decomposition/_cdnmf_fast.pyx",
+          "type": "file"
+        },
+        {
+          "name": "_dict_learning.py",
+          "path": "sklearn/decomposition/_dict_learning.py",
+          "type": "file"
+        },
+        {
+          "name": "_factor_analysis.py",
+          "path": "sklearn/decomposition/_factor_analysis.py",
+          "type": "file"
+        },
+        {
+          "name": "_fastica.py",
+          "path": "sklearn/decomposition/_fastica.py",
+          "type": "file"
+        },
+        {
+          "name": "_incremental_pca.py",
+          "path": "sklearn/decomposition/_incremental_pca.py",
+          "type": "file"
+        },
+        {
+          "name": "_kernel_pca.py",
+          "path": "sklearn/decomposition/_kernel_pca.py",
+          "type": "file"
+        },
+        {
+          "name": "_lda.py",
+          "path": "sklearn/decomposition/_lda.py",
+          "type": "file"
+        },
+        {
+          "name": "_nmf.py",
+          "path": "sklearn/decomposition/_nmf.py",
+          "type": "file"
+        },
+        {
+          "name": "_online_lda_fast.pyx",
+          "path": "sklearn/decomposition/_online_lda_fast.pyx",
+          "type": "file"
+        },
+        {
+          "name": "_pca.py",
+          "path": "sklearn/decomposition/_pca.py",
+          "type": "file"
+        },
+        {
+          "name": "_sparse_pca.py",
+          "path": "sklearn/decomposition/_sparse_pca.py",
+          "type": "file"
+        },
+        {
+          "name": "_truncated_svd.py",
+          "path": "sklearn/decomposition/_truncated_svd.py",
+          "type": "file"
+        },
+        {
+          "name": "meson.build",
+          "path": "sklearn/decomposition/meson.build",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "sklearn/decomposition/tests",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "sklearn/decomposition/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"Matrix decomposition algorithms.\n2: \n3: These include PCA, NMF, ICA, and more. Most of the algorithms of this module can be\n4: regarded as dimensionality reduction techniques.\n5: \"\"\"\n6: \n7: # Authors: The scikit-learn developers\n8: # SPDX-License-Identifier: BSD-3-Clause\n9: \n10: from sklearn.decomposition._dict_learning import (\n11:     DictionaryLearning,\n12:     MiniBatchDictionaryLearning,\n13:     SparseCoder,"
+        },
+        {
+          "name": "_base.py",
+          "path": "sklearn/decomposition/_base.py",
+          "match_reason": "symbol_match",
+          "start_line": 151,
+          "end_line": 169,
+          "excerpt": "    def _transform(self, X, xp, x_is_centered=False):\n        X_transformed = X @ self.components_.T\n        if not x_is_centered:\n            # Apply the centering after the projection.\n            # For dense X this avoids copying or mutating the data passed by\n            # the caller.\n            # For sparse X it keeps sparsity and avoids having to wrap X into\n            # a linear operator.\n            X_transformed -= xp.reshape(self.mean_, (1, -1)) @ self.components_.T\n        if self.whiten:\n            # For some solvers (such as \"arpack\" and \"covariance_eigh\"), on\n            # rank deficient data, some components can have a variance\n            # arbitrarily close to zero, leading to non-finite results when\n            # whitening. To avoid this problem we clip the variance below.\n            scale = xp.sqrt(self.explained_variance_)\n            min_scale = xp.finfo(scale.dtype).eps\n            scale[scale < min_scale] = min_scale\n            X_transformed /= scale\n        return X_transformed"
+        },
+        {
+          "name": "_cdnmf_fast.pyx",
+          "path": "sklearn/decomposition/_cdnmf_fast.pyx",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Authors: The scikit-learn developers\n2: # SPDX-License-Identifier: BSD-3-Clause\n3: \n4: from cython cimport floating\n5: from libc.math cimport fabs\n6: \n7: \n8: def _update_cdnmf_fast(floating[:, ::1] W, floating[:, :] HHt,\n9:                        floating[:, :] XHt, Py_ssize_t[::1] permutation):\n10:     cdef:\n11:         floating violation = 0\n12:         Py_ssize_t n_components = W.shape[1]\n13:         Py_ssize_t n_samples = W.shape[0]  # n_features for H update"
+        },
+        {
+          "name": "_factor_analysis.py",
+          "path": "sklearn/decomposition/_factor_analysis.py",
+          "match_reason": "anchor_text",
+          "start_line": 149,
+          "end_line": 173,
+          "excerpt": "149:     - David Barber, Bayesian Reasoning and Machine Learning,\n150:       Algorithm 21.1.\n151: \n152:     - Christopher M. Bishop: Pattern Recognition and Machine Learning,\n153:       Chapter 12.2.4.\n154: \n155:     Examples\n156:     --------\n157:     >>> from sklearn.datasets import load_digits\n158:     >>> from sklearn.decomposition import FactorAnalysis\n159:     >>> X, _ = load_digits(return_X_y=True)\n160:     >>> transformer = FactorAnalysis(n_components=7, random_state=0)\n161:     >>> X_transformed = transformer.fit_transform(X)\n162:     >>> X_transformed.shape\n163:     (1797, 7)\n164:     \"\"\"\n165: \n166:     _parameter_constraints: dict = {\n167:         \"n_components\": [Interval(Integral, 0, None, closed=\"left\"), None],\n168:         \"tol\": [Interval(Real, 0.0, None, closed=\"left\")],\n169:         \"copy\": [\"boolean\"],\n170:         \"max_iter\": [Interval(Integral, 1, None, closed=\"left\")],\n171:         \"noise_variance_init\": [\"array-like\", None],\n172:         \"svd_method\": [StrOptions({\"randomized\", \"lapack\"})],\n173:         \"iterated_power\": [Interval(Integral, 0, None, closed=\"left\")],"
+        },
+        {
+          "name": "_fastica.py",
+          "path": "sklearn/decomposition/_fastica.py",
+          "match_reason": "anchor_text",
+          "start_line": 342,
+          "end_line": 366,
+          "excerpt": "342:         n_components=n_components,\n343:         algorithm=algorithm,\n344:         whiten=whiten,\n345:         fun=fun,\n346:         fun_args=fun_args,\n347:         max_iter=max_iter,\n348:         tol=tol,\n349:         w_init=w_init,\n350:         whiten_solver=whiten_solver,\n351:         random_state=random_state,\n352:     )\n353:     est._validate_params()\n354:     S = est._fit_transform(X, compute_sources=compute_sources)\n355: \n356:     if est.whiten in [\"unit-variance\", \"arbitrary-variance\"]:\n357:         K = est.whitening_\n358:         X_mean = est.mean_\n359:     else:\n360:         K = None\n361:         X_mean = None\n362: \n363:     returned_values = [K, est._unmixing, S]\n364:     if return_X_mean:\n365:         returned_values.append(X_mean)\n366:     if return_n_iter:"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "sklearn/decomposition/_dict_learning.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "938cd9798879757d8f681d5c82cdf0503aac96a3",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/commit/938cd9798879757d8f681d5c82cdf0503aac96a3",
+          "message": "Fix make sure enabling `array_api_dispatch=True` does not break any estimator on NumPy inputs (#32846)\n\nCo-authored-by: Omar Salman <omar.salman@arbisoft.com>\nCo-authored-by: Lucy Liu <jliu176@gmail.com>\nCo-authored-by: Loïc Estève <loic.esteve@ymail.com>\nCo-authored-by: Tim Head <betatim@gmail.com>",
+          "author": "Olivier Grisel",
+          "date": "2026-01-06T14:26:20Z"
+        },
+        {
+          "sha": "fc8122a7041f16baab6699d95d92e15868c283dd",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/commit/fc8122a7041f16baab6699d95d92e15868c283dd",
+          "message": "ENH add gap safe screening rules to enet_coordinate_descent_gram (#31987)\n\nCo-authored-by: Olivier Grisel <olivier.grisel@ensta.org>",
+          "author": "Christian Lorentzen",
+          "date": "2025-09-11T16:45:26Z"
+        },
+        {
+          "sha": "68218f7891d527e05aa39f08c37ca22208841997",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/commit/68218f7891d527e05aa39f08c37ca22208841997",
+          "message": "FIX SparseCoder now passes our common tests (#32077)\n\nCo-authored-by: Jérémie du Boisberranger <jeremie@probabl.ai>",
+          "author": "François Paugam",
+          "date": "2025-09-09T08:19:52Z"
+        },
+        {
+          "sha": "0033630cd35d5945ea8c1b5beff6efe9583cd523",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/commit/0033630cd35d5945ea8c1b5beff6efe9583cd523",
+          "message": "DOC Add links to example plot_image_denoising.py (#30864)\n\nCo-authored-by: Stefanie Senger <91849487+StefanieSenger@users.noreply.github.com>\nCo-authored-by: Maren Westermann <maren.westermann@gmail.com>",
+          "author": "Gesa Loof",
+          "date": "2025-09-06T21:05:10Z"
+        },
+        {
+          "sha": "1fe659545c70d9f805c1c4097dd2fce9a6285a12",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/commit/1fe659545c70d9f805c1c4097dd2fce9a6285a12",
+          "message": "MNT Switch to absolute imports enforced by `ruff` (#31847)",
+          "author": "Loïc Estève",
+          "date": "2025-07-29T13:42:22Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_transform TODO change self alpha",
+      "count": 2,
+      "items": [
+        {
+          "number": 27475,
+          "title": "MAINT Parameters validation for sklearn.metrics.pairwise.check_paired_arrays",
+          "state": "closed",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/pull/27475",
+          "is_pull_request": true
+        },
+        {
+          "number": 27155,
+          "title": "Updated versions of pre-commit hooks and modified files accordingly.",
+          "state": "closed",
+          "html_url": "https://github.com/scikit-learn/scikit-learn/pull/27155",
+          "is_pull_request": true
+        }
+      ]
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [
+      {
+        "ok": true,
+        "number": 27475,
+        "count": 8,
+        "files": [
+          {
+            "filename": "doc/conf.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "patch_excerpt": "@@ -685,11 +685,9 @@ def setup(app):\n # The following is used by sphinx.ext.linkcode to provide links to github\n linkcode_resolve = make_linkcode_resolve(\n     \"sklearn\",\n-    (\n-        \"https://github.com/scikit-learn/\"\n-        \"scikit-learn/blob/{revision}/\"\n-        \"{package}/{path}#L{lineno}\"\n-    ),\n+    \"https://github.com/scikit-learn/\"\n+    \"scikit-learn/blob/{revision}/\"\n+    \"{package}/{path}#L{lineno}\",\n )\n \n warnings.filterwarnings("
+          },
+          {
+            "filename": "examples/applications/plot_digits_denoising.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "patch_excerpt": "@@ -136,10 +136,8 @@ def plot_digits(X, title):\n )\n plot_digits(\n     X_reconstructed_kernel_pca,\n-    (\n-        \"Kernel PCA reconstruction\\n\"\n-        f\"MSE: {np.mean((X_test - X_reconstructed_kernel_pca) ** 2):.2f}\"\n-    ),\n+    \"Kernel PCA reconstruction\\n\"\n+    f\"MSE: {np.mean((X_test - X_reconstructed_kernel_pca) ** 2):.2f}\",\n )\n \n # %%"
+          },
+          {
+            "filename": "examples/gaussian_process/plot_gpr_noisy.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 8,
+            "changes": 12,
+            "patch_excerpt": "@@ -103,10 +103,8 @@ def target_generator(X, add_noise=False):\n plt.xlabel(\"X\")\n plt.ylabel(\"y\")\n _ = plt.title(\n-    (\n-        f\"Initial: {kernel}\\nOptimum: {gpr.kernel_}\\nLog-Marginal-Likelihood: \"\n-        f\"{gpr.log_marginal_likelihood(gpr.kernel_.theta)}\"\n-    ),\n+    f\"Initial: {kernel}\\nOptimum: {gpr.kernel_}\\nLog-Marginal-Likelihood: \"\n+    f\"{gpr.log_marginal_likelihood(gpr.kernel_.theta)}\",\n     fontsize=8,\n )\n # %%\n@@ -134,10 +132,8 @@ def target_generator(X, add_noise=False):\n plt.xlabel(\"X\")\n plt.ylabel(\"y\")\n _ = plt.title(\n-    (\n-        f\"Initial: {kernel}\\nOptimum: {gpr.kernel_}\\nLog-Marginal-Likelihood: \"\n-        f\"{gpr.log_marginal_likelihood(gpr.kernel_.theta)}\"\n-    ),\n+    f\"Initial: {kernel}\\nOptimum: {gpr.kernel_}\\nLog-Marginal-Likelihood: \"\n+    f\"{gpr.log_marginal_likelihood(gpr.kernel_.theta)}\",\n     fontsize=8,\n )\n "
+          },
+          {
+            "filename": "examples/inspection/plot_partial_dependence.py",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 8,
+            "changes": 12,
+            "patch_excerpt": "@@ -273,10 +273,8 @@\n )\n print(f\"done in {time() - tic:.3f}s\")\n _ = display.figure_.suptitle(\n-    (\n-        \"Partial dependence of the number of bike rentals\\n\"\n-        \"for the bike rental dataset with an MLPRegressor\"\n-    ),\n+    \"Partial dependence of the number of bike rentals\\n\"\n+    \"for the bike rental dataset with an MLPRegressor\",\n     fontsize=16,\n )\n \n@@ -327,10 +325,8 @@\n )\n print(f\"done in {time() - tic:.3f}s\")\n _ = display.figure_.suptitle(\n-    (\n-        \"Partial dependence of the number of bike rentals\\n\"\n-        \"for the bike rental dataset with a gradient boosting\"\n-    ),\n+    \"Partial dependence of the number of bike rentals\\n\"\n+    \"for the bike rental dataset with a gradient boosting\",\n     fontsize=16,\n )\n "
+          },
+          {
+            "filename": "examples/semi_supervised/plot_label_propagation_digits_active_learning.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "patch_excerpt": "@@ -115,10 +115,8 @@\n     n_labeled_points += len(uncertainty_index)\n \n f.suptitle(\n-    (\n-        \"Active learning with Label Propagation.\\nRows show 5 most \"\n-        \"uncertain labels to learn with the next model.\"\n-    ),\n+    \"Active learning with Label Propagation.\\nRows show 5 most \"\n+    \"uncertain labels to learn with the next model.\",\n     y=1.15,\n )\n plt.subplots_adjust(left=0.2, bottom=0.03, right=0.9, top=0.9, wspace=0.2, hspace=0.85)"
+          },
+          {
+            "filename": "sklearn/base.py",
+            "status": "modified",
+            "additions": 17,
+            "deletions": 23,
+            "changes": 40,
+            "patch_excerpt": "@@ -251,11 +251,9 @@ def set_params(self, **params):\n                 and self.__module__.startswith(\"sklearn.\")\n             ):\n                 warnings.warn(\n-                    (\n-                        f\"Parameter 'base_estimator' of {self.__class__.__name__} is\"\n-                        \" deprecated in favor of 'estimator'. See\"\n-                        f\" {self.__class__.__name__}'s docstring for more details.\"\n-                    ),\n+                    f\"Parameter 'base_estimator' of {self.__class__.__name__} is\"\n+                    \" deprecated in favor of 'estimator'. See\"\n+                    f\" {self.__class__.__name__}'s docstring for more details.\",\n                     FutureWarning,\n                     stacklevel=2,\n                 )\n@@ -931,15 +929,13 @@ def fit_transform(self, X, y=None, **fit_params):\n             )\n             if transform_params:\n                 warnings.warn(\n-                    (\n-                        f\"This object ({self.__class__.__name__}) has a `transform`\"\n-                        \" method which consumes metadata, but `fit_transform` does not\"\n-                        \" forward metadata to `transform`. Please implement a custom\"\n-                        \" `fit_transform` method to forward metadata to `transform` as\"\n-                        \" well. Alternatively, you can explicitly do\"\n-                        \" `set_transform_request`and set all values to `False` to\"\n-                        \" disable metadata routed to `transform`, if that's an option.\"\n-                    ),\n+                    f\"This object ({self.__class__.__name__}) has a `transform`\"\n+                    \" method which consumes metadata, but `fit_transform` does not\"\n+                    \" forward metadata to `transform`. Please implement a custom\"\n+                    \" `fit_transform` method to forward metadata to `transform` as\"\n+                    \" well. Alternatively, you can explicitly do\"\n+                    \" `set_transform_request`and set all values to `False` to\"\n+                    \" disable metadata routed to `transform`, if that's an option.\",\n                     UserWarning,\n                 )\n \n@@ -1083,15 +10"
+          },
+          {
+            "filename": "sklearn/calibration.py",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 4,
+            "changes": 6,
+            "patch_excerpt": "@@ -299,10 +299,8 @@ def _get_estimator(self):\n                     \"`estimator` since `base_estimator` is deprecated.\"\n                 )\n             warnings.warn(\n-                (\n-                    \"`base_estimator` was renamed to `estimator` in version 1.2 and \"\n-                    \"will be removed in 1.4.\"\n-                ),\n+                \"`base_estimator` was renamed to `estimator` in version 1.2 and \"\n+                \"will be removed in 1.4.\",\n                 FutureWarning,\n             )\n             estimator = self.base_estimator"
+          },
+          {
+            "filename": "sklearn/cluster/_affinity_propagation.py",
+            "status": "modified",
+            "additions": 7,
+            "deletions": 13,
+            "changes": 20,
+            "patch_excerpt": "@@ -140,10 +140,8 @@ def _affinity_propagation(\n     if K > 0:\n         if never_converged:\n             warnings.warn(\n-                (\n-                    \"Affinity propagation did not converge, this model \"\n-                    \"may return degenerate cluster centers and labels.\"\n-                ),\n+                \"Affinity propagation did not converge, this model \"\n+                \"may return degenerate cluster centers and labels.\",\n                 ConvergenceWarning,\n             )\n         c = np.argmax(S[:, I], axis=1)\n@@ -162,10 +160,8 @@ def _affinity_propagation(\n         labels = np.searchsorted(cluster_centers_indices, labels)\n     else:\n         warnings.warn(\n-            (\n-                \"Affinity propagation did not converge and this model \"\n-                \"will not have any cluster centers.\"\n-            ),\n+            \"Affinity propagation did not converge and this model \"\n+            \"will not have any cluster centers.\",\n             ConvergenceWarning,\n         )\n         labels = np.array([-1] * n_samples)\n@@ -559,11 +555,9 @@ def predict(self, X):\n                 return pairwise_distances_argmin(X, self.cluster_centers_)\n         else:\n             warnings.warn(\n-                (\n-                    \"This model does not have any cluster centers \"\n-                    \"because affinity propagation did not converge. \"\n-                    \"Labeling every sample as '-1'.\"\n-                ),\n+                \"This model does not have any cluster centers \"\n+                \"because affinity propagation did not converge. \"\n+                \"Labeling every sample as '-1'.\",\n                 ConvergenceWarning,\n             )\n             return np.array([-1] * X.shape[0])"
+          }
+        ]
+      },
+      {
+        "ok": true,
+        "number": 27155,
+        "count": 8,
+        "files": [
+          {
+            "filename": ".pre-commit-config.yaml",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 4,
+            "changes": 8,
+            "patch_excerpt": "@@ -1,22 +1,22 @@\n repos:\n -   repo: https://github.com/pre-commit/pre-commit-hooks\n-    rev: v4.3.0\n+    rev: v4.4.0\n     hooks:\n     -   id: check-yaml\n     -   id: end-of-file-fixer\n     -   id: trailing-whitespace\n -   repo: https://github.com/psf/black\n-    rev: 23.3.0\n+    rev: 23.7.0\n     hooks:\n     -   id: black\n -   repo: https://github.com/astral-sh/ruff-pre-commit\n     # Ruff version.\n-    rev: v0.0.272\n+    rev: v0.0.285\n     hooks:\n     -   id: ruff\n         args: [\"--fix\", \"--show-source\"]\n -   repo: https://github.com/pre-commit/mirrors-mypy\n-    rev: v1.3.0\n+    rev: v1.5.1\n     hooks:\n      -  id: mypy\n         files: sklearn/"
+          },
+          {
+            "filename": "CODE_OF_CONDUCT.md",
+            "status": "modified",
+            "additions": 0,
+            "deletions": 1,
+            "changes": 1,
+            "patch_excerpt": "@@ -13,4 +13,3 @@ all priceless contributions.\n \n We abide by the principles of openness, respect, and consideration of others of\n the Python Software Foundation: https://www.python.org/psf/codeofconduct/\n-"
+          },
+          {
+            "filename": "asv_benchmarks/benchmarks/config.json",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "patch_excerpt": "@@ -9,7 +9,7 @@\n     // Can be overridden by environment variable SKLBENCH_PROFILE.\n     \"profile\": \"regular\",\n \n-    // List of values of n_jobs to use for estimators which accept this \n+    // List of values of n_jobs to use for estimators which accept this\n     // parameter (-1 means all cores). An empty list means all values from 1 to\n     // the maximum number of available cores.\n     // Can be overridden by environment variable SKLBENCH_NJOBS."
+          },
+          {
+            "filename": "doc/README.md",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "patch_excerpt": "@@ -3,4 +3,4 @@\n This directory contains the full manual and website as displayed at\n http://scikit-learn.org. See\n http://scikit-learn.org/dev/developers/contributing.html#documentation for\n-detailed information about the documentation. \n+detailed information about the documentation."
+          },
+          {
+            "filename": "doc/conf.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 5,
+            "changes": 8,
+            "patch_excerpt": "@@ -681,11 +681,9 @@ def setup(app):\n # The following is used by sphinx.ext.linkcode to provide links to github\n linkcode_resolve = make_linkcode_resolve(\n     \"sklearn\",\n-    (\n-        \"https://github.com/scikit-learn/\"\n-        \"scikit-learn/blob/{revision}/\"\n-        \"{package}/{path}#L{lineno}\"\n-    ),\n+    \"https://github.com/scikit-learn/\"\n+    \"scikit-learn/blob/{revision}/\"\n+    \"{package}/{path}#L{lineno}\",\n )\n \n warnings.filterwarnings("
+          },
+          {
+            "filename": "doc/images/czi_logo.svg",
+            "status": "modified",
+            "additions": 1,
+            "deletions": 1,
+            "changes": 2,
+            "patch_excerpt": "@@ -16,4 +16,4 @@\n             <path d=\"M128.264258,140.830158 C127.731065,146.452835 124.81253,151.094434 120.437535,153.404009 C116.963637,155.237918 113.167297,155.227815 109.745876,153.371175 C106.186106,151.433995 104.498127,148.533417 103.864188,144.868125 C102.862906,139.054059 106.168707,132.991356 110.67195,129.934748 L181.049041,84.1510133 C181.585041,88.0250929 181.869318,91.9799935 181.869318,96 C181.869318,143.38388 143.348592,181.932164 95.9998597,181.932164 C48.6516891,181.932164 10.1309628,143.38388 10.1309628,96 C10.1309628,48.616401 48.6516891,10.0655911 95.9998597,10.0655911 C131.406173,10.0655911 161.85659,31.6327505 174.973438,62.3195017 L183.562348,56.7394801 C168.526003,23.330911 134.948264,0 95.9998597,0 C43.0640987,0 0,43.0641617 0,96 C0,148.933313 43.0640987,192 95.9998597,192 C148.933376,192 192,148.933313 192,96 C192,89.8893095 191.418819,83.9121983 190.322123,78.115812 C189.660402,74.3219922 188.211237,69.2931255 187.972422,68.477899 L167.980181,80.9835569 L141.509354,97.7435463 C140.575984,94.2213751 138.445173,90.6540228 133.924531,88.6012237 C128.571266,86.1709789 119.901815,88.0427725 113.539691,91.6603574 C113.539691,91.6603574 130.963622,57.9473061 133.854094,52.4051694 C134.042957,52.0454034 133.77636,51.6202509 133.368607,51.6227765 L132.299413,51.6328792 L100.784853,51.6076226 L99.4768445,62.5030328 L104.405239,62.4856339 L117.132014,62.4856339 L92.1861209,110.251449 C91.7006339,111.182575 92.706967,112.183578 93.6428625,111.700616 L106.95587,104.624001 C113.383661,101.326053 124.083177,94.5586909 129.373582,98.473181 C130.143346,99.0414541 131.129473,100.545905 131.192615,102.123599 C131.220116,102.734528 130.910864,103.318236 130.39984,103.660322 L103.841457,121.605126 C95.2152229,127.771101 91.8415093,136.945976 92.6415806,145.600005 C93.3105985,152.875585 97.8390977,159.144831 104.560988,162.797775 C108.085679,164.71475 111.899418,165.617532 115.708386,165.512016 C119.048986,165.418847 122.385095,164.546092 125.514381,162.893189 C133.086856,158.890862 138.125818,151.11464 139.001378,142.078114 L141.139766,117.778753 L129.537188,126.397704 L128.264258,140.830158 Z\" id=\"Fill-3\" fill=\"#FF414B\" mask=\"url(#mask-2)\"></path>\n  "
+          },
+          {
+            "filename": "doc/includes/big_toc_css.rst",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 5,
+            "changes": 7,
+            "patch_excerpt": "@@ -1,4 +1,4 @@\n-..  \n+..\n     File to ..include in a document with a big table of content, to give\n     it 'style'\n \n@@ -33,8 +33,5 @@\n     div.body li.toctree-l4 {\n         margin-left: 40px;\n     }\n- \n-  </style>\n-\n-\n \n+  </style>"
+          },
+          {
+            "filename": "doc/includes/bigger_toc_css.rst",
+            "status": "modified",
+            "additions": 4,
+            "deletions": 7,
+            "changes": 11,
+            "patch_excerpt": "@@ -1,5 +1,5 @@\n-..  \n-    File to ..include in a document with a very big table of content, to \n+..\n+    File to ..include in a document with a very big table of content, to\n     give it 'style'\n \n .. raw:: html\n@@ -29,7 +29,7 @@\n     li.toctree-l1 a {\n         padding: 0 0 0 10px ;\n     }\n- \n+\n     li.toctree-l2 {\n         padding: 0.25em 0 0.25em 0 ;\n         list-style-type: none;\n@@ -53,8 +53,5 @@\n         list-style-type: none;\n \tfont-weight: normal;\n         }\n- \n-  </style>\n-\n-\n \n+  </style>"
+          }
+        ]
+      }
+    ],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "sklearn/decomposition/_dict_learning.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "938cd9798879757d8f681d5c82cdf0503aac96a3",
+        "html_url": "https://github.com/scikit-learn/scikit-learn/commit/938cd9798879757d8f681d5c82cdf0503aac96a3",
+        "message": "Fix make sure enabling `array_api_dispatch=True` does not break any estimator on NumPy inputs (#32846)\n\nCo-authored-by: Omar Salman <omar.salman@arbisoft.com>\nCo-authored-by: Lucy Liu <jliu176@gmail.com>\nCo-authored-by: Loïc Estève <loic.esteve@ymail.com>\nCo-authored-by: Tim Head <betatim@gmail.com>",
+        "author": "Olivier Grisel",
+        "date": "2026-01-06T14:26:20Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 4,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

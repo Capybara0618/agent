@@ -1,0 +1,490 @@
+{
+  "task_id": "200",
+  "repo_owner": "edcd",
+  "repo_name": "edmarketconnector",
+  "file_path": "update.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T08:44:06+00:00",
+    "base_cache_source": "disk_cache",
+    "symbol_name": "update_files",
+    "satd_line": 147,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T08:47:14+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T08:47:19+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "update.py",
+    "original_code": "def worker(self) -> None:\n    \"\"\"\n    Thread worker to perform internal update checking and update GUI\n    status if a newer version is found.\n    :return: None\n    \"\"\"\n    newversion = self.check_appcast()\n\n    if newversion:\n        # TODO: Surely we can do better than this\n        #       nametowidget('.{}.status'.format(appname.lower()))['text']\n        self.root.nametowidget('.{}.status'.format(appname.lower()))['text'] = newversion.title + ' is available'\n        self.root.update_idletasks()",
+    "original_signature": "def worker(self) -> None:",
+    "satd_comment": "# TODO: Surely we can do better than this\n#       nametowidget('.{}.status'.format(appname.lower()))['text']",
+    "target_file": {
+      "ok": true,
+      "path": "update.py",
+      "sha": "aebabf5e82b204a530ea8db689892b2924280507",
+      "download_url": "https://raw.githubusercontent.com/EDCD/EDMarketConnector/main/update.py",
+      "content_excerpt": "\"\"\"\nupdate.py - Checking for Program Updates.\n\nCopyright (c) EDCD, All Rights Reserved\nLicensed under the GNU General Public License v2 or later.\nSee LICENSE file.\n\"\"\"\nfrom __future__ import annotations\n\nimport pathlib\nimport hashlib\nimport shutil\nimport sys\nimport threading\nimport os\nimport time\nfrom concurrent.futures import ThreadPoolExecutor, as_completed\nfrom dataclasses import dataclass\nfrom tkinter import messagebox\nfrom traceback import print_exc\nfrom typing import TYPE_CHECKING, cast, Any\nfrom xml.etree import ElementTree\nimport requests\nimport semantic_version\nfrom config import appname, appversion_nobuild, config, get_update_feed\nfrom EDMCLogging import get_main_logger\nfrom l10n import translations as tr\n\nif TYPE_CHECKING:\n    import tkinter as tk\n\nlogger = get_main_logger()\n\nHTTP_TIMEOUT = (5, 20)          # (connect, read)\nHTTP_RETRIES = 3\nRETRY_BACKOFF = 1.5             # seconds multiplier\nMAX_WORKERS = 8\n\n\ndef read_normalized_file(path: pathlib.Path) -> tuple[str, str, str] | None:\n    \"\"\"Read a UTF-8 (with BOM-safe) file and normalize line endings and whitespace.\"\"\"\n    try:\n        raw = path.read_bytes()\n    except FileNotFoundError:\n        return None\n    newline = '\\r\\n' if b'\\r\\n' in raw else '\\n'\n    text = raw.decode('utf-8-sig')\n    normalized = text.replace('\\r\\n', '\\n').strip()\n\n    return normalized, hashlib.sha256(normalized.encode()).hexdigest(), newline\n\n\ndef copy_bundle_file(filename: str, dest_dir: pathlib.Path) -> tuple[str, str] | None:\n    \"\"\"\n    Attempt to copy a missing file from the bundled FDevIDs folder.\n\n    Returns (content, hash) or None.\n    \"\"\"\n    try:\n        dest = dest_dir / filename\n        shutil.copy(f\"FDevIDs/{filename}\", dest)\n        return read_normalized_file(dest)  # type: ignore\n    except (FileNotFoundError, shutil.SameFileError):\n        logger.info(\"Bundle copy failed or identical; continuing with empty content.\")\n        return None\n\n\ndef fetch_remote_file(url: str) -> tuple[str, str] | None:\n    \"\"\"\n    Fetch a remote file with retries.\n\n    Returns (normalized_text, hash) or None on failure.\n    \"\"\"\n    delay = 1.0\n\n    for attempt in range(1, HTTP_RETRIES + 1):\n        try:\n            response = requests.get(url, timeout=HTTP_TIMEOUT)\n            response.raise_for_status()\n\n            text = response.text.replace('\\r\\n', '\\n').strip()\n            return text, hashlib.sha256(text.encode()).hexdigest()\n\n        except requests.RequestException as exc:\n            if attempt >= HTTP_RETRIES:\n                logger.debug(\"Download failed after %d attempts: %s\", attempt, exc)\n                return None\n\n            time.sleep(delay)\n            delay *= RETRY_BACKOFF\n    return None\n\n\ndef update_single_file(\n    directory: pathlib.Path,\n    filename: str,\n    url: str,\n    silent: bool = False,\n) -> None:\n    \"\"\"Update a single bundle file.\"\"\"\n    file_path = directory / filename\n\n    local = read_normalized_file(file_path)\n    if local is None:\n        local = copy_bundle_file(filename, directory)  # type: ignore\n\n    if local:\n        local_text, local_hash, newline = local\n    else:\n        local_text, local_hash, newline = '', '', '\\n'  # noqa: F841\n\n    remote = fetch_remote_file(url)\n    if not remote:\n        if not silent:\n            logger.error(f'Failed to download {filename}! Unable to continue.')\n        return\n\n    remote_text, remote_hash = remote\n\n    if local_hash == remote_hash:\n        if not silent:\n            logger.info(f'{filename} already up to date.')\n        return\n\n    if not silent:\n        logger.info(f'Updating file {filename}...')\n\n    # Restore original newline style\n    output = remote_text.replace('\\n', newline)\n    file_path.write_text(output, encoding='utf-8', newline='')\n\n\ndef update_files(\n    directory: pathlib.Path,\n    files_urls: dict[str, str],\n    silent: bool = False,\n) -> None:\n    \"\"\"Start threads to update bundle files.\"\"\"\n    directory.mkdir(parents=True, exist_ok=True)\n\n    max_workers = min(MAX_WORKERS, len(files_urls))\n\n    with ThreadPoolExecutor(max_workers=max_workers) as executor:\n        futures = [\n            executor.submit(update_single_file, directory, filename, url, silent)\n            for filename, url in files_urls.items()\n        ]\n\n        for future in as_completed(futures):\n            try:\n                future.result()\n            except Exception:\n                logger.exception(\"Unexpected error while updating files\")\n\n\ndef check_for_fdev_updates(silent: bool = False, local: bool = False) -> None:\n    \"\"\"Check for and download FDEV ID file updates.\"\"\"\n    base_path = config.respath_path if local else config.app_dir_path\n    fdevid_dir = pathlib.Path(base_path, 'FDevIDs')\n    fdevid_dir.mkdir(parents=True, exist_ok=True)\n\n    files_urls = {\n        'commodity.csv': 'https://raw.githubusercontent.com/EDCD/FDevIDs/master/commodity.csv',\n        'rare_commodity.csv': 'https://raw.githubusercontent.com/EDCD/FDevIDs/master/rare_commodity.csv'\n    }\n    if not silent:\n        logger.info(f\"Checking for {'local ' if local else ''}FDEVID file updates...\")\n    update_files(fdevid_dir, files_urls, silent)\n\n\ndef check_for_datafile_updates(silent: bool = False, local: bool = False) -> None:\n    \"\"\"Check for and download data file updates.\"\"\"\n    base_path = config.respath_path if local else config.app_dir_path\n    files_urls = {\n        'modules.json': 'https://raw.githubusercontent.com/EDCD/EDMarketConnector/refs/heads/releases/modules.json',\n        'ships.json': 'https://raw.githubusercontent.com/EDCD/EDMarketConnector/refs/heads/releases/ships.json',\n        'master_plugin_list.json': 'https://raw.githubusercontent.com/EDCD/'\n                                   'EDMC-Plugin-Registry/refs/heads/main/master_plugin_list.json'\n    }\n    if not silent:\n        logger.info(f\"Checking for {'local ' if local else ''}datafile file updates...\")\n    update_files(pathlib.Path(base_path), files_urls, silent)\n\n\n@dataclass(slots=True)\nclass EDMCVersion:\n    \"\"\"\n    Hold all the information about an EDMC version.\n\n    Attributes\n    ----------\n    version : str\n        Full version string\n    title: str\n        Title of the release\n    sv: semantic_version.base.Version\n        semantic_version object for this version\n    \"\"\"\n\n    version: str\n    title: str\n    sv: semantic_version.Version\n\n\nclass Updater:\n    \"\"\"\n    Handle checking for updates.\n\n    This is used whether using internal code or an external library such as\n    WinSparkle on win32.\n    \"\"\"\n\n    def __init__(self, tkroot: tk.Tk | None = None, provider: str = 'internal'):\n        \"\"\"\n        Initialise an Updater instance.\n\n        :param tkroot: reference to the root window of the GUI\n        :param provider: 'internal' or other string if not\n        \"\"\"\n        self.root: tk.Tk | None = tkroot\n        self.provider: str = provider\n        self.thread: threading.Thread | None = None\n        self.updater: Any | None = None  # ensure attribute exists\n\n        if not self.use_internal() and sys.platform == 'win32':\n            self._init_winsparkle()\n            self.set_automatic_updates_check(config.get_bool(\"core_updater_disable_in_game\", default=False))\n\n    def start_check_thread(self) -> None:\n        \"\"\"Start the background update worker thread safely.\"\"\"\n        if self.use_internal():\n            self.thread = threading.Thread(\n                target=self.worker,\n                name='update worker',\n                daemon=True\n            )\n            self.thread.start()\n        else:\n            if sys.platform == 'win32' and self.updater:\n                self.updater.win_sparkle_check_update_with_ui()\n\n        # Always trigger FDEV checks here too\n        check_for_fdev_updates()\n        check_for_datafile_updates()\n\n    def shutdown_request(self) -> None:\n        \"\"\"Receive (Win)Sparkle shutdown request and send it to parent.\"\"\"\n        if not config.shutting_down and self.root:\n            self.root.event_generate('<<Quit>>', when=\"tail\")\n\n    def use_internal(self) -> bool:\n        \"\"\"\n        Signal if internal update checks should be used.\n\n        :return: bool\n        \"\"\"\n        return self.provider == 'internal'\n\n    def _init_winsparkle(self) -> None:\n        \"\"\"Initialize WinSparkle updater for Windows.\"\"\"\n        import ctypes\n        try:\n            self.updater = cast(ctypes.CDLL, ctypes.cdll.WinSparkle)\n            self.updater.win_sparkle_set_appcast_url(get_update_feed().encode())  # Set the appcast URL\n\n            # Set the appversion *without* build metadata, as WinSparkle\n            # doesn't do proper Semantic Version checks.\n            # NB: It 'accidentally' supports pre-release due to how it\n            # splits and compares strings:\n            # <https://github.com/vslavik/winsparkle/issues/214>\n            self.updater.win_sparkle_set_app_build_version(str(appversion_nobuild()))\n\n            # set up shutdown callback\n            self.callback_t = ctypes.CFUNCTYPE(None)  # keep reference\n            self.callback_fn = self.callback_t(self.shutdown_request)\n            self.updater.win_sparkle_set_shutdown_request_callback(self.callback_fn)\n\n            # Get WinSparkle running\n            self.updater.win_sparkle_init()\n\n        except Exception:\n            print_exc()\n            self.updater = None\n            msg = \"Updater Failed to Initialize. Please file a bug report!\"\n            if not os.getenv(\"EDMC_NO_UI\"):\n                messagebox.showerror(title=appname, message=msg)\n            else:\n                logger.error(msg)\n\n    def set_automatic_updates_check(self, onoroff: bool) -> None:\n        \"\"\"\n        Set (Win)Sparkle to perform automatic update checks, or not.\n\n        :param onoroff: bool for if we should have the library check or not.\n        \"\"\"\n        if self.use_internal():\n            return\n\n        if sys.platform == 'win32' and self.updater:\n            self.updater.win_sparkle_set_automatic_check_for_updates(onoroff)\n\n    def check_for_updates(self) -> None:\n        \"\"\"Trigger the requisite method to check for an update.\"\"\"\n        if self.use_internal():\n            self.thread = threading.Thread(target=self.worker, name='update worker', daemon=True)\n            self.thread.start()\n        elif sys.platform == 'win32' and self.updater:\n            self.updater.win_sparkle_check_update_with_ui()\n\n        check_for_fdev_updates()\n        check_for_datafile_updates()\n\n    def check_appcast(self) -> EDMCVersion | None:\n        \"\"\"\n        Manually (no Sparkle or WinSparkle) check the get_update_feed() appcast file.\n\n        Checks if any listed version is semantically greater than the current\n        running version.\n        :return: EDMCVersion or None if no newer version found\n        \"\"\"\n        newversion = None\n        items = {}\n        try:\n            request = requests.get(get_update_feed(), timeout=10)\n\n        except requests.RequestException as ex:\n            logger.exception(f'Error retrieving update_feed file: {ex}')\n            return None\n\n        try:\n            feed = ElementTree.fromstring(request.text)\n\n        except SyntaxError as ex:\n            logger.exception(f'Syntax error in update_feed file: {ex}')\n            return None\n\n        # For *these* purposes all systems are the same as 'windows', as\n        # non-win32 would be running from source.\n        sparkle_platform = 'windows'\n\n        for item in feed.findall('channel/item'):\n            # xml is a pain with types, hence these ignores\n            ver = item.find('enclosure').attrib.get(  # type: ignore\n                '{http://www.andymatuschak.org/xml-namespaces/sparkle}version'\n            )\n            ver_platform = item.find('enclosure').attrib.get(  # type: ignore\n                '{http://www.andymatuschak.org/xml-namespaces/sparkle}os'\n            )\n            if ver_platform != sparkle_platform:\n                continue\n\n            # This will change A.B.C.D to A.B.C+D\n            semver = semantic_version.Version.coerce(ver)\n\n  ",
+      "total_lines": 400
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 147,
+      "start_line": 127,
+      "end_line": 167,
+      "matched_line": "        ]",
+      "excerpt": "127: \n128:     # Restore original newline style\n129:     output = remote_text.replace('\\n', newline)\n130:     file_path.write_text(output, encoding='utf-8', newline='')\n131: \n132: \n133: def update_files(\n134:     directory: pathlib.Path,\n135:     files_urls: dict[str, str],\n136:     silent: bool = False,\n137: ) -> None:\n138:     \"\"\"Start threads to update bundle files.\"\"\"\n139:     directory.mkdir(parents=True, exist_ok=True)\n140: \n141:     max_workers = min(MAX_WORKERS, len(files_urls))\n142: \n143:     with ThreadPoolExecutor(max_workers=max_workers) as executor:\n144:         futures = [\n145:             executor.submit(update_single_file, directory, filename, url, silent)\n146:             for filename, url in files_urls.items()\n147:         ]\n148: \n149:         for future in as_completed(futures):\n150:             try:\n151:                 future.result()\n152:             except Exception:\n153:                 logger.exception(\"Unexpected error while updating files\")\n154: \n155: \n156: def check_for_fdev_updates(silent: bool = False, local: bool = False) -> None:\n157:     \"\"\"Check for and download FDEV ID file updates.\"\"\"\n158:     base_path = config.respath_path if local else config.app_dir_path\n159:     fdevid_dir = pathlib.Path(base_path, 'FDevIDs')\n160:     fdevid_dir.mkdir(parents=True, exist_ok=True)\n161: \n162:     files_urls = {\n163:         'commodity.csv': 'https://raw.githubusercontent.com/EDCD/FDevIDs/master/commodity.csv',\n164:         'rare_commodity.csv': 'https://raw.githubusercontent.com/EDCD/FDevIDs/master/rare_commodity.csv'\n165:     }\n166:     if not silent:\n167:         logger.info(f\"Checking for {'local ' if local else ''}FDEVID file updates...\")"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "update_files",
+      "start_line": 133,
+      "end_line": 153,
+      "source": "def update_files(\n    directory: pathlib.Path,\n    files_urls: dict[str, str],\n    silent: bool = False,\n) -> None:\n    \"\"\"Start threads to update bundle files.\"\"\"\n    directory.mkdir(parents=True, exist_ok=True)\n\n    max_workers = min(MAX_WORKERS, len(files_urls))\n\n    with ThreadPoolExecutor(max_workers=max_workers) as executor:\n        futures = [\n            executor.submit(update_single_file, directory, filename, url, silent)\n            for filename, url in files_urls.items()\n        ]\n\n        for future in as_completed(futures):\n            try:\n                future.result()\n            except Exception:\n                logger.exception(\"Unexpected error while updating files\")"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 133,
+      "end_line": 153,
+      "excerpt": "def update_files(\n    directory: pathlib.Path,\n    files_urls: dict[str, str],\n    silent: bool = False,\n) -> None:\n    \"\"\"Start threads to update bundle files.\"\"\"\n    directory.mkdir(parents=True, exist_ok=True)\n\n    max_workers = min(MAX_WORKERS, len(files_urls))\n\n    with ThreadPoolExecutor(max_workers=max_workers) as executor:\n        futures = [\n            executor.submit(update_single_file, directory, filename, url, silent)\n            for filename, url in files_urls.items()\n        ]\n\n        for future in as_completed(futures):\n            try:\n                future.result()\n            except Exception:\n                logger.exception(\"Unexpected error while updating files\")",
+      "symbol_name": "update_files",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "update.py",
+      "sha": "aebabf5e82b204a530ea8db689892b2924280507",
+      "download_url": "https://raw.githubusercontent.com/EDCD/EDMarketConnector/main/update.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "pathlib",
+        "hashlib",
+        "shutil",
+        "sys",
+        "threading",
+        "os",
+        "time",
+        "concurrent.futures:ThreadPoolExecutor",
+        "concurrent.futures:as_completed",
+        "dataclasses:dataclass",
+        "tkinter:messagebox",
+        "traceback:print_exc",
+        "typing:TYPE_CHECKING",
+        "typing:cast",
+        "typing:Any",
+        "xml.etree:ElementTree",
+        "requests",
+        "semantic_version",
+        "config:appname",
+        "config:appversion_nobuild",
+        "config:config",
+        "config:get_update_feed",
+        "EDMCLogging:get_main_logger",
+        "l10n:translations",
+        "tkinter",
+        "ctypes"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": false,
+      "error": "no_module_prefix"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "update_files test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"update_files(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "update.py",
+          "path": "update.py",
+          "sha": "aebabf5e82b204a530ea8db689892b2924280507",
+          "html_url": "https://github.com/EDCD/EDMarketConnector/blob/b7758a66ba01862b777d10d3dd55cc323a371e07/update.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 133,
+          "end_line": 153,
+          "excerpt": "def update_files(\n    directory: pathlib.Path,\n    files_urls: dict[str, str],\n    silent: bool = False,\n) -> None:\n    \"\"\"Start threads to update bundle files.\"\"\"\n    directory.mkdir(parents=True, exist_ok=True)\n\n    max_workers = min(MAX_WORKERS, len(files_urls))\n\n    with ThreadPoolExecutor(max_workers=max_workers) as executor:\n        futures = [\n            executor.submit(update_single_file, directory, filename, url, silent)\n            for filename, url in files_urls.items()\n        ]\n\n        for future in as_completed(futures):\n            try:\n                future.result()\n            except Exception:\n                logger.exception(\"Unexpected error while updating files\")",
+          "symbol_name": "update_files",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "",
+      "count": 40,
+      "entries": [
+        {
+          "name": ".editorconfig",
+          "path": ".editorconfig",
+          "type": "file"
+        },
+        {
+          "name": ".flake8",
+          "path": ".flake8",
+          "type": "file"
+        },
+        {
+          "name": ".gitattributes",
+          "path": ".gitattributes",
+          "type": "file"
+        },
+        {
+          "name": ".github",
+          "path": ".github",
+          "type": "dir"
+        },
+        {
+          "name": ".gitignore",
+          "path": ".gitignore",
+          "type": "file"
+        },
+        {
+          "name": ".gitmodules",
+          "path": ".gitmodules",
+          "type": "file"
+        },
+        {
+          "name": ".mypy.ini",
+          "path": ".mypy.ini",
+          "type": "file"
+        },
+        {
+          "name": ".pre-commit-config.yaml",
+          "path": ".pre-commit-config.yaml",
+          "type": "file"
+        },
+        {
+          "name": ".python-version",
+          "path": ".python-version",
+          "type": "file"
+        },
+        {
+          "name": "ChangeLog.md",
+          "path": "ChangeLog.md",
+          "type": "file"
+        },
+        {
+          "name": "Contributing.md",
+          "path": "Contributing.md",
+          "type": "file"
+        },
+        {
+          "name": "EDMC.py",
+          "path": "EDMC.py",
+          "type": "file"
+        },
+        {
+          "name": "EDMCLogging.py",
+          "path": "EDMCLogging.py",
+          "type": "file"
+        },
+        {
+          "name": "EDMCSystemProfiler.py",
+          "path": "EDMCSystemProfiler.py",
+          "type": "file"
+        },
+        {
+          "name": "EDMarketConnector - TRACE.bat",
+          "path": "EDMarketConnector - TRACE.bat",
+          "type": "file"
+        },
+        {
+          "name": "EDMarketConnector - localserver-auth.bat",
+          "path": "EDMarketConnector - localserver-auth.bat",
+          "type": "file"
+        },
+        {
+          "name": "EDMarketConnector - reset-ui.bat",
+          "path": "EDMarketConnector - reset-ui.bat",
+          "type": "file"
+        },
+        {
+          "name": "EDMarketConnector.ico",
+          "path": "EDMarketConnector.ico",
+          "type": "file"
+        },
+        {
+          "name": "EDMarketConnector.py",
+          "path": "EDMarketConnector.py",
+          "type": "file"
+        },
+        {
+          "name": "EUROCAPS.TTF",
+          "path": "EUROCAPS.TTF",
+          "type": "file"
+        },
+        {
+          "name": "L10n",
+          "path": "L10n",
+          "type": "dir"
+        },
+        {
+          "name": "LICENSE",
+          "path": "LICENSE",
+          "type": "file"
+        },
+        {
+          "name": "PLUGINS.md",
+          "path": "PLUGINS.md",
+          "type": "file"
+        },
+        {
+          "name": "README.md",
+          "path": "README.md",
+          "type": "file"
+        },
+        {
+          "name": "build.py",
+          "path": "build.py",
+          "type": "file"
+        },
+        {
+          "name": "collate.py",
+          "path": "collate.py",
+          "type": "file"
+        },
+        {
+          "name": "commodity.py",
+          "path": "commodity.py",
+          "type": "file"
+        },
+        {
+          "name": "common_utils.py",
+          "path": "common_utils.py",
+          "type": "file"
+        },
+        {
+          "name": "companion.py",
+          "path": "companion.py",
+          "type": "file"
+        },
+        {
+          "name": "config",
+          "path": "config",
+          "type": "dir"
+        },
+        {
+          "name": "constants.py",
+          "path": "constants.py",
+          "type": "file"
+        },
+        {
+          "name": "coriolis-data",
+          "path": "coriolis-data",
+          "type": "file"
+        },
+        {
+          "name": "coriolis-update-files.py",
+          "path": "coriolis-update-files.py",
+          "type": "file"
+        },
+        {
+          "name": "dashboard.py",
+          "path": "dashboard.py",
+          "type": "file"
+        },
+        {
+          "name": "debug_webserver.py",
+          "path": "debug_webserver.py",
+          "type": "file"
+        },
+        {
+          "name": "docs",
+          "path": "docs",
+          "type": "dir"
+        },
+        {
+          "name": "edmc_data.py",
+          "path": "edmc_data.py",
+          "type": "file"
+        },
+        {
+          "name": "edshipyard.py",
+          "path": "edshipyard.py",
+          "type": "file"
+        },
+        {
+          "name": "hotkey",
+          "path": "hotkey",
+          "type": "dir"
+        },
+        {
+          "name": "img",
+          "path": "img",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": ".editorconfig",
+          "path": ".editorconfig",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # This is the project top-level .editorconfig\n2: root = true\n3: \n4: # Defaults for all file types\n5: [*]\n6: # 4-space indents, no TABs\n7: indent_style = space\n8: tab_width = 4\n9: indent_size = tab\n10: \n11: # Hard-wrap at 120 columns\n12: max_line_length = 119\n13: "
+        },
+        {
+          "name": ".flake8",
+          "path": ".flake8",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: [flake8]\n2: exclude = \n3:     .git/\n4:     build/\n5:     coriolis-data/\n6:     dist.win32/\n7:     FDevIDs/\n8:     venv/\n9:     .venv/\n10: \n11: # Show exactly where in a line the error happened\n12: #show-source = True\n13: "
+        },
+        {
+          "name": ".gitattributes",
+          "path": ".gitattributes",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 2,
+          "excerpt": "1: *.csv eol=crlf\n2: *.p binary"
+        },
+        {
+          "name": ".gitignore",
+          "path": ".gitignore",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Ignore version file\n2: .gitversion\n3: \n4: # Ignore macOS DS_Store files\n5: .DS_Store\n6: \n7: # Ignore build artifacts\n8: build\n9: dist.win32/\n10: dist.*\n11: \n12: # Ignore generated ChangeLog files\n13: ChangeLog.html"
+        },
+        {
+          "name": ".gitmodules",
+          "path": ".gitmodules",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 3,
+          "excerpt": "1: [submodule \"coriolis-data\"]\n2: \tpath = coriolis-data\n3: \turl = https://github.com/EDCD/coriolis-data.git"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "update.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "a5533b882f78d2ba4b7679ac8a9b898b501d2d6c",
+          "html_url": "https://github.com/EDCD/EDMarketConnector/commit/a5533b882f78d2ba4b7679ac8a9b898b501d2d6c",
+          "message": "[RELEASE] 6.1.0-beta4",
+          "author": "David Sangrey",
+          "date": "2026-01-19T06:06:44Z"
+        },
+        {
+          "sha": "9017de68275c5688764f0b61610e011d6d48182f",
+          "html_url": "https://github.com/EDCD/EDMarketConnector/commit/9017de68275c5688764f0b61610e011d6d48182f",
+          "message": "I'm really bad at reading.",
+          "author": "David Sangrey",
+          "date": "2026-01-10T17:31:45Z"
+        },
+        {
+          "sha": "82629bea0688027c4dc3d071978edc0e22bcb92b",
+          "html_url": "https://github.com/EDCD/EDMarketConnector/commit/82629bea0688027c4dc3d071978edc0e22bcb92b",
+          "message": "Fix URL Update",
+          "author": "David Sangrey",
+          "date": "2026-01-10T17:29:18Z"
+        },
+        {
+          "sha": "1868f9ca15c844fd0bca757a8deb46acfcb5c845",
+          "html_url": "https://github.com/EDCD/EDMarketConnector/commit/1868f9ca15c844fd0bca757a8deb46acfcb5c845",
+          "message": "Enable Live Repo",
+          "author": "David Sangrey",
+          "date": "2026-01-10T17:16:36Z"
+        },
+        {
+          "sha": "f345dc6715fe50f4409b994546139e53e8016d96",
+          "html_url": "https://github.com/EDCD/EDMarketConnector/commit/f345dc6715fe50f4409b994546139e53e8016d96",
+          "message": "[#559] Prevent EDMC Crash -> No Update",
+          "author": "David Sangrey",
+          "date": "2026-01-04T02:21:12Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "update_files TODO Surely better than this",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "update.py",
+      "satd_line": 147,
+      "last_commit": {
+        "sha": "a5533b882f78d2ba4b7679ac8a9b898b501d2d6c",
+        "html_url": "https://github.com/EDCD/EDMarketConnector/commit/a5533b882f78d2ba4b7679ac8a9b898b501d2d6c",
+        "message": "[RELEASE] 6.1.0-beta4",
+        "author": "David Sangrey",
+        "date": "2026-01-19T06:06:44Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "update_files",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

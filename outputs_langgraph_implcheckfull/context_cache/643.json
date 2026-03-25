@@ -1,0 +1,434 @@
+{
+  "task_id": "643",
+  "repo_owner": "chanzuckerberg",
+  "repo_name": "miniwdl",
+  "file_path": "WDL/StdLib.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T14:06:08+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T14:06:49+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T14:06:55+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "WDL/StdLib.py",
+    "original_code": "def infer_type(self, expr: E.Apply) -> T.Base:\n    if len(expr.arguments) != 1:\n        raise Error.WrongArity(expr, 1)\n    if not isinstance(expr.arguments[0].type, T.Array) or (\n        expr.arguments[0]._check_quant and expr.arguments[0].type.optional\n    ):\n        raise Error.StaticTypeMismatch(\n            expr.arguments[0], T.Array(T.Any()), expr.arguments[0].type\n        )\n    if isinstance(expr.arguments[0].type.item_type, T.Any):\n        # TODO: error for 'indeterminate type'\n        raise Error.EmptyArray(expr.arguments[0])\n    ty = expr.arguments[0].type.item_type\n    assert isinstance(ty, T.Base)\n    return ty.copy(optional=False)",
+    "original_signature": "def infer_type(self, expr: E.Apply) -> T.Base:",
+    "satd_comment": "# TODO: error for 'indeterminate type'",
+    "target_file": {
+      "ok": true,
+      "path": "WDL/StdLib.py",
+      "sha": "038dcc49742c1a63e463d2572588cde870c2b8a7",
+      "download_url": "https://raw.githubusercontent.com/chanzuckerberg/miniwdl/main/WDL/StdLib.py",
+      "content_excerpt": "# pylint: disable=protected-access,exec-used\nimport math\nimport os\nimport json\nimport tempfile\nfrom typing import List, Tuple, Dict, Callable, IO, Optional\nfrom abc import ABC, abstractmethod\nfrom contextlib import suppress\nimport regex\nfrom . import Type, Value, Expr, Env, Error\nfrom ._util import byte_size_units, chmod_R_plus, round_half_up\n\n\nclass Base:\n    \"\"\"\n    Base class for standard library implementations. An instance has an\n    attribute with the name of each available function and a ``Function``\n    object providing the type-checking logic and implementation.\n\n    Subclasses may replace these objects with custom context-dependent logic,\n    or add new ones. For example, ``stdout()`` is only meaningful in task\n    output sections.\n    \"\"\"\n\n    wdl_version: str\n    _write_dir: str  # directory in which write_* functions create files\n\n    def __init__(self, wdl_version: str, write_dir: str = \"\"):\n        self.wdl_version = wdl_version\n        self._write_dir = write_dir if write_dir else tempfile.gettempdir()\n\n        # language built-ins\n        self._at = _At()\n        self._land = _And()\n        self._lor = _Or()\n        self._negate = StaticFunction(\n            \"_negate\", [Type.Boolean()], Type.Boolean(), lambda x: Value.Boolean(not x.value)\n        )\n        self._add = _AddOperator()\n        self._interpolation_add = _InterpolationAddOperator()\n        self._sub = _ArithmeticOperator(\"-\", lambda l, r: l - r)\n        self._mul = _ArithmeticOperator(\"*\", lambda l, r: l * r)\n        self._div = _ArithmeticOperator(\"/\", lambda l, r: l // r)\n        self._rem = StaticFunction(\n            \"_rem\", [Type.Int(), Type.Int()], Type.Int(), lambda l, r: Value.Int(l.value % r.value)\n        )\n        self._eqeq = _EqualityOperator()\n        self._neq = _EqualityOperator(negate=True)\n        self._lt = _ComparisonOperator(\"<\", lambda l, r: l < r)\n        self._lte = _ComparisonOperator(\"<=\", lambda l, r: l <= r)\n        self._gt = _ComparisonOperator(\">\", lambda l, r: l > r)\n        self._gte = _ComparisonOperator(\">=\", lambda l, r: l >= r)\n\n        # static stdlib functions\n        def static(\n            argument_types: List[Type.Base], return_type: Type.Base, name: Optional[str] = None\n        ):\n            \"\"\"\n            helper/decorator to create a static function from type signature and a lambda\n            \"\"\"\n            return lambda F: setattr(\n                self,\n                name or F.__name__,\n                StaticFunction(name or F.__name__, argument_types, return_type, F),\n            )\n\n        static([Type.Float()], Type.Int(), \"floor\")(lambda v: Value.Int(math.floor(v.value)))\n        static([Type.Float()], Type.Int(), \"ceil\")(lambda v: Value.Int(math.ceil(v.value)))\n        static([Type.Float()], Type.Int(), \"round\")(lambda v: Value.Int(round_half_up(v.value)))\n        static([Type.Array(Type.Any())], Type.Int(), \"length\")(lambda v: Value.Int(len(v.value)))\n\n        @static([Type.String(), Type.String(), Type.String()], Type.String())\n        def sub(input: Value.String, pattern: Value.String, replace: Value.String) -> Value.String:\n            pattern_re = regex.compile(pattern.value, flags=regex.POSIX)  # pylint: disable=E1101\n            return Value.String(pattern_re.sub(replace.value, input.value))\n\n        static([Type.String(), Type.String(optional=True)], Type.String())(basename)\n\n        @static([Type.Any(optional=True)], Type.Boolean())\n        def defined(v: Value.Base):\n            return Value.Boolean(not isinstance(v, Value.Null))\n\n        @static([Type.String(), Type.Array(Type.String())], Type.String())\n        def sep(sep: Value.String, iterable: Value.Array) -> Value.String:\n            return Value.String(sep.value.join(v.value for v in iterable.value))\n\n        # write_*\n        static([Type.Array(Type.String())], Type.File(), \"write_lines\")(\n            self._write(_serialize_lines)\n        )\n        static([Type.Array(Type.Array(Type.String()))], Type.File(), \"write_tsv\")(\n            self._write(_serialize_tsv)\n        )\n        static([Type.Map((Type.Any(), Type.Any()))], Type.File(), \"write_map\")(\n            self._write(_serialize_map)\n        )\n        static([Type.Any()], Type.File(), \"write_json\")(\n            self._write(\n                lambda v, outfile: (outfile.write(json.dumps(v.json).encode(\"utf-8\")), None)[1]\n            )\n        )\n\n        # read_*\n        static([Type.File()], Type.Int(), \"read_int\")(self._read(lambda s: Value.Int(int(s))))\n        static([Type.File()], Type.Boolean(), \"read_boolean\")(self._read(_parse_boolean))\n        static([Type.File()], Type.String(), \"read_string\")(\n            self._read(lambda s: Value.String(s[:-1] if s.endswith(\"\\n\") else s))\n        )\n        static([Type.File()], Type.Float(), \"read_float\")(\n            self._read(lambda s: Value.Float(float(s)))\n        )\n        static([Type.File()], Type.Map((Type.String(), Type.String())), \"read_map\")(\n            self._read(_parse_map)\n        )\n        static([Type.File()], Type.Array(Type.String()), \"read_lines\")(self._read(_parse_lines))\n        static([Type.File()], Type.Array(Type.Array(Type.String())), \"read_tsv\")(\n            self._read(_parse_tsv)\n        )\n        static([Type.File()], Type.Any(), \"read_json\")(self._read(_parse_json))\n        static([Type.File()], Type.Map((Type.String(), Type.String())), \"read_object\")(\n            self._read(_parse_object)\n        )\n        static([Type.File()], Type.Array(Type.Map((Type.String(), Type.String()))), \"read_objects\")(\n            self._read(_parse_objects)\n        )\n\n        # polymorphically typed stdlib functions which require specialized\n        # infer_type logic\n        self.range = _Range()\n        self.prefix = _Prefix()\n        self.suffix = _Suffix()\n        self.size = _Size(self)\n        self.select_first = _SelectFirst()\n        self.select_all = _SelectAll()\n        self.zip = _Zip()\n        self.unzip = _Unzip()\n        self.cross = _Cross()\n        self.flatten = _Flatten()\n        self.transpose = _Transpose()\n\n        if self.wdl_version not in [\"draft-2\", \"1.0\"]:\n            self.min = _ArithmeticOperator(\"min\", lambda l, r: min(l, r))\n            self.max = _ArithmeticOperator(\"max\", lambda l, r: max(l, r))\n            self.quote = _Quote()\n            self.squote = _Quote(squote=True)\n            self.keys = _Keys()\n            self.as_map = _AsMap()\n            self.as_pairs = _AsPairs()\n            self.collect_by_key = _CollectByKey()\n\n    def _read(self, parse: Callable[[str], Value.Base]) -> Callable[[Value.File], Value.Base]:\n        \"generate read_* function implementation based on parse\"\n\n        def f(file: Value.File) -> Value.Base:\n            with open(self._devirtualize_filename(file.value), \"r\") as infile:\n                return parse(infile.read())\n\n        return f\n\n    def _devirtualize_filename(self, filename: str) -> str:\n        \"\"\"\n        'devirtualize' filename passed to a read_* function: return a filename that can be open()ed\n        on the local host. Subclasses may further wish to forbid access to files outside of a\n        designated directory or allowlist (by raising an exception)\n        \"\"\"\n        # TODO: add directory: bool argument when we have stdlib functions that take Directory\n        raise NotImplementedError()\n\n    def _write(\n        self, serialize: Callable[[Value.Base, IO[bytes]], None]\n    ) -> Callable[[Value.Base], Value.File]:\n        \"generate write_* function implementation based on serialize\"\n\n        def _f(\n            v: Value.Base,\n        ) -> Value.File:\n            os.makedirs(self._write_dir, exist_ok=True)\n            with tempfile.NamedTemporaryFile(dir=self._write_dir, delete=False) as outfile:\n                serialize(v, outfile)\n                filename = outfile.name\n            chmod_R_plus(filename, file_bits=0o660)\n            vfn = self._virtualize_filename(filename)\n            return Value.File(vfn)\n\n        return _f\n\n    def _virtualize_filename(self, filename: str) -> str:\n        \"\"\"\n        from a local path in write_dir, 'virtualize' into the filename as it should present in a\n        File value\n        \"\"\"\n        # TODO: add directory: bool argument when we have stdlib functions that take Directory\n        raise NotImplementedError()\n\n    def _override_static(self, name: str, f: Callable) -> None:\n        # replace the implementation lambda of a StaticFunction (keeping its\n        # types etc. the same)\n        sf = getattr(self, name)\n        assert isinstance(sf, StaticFunction)\n        setattr(sf, \"F\", f)\n\n\nclass Function(ABC):\n    # Abstract interface to a standard library function implementation\n\n    @abstractmethod\n    def infer_type(self, expr: \"Expr.Apply\") -> Type.Base:\n        # Typecheck the Apply expression (including the argument expressions);\n        # raise an exception or return the function's return type, which may\n        # depend on the argument types.\n        pass\n\n    @abstractmethod\n    def __call__(\n        self, expr: \"Expr.Apply\", env: Env.Bindings[Value.Base], stdlib: Base\n    ) -> Value.Base:\n        # Invoke the function, evaluating the arguments as needed\n        pass\n\n\nclass EagerFunction(Function):\n    # Function helper providing boilerplate for eager argument evaluation.\n    # Implementation is responsible for any appropriate type coercion of\n    # argument and return values.\n\n    @abstractmethod\n    def _call_eager(self, expr: \"Expr.Apply\", arguments: List[Value.Base]) -> Value.Base:\n        pass\n\n    def __call__(\n        self, expr: \"Expr.Apply\", env: Env.Bindings[Value.Base], stdlib: Base\n    ) -> Value.Base:\n        return self._call_eager(expr, [arg.eval(env, stdlib=stdlib) for arg in expr.arguments])\n\n\nclass StaticFunction(EagerFunction):\n    # Function helper for static argument and return types.\n    # In this case the boilerplate can handle the coercions.\n\n    name: str\n    argument_types: List[Type.Base]\n    return_type: Type.Base\n    F: Callable\n\n    def __init__(\n        self, name: str, argument_types: List[Type.Base], return_type: Type.Base, F: Callable\n    ) -> None:\n        self.name = name\n        self.argument_types = argument_types\n        self.return_type = return_type\n        self.F = F\n\n    def infer_type(self, expr: \"Expr.Apply\") -> Type.Base:\n        min_args = len(self.argument_types)\n        for ty in reversed(self.argument_types):\n            if ty.optional:\n                min_args = min_args - 1\n            else:\n                break\n        if len(expr.arguments) > len(self.argument_types) or len(expr.arguments) < min_args:\n            raise Error.WrongArity(expr, len(self.argument_types))\n        for i in range(len(expr.arguments)):\n            try:\n                expr.arguments[i].typecheck(self.argument_types[i])\n            except Error.StaticTypeMismatch:\n                raise Error.StaticTypeMismatch(\n                    expr.arguments[i],\n                    self.argument_types[i],\n                    expr.arguments[i].type,\n                    \"for {} argument #{}\".format(self.name, i + 1),\n                ) from None\n        return self.return_type\n\n    def _call_eager(self, expr: \"Expr.Apply\", arguments: List[Value.Base]) -> Value.Base:\n        argument_values = [arg.coerce(ty) for arg, ty in zip(arguments, self.argument_types)]\n        try:\n            ans: Value.Base = self.F(*argument_values)\n        except Exception as exn:\n            msg = \"function evaluation failed\"\n            if str(exn):\n                msg += \", \" + str(exn)\n            raise Error.EvalError(expr, msg) from exn\n        return ans.coerce(self.return_type)\n\n\ndef _notimpl(*args, **kwargs) -> None:\n    exec(\"raise NotImplementedError('function not available in this context')\")\n\n\nclass TaskOutputs(Base):\n    \"\"\"\n    Defines type signatures for functions only available in task output sections.\n    (Implementations left to by overridden by the task runtime)\n    \"\"\"\n\n    def __init__(self, *args, **kwargs):\n        supe",
+      "total_lines": 1160
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 207,
+      "end_line": 211,
+      "excerpt": "    def infer_type(self, expr: \"Expr.Apply\") -> Type.Base:\n        # Typecheck the Apply expression (including the argument expressions);\n        # raise an exception or return the function's return type, which may\n        # depend on the argument types.\n        pass",
+      "symbol_name": "infer_type",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "WDL/StdLib.py",
+      "sha": "038dcc49742c1a63e463d2572588cde870c2b8a7",
+      "download_url": "https://raw.githubusercontent.com/chanzuckerberg/miniwdl/main/WDL/StdLib.py"
+    },
+    "imports": {
+      "imports": [
+        "math",
+        "os",
+        "json",
+        "tempfile",
+        "typing:List",
+        "typing:Tuple",
+        "typing:Dict",
+        "typing:Callable",
+        "typing:IO",
+        "typing:Optional",
+        "abc:ABC",
+        "abc:abstractmethod",
+        "contextlib:suppress",
+        "regex",
+        ":Type",
+        ":Value",
+        ":Expr",
+        ":Env",
+        ":Error",
+        "_util:byte_size_units",
+        "_util:chmod_R_plus",
+        "_util:round_half_up"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/chanzuckerberg/miniwdl/main/README.md",
+      "content_excerpt": "# miniwdl\n**[Workflow Description Language](http://openwdl.org/) local runner & developer toolkit for Python 3.8+**\n\n![Project Status](https://img.shields.io/badge/status-stable-green.svg)\n[![MIT license](https://img.shields.io/badge/license-MIT-brightgreen.svg)](https://github.com/chanzuckerberg/miniwdl/blob/main/LICENSE)\n[![CI](https://github.com/chanzuckerberg/miniwdl/workflows/CI/badge.svg?branch=main)](https://github.com/chanzuckerberg/miniwdl/actions?query=workflow%3ACI)\n[![Coverage Status](https://coveralls.io/repos/github/chanzuckerberg/miniwdl/badge.svg?branch=main)](https://coveralls.io/github/chanzuckerberg/miniwdl?branch=main)\n[![Docs Status](https://readthedocs.org/projects/miniwdl/badge/?version=latest)](https://miniwdl.readthedocs.io/en/latest/)\n\n## Install miniwdl\n\nInstallation requires Python 3.8+, pip (or conda) and Docker (or Podman/Singularity/udocker). Linux preferred; [macOS compatible with extra steps](https://github.com/chanzuckerberg/miniwdl/issues/145). More detail in [full documentation](https://miniwdl.readthedocs.io/en/latest/getting_started.html).\n\n- Install with pip [![PyPI version](https://img.shields.io/pypi/v/miniwdl.svg)](https://pypi.org/project/miniwdl/) : run `pip3 install miniwdl`\n- Install with conda [![Anaconda-Server Badge](https://anaconda.org/conda-forge/miniwdl/badges/version.svg)](https://anaconda.org/conda-forge/miniwdl) : [setup conda-forge](https://conda-forge.org/docs/user/introduction/#how-can-i-install-packages-from-conda-forge) and run `conda install miniwdl`\n- Verify your miniwdl installation: `miniwdl run_self_test`\n- I"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "infer_type test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_0eval.py",
+          "path": "tests/test_0eval.py",
+          "sha": "4c39dbe4235d7df83080e1b36baea0dc9dd7f3ab",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/blob/d8d73a47685a34ae1da7a5cf5eae2a880a2e07a0/tests/test_0eval.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 54,
+          "end_line": 78,
+          "excerpt": "54:         combo = \"[treu][1] || defined(var) && !(8 == 1 * (12 + if false then 2 else 3) / 6)\"\n55:         self.assertEqual(str(WDL.parse_expr(combo)), combo)\n56:         combo2 = \"(if true then 1 else 2 * 8) % a.b - 16\"\n57:         self.assertEqual(str(WDL.parse_expr(combo2)), combo2)\n58:         combo3 = \"defined(if true then hey else hello)\"\n59:         self.assertEqual(str(WDL.parse_expr(combo3)), combo3)\n60:         ifthenelsechain = \"!if true then if false then true else false else true\"\n61:         self.assertEqual(str(WDL.parse_expr(ifthenelsechain)), ifthenelsechain)\n62: \n63:     def test_boolean(self):\n64:         stdlib = WDL.StdLib.Base(\"1.0\")\n65:         expr = WDL.parse_expr(\"true\")\n66:         expr.infer_type([], stdlib)\n67:         self.assertIsInstance(expr.type, WDL.Type.Boolean)\n68:         self.assertEqual(str(expr.type), \"Boolean\")\n69:         val = expr.eval([], stdlib)\n70:         self.assertIsInstance(val, WDL.Value.Boolean)\n71:         self.assertEqual(str(val.type), \"Boolean\")\n72:         self.assertEqual(val.value, True)\n73:         self.assertEqual(str(val), \"true\")\n74:         self.assertEqual(val, WDL.Value.Boolean(True))\n75:         self.assertNotEqual(val, WDL.Value.Boolean(False))\n76:         self.assertIsInstance(expr.literal, WDL.Value.Boolean)\n77: \n78:         expr = WDL.parse_expr(\"false\")",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"infer_type(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "add_functions.md",
+          "path": "docs/add_functions.md",
+          "sha": "d0bc8955e4b6da13d7652d2a71802dab2e8c6b64",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/blob/d8d73a47685a34ae1da7a5cf5eae2a880a2e07a0/docs/add_functions.md",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 85,
+          "end_line": 109,
+          "excerpt": "85: Lastly we'll introduce a polymorphic function, which takes a variable number of arguments and whose return type depends on the argument types. The `static()` helper we've used so far isn't flexible enough to capture this, so we'll need to supply custom type-checking logic as well as the implementation.\n86: \n87: Given `Array[T] x`, `choose_random(x)` returns a random element of `x`, with type `T`. Given `Array[T] x` and `Array[U] y`, `choose_random(x,y)` returns a `Pair[T,U]` with one random element from each `x` and `y`; equivalent to `choose_random(cross(x,y))`, but more efficient as it doesn't compute the full cross-product array.\n88: \n89: We can implement this polymorphic function by writing a class derived from `WDL.StdLib.EagerFunction`, and in `WDL.StdLib.Base.__init__`, setting `self.choose_random` to an instance of this class.\n90: \n91: ```python3\n92:         ...\n93:         self.choose_random = _ChooseRandom()\n94:         ...\n95: ...\n96: class _ChooseRandom(EagerFunction):\n97:     def infer_type(self, expr: \"Expr.Apply\") -> Type.Base:\n98:         if len(expr.arguments) not in [1, 2]:\n99:             raise Error.WrongArity(expr, 1)\n100:         arg0ty = expr.arguments[0].type\n101:         if not isinstance(arg0ty, Type.Array):\n102:             raise Error.StaticTypeMismatch(expr.arguments[0], Type.Array(Type.Any()), arg0ty)\n103:         if len(expr.arguments) == 1:\n104:             return arg0ty.item_type\n105:         arg1ty = expr.arguments[1].type\n106:         if not isinstance(arg1ty, Type.Array):\n107:             raise Error.StaticTypeMismatch(expr.arguments[1], Type.Array(Type.Any()), arg1ty)\n108:         return Type.Pair(arg0ty.item_type, arg1ty.item_type)\n109: ```",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "Expr.py",
+          "path": "WDL/Expr.py",
+          "sha": "32ad88fe391447b95a27b007528416a750ca4816",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/blob/d8d73a47685a34ae1da7a5cf5eae2a880a2e07a0/WDL/Expr.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 53,
+          "end_line": 98,
+          "excerpt": "    def infer_type(\n        self,\n        type_env: Env.Bindings[Type.Base],\n        stdlib: StdLib.Base,\n        check_quant: bool = True,\n        struct_types: Optional[Env.Bindings[Dict[str, Type.Base]]] = None,\n    ) -> \"Base\":\n        \"\"\"infer_type(self, type_env : Env.Bindings[Type.Base], stdlib : StdLib.Base) -> WDL.Expr.Base\n\n        Infer the expression's type within the given type environment. Must be\n        invoked exactly once prior to use of other methods.\n\n        :param stdlib: a context-specific standard function library for typechecking\n        :param check_quant:\n            when ``False``, disables static validation of the optional (?) type quantifier when `typecheck()` is called\n            on this expression, so for example type ``T?`` can satisfy an expected type ``T``. Applies recursively to\n            the type inference and checking of any sub-expressions.\n        :raise WDL.Error.StaticTypeMismatch: when the expression fails to type-check\n        :return: `self`\n        \"\"\"\n        # Failure of this assertion indicates multiple invocations of\n        # infer_type\n        assert self._type is None\n        # recursive descent into child expressions\n        with Error.multi_context() as errors:\n            for child in self.children:\n                assert isinstance(child, Base)\n                errors.try1(\n                    (\n                        lambda child: (\n                            lambda: child.infer_type(type_env, stdlib, check_quant, struct_types)\n                        )\n                    )(child)\n                )\n        # invoke derived-class logic. we pass check_quant, stdlib, and struct_types hackily through\n        # instance variables since only some subclasses use them.\n        self._check_quant = check_quant\n        self._stdlib = stdlib\n        self._struct_types = struct_types\n        try:\n            self._type = self._infer_type(type_env)\n        finally:\n            self._stdlib = None\n            self._struct_types = None\n        assert self._type and isinstance(self.type, Type.Base)\n        return self",
+          "symbol_name": "infer_type",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "Tree.py",
+          "path": "WDL/Tree.py",
+          "sha": "ce0642e87b467523e3f19ec336b7887ffa1a0bc0",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/blob/d8d73a47685a34ae1da7a5cf5eae2a880a2e07a0/WDL/Tree.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 234,
+          "end_line": 258,
+          "excerpt": "234:         return type_env.bind(self.name, self.type, self)\n235: \n236:     def typecheck(\n237:         self,\n238:         type_env: Env.Bindings[Type.Base],\n239:         stdlib: StdLib.Base,\n240:         struct_types: Env.Bindings[Dict[str, Type.Base]],\n241:         check_quant: bool = True,\n242:     ) -> None:\n243:         # Infer the expression's type and ensure it checks against the declared\n244:         # type. One time use!\n245:         if self.expr:\n246:             self.expr.infer_type(\n247:                 type_env, stdlib, check_quant=check_quant, struct_types=struct_types\n248:             ).typecheck(self.type)\n249: \n250:     def _workflow_node_dependencies(self) -> Iterable[str]:\n251:         yield from _expr_workflow_node_dependencies(self.expr)\n252: \n253: \n254: class Task(SourceNode):\n255:     \"\"\"\n256:     WDL Task\n257:     \"\"\"\n258: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "CLI.py",
+          "path": "WDL/CLI.py",
+          "sha": "e314a37fafb8da2116f0728f381b4d2987932355",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/blob/d8d73a47685a34ae1da7a5cf5eae2a880a2e07a0/WDL/CLI.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 1978,
+          "end_line": 2002,
+          "excerpt": "1978:     for a_decl in decl:\n1979:         try:\n1980:             decl_ast = parse_bound_decl(a_decl, wdl_version)\n1981:             decl_ast.typecheck(type_env, stdlib, Env.Bindings(), check_quant=check_quant)\n1982:             type_env = decl_ast.add_to_type_env(Env.Bindings(), type_env)\n1983:             value_env = value_env.bind(decl_ast.name, decl_ast.expr.eval(value_env, stdlib))\n1984:         except Exception as exn:\n1985:             setattr(exn, \"source_text\", a_decl)  # for print_error()\n1986:             raise\n1987: \n1988:     # typecheck & evaluate expr, display result\n1989:     try:\n1990:         expr_ast = parse_expr(expr, wdl_version).infer_type(\n1991:             type_env, stdlib, check_quant=check_quant\n1992:         )\n1993:         if report_type:\n1994:             print(str(expr_ast.type))\n1995:         v = expr_ast.eval(value_env, stdlib)\n1996:         print(json.dumps(v.json, indent=2))\n1997:     except Exception as exn:\n1998:         setattr(exn, \"source_text\", expr)  # for print_error()\n1999:         raise\n2000: \n2001: \n2002: def fill_zip_subparser(subparsers):",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "WDL",
+      "count": 19,
+      "entries": [
+        {
+          "name": "CLI.py",
+          "path": "WDL/CLI.py",
+          "type": "file"
+        },
+        {
+          "name": "Env.py",
+          "path": "WDL/Env.py",
+          "type": "file"
+        },
+        {
+          "name": "Error.py",
+          "path": "WDL/Error.py",
+          "type": "file"
+        },
+        {
+          "name": "Expr.py",
+          "path": "WDL/Expr.py",
+          "type": "file"
+        },
+        {
+          "name": "Lint.py",
+          "path": "WDL/Lint.py",
+          "type": "file"
+        },
+        {
+          "name": "StdLib.py",
+          "path": "WDL/StdLib.py",
+          "type": "file"
+        },
+        {
+          "name": "Tree.py",
+          "path": "WDL/Tree.py",
+          "type": "file"
+        },
+        {
+          "name": "Type.py",
+          "path": "WDL/Type.py",
+          "type": "file"
+        },
+        {
+          "name": "Value.py",
+          "path": "WDL/Value.py",
+          "type": "file"
+        },
+        {
+          "name": "Walker.py",
+          "path": "WDL/Walker.py",
+          "type": "file"
+        },
+        {
+          "name": "Zip.py",
+          "path": "WDL/Zip.py",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "WDL/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "__main__.py",
+          "path": "WDL/__main__.py",
+          "type": "file"
+        },
+        {
+          "name": "_grammar.py",
+          "path": "WDL/_grammar.py",
+          "type": "file"
+        },
+        {
+          "name": "_grammar_old.py",
+          "path": "WDL/_grammar_old.py",
+          "type": "file"
+        },
+        {
+          "name": "_parser.py",
+          "path": "WDL/_parser.py",
+          "type": "file"
+        },
+        {
+          "name": "_util.py",
+          "path": "WDL/_util.py",
+          "type": "file"
+        },
+        {
+          "name": "py.typed",
+          "path": "WDL/py.typed",
+          "type": "file"
+        },
+        {
+          "name": "runtime",
+          "path": "WDL/runtime",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "CLI.py",
+          "path": "WDL/CLI.py",
+          "match_reason": "anchor_text",
+          "start_line": 1978,
+          "end_line": 2002,
+          "excerpt": "1978:     for a_decl in decl:\n1979:         try:\n1980:             decl_ast = parse_bound_decl(a_decl, wdl_version)\n1981:             decl_ast.typecheck(type_env, stdlib, Env.Bindings(), check_quant=check_quant)\n1982:             type_env = decl_ast.add_to_type_env(Env.Bindings(), type_env)\n1983:             value_env = value_env.bind(decl_ast.name, decl_ast.expr.eval(value_env, stdlib))\n1984:         except Exception as exn:\n1985:             setattr(exn, \"source_text\", a_decl)  # for print_error()\n1986:             raise\n1987: \n1988:     # typecheck & evaluate expr, display result\n1989:     try:\n1990:         expr_ast = parse_expr(expr, wdl_version).infer_type(\n1991:             type_env, stdlib, check_quant=check_quant\n1992:         )\n1993:         if report_type:\n1994:             print(str(expr_ast.type))\n1995:         v = expr_ast.eval(value_env, stdlib)\n1996:         print(json.dumps(v.json, indent=2))\n1997:     except Exception as exn:\n1998:         setattr(exn, \"source_text\", expr)  # for print_error()\n1999:         raise\n2000: \n2001: \n2002: def fill_zip_subparser(subparsers):"
+        },
+        {
+          "name": "Env.py",
+          "path": "WDL/Env.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Environments, for identifier resolution during WDL typechecking and evaluation.\n3: \"\"\"\n4: \n5: from typing import Optional, TypeVar, Generic, Any, Callable, Set, Iterator\n6: \n7: T = TypeVar(\"T\")\n8: S = TypeVar(\"S\")\n9: \n10: \n11: class Binding(Generic[T]):\n12:     \"\"\"\n13:     An individual, immutable binding of a possibly-namespaced name to a right-hand-side value of"
+        },
+        {
+          "name": "Error.py",
+          "path": "WDL/Error.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from typing import (\n2:     List,\n3:     Optional,\n4:     Union,\n5:     Iterable,\n6:     Generator,\n7:     Callable,\n8:     Any,\n9:     Dict,\n10:     NamedTuple,\n11: )\n12: from functools import total_ordering\n13: from contextlib import contextmanager"
+        },
+        {
+          "name": "Expr.py",
+          "path": "WDL/Expr.py",
+          "match_reason": "symbol_match",
+          "start_line": 53,
+          "end_line": 98,
+          "excerpt": "    def infer_type(\n        self,\n        type_env: Env.Bindings[Type.Base],\n        stdlib: StdLib.Base,\n        check_quant: bool = True,\n        struct_types: Optional[Env.Bindings[Dict[str, Type.Base]]] = None,\n    ) -> \"Base\":\n        \"\"\"infer_type(self, type_env : Env.Bindings[Type.Base], stdlib : StdLib.Base) -> WDL.Expr.Base\n\n        Infer the expression's type within the given type environment. Must be\n        invoked exactly once prior to use of other methods.\n\n        :param stdlib: a context-specific standard function library for typechecking\n        :param check_quant:\n            when ``False``, disables static validation of the optional (?) type quantifier when `typecheck()` is called\n            on this expression, so for example type ``T?`` can satisfy an expected type ``T``. Applies recursively to\n            the type inference and checking of any sub-expressions.\n        :raise WDL.Error.StaticTypeMismatch: when the expression fails to type-check\n        :return: `self`\n        \"\"\"\n        # Failure of this assertion indicates multiple invocations of\n        # infer_type\n        assert self._type is None\n        # recursive descent into child expressions\n        with Error.multi_context() as errors:\n            for child in self.children:\n                assert isinstance(child, Base)\n                errors.try1(\n                    (\n                        lambda child: (\n                            lambda: child.infer_type(type_env, stdlib, check_quant, struct_types)\n                        )\n                    )(child)\n                )\n        # invoke derived-class logic. we pass check_quant, stdlib, and struct_types hackily through\n        # instance variables since only some subclasses use them.\n        self._check_quant = check_quant\n        self._stdlib = stdlib\n        self._struct_types = struct_types\n        try:\n            self._type = self._infer_type(type_env)\n        finally:\n            self._stdlib = None\n            self._struct_types = None\n        assert self._type and isinstance(self.type, Type.Base)\n        return self"
+        },
+        {
+          "name": "Lint.py",
+          "path": "WDL/Lint.py",
+          "match_reason": "anchor_text",
+          "start_line": 1182,
+          "end_line": 1206,
+          "excerpt": "1182:                         self.add(\n1183:                             obj,\n1184:                             \"runtime.memory doesn't follow expected format like '8G' or '1024 MiB'\",\n1185:                             memory.pos,\n1186:                         )\n1187: \n1188: \n1189: @a_linter\n1190: class MissingVersion(Linter):\n1191:     def document(self, obj: Tree.Document) -> Any:\n1192:         first_sloc = next(\n1193:             (\n1194:                 p\n1195:                 for p in enumerate(line.lstrip() for line in obj.source_lines)\n1196:                 if p[1] and p[1][0] != \"#\"\n1197:             ),\n1198:             None,\n1199:         )\n1200:         # (don't bother with this warning if the document is effectively empty)\n1201:         if first_sloc and obj.wdl_version is None:\n1202:             line = (first_sloc[0] + 1) if first_sloc else obj.pos.line\n1203:             self.add(\n1204:                 obj,\n1205:                 \"document should declare WDL version; draft-2 assumed\",\n1206:                 Error.SourcePosition("
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "WDL/StdLib.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "fcddc6a43965f62ba63c6ac996d2ea933bf44466",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/commit/fcddc6a43965f62ba63c6ac996d2ea933bf44466",
+          "message": "make comparability typecheck aware of --no-quant-check (#756)\n\n#752 @stxue1",
+          "author": "Mike Lin",
+          "date": "2025-05-15T05:22:20Z"
+        },
+        {
+          "sha": "7da1cc0b6074e52c0881b5530205795c9fa31ae7",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/commit/7da1cc0b6074e52c0881b5530205795c9fa31ae7",
+          "message": "round() half up (instead of to even)\n\n#698 @stxue1",
+          "author": "Mike Lin",
+          "date": "2025-04-08T07:57:34Z"
+        },
+        {
+          "sha": "0ebe06abb9f730cfc80f048340cee99cddf64d52",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/commit/0ebe06abb9f730cfc80f048340cee99cddf64d52",
+          "message": "refactor equatability & comparability\n\nRefine static typecheck for == != on two expressions (equatability). Disallows some ill-defined cases and newly allows other cases that should have been.\n\nDisallow < <= > >= on compound types (comparability), which aren't defined in WDL spec.\n\n#736",
+          "author": "Mike Lin",
+          "date": "2025-03-26T09:23:53Z"
+        },
+        {
+          "sha": "ab5351079bc77f9fddb34ef5f69883649625255c",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/commit/ab5351079bc77f9fddb34ef5f69883649625255c",
+          "message": "fix transpose() runtime typing\n\nThe runtime value returned by `transpose()` had incorrect type information attached. Also simplifies `Value.__eq__` to not concern itself with the runtime type information (assuming static typechecking prevents nonsensical invocations).\n\n(#699 @stxue1)",
+          "author": "Mike Lin",
+          "date": "2025-03-21T01:45:16Z"
+        },
+        {
+          "sha": "dd5d0607e54f26cabfb3580fea45e76c49211490",
+          "html_url": "https://github.com/chanzuckerberg/miniwdl/commit/dd5d0607e54f26cabfb3580fea45e76c49211490",
+          "message": "read_boolean(): allow leading whitespace\n\n(#701 @stxue1)",
+          "author": "Mike Lin",
+          "date": "2025-03-17T03:07:24Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "infer_type TODO error indeterminate type",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "WDL/StdLib.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "fcddc6a43965f62ba63c6ac996d2ea933bf44466",
+        "html_url": "https://github.com/chanzuckerberg/miniwdl/commit/fcddc6a43965f62ba63c6ac996d2ea933bf44466",
+        "message": "make comparability typecheck aware of --no-quant-check (#756)\n\n#752 @stxue1",
+        "author": "Mike Lin",
+        "date": "2025-05-15T05:22:20Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

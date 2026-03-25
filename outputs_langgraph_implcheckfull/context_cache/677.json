@@ -1,0 +1,464 @@
+{
+  "task_id": "677",
+  "repo_owner": "pandas-dev",
+  "repo_name": "pandas",
+  "file_path": "pandas/io/sql.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T14:32:59+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "_get_dtype",
+    "satd_line": 1436,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 2,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 2,
+    "retrieved_callsite_snippets_count": 3,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T14:35:45+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T14:35:55+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "pandas/io/sql.py",
+    "original_code": "def _sqlalchemy_type(self, col):\n\n    dtype = self.dtype or {}\n    if col.name in dtype:\n        return self.dtype[col.name]\n\n    col_type = self._get_notnull_col_dtype(col)\n\n    from sqlalchemy.types import (BigInteger, Float, Text, Boolean,\n        DateTime, Date, Time)\n\n    if col_type == 'datetime64' or col_type == 'datetime':\n        try:\n            tz = col.tzinfo\n            return DateTime(timezone=True)\n        except:\n            return DateTime\n    if col_type == 'timedelta64':\n        warnings.warn(\"the 'timedelta' type is not supported, and will be \"\n                      \"written as integer values (ns frequency) to the \"\n                      \"database.\", UserWarning)\n        return BigInteger\n    elif col_type == 'floating':\n        return Float\n    elif col_type == 'integer':\n        # TODO: Refine integer size.\n        return BigInteger\n    elif col_type == 'boolean':\n        return Boolean\n    elif col_type == 'date':\n        return Date\n    elif col_type == 'time':\n        return Time\n    elif col_type == 'complex':\n        raise ValueError('Complex datatypes not supported')\n\n    return Text",
+    "original_signature": "def _sqlalchemy_type(self, col):",
+    "satd_comment": "# TODO: Refine integer size.",
+    "target_file": {
+      "ok": true,
+      "path": "pandas/io/sql.py",
+      "sha": "1b772c319cb3058061981978392ebbc33c2e50ad",
+      "download_url": "https://raw.githubusercontent.com/pandas-dev/pandas/main/pandas/io/sql.py",
+      "content_excerpt": "\"\"\"\nCollection of query wrappers / abstractions to both facilitate data\nretrieval and to reduce dependency on DB-specific API.\n\"\"\"\n\nfrom __future__ import annotations\n\nfrom abc import (\n    ABC,\n    abstractmethod,\n)\nfrom contextlib import (\n    ExitStack,\n    contextmanager,\n)\nfrom datetime import (\n    date,\n    datetime,\n    time,\n)\nfrom functools import partial\nimport re\nfrom typing import (\n    TYPE_CHECKING,\n    Any,\n    Literal,\n    Self,\n    cast,\n    overload,\n)\nimport warnings\n\nimport numpy as np\n\nfrom pandas._config import using_string_dtype\n\nfrom pandas._libs import lib\nfrom pandas.compat._optional import (\n    VERSIONS,\n    import_optional_dependency,\n)\nfrom pandas.errors import (\n    AbstractMethodError,\n    DatabaseError,\n)\nfrom pandas.util._decorators import set_module\nfrom pandas.util._exceptions import find_stack_level\nfrom pandas.util._validators import check_dtype_backend\n\nfrom pandas.core.dtypes.common import (\n    is_dict_like,\n    is_list_like,\n    is_object_dtype,\n    is_string_dtype,\n)\nfrom pandas.core.dtypes.dtypes import DatetimeTZDtype\nfrom pandas.core.dtypes.missing import isna\n\nfrom pandas import get_option\nfrom pandas.core.api import (\n    DataFrame,\n    Series,\n)\nfrom pandas.core.arrays import ArrowExtensionArray\nfrom pandas.core.arrays.string_ import StringDtype\nfrom pandas.core.base import PandasObject\nimport pandas.core.common as com\nfrom pandas.core.common import maybe_make_list\nfrom pandas.core.internals.construction import convert_object_array\nfrom pandas.core.tools.datetimes import to_datetime\n\nfrom pandas.io._util import arrow_table_to_pandas\n\nif TYPE_CHECKING:\n    from collections.abc import (\n        Callable,\n        Generator,\n        Iterator,\n        Mapping,\n    )\n\n    from sqlalchemy import Table\n    from sqlalchemy.sql.expression import (\n        Delete,\n        Select,\n        TextClause,\n    )\n\n    from pandas._typing import (\n        DtypeArg,\n        DtypeBackend,\n        IndexLabel,\n    )\n\n    from pandas import Index\n\n# -----------------------------------------------------------------------------\n# -- Helper functions\n\n\ndef _process_parse_dates_argument(parse_dates):\n    \"\"\"Process parse_dates argument for read_sql functions\"\"\"\n    # handle non-list entries for parse_dates gracefully\n    if parse_dates is True or parse_dates is None or parse_dates is False:\n        parse_dates = []\n\n    elif not hasattr(parse_dates, \"__iter__\"):\n        parse_dates = [parse_dates]\n    return parse_dates\n\n\ndef _handle_date_column(\n    col, utc: bool = False, format: str | dict[str, Any] | None = None\n):\n    if isinstance(format, dict):\n        # GH35185 Allow custom error values in parse_dates argument of\n        # read_sql like functions.\n        # Format can take on custom to_datetime argument values such as\n        # {\"errors\": \"coerce\"} or {\"dayfirst\": True}\n        return to_datetime(col, **format)\n    else:\n        # Allow passing of formatting string for integers\n        # GH17855\n        if format is None and (\n            issubclass(col.dtype.type, np.floating)\n            or issubclass(col.dtype.type, np.integer)\n        ):\n            format = \"s\"\n        if format in [\"D\", \"d\", \"h\", \"m\", \"s\", \"ms\", \"us\", \"ns\"]:\n            return to_datetime(col, errors=\"coerce\", unit=format, utc=utc)\n        elif isinstance(col.dtype, DatetimeTZDtype):\n            # coerce to UTC timezone\n            # GH11216\n            return to_datetime(col, utc=True)\n        else:\n            return to_datetime(col, errors=\"coerce\", format=format, utc=utc)\n\n\ndef _parse_date_columns(data_frame: DataFrame, parse_dates) -> DataFrame:\n    \"\"\"\n    Force non-datetime columns to be read as such.\n    Supports both string formatted and integer timestamp columns.\n    \"\"\"\n    parse_dates = _process_parse_dates_argument(parse_dates)\n\n    # we want to coerce datetime64_tz dtypes for now to UTC\n    # we could in theory do a 'nice' conversion from a FixedOffset tz\n    # GH11216\n    for i, (col_name, df_col) in enumerate(data_frame.items()):\n        if isinstance(df_col.dtype, DatetimeTZDtype) or col_name in parse_dates:\n            try:\n                fmt = parse_dates[col_name]\n            except (KeyError, TypeError):\n                fmt = None\n            data_frame.isetitem(i, _handle_date_column(df_col, format=fmt))\n\n    return data_frame\n\n\ndef _convert_arrays_to_dataframe(\n    data,\n    columns,\n    coerce_float: bool = True,\n    dtype_backend: DtypeBackend | Literal[\"numpy\"] = \"numpy\",\n) -> DataFrame:\n    content = lib.to_object_array_tuples(data)\n    idx_len = content.shape[0]\n    arrays = convert_object_array(\n        list(content.T),\n        dtype=None,\n        coerce_float=coerce_float,\n        dtype_backend=dtype_backend,\n    )\n    if dtype_backend == \"pyarrow\":\n        pa = import_optional_dependency(\"pyarrow\")\n\n        result_arrays = []\n        for arr in arrays:\n            pa_array = pa.array(arr, from_pandas=True)\n            if arr.dtype == \"string\":\n                # TODO: Arrow still infers strings arrays as regular strings instead\n                # of large_string, which is what we preserver everywhere else for\n                # dtype_backend=\"pyarrow\". We may want to reconsider this\n                pa_array = pa_array.cast(pa.string())\n            result_arrays.append(ArrowExtensionArray(pa_array))\n        arrays = result_arrays  # type: ignore[assignment]\n    if arrays:\n        return DataFrame._from_arrays(\n            arrays, columns=columns, index=range(idx_len), verify_integrity=False\n        )\n    else:\n        return DataFrame(columns=columns)\n\n\ndef _wrap_result(\n    data,\n    columns,\n    index_col=None,\n    coerce_float: bool = True,\n    parse_dates=None,\n    dtype: DtypeArg | None = None,\n    dtype_backend: DtypeBackend | Literal[\"numpy\"] = \"numpy\",\n) -> DataFrame:\n    \"\"\"Wrap result set of a SQLAlchemy query in a DataFrame.\"\"\"\n    frame = _convert_arrays_to_dataframe(data, columns, coerce_float, dtype_backend)\n\n    if dtype:\n        frame = frame.astype(dtype)\n\n    frame = _parse_date_columns(frame, parse_dates)\n\n    if index_col is not None:\n        frame = frame.set_index(index_col)\n\n    return frame\n\n\ndef _wrap_result_adbc(\n    df: DataFrame,\n    *,\n    index_col=None,\n    parse_dates=None,\n    dtype: DtypeArg | None = None,\n    dtype_backend: DtypeBackend | Literal[\"numpy\"] = \"numpy\",\n) -> DataFrame:\n    \"\"\"Wrap result set of a SQLAlchemy query in a DataFrame.\"\"\"\n    if dtype:\n        df = df.astype(dtype)\n\n    df = _parse_date_columns(df, parse_dates)\n\n    if index_col is not None:\n        df = df.set_index(index_col)\n\n    return df\n\n\n# -----------------------------------------------------------------------------\n# -- Read and write to DataFrames\n\n\n@overload\ndef read_sql_table(  # pyright: ignore[reportOverlappingOverload]\n    table_name: str,\n    con,\n    schema=...,\n    index_col: str | list[str] | None = ...,\n    coerce_float=...,\n    parse_dates: list[str] | dict[str, str] | dict[str, dict[str, Any]] | None = ...,\n    columns: list[str] | None = ...,\n    chunksize: None = ...,\n    dtype_backend: DtypeBackend | lib.NoDefault = ...,\n) -> DataFrame: ...\n\n\n@overload\ndef read_sql_table(\n    table_name: str,\n    con,\n    schema=...,\n    index_col: str | list[str] | None = ...,\n    coerce_float=...,\n    parse_dates: list[str] | dict[str, str] | dict[str, dict[str, Any]] | None = ...,\n    columns: list[str] | None = ...,\n    chunksize: int = ...,\n    dtype_backend: DtypeBackend | lib.NoDefault = ...,\n) -> Iterator[DataFrame]: ...\n\n\n@set_module(\"pandas\")\ndef read_sql_table(\n    table_name: str,\n    con,\n    schema: str | None = None,\n    index_col: str | list[str] | None = None,\n    coerce_float: bool = True,\n    parse_dates: list[str] | dict[str, str] | dict[str, dict[str, Any]] | None = None,\n    columns: list[str] | None = None,\n    chunksize: int | None = None,\n    dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,\n) -> DataFrame | Iterator[DataFrame]:\n    \"\"\"\n    Read SQL database table into a DataFrame.\n\n    Given a table name and a SQLAlchemy connectable, returns a DataFrame.\n    This function does not support DBAPI connections.\n\n    Parameters\n    ----------\n    table_name : str\n        Name of SQL table in database.\n    con : SQLAlchemy connectable or str\n        A database URI could be provided as str.\n        SQLite DBAPI connection mode not supported.\n    schema : str, default None\n        Name of SQL schema in database to query (if database flavor\n        supports this). Uses default schema if None (default).\n    index_col : str or list of str, optional, default: None\n        Column(s) to set as index(MultiIndex).\n    coerce_float : bool, default True\n        Attempts to convert values of non-string, non-numeric objects (like\n        decimal.Decimal) to floating point. Can result in loss of Precision.\n    parse_dates : list or dict, default None\n        - List of column names to parse as dates.\n        - Dict of ``{column_name: format string}`` where format string is\n          strftime compatible in case of parsing string times or is one of\n          (D, s, ns, ms, us) in case of parsing integer timestamps.\n        - Dict of ``{column_name: arg dict}``, where the arg dict corresponds\n          to the keyword arguments of :func:`pandas.to_datetime`\n          Especially useful with databases without native Datetime support,\n          such as SQLite.\n    columns : list, default None\n        List of column names to select from SQL table.\n    chunksize : int, default None\n        If specified, returns an iterator where `chunksize` is the number of\n        rows to include in each chunk.\n    dtype_backend : {'numpy_nullable', 'pyarrow'}\n        Back-end data type applied to the resultant :class:`DataFrame`\n        (still experimental). If not specified, the default behavior\n        is to not use nullable data types. If specified, the behavior\n        is as follows:\n\n        * ``\"numpy_nullable\"``: returns nullable-dtype-backed :class:`DataFrame`\n        * ``\"pyarrow\"``: returns pyarrow-backed nullable\n          :class:`ArrowDtype` :class:`DataFrame`\n\n        .. versionadded:: 2.0\n\n    Returns\n    -------\n    DataFrame or Iterator[DataFrame]\n        A SQL table is returned as two-dimensional data structure with labeled\n        axes.\n\n    See Also\n    --------\n    read_sql_query : Read SQL query into a DataFrame.\n    read_sql : Read SQL query or database table into a DataFrame.\n\n    Notes\n    -----\n    Any datetime values with time zone information will be converted to UTC.\n\n    Examples\n    --------\n    >>> pd.read_sql_table(\"table_name\", \"postgres:///db_name\")  # doctest:+SKIP\n    \"\"\"\n\n    check_dtype_backend(dtype_backend)\n    if dtype_backend is lib.no_default:\n        dtype_backend = \"numpy\"  # type: ignore[assignment]\n    assert dtype_backend is not lib.no_default\n\n    with pandasSQL_builder(con, schema=schema, need_transaction=True) as pandas_sql:\n        if not pandas_sql.has_table(table_name):\n            raise ValueError(f\"Table {table_name} not found\")\n\n        table = pandas_sql.read_table(\n            table_name,\n            index_col=index_col,\n            coerce_float=coerce_float,\n            parse_dates=parse_dates,\n            columns=columns,\n            chunksize=chunksize,\n            dtype_backend=dtype_backend,\n        )\n\n    if table is not None:\n        return table\n    else:\n        raise ValueError(f\"Table {table_name} not found\", con)\n\n\n@overload\ndef read_sql_query(  # pyright: ignore[reportOverlappingOverload]\n    sql,\n    con,\n    index_col: str | list[str] | None = ...,\n    coerce_float=...,\n    params: list[Any] | Mapping[str, Any] | None = ...,\n    parse_dates: list[str] | dict[str, str] | dict[str, dict[str, Any]] | None = ...,\n    chunksize: None = ...,\n    dtype: DtypeArg | None = ...,\n    dtype_backend: DtypeBackend | lib.NoDefault = ...,\n) -> DataFrame: ...\n\n\n@overload\ndef read_sql_query(\n    sql,\n    con,\n    index_col: str | list[str] | None = ...,\n    coerce_float=...,\n    p",
+      "total_lines": 2961
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 1436,
+      "start_line": 1416,
+      "end_line": 1456,
+      "matched_line": "            # TODO: Refine integer size.",
+      "excerpt": "1416:             return Time\n1417:         elif col_type == \"complex\":\n1418:             raise ValueError(\"Complex datatypes not supported\")\n1419: \n1420:         return Text\n1421: \n1422:     def _get_dtype(self, sqltype):\n1423:         from sqlalchemy.types import (\n1424:             TIMESTAMP,\n1425:             Boolean,\n1426:             Date,\n1427:             DateTime,\n1428:             Float,\n1429:             Integer,\n1430:             String,\n1431:         )\n1432: \n1433:         if isinstance(sqltype, Float):\n1434:             return float\n1435:         elif isinstance(sqltype, Integer):\n1436:             # TODO: Refine integer size.\n1437:             return np.dtype(\"int64\")\n1438:         elif isinstance(sqltype, TIMESTAMP):\n1439:             # we have a timezone capable type\n1440:             if not sqltype.timezone:\n1441:                 return datetime\n1442:             return DatetimeTZDtype\n1443:         elif isinstance(sqltype, DateTime):\n1444:             # Caution: np.datetime64 is also a subclass of np.number.\n1445:             return datetime\n1446:         elif isinstance(sqltype, Date):\n1447:             return date\n1448:         elif isinstance(sqltype, Boolean):\n1449:             return bool\n1450:         elif isinstance(sqltype, String):\n1451:             if using_string_dtype():\n1452:                 return StringDtype(na_value=np.nan)\n1453: \n1454:         return object\n1455: \n1456: "
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_get_dtype",
+      "start_line": 1422,
+      "end_line": 1454,
+      "source": "    def _get_dtype(self, sqltype):\n        from sqlalchemy.types import (\n            TIMESTAMP,\n            Boolean,\n            Date,\n            DateTime,\n            Float,\n            Integer,\n            String,\n        )\n\n        if isinstance(sqltype, Float):\n            return float\n        elif isinstance(sqltype, Integer):\n            # TODO: Refine integer size.\n            return np.dtype(\"int64\")\n        elif isinstance(sqltype, TIMESTAMP):\n            # we have a timezone capable type\n            if not sqltype.timezone:\n                return datetime\n            return DatetimeTZDtype\n        elif isinstance(sqltype, DateTime):\n            # Caution: np.datetime64 is also a subclass of np.number.\n            return datetime\n        elif isinstance(sqltype, Date):\n            return date\n        elif isinstance(sqltype, Boolean):\n            return bool\n        elif isinstance(sqltype, String):\n            if using_string_dtype():\n                return StringDtype(na_value=np.nan)\n\n        return object"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 1422,
+      "end_line": 1454,
+      "excerpt": "    def _get_dtype(self, sqltype):\n        from sqlalchemy.types import (\n            TIMESTAMP,\n            Boolean,\n            Date,\n            DateTime,\n            Float,\n            Integer,\n            String,\n        )\n\n        if isinstance(sqltype, Float):\n            return float\n        elif isinstance(sqltype, Integer):\n            # TODO: Refine integer size.\n            return np.dtype(\"int64\")\n        elif isinstance(sqltype, TIMESTAMP):\n            # we have a timezone capable type\n            if not sqltype.timezone:\n                return datetime\n            return DatetimeTZDtype\n        elif isinstance(sqltype, DateTime):\n            # Caution: np.datetime64 is also a subclass of np.number.\n            return datetime\n        elif isinstance(sqltype, Date):\n            return date\n        elif isinstance(sqltype, Boolean):\n            return bool\n        elif isinstance(sqltype, String):\n            if using_string_dtype():\n                return StringDtype(na_value=np.nan)\n\n        return object",
+      "symbol_name": "_get_dtype",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "pandas/io/sql.py",
+      "sha": "1b772c319cb3058061981978392ebbc33c2e50ad",
+      "download_url": "https://raw.githubusercontent.com/pandas-dev/pandas/main/pandas/io/sql.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:annotations",
+        "abc:ABC",
+        "abc:abstractmethod",
+        "contextlib:ExitStack",
+        "contextlib:contextmanager",
+        "datetime:date",
+        "datetime:datetime",
+        "datetime:time",
+        "functools:partial",
+        "re",
+        "typing:TYPE_CHECKING",
+        "typing:Any",
+        "typing:Literal",
+        "typing:Self",
+        "typing:cast",
+        "typing:overload",
+        "warnings",
+        "numpy",
+        "pandas._config:using_string_dtype",
+        "pandas._libs:lib",
+        "pandas.compat._optional:VERSIONS",
+        "pandas.compat._optional:import_optional_dependency",
+        "pandas.errors:AbstractMethodError",
+        "pandas.errors:DatabaseError",
+        "pandas.util._decorators:set_module",
+        "pandas.util._exceptions:find_stack_level",
+        "pandas.util._validators:check_dtype_backend",
+        "pandas.core.dtypes.common:is_dict_like",
+        "pandas.core.dtypes.common:is_list_like",
+        "pandas.core.dtypes.common:is_object_dtype"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/pandas-dev/pandas/main/README.md",
+      "content_excerpt": "<picture align=\"center\">\n  <source media=\"(prefers-color-scheme: dark)\" srcset=\"https://pandas.pydata.org/static/img/pandas_white.svg\">\n  <img alt=\"Pandas Logo\" src=\"https://pandas.pydata.org/static/img/pandas.svg\">\n</picture>\n\n-----------------\n\n# pandas: A Powerful Python Data Analysis Toolkit\n\n| | |\n| --- | --- |\n| Testing | [![CI - Test](https://github.com/pandas-dev/pandas/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/pandas-dev/pandas/actions/workflows/unit-tests.yml) [![Coverage](https://codecov.io/github/pandas-dev/pandas/coverage.svg?branch=main)](https://codecov.io/gh/pandas-dev/pandas) |\n| Package | [![PyPI Latest Release](https://img.shields.io/pypi/v/pandas.svg)](https://pypi.org/project/pandas/) [![PyPI Downloads](https://img.shields.io/pypi/dm/pandas.svg?label=PyPI%20downloads)](https://pypi.org/project/pandas/) [![Conda Latest Release](https://anaconda.org/conda-forge/pandas/badges/version.svg)](https://anaconda.org/conda-forge/pandas) [![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/pandas.svg?label=Conda%20downloads)](https://anaconda.org/conda-forge/pandas) |\n| Meta | [![Powered by NumFOCUS](https://img.shields.io/badge/powered%20by-NumFOCUS-orange.svg?style=flat&colorA=E1523D&colorB=007D8A)](https://numfocus.org) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3509134.svg)](https://doi.org/10.5281/zenodo.3509134) [![License - BSD 3-Clause](https://img.shields.io/pypi/l/pandas.svg)](https://github.com/pandas-dev/pandas/blob/main/LICENSE) [![Slack](https://img.shields.io/badge/join_Slack-information-brightgreen.svg?logo"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "_get_dtype test",
+      "count": 2,
+      "items": [
+        {
+          "name": "test_common.py",
+          "path": "pandas/tests/dtypes/test_common.py",
+          "sha": "df6ee012e5e2605177e3bbfeb067bb2f2c993ed8",
+          "html_url": "https://github.com/pandas-dev/pandas/blob/9df51a79c83d8f905da9d6af2a391b23d2095410/pandas/tests/dtypes/test_common.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 162,
+          "end_line": 186,
+          "excerpt": "162:     begin with 'is_' and end with 'dtype'\n163: \n164:     \"\"\"\n165:     fnames = [f for f in dir(com) if (f.startswith(\"is_\") and f.endswith(\"dtype\"))]\n166:     fnames.remove(\"is_string_or_object_np_dtype\")  # fastpath requires np.dtype obj\n167:     return [getattr(com, fname) for fname in fnames]\n168: \n169: \n170: @pytest.mark.filterwarnings(\n171:     \"ignore:is_categorical_dtype is deprecated:DeprecationWarning\"\n172: )\n173: @pytest.mark.parametrize(\"func\", get_is_dtype_funcs(), ids=lambda x: x.__name__)\n174: def test_get_dtype_error_catch(func):\n175:     # see gh-15941\n176:     #\n177:     # No exception should be raised.\n178: \n179:     msg = f\"{func.__name__} is deprecated\"\n180:     warn = None\n181:     if (\n182:         func is com.is_int64_dtype\n183:         or func is com.is_interval_dtype\n184:         or func is com.is_datetime64tz_dtype\n185:         or func is com.is_categorical_dtype\n186:         or func is com.is_period_dtype",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_get_set.py",
+          "path": "pandas/tests/indexes/multi/test_get_set.py",
+          "sha": "b794a49b5f85f11e387f6e2ed16d0fb0e56b0be5",
+          "html_url": "https://github.com/pandas-dev/pandas/blob/9df51a79c83d8f905da9d6af2a391b23d2095410/pandas/tests/indexes/multi/test_get_set.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 23,
+          "end_line": 47,
+          "excerpt": "23: \n24: def test_get_level_number_integer(idx):\n25:     idx.names = [1, 0]\n26:     assert idx._get_level_number(1) == 0\n27:     assert idx._get_level_number(0) == 1\n28:     msg = \"Too many levels: Index has only 2 levels, not 3\"\n29:     with pytest.raises(IndexError, match=msg):\n30:         idx._get_level_number(2)\n31:     with pytest.raises(KeyError, match=\"Level fourth not found\"):\n32:         idx._get_level_number(\"fourth\")\n33: \n34: \n35: def test_get_dtypes(using_infer_string):\n36:     # Test MultiIndex.dtypes (# Gh37062)\n37:     idx_multitype = MultiIndex.from_product(\n38:         [\n39:             [1, 2, 3],\n40:             [\"a\", \"b\", \"c\"],\n41:             pd.date_range(\"20200101\", periods=2, tz=\"UTC\", unit=\"ns\"),\n42:         ],\n43:         names=[\"int\", \"string\", \"dt\"],\n44:     )\n45: \n46:     exp = \"object\" if not using_infer_string else pd.StringDtype(na_value=np.nan)\n47:     expected = pd.Series(",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_get_dtype(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "common.py",
+          "path": "pandas/core/dtypes/common.py",
+          "sha": "3429f588434bcbad60fd18a755f07d3615bb4fac",
+          "html_url": "https://github.com/pandas-dev/pandas/blob/9df51a79c83d8f905da9d6af2a391b23d2095410/pandas/core/dtypes/common.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 1654,
+          "end_line": 1686,
+          "excerpt": "def _get_dtype(arr_or_dtype) -> DtypeObj:\n    \"\"\"\n    Get the dtype instance associated with an array\n    or dtype object.\n\n    Parameters\n    ----------\n    arr_or_dtype : array-like or dtype\n        The array-like or dtype object whose dtype we want to extract.\n\n    Returns\n    -------\n    obj_dtype : The extract dtype instance from the\n                passed in array or dtype object.\n\n    Raises\n    ------\n    TypeError : The passed in object is None.\n    \"\"\"\n    if arr_or_dtype is None:\n        raise TypeError(\"Cannot deduce dtype from null object\")\n\n    # fastpath\n    if isinstance(arr_or_dtype, np.dtype):\n        return arr_or_dtype\n    elif isinstance(arr_or_dtype, type):\n        return np.dtype(arr_or_dtype)\n\n    # if we have an array-like\n    elif hasattr(arr_or_dtype, \"dtype\"):\n        arr_or_dtype = arr_or_dtype.dtype\n\n    return pandas_dtype(arr_or_dtype)",
+          "symbol_name": "_get_dtype",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "sql.py",
+          "path": "pandas/io/sql.py",
+          "sha": "1b772c319cb3058061981978392ebbc33c2e50ad",
+          "html_url": "https://github.com/pandas-dev/pandas/blob/9df51a79c83d8f905da9d6af2a391b23d2095410/pandas/io/sql.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 1422,
+          "end_line": 1454,
+          "excerpt": "    def _get_dtype(self, sqltype):\n        from sqlalchemy.types import (\n            TIMESTAMP,\n            Boolean,\n            Date,\n            DateTime,\n            Float,\n            Integer,\n            String,\n        )\n\n        if isinstance(sqltype, Float):\n            return float\n        elif isinstance(sqltype, Integer):\n            # TODO: Refine integer size.\n            return np.dtype(\"int64\")\n        elif isinstance(sqltype, TIMESTAMP):\n            # we have a timezone capable type\n            if not sqltype.timezone:\n                return datetime\n            return DatetimeTZDtype\n        elif isinstance(sqltype, DateTime):\n            # Caution: np.datetime64 is also a subclass of np.number.\n            return datetime\n        elif isinstance(sqltype, Date):\n            return date\n        elif isinstance(sqltype, Boolean):\n            return bool\n        elif isinstance(sqltype, String):\n            if using_string_dtype():\n                return StringDtype(na_value=np.nan)\n\n        return object",
+          "symbol_name": "_get_dtype",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "test_common.py",
+          "path": "pandas/tests/dtypes/test_common.py",
+          "sha": "df6ee012e5e2605177e3bbfeb067bb2f2c993ed8",
+          "html_url": "https://github.com/pandas-dev/pandas/blob/9df51a79c83d8f905da9d6af2a391b23d2095410/pandas/tests/dtypes/test_common.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 136,
+          "end_line": 160,
+          "excerpt": "136:     # GH-44276\n137:     assert not com.is_dtype_equal(dtype, \"string[pyarrow]\")\n138: \n139: \n140: @pytest.mark.parametrize(\n141:     \"dtype1,dtype2\",\n142:     [\n143:         (np.int8, np.int64),\n144:         (np.int16, np.int64),\n145:         (np.int32, np.int64),\n146:         (np.float32, np.float64),\n147:         (PeriodDtype(\"D\"), PeriodDtype(\"2D\")),  # PeriodType\n148:         (\n149:             com.pandas_dtype(\"datetime64[ns, US/Eastern]\"),\n150:             com.pandas_dtype(\"datetime64[ns, CET]\"),\n151:         ),  # Datetime\n152:         (None, None),  # gh-15941: no exception should be raised.\n153:     ],\n154: )\n155: def test_dtype_equal_strict(dtype1, dtype2):\n156:     assert not com.is_dtype_equal(dtype1, dtype2)\n157: \n158: \n159: def get_is_dtype_funcs():\n160:     \"\"\"",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "pandas/io",
+      "count": 22,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "pandas/io/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "_util.py",
+          "path": "pandas/io/_util.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "pandas/io/api.py",
+          "type": "file"
+        },
+        {
+          "name": "clipboard",
+          "path": "pandas/io/clipboard",
+          "type": "dir"
+        },
+        {
+          "name": "clipboards.py",
+          "path": "pandas/io/clipboards.py",
+          "type": "file"
+        },
+        {
+          "name": "common.py",
+          "path": "pandas/io/common.py",
+          "type": "file"
+        },
+        {
+          "name": "excel",
+          "path": "pandas/io/excel",
+          "type": "dir"
+        },
+        {
+          "name": "feather_format.py",
+          "path": "pandas/io/feather_format.py",
+          "type": "file"
+        },
+        {
+          "name": "formats",
+          "path": "pandas/io/formats",
+          "type": "dir"
+        },
+        {
+          "name": "html.py",
+          "path": "pandas/io/html.py",
+          "type": "file"
+        },
+        {
+          "name": "iceberg.py",
+          "path": "pandas/io/iceberg.py",
+          "type": "file"
+        },
+        {
+          "name": "json",
+          "path": "pandas/io/json",
+          "type": "dir"
+        },
+        {
+          "name": "orc.py",
+          "path": "pandas/io/orc.py",
+          "type": "file"
+        },
+        {
+          "name": "parquet.py",
+          "path": "pandas/io/parquet.py",
+          "type": "file"
+        },
+        {
+          "name": "parsers",
+          "path": "pandas/io/parsers",
+          "type": "dir"
+        },
+        {
+          "name": "pickle.py",
+          "path": "pandas/io/pickle.py",
+          "type": "file"
+        },
+        {
+          "name": "pytables.py",
+          "path": "pandas/io/pytables.py",
+          "type": "file"
+        },
+        {
+          "name": "sas",
+          "path": "pandas/io/sas",
+          "type": "dir"
+        },
+        {
+          "name": "spss.py",
+          "path": "pandas/io/spss.py",
+          "type": "file"
+        },
+        {
+          "name": "sql.py",
+          "path": "pandas/io/sql.py",
+          "type": "file"
+        },
+        {
+          "name": "stata.py",
+          "path": "pandas/io/stata.py",
+          "type": "file"
+        },
+        {
+          "name": "xml.py",
+          "path": "pandas/io/xml.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "pandas/io/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # ruff: noqa: TC004\n2: from typing import TYPE_CHECKING\n3: \n4: if TYPE_CHECKING:\n5:     # import modules that have public classes/functions\n6:     from pandas.io import (\n7:         formats,\n8:         json,\n9:         stata,\n10:     )\n11: \n12:     # mark only those modules as public\n13:     __all__ = [\"formats\", \"json\", \"stata\"]"
+        },
+        {
+          "name": "_util.py",
+          "path": "pandas/io/_util.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from __future__ import annotations\n2: \n3: from typing import (\n4:     TYPE_CHECKING,\n5:     Literal,\n6: )\n7: \n8: import numpy as np\n9: \n10: from pandas._config import using_string_dtype\n11: \n12: from pandas._libs import lib\n13: from pandas.compat import ("
+        },
+        {
+          "name": "api.py",
+          "path": "pandas/io/api.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Data I/O API\n3: \"\"\"\n4: \n5: from pandas.io.clipboards import read_clipboard\n6: from pandas.io.excel import (\n7:     ExcelFile,\n8:     ExcelWriter,\n9:     read_excel,\n10: )\n11: from pandas.io.feather_format import read_feather\n12: from pandas.io.html import read_html\n13: from pandas.io.iceberg import read_iceberg"
+        },
+        {
+          "name": "clipboards.py",
+          "path": "pandas/io/clipboards.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"io on the clipboard\"\"\"\n2: \n3: from __future__ import annotations\n4: \n5: from io import StringIO\n6: from typing import TYPE_CHECKING\n7: import warnings\n8: \n9: from pandas._libs import lib\n10: from pandas.util._decorators import set_module\n11: from pandas.util._exceptions import find_stack_level\n12: from pandas.util._validators import check_dtype_backend\n13: "
+        },
+        {
+          "name": "common.py",
+          "path": "pandas/io/common.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"Common I/O API utilities\"\"\"\n2: \n3: from __future__ import annotations\n4: \n5: from abc import (\n6:     ABC,\n7:     abstractmethod,\n8: )\n9: import codecs\n10: from collections import defaultdict\n11: from collections.abc import (\n12:     Hashable,\n13:     Mapping,"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "pandas/io/sql.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "4a8d11e43e8504012b37ca92f93f20e0aea97319",
+          "html_url": "https://github.com/pandas-dev/pandas/commit/4a8d11e43e8504012b37ca92f93f20e0aea97319",
+          "message": "TYP: enable 7 pyright checks, remove stale mypy overrides (#64551)\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
+          "author": "jbrockmendel",
+          "date": "2026-03-12T19:14:17Z"
+        },
+        {
+          "sha": "3bdb9728f755bb734d3e45d31b037b63681ffe34",
+          "html_url": "https://github.com/pandas-dev/pandas/commit/3bdb9728f755bb734d3e45d31b037b63681ffe34",
+          "message": "CLN: Enable ruff rule TC006 (runtime-cast-value) (#64149)",
+          "author": "Thierry Moisan",
+          "date": "2026-02-15T17:32:05Z"
+        },
+        {
+          "sha": "f4851e500a43125d505db64e548af0355227714b",
+          "html_url": "https://github.com/pandas-dev/pandas/commit/f4851e500a43125d505db64e548af0355227714b",
+          "message": "DOC: Remove ..versionadded directives before 2.0 (#63035)\n\nCo-authored-by: Richard Shadrach <45562402+rhshadrach@users.noreply.github.com>",
+          "author": "Matthew Roeschke",
+          "date": "2025-11-08T20:40:33Z"
+        },
+        {
+          "sha": "81f8d5d3199d0ec3f94ad7eb8015e183b1681275",
+          "html_url": "https://github.com/pandas-dev/pandas/commit/81f8d5d3199d0ec3f94ad7eb8015e183b1681275",
+          "message": "Raise on SQLAlchemy minimal version violation Issue #57178 (#62751)",
+          "author": "Mika Allert",
+          "date": "2025-10-22T17:55:56Z"
+        },
+        {
+          "sha": "620c0f8d2df52242be01e2e3212df33527dca93f",
+          "html_url": "https://github.com/pandas-dev/pandas/commit/620c0f8d2df52242be01e2e3212df33527dca93f",
+          "message": "ENH: set __module__ on remaining io.* (#62597)\n\nCo-authored-by: dkane01 <dk1284@nyu.edu>",
+          "author": "dkane01",
+          "date": "2025-10-06T17:00:16Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_get_dtype TODO Refine integer size",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "pandas/io/sql.py",
+      "satd_line": 1436,
+      "last_commit": {
+        "sha": "4a8d11e43e8504012b37ca92f93f20e0aea97319",
+        "html_url": "https://github.com/pandas-dev/pandas/commit/4a8d11e43e8504012b37ca92f93f20e0aea97319",
+        "message": "TYP: enable 7 pyright checks, remove stale mypy overrides (#64551)\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
+        "author": "jbrockmendel",
+        "date": "2026-03-12T19:14:17Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "clear TODO comment specifying refinement of integer size",
+        "code snippet shows explicit integer type handling",
+        "enclosing function _get_dtype and _sqlalchemy_type provide context for type mapping"
+      ],
+      "related_tests_count": 2,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_get_dtype",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

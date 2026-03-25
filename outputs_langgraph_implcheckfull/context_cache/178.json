@@ -1,0 +1,383 @@
+{
+  "task_id": "178",
+  "repo_owner": "webcompat",
+  "repo_name": "webcompat.com",
+  "file_path": "webcompat/helpers.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T07:38:13+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 3,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 3,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T07:38:26+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T07:38:31+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "webcompat/helpers.py",
+    "original_code": "def prepare_form(form_request):\n    \"\"\"Extract all known information from the form request.\n\n    This is called by /issues/new to prepare needed by the form\n    before being posted on GitHub.\n    For HTTP POST:\n    The JSON content will override any existing URL parameters.\n    The URL parameters will be kept if non-existent in the JSON.\n    \"\"\"\n    form_data = {}\n    form_data['user_agent'] = request.headers.get('User-Agent')\n    form_data['src'] = request.args.get('src')\n    form_data['extra_labels'] = request.args.getlist('label')\n    form_data['url'] = request.args.get('url')\n    # we rely here on the fact we receive the right POST\n    # because we tested it with form_type(request)\n    if form_request.method == 'POST':\n        json_data = form_request.get_json()\n        form_data.update(json_data)\n    channel = ''\n    details = form_data.get('details')\n    if details:\n        channel = details.get('channel')\n    # XXXTemp Hack: if the user clicked on Report Site Issue from Release,\n    # we want to redirect them somewhere else and forget all their data.\n    # See https://bugzilla.mozilla.org/show_bug.cgi?id=1513541\n    if channel == 'release':\n        form_data = 'release'\n    return form_data",
+    "original_signature": "def prepare_form(form_request):",
+    "satd_comment": "# XXXTemp Hack: if the user clicked on Report Site Issue from Release,\n# we want to redirect them somewhere else and forget all their data.\n# See https://bugzilla.mozilla.org/show_bug.cgi?id=1513541",
+    "target_file": {
+      "ok": true,
+      "path": "webcompat/helpers.py",
+      "sha": "ffa40911b473e32d18298ab408a97cbe44fb6ede",
+      "download_url": "https://raw.githubusercontent.com/webcompat/webcompat.com/main/webcompat/helpers.py",
+      "content_excerpt": "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n# This Source Code Form is subject to the terms of the Mozilla Public\n# License, v. 2.0. If a copy of the MPL was not distributed with this\n# file, You can obtain one at http://mozilla.org/MPL/2.0/.\n\n\"\"\"Webcompat.com relies on many little functions for processing data.\n\nWe collect them in that module.\n\"\"\"\n\nfrom functools import update_wrapper\nfrom functools import wraps\nimport hashlib\nimport json\nimport logging\nimport os\nimport math\nimport random\nimport re\nimport urllib.parse\n\nfrom flask import abort\nfrom flask import g\nfrom flask import make_response\nfrom flask import request\nfrom flask import session\nimport requests\nfrom requests.utils import parse_header_links\nfrom ua_parser import user_agent_parser\n\nfrom webcompat import app\nfrom webcompat import github\n\nAPI_URI = 'https://api.github.com/'\nAUTH_HEADERS = {'Authorization': 'token {0}'.format(app.config['OAUTH_TOKEN']),\n                'User-Agent': 'webcompat/webcompat-bot'}\nHOST_WHITELIST = ('webcompat.com', 'staging.webcompat.com',\n                  '127.0.0.1', 'localhost')\nFIXTURES_PATH = os.getcwd() + '/tests/fixtures'\nJSON_MIME = 'application/json'\n\nlog = app.logger\nlog.setLevel(logging.INFO)\n\n\n@app.context_processor\ndef register_ab_active():\n    \"\"\"Register `ab_active` in jinja context\"\"\"\n    return dict(ab_active=ab_active)\n\n\ndef get_list_items(val_dict):\n    \"\"\"Return list items (<li>) from the passed in list ([]).\"\"\"\n    rv = ''.join(['<li>{k}: {v}</li>'.format(k=k, v=get_serialized_value(v))\n                  for k, v in list(val_dict.items())])\n    return '<ul>\\n  {rv}\\n</ul>'.format(rv=rv)\n\n\ndef get_details_list(details):\n    \"\"\"Return details content as list items in a <ul>.\n\n    * If a dict, as a formatted string\n    * If the dict has a value that looks like [{k: v}], that will\n      be returned as a nested <ul>.\n    * Otherwise as a string as-is.\n    \"\"\"\n    content = details\n    try:\n        rv = get_list_items(details)\n    except AttributeError:\n        rv = '<ul>\\n  <li>{content}</li>\\n</ul>'.format(content=content)\n    return rv\n\n\ndef get_serialized_value(val):\n    \"\"\"Map values from JSON to a more human readable format.\n\n    This might be a nested <ul> with list items, depending\n    on the input.\n    \"\"\"\n    details_map = {False: 'false', True: 'true', None: 'null'}\n    if isinstance(val, (bool, type(None))):\n        return details_map[val]\n    if isinstance(val, list) and isinstance(val[0], dict):\n        # if val is a list, we expect there to be a single object\n        # inside. if so, we build a nested <ul> from that object's data\n        return get_list_items(val[0])\n    if isinstance(val, str):\n        return val\n    return str(val)\n\n\ndef get_user_info():\n    \"\"\"Grab the username and avatar URL from GitHub.\"\"\"\n    if session.get('username') and session.get('avatar_url'):\n        return\n    else:\n        gh_user = github.get('user')\n        session['username'] = gh_user.get('login')\n        session['avatar_url'] = gh_user.get('avatar_url')\n\n\ndef get_version_string(dictionary):\n    \"\"\"Return version string from dict.\n\n    Used on `user_agent` or `os` dict\n    with `major`, and optional `minor` and `patch`.\n    Minor and patch, orderly, are added only if they exist.\n    \"\"\"\n    version = dictionary.get('major')\n    if not version:\n        return ''\n    minor = dictionary.get('minor')\n    if not minor:\n        return version\n    patch = dictionary.get('patch')\n    if not patch:\n        return version + \".\" + minor\n    return version + \".\" + minor + \".\" + patch\n\n\ndef get_name(dictionary):\n    \"\"\"Return name from UA or OS dictionary's `family`.\n\n    As bizarre UA or OS strings can be parsed like so:\n    {'major': None, 'minor': None, 'family': 'Other', 'patch': None}\n    we return \"Unknown\", rather than \"Other\"\n    \"\"\"\n    name = dictionary.get('family')\n    if name.lower() == \"other\":\n        name = \"Unknown\"\n    return name\n\n\ndef get_browser(user_agent_string=None):\n    \"\"\"Return browser name family and version.\n\n    It will pre-populate the bug reporting form.\n    \"\"\"\n    if user_agent_string and isinstance(user_agent_string, str):\n        ua_dict = user_agent_parser.Parse(user_agent_string)\n        ua = ua_dict.get('user_agent')\n        name = get_name(ua)\n        # if browser is unknown, we don't need further details\n        if name == \"Unknown\":\n            return \"Unknown\"\n        version = get_version_string(ua)\n        # Check for tablet devices\n        if ua_dict.get('device').get('model') == 'Tablet':\n            model = '(Tablet) '\n        else:\n            model = ''\n        rv = '{0} {1}{2}'.format(name, model, version).rstrip()\n        return rv\n    return \"Unknown\"\n\n\ndef get_browser_name(user_agent_string=None):\n    \"\"\"Return just the browser name.\n\n    unknown user agents will be reported as \"unknown\".\n    \"\"\"\n    if user_agent_string and isinstance(user_agent_string, str):\n        # get_browser will return something like 'Chrome Mobile 47.0'\n        # we just want 'chrome mobile', i.e., the lowercase name\n        # w/o the version\n        return get_browser(user_agent_string).rsplit(' ', 1)[0].lower()\n    return \"unknown\"\n\n\ndef get_os(user_agent_string=None):\n    \"\"\"Return operating system name.\n\n    It pre-populates the bug reporting form.\n    \"\"\"\n    if user_agent_string and isinstance(user_agent_string, str):\n        ua_dict = user_agent_parser.Parse(user_agent_string)\n        os = ua_dict.get('os')\n        name = get_name(os)\n        # if OS is unknown, we don't need further details\n        if name == \"Unknown\":\n            return \"Unknown\"\n        version = get_version_string(os)\n        rv = '{0} {1}'.format(name, version).rstrip()\n        return rv\n    return \"Unknown\"\n\n\ndef get_response_headers(response, mime_type=JSON_MIME):\n    \"\"\"Return a dictionary of headers based on a passed in Response object.\n\n    This allows us to proxy response headers from GitHub to our own responses.\n    \"\"\"\n    # handle the case where we get the data directly\n    headers = {}\n    if isinstance(response, requests.models.Response):\n        headers = response.headers\n    # or the case where we proxy an already fetched reponse\n    if isinstance(response, tuple):\n        headers = response[2]\n    new_headers = {'etag': headers.get('etag'),\n                   'cache-control': headers.get('cache-control'),\n                   'content-type': mime_type}\n    if headers.get('link'):\n        new_headers['link'] = rewrite_and_sanitize_link(headers.get('link'))\n    return new_headers\n\n\ndef get_request_headers(headers, mime_type=JSON_MIME):\n    \"\"\"Return a dictionary of headers based on the client Request.\n\n    This allows us to send back headers to GitHub when we are acting as client.\n    \"\"\"\n    client_headers = {'Accept': mime_type}\n    if 'If-None-Match' in headers:\n        etag = headers['If-None-Match'].encode('utf-8')\n        client_headers['If-None-Match'] = etag\n    if 'User-Agent' in headers:\n        client_headers['User-Agent'] = headers['User-Agent']\n    return client_headers\n\n\ndef get_referer(request):\n    \"\"\"Return the Referer URI based on the passed in Request object.\n\n    Also validate that it came from our own server. If it didn't, check\n    the session for a manually stashed 'referer' key, otherwise return None.\n    \"\"\"\n    if request.referrer:\n        host = urllib.parse.urlparse(request.referrer).hostname\n        if host in HOST_WHITELIST:\n            return request.referrer\n        else:\n            return session.pop('referer', None)\n    else:\n        return None\n\n\ndef set_referer(request):\n    \"\"\"Set manually the referer URI.\n\n    We only allow stashing a URI in here if it is whitelisted against\n    the HOST_WHITELIST.\n    \"\"\"\n    if request.referrer:\n        host = urllib.parse.urlparse(request.referrer).hostname\n        if host in HOST_WHITELIST:\n            session['referer'] = request.referrer\n\n\ndef normalize_api_params(params):\n    \"\"\"Normalize GitHub Issues API params to Search API.\n\n    conventions:\n\n    Issues API params        | Search API converted values\n    -------------------------|---------------------------------------\n    state                    | into q as \"state:open\", \"state:closed\"\n    creator                  | into q as \"author:username\"\n    mentioned                | into q as \"mentions:username\"\n    direction                | order\n    \"\"\"\n    if 'direction' in params:\n        params['order'] = params['direction']\n        del params['direction']\n\n    # these params need to be added to the \"q\" param as substrings\n    if 'state' in params:\n        state_param = ' state:' + params['state']\n        params['q'] += state_param\n        del params['state']\n    if 'creator' in params:\n        creator_param = ' author:' + params['creator']\n        params['q'] += creator_param\n        del params['creator']\n    if 'mentioned' in params:\n        mentioned_param = ' mentions:' + params['mentioned']\n        params['q'] += mentioned_param\n        del params['mentioned']\n    return params\n\n\ndef rewrite_links(link_header):\n    \"\"\"Rewrite Link header Github API endpoints to our own.\n\n    <https://api.github.com/repositories/17839063/iss...&page=2>; rel=\"next\",\n    <https://api.github.com/repositories/17839063/iss...&page=4>; rel=\"last\"\n\n    is transformed into\n\n    </api/issues?per_page=50&page=2>; rel=\"next\",\n    </api/issues?per_page=50&page=4>; rel=\"last\" etc.\n    \"\"\"\n    header_link_data = parse_header_links(link_header)\n    for data in header_link_data:\n        uri = data['url']\n        uri_tuple = urllib.parse.urlsplit(uri)\n        path = uri_tuple.path\n        query = uri_tuple.query\n        if path.startswith('/repositories/'):\n            # remove repositories and takes the second element\n            # of ['17839063', 'issues/398/comments']\n            path = path.lstrip('/repositories/').split('/', 1)[1]\n        elif path.startswith('/search/issues'):\n            path = 'issues/search'\n        api_path = '{}{}'.format('/api/', path)\n        data['url'] = urllib.parse.urlunsplit(('', '', api_path, query, ''))\n    return format_link_header(header_link_data)\n\n\ndef sanitize_link(link_header):\n    \"\"\"Remove any oauth tokens from the Link header from GitHub.\n\n    see Also rewrite_links.\n    \"\"\"\n    header_link_data = parse_header_links(link_header)\n    for data in header_link_data:\n        data['url'] = remove_oauth(data['url'])\n    return format_link_header(header_link_data)\n\n\ndef remove_oauth(uri):\n    \"\"\"Remove Oauth token from a uri.\n\n    Github returns Oauth tokens in some circumstances. We remove it for\n    avoiding to spill it in public as it's not necessary in Link Header.\n    \"\"\"\n    uri_group = urllib.parse.urlparse(uri)\n    parameters = uri_group.query.split('&')\n    clean_parameters_list = [parameter for parameter in parameters\n                             if not parameter.startswith('access_token=')]\n    clean_parameters = '&'.join(clean_parameters_list)\n    clean_uri = uri_group._replace(query=clean_parameters)\n    return urllib.parse.urlunparse(clean_uri)\n\n\ndef rewrite_and_sanitize_link(link_header):\n    \"\"\"Sanitize and then rewrite a link header.\"\"\"\n    return rewrite_links(sanitize_link(link_header))\n\n\ndef format_link_header(link_header_data):\n    \"\"\"Return a string ready to be used in a Link: header.\"\"\"\n    links = ['<{0}>; rel=\"{1}\"'.format(data['url'], data['rel'])\n             for data in link_header_data]\n    return ', '.join(links)\n\n\ndef get_comment_data(request_data):\n    \"\"\"Return a comment ready to send to GitHub.\n\n    We do this by JSON-encoding the body property\n    of a request's data object.\n    \"\"\"\n    comment_data = json.loads(request_data)\n    return json.dumps({\"body\": comment_data['body']})\n\n\ndef get_fixture_headers(file_data):\n    \"\"\"Return headers to be served with a fixture file.\"\"\"\n    headers = {'content-type': JSON_MIME}\n    data = json.loads(file_data)\n    for item in data:\n        if '_fixtureLinkHeader' in item:\n            headers.update({'link': item['_fixtureLinkHeader']})\n          ",
+      "total_lines": 799
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 637,
+      "end_line": 656,
+      "excerpt": "def prepare_form(form_request):\n    \"\"\"Extract all known information from the form request.\n\n    This is called by /issues/new to prepare needed by the form\n    before being posted on GitHub.\n    For HTTP POST:\n    The JSON content will override any existing URL parameters.\n    The URL parameters will be kept if non-existent in the JSON.\n    \"\"\"\n    form_data = {}\n    form_data['user_agent'] = request.headers.get('User-Agent')\n    form_data['src'] = request.args.get('src')\n    form_data['extra_labels'] = request.args.getlist('label')\n    form_data['url'] = request.args.get('url')\n    # we rely here on the fact we receive the right POST\n    # because we tested it with form_type(request)\n    if form_request.method == 'POST':\n        json_data = form_request.get_json()\n        form_data.update(json_data)\n    return form_data",
+      "symbol_name": "prepare_form",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "webcompat/helpers.py",
+      "sha": "ffa40911b473e32d18298ab408a97cbe44fb6ede",
+      "download_url": "https://raw.githubusercontent.com/webcompat/webcompat.com/main/webcompat/helpers.py"
+    },
+    "imports": {
+      "imports": [
+        "functools:update_wrapper",
+        "functools:wraps",
+        "hashlib",
+        "json",
+        "logging",
+        "os",
+        "math",
+        "random",
+        "re",
+        "urllib.parse",
+        "flask:abort",
+        "flask:g",
+        "flask:make_response",
+        "flask:request",
+        "flask:session",
+        "requests",
+        "requests.utils:parse_header_links",
+        "ua_parser:user_agent_parser",
+        "webcompat:app",
+        "webcompat:github"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/webcompat/webcompat.com/main/README.md",
+      "content_excerpt": "# webcompat.com\n\n\n[![CircleCI](https://circleci.com/gh/webcompat/webcompat.com.svg?style=svg)](https://circleci.com/gh/webcompat/webcompat.com)\n\n[![Twitter](https://img.shields.io/twitter/url/https/github.com/webcompat/webcompat.com.svg?style=social)](https://twitter.com/webcompat)\n\n\n\nThis repository hosts the code which powers the [webcompat.com Web site](http://webcompat.com/).\n\n## Changelog\n\nSee the [CHANGELOG](https://github.com/webcompat/webcompat.com/blob/master/CHANGELOG.md) to track updates.\n\n## Contributing\n\nYour contributions are appreciated which could be; contributing code, design and UX, documentation, feature requests, taking care of bugs or other kinds of issues. For more details, please check out [CONTRIBUTING.md]( https://github.com/webcompat/webcompat.com/blob/master/.github/CONTRIBUTING.md) and for instructions on how to set up a [local build environment](https://github.com/webcompat/webcompat.com/blob/master/docs/dev-env-setup.md). Everyone interacting in our codebases, issue trackers, and any other form of communication, including chat rooms and mailing lists, is expected to follow our [code of conduct](https://github.com/webcompat/webcompat.com/blob/master/CODE_OF_CONDUCT.md) so we can all enjoy the effort we put into this project.\n\n### Assets & Design\n\nSee the [design](https://github.com/webcompat/design) repo and our [Living Style Guide](https://webcompat.github.io/design/).\n\n### License\n\nThis Source Code Form is subject to the terms of the Mozilla Public\nLicense, v. 2.0. If a copy of the MPL was not distributed with this\nfile, You can obtain one at "
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "prepare_form test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_helpers.py",
+          "path": "tests/unit/test_helpers.py",
+          "sha": "e28e544086729066a8f7b1312e840fdd789fb66d",
+          "html_url": "https://github.com/webcompat/webcompat.com/blob/144eb3458acedcac30b20b74c598a19532bc8755/tests/unit/test_helpers.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 22,
+          "end_line": 46,
+          "excerpt": "22: from webcompat.helpers import ab_init\n23: from webcompat.helpers import form_type\n24: from webcompat.helpers import format_link_header\n25: from webcompat.helpers import get_browser\n26: from webcompat.helpers import get_browser_name\n27: from webcompat.helpers import get_name\n28: from webcompat.helpers import get_os\n29: from webcompat.helpers import get_response_headers\n30: from webcompat.helpers import get_serialized_value\n31: from webcompat.helpers import get_version_string\n32: from webcompat.helpers import is_json_object\n33: from webcompat.helpers import normalize_api_params\n34: from webcompat.helpers import prepare_form\n35: from webcompat.helpers import rewrite_and_sanitize_link\n36: from webcompat.helpers import rewrite_links\n37: from webcompat.helpers import sanitize_link\n38: from webcompat.helpers import get_extra_labels\n39: from webcompat.helpers import get_filename_from_url\n40: from webcompat.helpers import is_darknet_domain\n41: from webcompat.helpers import get_domains\n42: \n43: \n44: ACCESS_TOKEN_LINK = '<https://api.github.com/repositories/17839063/issues?per_page=50&page=3&access_token=12345>; rel=\"next\", <https://api.github.com/repositories/17839063/issues?access_token=12345&per_page=50&page=4>; rel=\"last\", <https://api.github.com/repositories/17839063/issues?per_page=50&access_token=12345&page=1>; rel=\"first\", <https://api.github.com/repositories/17839063/issues?per_page=50&page=1&access_token=12345>; rel=\"prev\"'  # noqa\n45: GITHUB_ISSUES_LINK_HEADER = '<https://api.github.com/repositories/17839063/issues?per_page=50&page=3>; rel=\"next\", <https://api.github.com/repositories/17839063/issues?per_page=50&page=4>; rel=\"last\", <https://api.github.com/repositories/17839063/issues?per_page=50&page=1>; rel=\"first\", <https://api.github.com/repositories/17839063/issues?per_page=50&page=1>; rel=\"prev\"'  # noqa\n46: REWRITTEN_ISSUES_LINK_HEADER = '</api/issues?per_page=50&page=3>; rel=\"next\", </api/issues?per_page=50&page=4>; rel=\"last\", </api/issues?per_page=50&page=1>; rel=\"first\", </api/issues?per_page=50&page=1>; rel=\"prev\"'  # noqa",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"prepare_form(\"",
+      "count": 3,
+      "items": [
+        {
+          "name": "views.py",
+          "path": "webcompat/views.py",
+          "sha": "afd9f8592f1817823288eb6036d9706e34ea6127",
+          "html_url": "https://github.com/webcompat/webcompat.com/blob/144eb3458acedcac30b20b74c598a19532bc8755/webcompat/views.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 261,
+          "end_line": 285,
+          "excerpt": "261:         'as': 'script',\n262:         'rel': 'preload'\n263:     })\n264:     # Starting a logger\n265:     log = app.logger\n266:     log.setLevel(logging.INFO)\n267:     if g.user:\n268:         get_user_info()\n269:     # We define which type of requests we are dealing with.\n270:     request_type = form_type(request)\n271:     # Form Prefill section\n272:     if request_type == 'prefill':\n273:         form_data = prepare_form(request)\n274:         bug_form = get_form(form_data, form=FormWizard)\n275:         pagetitle = \"New Issue\"\n276:         session['extra_labels'] = form_data['extra_labels']\n277:         source = form_data.pop('utm_source', None)\n278:         campaign = form_data.pop('utm_campaign', None)\n279:         anonymous_reporting = app.config['ANONYMOUS_REPORTING_ENABLED']\n280:         return render_template('new-issue.html', form=bug_form, source=source,\n281:                                campaign=campaign, nonce=request.nonce,\n282:                                pagetitle=pagetitle,\n283:                                anonymous_reporting=anonymous_reporting)\n284:     # Issue Creation section\n285:     elif request_type == 'create':",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "helpers.py",
+          "path": "webcompat/helpers.py",
+          "sha": "ffa40911b473e32d18298ab408a97cbe44fb6ede",
+          "html_url": "https://github.com/webcompat/webcompat.com/blob/144eb3458acedcac30b20b74c598a19532bc8755/webcompat/helpers.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 637,
+          "end_line": 656,
+          "excerpt": "def prepare_form(form_request):\n    \"\"\"Extract all known information from the form request.\n\n    This is called by /issues/new to prepare needed by the form\n    before being posted on GitHub.\n    For HTTP POST:\n    The JSON content will override any existing URL parameters.\n    The URL parameters will be kept if non-existent in the JSON.\n    \"\"\"\n    form_data = {}\n    form_data['user_agent'] = request.headers.get('User-Agent')\n    form_data['src'] = request.args.get('src')\n    form_data['extra_labels'] = request.args.getlist('label')\n    form_data['url'] = request.args.get('url')\n    # we rely here on the fact we receive the right POST\n    # because we tested it with form_type(request)\n    if form_request.method == 'POST':\n        json_data = form_request.get_json()\n        form_data.update(json_data)\n    return form_data",
+          "symbol_name": "prepare_form",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "test_helpers.py",
+          "path": "tests/unit/test_helpers.py",
+          "sha": "e28e544086729066a8f7b1312e840fdd789fb66d",
+          "html_url": "https://github.com/webcompat/webcompat.com/blob/144eb3458acedcac30b20b74c598a19532bc8755/tests/unit/test_helpers.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 278,
+          "end_line": 302,
+          "excerpt": "278: \n279:     def test_prepare_form_get(self):\n280:         \"\"\"Extract information of a form request with a GET.\"\"\"\n281:         form_data = {'extra_labels': ['type-stylo'],\n282:                      'src': 'web',\n283:                      'user_agent': 'Burger',\n284:                      'url': 'http://example.net/',\n285:                      }\n286:         with webcompat.app.test_request_context(\n287:                 '/issues/new?url=http://example.net/&src=web&label=type-stylo',\n288:                 method='GET',\n289:                 headers={'User-agent': 'Burger'}):\n290:             self.assertEqual(prepare_form(flask.request), form_data)\n291:         # Testing that we keep processing\n292:         # even when some parameters are not defined.\n293:         with webcompat.app.test_request_context(\n294:                 '/issues/new?src=web&label=type-stylo',\n295:                 method='GET',\n296:                 headers={'User-agent': 'Burger'}):\n297:             # URL is not defined\n298:             form_data['url'] = None\n299:             self.assertEqual(prepare_form(flask.request), form_data)\n300:         # Testing with non-valid extra-labels. For now we keep them.\n301:         # They are filtered by form.py\n302:         with webcompat.app.test_request_context(",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "webcompat",
+      "count": 12,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "webcompat/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "api",
+          "path": "webcompat/api",
+          "type": "dir"
+        },
+        {
+          "name": "db",
+          "path": "webcompat/db",
+          "type": "dir"
+        },
+        {
+          "name": "error_handlers",
+          "path": "webcompat/error_handlers",
+          "type": "dir"
+        },
+        {
+          "name": "form.py",
+          "path": "webcompat/form.py",
+          "type": "file"
+        },
+        {
+          "name": "helpers.py",
+          "path": "webcompat/helpers.py",
+          "type": "file"
+        },
+        {
+          "name": "issues.py",
+          "path": "webcompat/issues.py",
+          "type": "file"
+        },
+        {
+          "name": "nsfw.py",
+          "path": "webcompat/nsfw.py",
+          "type": "file"
+        },
+        {
+          "name": "static",
+          "path": "webcompat/static",
+          "type": "dir"
+        },
+        {
+          "name": "templates",
+          "path": "webcompat/templates",
+          "type": "dir"
+        },
+        {
+          "name": "views.py",
+          "path": "webcompat/views.py",
+          "type": "file"
+        },
+        {
+          "name": "webhooks",
+          "path": "webcompat/webhooks",
+          "type": "dir"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "webcompat/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: # -*- coding: utf-8 -*-\n3: # This Source Code Form is subject to the terms of the Mozilla Public\n4: # License, v. 2.0. If a copy of the MPL was not distributed with this\n5: # file, You can obtain one at http://mozilla.org/MPL/2.0/.\n6: \n7: \"\"\"This module powers the webcompat.com Flask application.\"\"\"\n8: \n9: import logging\n10: \n11: from flask import Flask\n12: from flask_firehose import Firehose\n13: from flask_github import GitHub"
+        },
+        {
+          "name": "form.py",
+          "path": "webcompat/form.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: # -*- coding: utf-8 -*-\n3: # This Source Code Form is subject to the terms of the Mozilla Public\n4: # License, v. 2.0. If a copy of the MPL was not distributed with this\n5: # file, You can obtain one at http://mozilla.org/MPL/2.0/.\n6: \n7: \"\"\"IssueForm class module.\n8: \n9: The module powers the issue reporting form on webcompat.com.\n10: It includes helper methods.\n11: \"\"\"\n12: \n13: import json"
+        },
+        {
+          "name": "issues.py",
+          "path": "webcompat/issues.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: # -*- coding: utf-8 -*-\n3: # This Source Code Form is subject to the terms of the Mozilla Public\n4: # License, v. 2.0. If a copy of the MPL was not distributed with this\n5: # file, You can obtain one at http://mozilla.org/MPL/2.0/.\n6: \n7: \"\"\"Module that handles submission of issues via the GitHub API.\n8: \n9: It handles authenticated users and webcompat-bot (proxy) case.\n10: \"\"\"\n11: \n12: import json\n13: "
+        },
+        {
+          "name": "nsfw.py",
+          "path": "webcompat/nsfw.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: #!/usr/bin/env python\n2: # -*- coding: utf-8 -*-\n3: # This Source Code Form is subject to the terms of the Mozilla Public\n4: # License, v. 2.0. If a copy of the MPL was not distributed with this\n5: # file, You can obtain one at http://mozilla.org/MPL/2.0/.\n6: \"\"\"Helpers methods for nsfw detection.\"\"\"\n7: \n8: import re\n9: \n10: from webcompat.db import SiteNSFW\n11: from webcompat.db import site_nsfw_db\n12: from webcompat.helpers import get_domains\n13: "
+        },
+        {
+          "name": "views.py",
+          "path": "webcompat/views.py",
+          "match_reason": "anchor_text",
+          "start_line": 35,
+          "end_line": 59,
+          "excerpt": "35: from webcompat.helpers import add_sec_headers\n36: from webcompat.helpers import cache_policy\n37: from webcompat.helpers import form_type\n38: from webcompat.helpers import get_browser_name\n39: from webcompat.helpers import get_extra_labels\n40: from webcompat.helpers import get_referer\n41: from webcompat.helpers import get_user_info\n42: from webcompat.helpers import is_blocked_domain\n43: from webcompat.helpers import to_str\n44: from webcompat.helpers import is_darknet_domain\n45: from webcompat.helpers import is_valid_issue_form\n46: from webcompat.helpers import mockable_response\n47: from webcompat.helpers import prepare_form\n48: from webcompat.helpers import set_referer\n49: from webcompat.issues import report_issue\n50: from webcompat.templates import bust_cache\n51: from webcompat import app\n52: from webcompat import github\n53: \n54: \n55: @app.teardown_appcontext\n56: def shutdown_session(exception=None):\n57:     \"\"\"Clear the session.\"\"\"\n58:     session_db.remove()\n59: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "webcompat/helpers.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "c4c5c479dc48aeac6727e4c84d01c01326c868be",
+          "html_url": "https://github.com/webcompat/webcompat.com/commit/c4c5c479dc48aeac6727e4c84d01c01326c868be",
+          "message": "Fixes #3784 - Revert BQ and simple form changes",
+          "author": "Ksenia Berezina",
+          "date": "2023-09-28T18:05:19Z"
+        },
+        {
+          "sha": "b4feab440d0b2fd02ba17095d3169248e5386526",
+          "html_url": "https://github.com/webcompat/webcompat.com/commit/b4feab440d0b2fd02ba17095d3169248e5386526",
+          "message": "Issue #3769 - Dual reporter form backend changes",
+          "author": "Ksenia Berezina",
+          "date": "2023-06-20T19:52:02Z"
+        },
+        {
+          "sha": "02c1746c9d1689218c44958a30cf4af5802a2146",
+          "html_url": "https://github.com/webcompat/webcompat.com/commit/02c1746c9d1689218c44958a30cf4af5802a2146",
+          "message": "Fixes #3703 - Automatically label nsfw issues",
+          "author": "Ksenia Berezina",
+          "date": "2022-06-12T23:01:42Z"
+        },
+        {
+          "sha": "1fba90a64484184767b2da9727734f4f1c39eac6",
+          "html_url": "https://github.com/webcompat/webcompat.com/commit/1fba90a64484184767b2da9727734f4f1c39eac6",
+          "message": "issue #3447 - Replaces cutstom link parsing with requests one",
+          "author": "Karl Dubost",
+          "date": "2021-01-18T01:25:45Z"
+        },
+        {
+          "sha": "23f2665af5333ade44833f9c9a71b115f2d9ed52",
+          "html_url": "https://github.com/webcompat/webcompat.com/commit/23f2665af5333ade44833f9c9a71b115f2d9ed52",
+          "message": "issue #3380 - Cleans up code\n\nThese are breadcrumbs of dead code and useless redirection of variables.\n\nLet's remove them before modifying the Form.",
+          "author": "Karl Dubost",
+          "date": "2020-07-14T02:25:59Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "prepare_form XXXTemp Hack user clicked Report",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "webcompat/helpers.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "c4c5c479dc48aeac6727e4c84d01c01326c868be",
+        "html_url": "https://github.com/webcompat/webcompat.com/commit/c4c5c479dc48aeac6727e4c84d01c01326c868be",
+        "message": "Fixes #3784 - Revert BQ and simple form changes",
+        "author": "Ksenia Berezina",
+        "date": "2023-09-28T18:05:19Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 3,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

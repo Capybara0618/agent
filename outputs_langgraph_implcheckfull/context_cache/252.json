@@ -1,0 +1,422 @@
+{
+  "task_id": "252",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T09:18:36+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "__init__",
+    "satd_line": 30,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T09:19:04+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T09:19:12+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+    "original_code": "def sample_boundaries(\n    blocks: List[ObjectRef[Block]], sort_key: SortKey, num_reducers: int\n) -> List[T]:\n    \"\"\"\n    Return (num_reducers - 1) items in ascending order from the blocks that\n    partition the domain into ranges with approximately equally many elements.\n    \"\"\"\n    columns = sort_key.get_columns()\n    # TODO(Clark): Support multiple boundary sampling keys.\n    if len(columns) > 1:\n        raise ValueError(\"Multiple boundary sampling keys not supported.\")\n\n    n_samples = int(num_reducers * 10 / len(blocks))\n\n    sample_block = cached_remote_fn(_sample_block)\n\n    sample_results = [\n        sample_block.remote(block, n_samples, sort_key) for block in blocks\n    ]\n    sample_bar = ProgressBar(\n        SortTaskSpec.SORT_SAMPLE_SUB_PROGRESS_BAR_NAME, len(sample_results)\n    )\n    samples = sample_bar.fetch_until_complete(sample_results)\n    sample_bar.close()\n    del sample_results\n    samples = [s for s in samples if len(s) > 0]\n    # The dataset is empty\n    if len(samples) == 0:\n        return [None] * (num_reducers - 1)\n    builder = DelegatingBlockBuilder()\n    for sample in samples:\n        builder.add_block(sample)\n    samples = builder.build()\n    column = columns[0]\n    sample_items = BlockAccessor.for_block(samples).to_numpy(column)\n    sample_items = np.sort(sample_items)\n    ret = [\n        np.quantile(sample_items, q, interpolation=\"nearest\")\n        for q in np.linspace(0, 1, num_reducers)\n    ]\n    return ret[1:]",
+    "original_signature": "def sample_boundaries(",
+    "satd_comment": "# TODO(Clark): Support multiple boundary sampling keys.",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "sha": "524a04a6e5280920831dde0205ff06ac6bedbd2c",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "content_excerpt": "from typing import TYPE_CHECKING, List, Optional, Tuple, TypeVar, Union\n\nimport numpy as np\n\nfrom ray.data._internal.delegating_block_builder import DelegatingBlockBuilder\nfrom ray.data._internal.planner.exchange.interfaces import ExchangeTaskSpec\nfrom ray.data._internal.progress.progress_bar import ProgressBar\nfrom ray.data._internal.remote_fn import cached_remote_fn\nfrom ray.data._internal.table_block import TableBlockAccessor\nfrom ray.data._internal.util import NULL_SENTINEL\nfrom ray.data.block import Block, BlockAccessor, BlockExecStats\nfrom ray.types import ObjectRef\n\nT = TypeVar(\"T\")\n\nif TYPE_CHECKING:\n    import pyarrow\n\n    from ray.data.block import BlockMetadataWithSchema\n\n\nclass SortKey:\n    \"\"\"SortKey class to convert between different sort args formats.\"\"\"\n\n    def __init__(\n        self,\n        key: Optional[Union[str, List[str]]] = None,\n        descending: Union[bool, List[bool]] = False,\n        boundaries: Optional[List[T]] = None,\n    ):\n        if key is None:\n            key = []\n        if isinstance(key, str):\n            key = [key]\n        if not (isinstance(key, list) and all(isinstance(k, str) for k in key)):\n            raise ValueError(\n                f\"Key must be a string or a list of strings, but got {key}.\"\n            )\n        if isinstance(descending, bool):\n            descending = [descending for _ in key]\n        elif isinstance(descending, list):\n            if len(descending) != len(key):\n                raise ValueError(\n                    \"Length of `descending` does not match the length of the key.\"\n                )\n        self._columns = key\n        self._descending = descending\n        if boundaries:\n            for item in boundaries:\n                if not isinstance(item, (int, float)):\n                    raise ValueError(\n                        \"The type of items in boundaries must be int or float.\"\n                    )\n            boundaries = list(set(boundaries))\n            boundaries.sort()\n        self._boundaries = boundaries\n\n    def get_columns(self) -> List[str]:\n        return self._columns\n\n    def get_descending(self) -> List[bool]:\n        return self._descending\n\n    def to_arrow_sort_args(self) -> List[Tuple[str, str]]:\n        return [\n            (key, \"descending\" if desc else \"ascending\")\n            for key, desc in zip(self._columns, self._descending)\n        ]\n\n    def to_pandas_sort_args(self) -> Tuple[List[str], List[bool]]:\n        return self._columns, [not desc for desc in self._descending]\n\n    def validate_schema(self, schema: Optional[Union[type, \"pyarrow.lib.Schema\"]]):\n        \"\"\"Check the key function is valid on the given schema.\"\"\"\n        if schema is None:\n            # Dataset is empty/cleared, validation not possible.\n            return\n\n        if self._columns and len(schema.names) > 0:\n            schema_names_set = set(schema.names)\n            for column in self._columns:\n                if column not in schema_names_set:\n                    raise ValueError(\n                        f\"You specified the column '{column}', but there's no such \"\n                        \"column in the dataset. The dataset has columns: \"\n                        f\"{schema.names}\"\n                    )\n\n    @property\n    def boundaries(self):\n        return self._boundaries\n\n\nclass SortTaskSpec(ExchangeTaskSpec):\n    \"\"\"\n    The implementation for distributed sort tasks.\n\n    The algorithm is similar to [External Merge Sort]\n    (https://en.wikipedia.org/wiki/External_sorting).\n    Sorting is done in 3 steps: sampling, sorting individual blocks, and\n    merging sorted blocks.\n\n    Sampling (`sample_boundaries`): we get a number of sample items from each block,\n    sort them, and use them to compute boundaries that would partition all items into\n    approximately equal ranges.\n\n    Sorting (`map`): each block is sorted locally, then partitioned into smaller\n    blocks according to the boundaries. Each partitioned block is passed to a merge\n    task.\n\n    Merging (`reduce`): a merge task would receive a block from every worker that\n    consists of items in a certain range. It then merges the sorted blocks into one\n    sorted block and becomes part of the new, sorted block.\n    \"\"\"\n\n    SORT_SAMPLE_SUB_PROGRESS_BAR_NAME = \"Sort Sample\"\n\n    def __init__(\n        self,\n        boundaries: List[T],\n        sort_key: SortKey,\n        batch_format: str,\n    ):\n        super().__init__(\n            map_args=[boundaries, sort_key],\n            reduce_args=[sort_key, batch_format],\n        )\n\n    @staticmethod\n    def map(\n        idx: int,\n        block: Block,\n        output_num_blocks: int,\n        boundaries: List[T],\n        sort_key: SortKey,\n    ) -> List[Union[Block, \"BlockMetadataWithSchema\"]]:\n        stats = BlockExecStats.builder()\n        accessor = BlockAccessor.for_block(block)\n        out = accessor.sort_and_partition(boundaries, sort_key)\n        from ray.data.block import BlockMetadataWithSchema\n\n        meta_with_schema = BlockMetadataWithSchema.from_block(\n            block, block_exec_stats=stats.build()\n        )\n        return out + [meta_with_schema]\n\n    @staticmethod\n    def reduce(\n        sort_key: SortKey,\n        batch_format: str,\n        *mapper_outputs: List[Block],\n        partial_reduce: bool = False,\n    ) -> Tuple[Block, \"BlockMetadataWithSchema\"]:\n        normalized_blocks = TableBlockAccessor.normalize_block_types(\n            mapper_outputs,\n            target_block_type=ExchangeTaskSpec._derive_target_block_type(batch_format),\n        )\n        blocks, meta_with_schema = BlockAccessor.for_block(\n            normalized_blocks[0]\n        ).merge_sorted_blocks(normalized_blocks, sort_key)\n        return blocks, meta_with_schema\n\n    @staticmethod\n    def sample_boundaries(\n        blocks: List[ObjectRef[Block]],\n        sort_key: SortKey,\n        num_reducers: int,\n        sample_bar: Optional[ProgressBar] = None,\n    ) -> List[T]:\n        \"\"\"\n        Return (num_reducers - 1) items in ascending order from the blocks that\n        partition the domain into ranges with approximately equally many elements.\n        Each boundary item is a tuple of a form (col1_value, col2_value, ...).\n        \"\"\"\n        columns = sort_key.get_columns()\n        n_samples = int(num_reducers * 10 / len(blocks))\n\n        sample_block = cached_remote_fn(_sample_block)\n\n        sample_results = [\n            sample_block.remote(block, n_samples, sort_key) for block in blocks\n        ]\n        if sample_bar is None:\n            sample_bar = ProgressBar(\n                SortTaskSpec.SORT_SAMPLE_SUB_PROGRESS_BAR_NAME,\n                len(blocks) * n_samples,\n                unit=\"rows\",\n            )\n        # TODO(zhilong): Update sort sample bar before finished.\n        samples = sample_bar.fetch_until_complete(sample_results)\n        del sample_results\n        samples: List[Block] = [s for s in samples if len(s) > 0]\n        # The dataset is empty\n        if len(samples) == 0:\n            return [None] * (num_reducers - 1)\n\n        # Convert samples to a sorted list[tuple[...]] where each tuple represents a\n        # sample.\n        # TODO: Once we deprecate pandas blocks, we can avoid this conversion and\n        # directly sort the samples.\n        builder = DelegatingBlockBuilder()\n        for sample in samples:\n            builder.add_block(sample)\n        samples_table = builder.build()\n        samples_dict = BlockAccessor.for_block(samples_table).to_numpy(columns=columns)\n        # This zip does the transposition from list of column values to list of tuples.\n        samples_list = list(zip(*samples_dict.values()))\n\n        def is_na(x):\n            # Check if x is None or NaN. Type casting to np.array first to avoid\n            # isnan failing on strings and other types.\n            if x is None:\n                return True\n            x = np.asarray(x)\n            if np.issubdtype(x.dtype, np.number):\n                return np.isnan(x)\n            return False\n\n        # To allow multi-directional sort, we utilize Python's stable sort: we\n        # sort several times with different directions. We do this in reverse, so\n        # that the last key we sort by is the primary sort key passed by the user.\n        for i, desc in list(enumerate(sort_key.get_descending()))[::-1]:\n            # Sort the list, but Nones should be NULL_SENTINEL to ensure safe sorting.\n            samples_list.sort(\n                key=lambda sample: NULL_SENTINEL if is_na(sample[i]) else sample[i],\n                reverse=desc,\n            )\n\n        # Each boundary corresponds to a quantile of the data.\n        quantile_indices = [\n            int(q * (len(samples_list) - 1))\n            for q in np.linspace(0, 1, num_reducers + 1)\n        ]\n        # Exclude the first and last quantiles because they're 0 and 1.\n        return [samples_list[i] for i in quantile_indices[1:-1]]\n\n\ndef _sample_block(block: Block, n_samples: int, sort_key: SortKey) -> Block:\n    return BlockAccessor.for_block(block).sample(n_samples, sort_key)\n",
+      "total_lines": 239
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 30,
+      "start_line": 10,
+      "end_line": 50,
+      "matched_line": "    ):",
+      "excerpt": "10: from ray.data._internal.util import NULL_SENTINEL\n11: from ray.data.block import Block, BlockAccessor, BlockExecStats\n12: from ray.types import ObjectRef\n13: \n14: T = TypeVar(\"T\")\n15: \n16: if TYPE_CHECKING:\n17:     import pyarrow\n18: \n19:     from ray.data.block import BlockMetadataWithSchema\n20: \n21: \n22: class SortKey:\n23:     \"\"\"SortKey class to convert between different sort args formats.\"\"\"\n24: \n25:     def __init__(\n26:         self,\n27:         key: Optional[Union[str, List[str]]] = None,\n28:         descending: Union[bool, List[bool]] = False,\n29:         boundaries: Optional[List[T]] = None,\n30:     ):\n31:         if key is None:\n32:             key = []\n33:         if isinstance(key, str):\n34:             key = [key]\n35:         if not (isinstance(key, list) and all(isinstance(k, str) for k in key)):\n36:             raise ValueError(\n37:                 f\"Key must be a string or a list of strings, but got {key}.\"\n38:             )\n39:         if isinstance(descending, bool):\n40:             descending = [descending for _ in key]\n41:         elif isinstance(descending, list):\n42:             if len(descending) != len(key):\n43:                 raise ValueError(\n44:                     \"Length of `descending` does not match the length of the key.\"\n45:                 )\n46:         self._columns = key\n47:         self._descending = descending\n48:         if boundaries:\n49:             for item in boundaries:\n50:                 if not isinstance(item, (int, float)):"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "__init__",
+      "start_line": 25,
+      "end_line": 56,
+      "source": "    def __init__(\n        self,\n        key: Optional[Union[str, List[str]]] = None,\n        descending: Union[bool, List[bool]] = False,\n        boundaries: Optional[List[T]] = None,\n    ):\n        if key is None:\n            key = []\n        if isinstance(key, str):\n            key = [key]\n        if not (isinstance(key, list) and all(isinstance(k, str) for k in key)):\n            raise ValueError(\n                f\"Key must be a string or a list of strings, but got {key}.\"\n            )\n        if isinstance(descending, bool):\n            descending = [descending for _ in key]\n        elif isinstance(descending, list):\n            if len(descending) != len(key):\n                raise ValueError(\n                    \"Length of `descending` does not match the length of the key.\"\n                )\n        self._columns = key\n        self._descending = descending\n        if boundaries:\n            for item in boundaries:\n                if not isinstance(item, (int, float)):\n                    raise ValueError(\n                        \"The type of items in boundaries must be int or float.\"\n                    )\n            boundaries = list(set(boundaries))\n            boundaries.sort()\n        self._boundaries = boundaries"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 118,
+      "end_line": 127,
+      "excerpt": "    def __init__(\n        self,\n        boundaries: List[T],\n        sort_key: SortKey,\n        batch_format: str,\n    ):\n        super().__init__(\n            map_args=[boundaries, sort_key],\n            reduce_args=[sort_key, batch_format],\n        )",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "sha": "524a04a6e5280920831dde0205ff06ac6bedbd2c",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/python/ray/data/_internal/planner/exchange/sort_task_spec.py"
+    },
+    "imports": {
+      "imports": [
+        "typing:TYPE_CHECKING",
+        "typing:List",
+        "typing:Optional",
+        "typing:Tuple",
+        "typing:TypeVar",
+        "typing:Union",
+        "numpy",
+        "ray.data._internal.delegating_block_builder:DelegatingBlockBuilder",
+        "ray.data._internal.planner.exchange.interfaces:ExchangeTaskSpec",
+        "ray.data._internal.progress.progress_bar:ProgressBar",
+        "ray.data._internal.remote_fn:cached_remote_fn",
+        "ray.data._internal.table_block:TableBlockAccessor",
+        "ray.data._internal.util:NULL_SENTINEL",
+        "ray.data.block:Block",
+        "ray.data.block:BlockAccessor",
+        "ray.data.block:BlockExecStats",
+        "ray.types:ObjectRef",
+        "pyarrow",
+        "ray.data.block:BlockMetadataWithSchema",
+        "ray.data.block:BlockMetadataWithSchema"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/README.rst",
+      "content_excerpt": ".. image:: https://github.com/ray-project/ray/raw/master/doc/source/images/ray_header_logo.png\n\n.. image:: https://readthedocs.org/projects/ray/badge/?version=master\n    :target: http://docs.ray.io/en/master/?badge=master\n\n.. image:: https://img.shields.io/badge/Ray-Join%20Slack-blue\n    :target: https://www.ray.io/join-slack\n\n.. image:: https://img.shields.io/badge/Discuss-Ask%20Questions-blue\n    :target: https://discuss.ray.io/\n\n.. image:: https://img.shields.io/twitter/follow/raydistributed.svg?style=social&logo=twitter\n    :target: https://x.com/raydistributed\n\n.. image:: https://img.shields.io/badge/Get_started_for_free-3C8AE9?logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2F9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAABKElEQVQ4Ea2TvWoCQRRGnWCVWChIIlikC9hpJdikSbGgaONbpAoY8gKBdAGfwkfwKQypLQ1sEGyMYhN1Pd%2B6A8PqwBZeOHt%2FvsvMnd3ZXBRFPQjBZ9K6OY8ZxF%2B0IYw9PW3qz8aY6lk92bZ%2BVqSI3oC9T7%2FyCVnrF1ngj93us%2B540sf5BrCDfw9b6jJ5lx%2FyjtGKBBXc3cnqx0INN4ImbI%2Bl%2BPnI8zWfFEr4chLLrWHCp9OO9j19Kbc91HX0zzzBO8EbLK2Iv4ZvNO3is3h6jb%2BCwO0iL8AaWqB7ILPTxq3kDypqvBuYuwswqo6wgYJbT8XxBPZ8KS1TepkFdC79TAHHce%2F7LbVioi3wEfTpmeKtPRGEeoldSP%2FOeoEftpP4BRbgXrYZefsAI%2BP9JU7ImyEAAAAASUVORK5CYII%3D\n   :target: https://www.anyscale.com/ray-on-anyscale?utm_source=github&utm_medium=ray_readme&utm_campaign=get_started_badge\n\nRay is a unified framework for scaling AI and Python applications. Ray consists of a core distributed runtime and a set of AI libraries for simplifying ML compute:\n\n.. imag"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "__init__ test",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_basic_3.py",
+          "path": "python/ray/tests/test_basic_3.py",
+          "sha": "73b58f7c3ecf80662f1e3985832cf5a1532b22e3",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/python/ray/tests/test_basic_3.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 12,
+          "end_line": 36,
+          "excerpt": "12: import ray\n13: import ray.cluster_utils\n14: from ray._common.test_utils import wait_for_condition\n15: \n16: logger = logging.getLogger(__name__)\n17: \n18: \n19: def test_auto_global_gc(shutdown_only):\n20:     ray.init(num_cpus=1, object_store_memory=100 * 1024 * 1024)\n21: \n22:     @ray.remote\n23:     class Test:\n24:         def __init__(self):\n25:             self.collected = False\n26:             gc.disable()\n27: \n28:             def gc_called(phase, info):\n29:                 self.collected = True\n30: \n31:             gc.callbacks.append(gc_called)\n32: \n33:         def circular_ref(self):\n34:             # 20MB\n35:             buf1 = b\"0\" * (10 * 1024 * 1024)\n36:             buf2 = b\"1\" * (10 * 1024 * 1024)",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test.py",
+          "path": "release/ray_release/test.py",
+          "sha": "3c710a02c5d7328699356501448672fbce382696",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/release/ray_release/test.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 156,
+          "end_line": 180,
+          "excerpt": "156:         return self.status == ResultStatus.SUCCESS.value\n157: \n158: \n159: class Test(dict):\n160:     \"\"\"A class represents a test to run on buildkite\"\"\"\n161: \n162:     KEY_GITHUB_ISSUE_NUMBER = \"github_issue_number\"\n163:     KEY_BISECT_BUILD_NUMBER = \"bisect_build_number\"\n164:     KEY_BISECT_BLAMED_COMMIT = \"bisect_blamed_commit\"\n165:     # a test is high impact if it catches regressions frequently\n166:     KEY_IS_HIGH_IMPACT = \"is_high_impact\"\n167: \n168:     def __init__(self, *args, **kwargs):\n169:         super().__init__(*args, **kwargs)\n170:         self.test_results = None\n171: \n172:     @classmethod\n173:     def from_bazel_event(cls, event: dict, team: str):\n174:         name = event[\"id\"][\"testResult\"][\"label\"]\n175:         system = platform.system().lower()\n176:         return cls(\n177:             {\n178:                 \"name\": f\"{system}:{name}\",\n179:                 \"team\": team,\n180:             }",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_utils.py",
+          "path": "python/ray/_common/test_utils.py",
+          "sha": "552aaeca73fdd8b4020ed37783e415a49870f694",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/python/ray/_common/test_utils.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 40,
+          "end_line": 64,
+          "excerpt": "40:     def text_string_to_metric_families(*args, **kwargs):\n41:         raise ModuleNotFoundError(\"`prometheus_client` not found\")\n42: \n43: \n44: @ray.remote(num_cpus=0)\n45: class SignalActor:\n46:     \"\"\"A Ray actor for coordinating test execution through signals.\n47: \n48:     Useful for testing async coordination, waiting for specific states,\n49:     and synchronizing multiple actors or tasks in tests.\n50:     \"\"\"\n51: \n52:     def __init__(self):\n53:         self.ready_event = asyncio.Event()\n54:         self.num_waiters = 0\n55: \n56:     def send(self, clear: bool = False):\n57:         self.ready_event.set()\n58:         if clear:\n59:             self.ready_event.clear()\n60: \n61:     async def wait(self, should_wait: bool = True):\n62:         if should_wait:\n63:             self.num_waiters += 1\n64:             await self.ready_event.wait()",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_ray_init.py",
+          "path": "python/ray/tests/test_ray_init.py",
+          "sha": "17fdea33ad8264d2ef7d4c9fe8a3b681b1c08af9",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/python/ray/tests/test_ray_init.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 135,
+          "end_line": 159,
+          "excerpt": "135: def test_ray_init_existing_instance_crashed(address):\n136:     ray._private.utils.write_ray_address(\"localhost:6379\")\n137:     try:\n138:         # If no address is specified, we will default to an existing cluster.\n139:         ray_constants.NUM_REDIS_GET_RETRIES = 1\n140:         with pytest.raises(ConnectionError):\n141:             ray.init(address=address)\n142:     finally:\n143:         ray._common.utils.reset_ray_address()\n144: \n145: \n146: class Credentials(grpc.ChannelCredentials):\n147:     def __init__(self, name):\n148:         self.name = name\n149: \n150: \n151: class Stop(Exception):\n152:     def __init__(self, credentials):\n153:         self.credentials = credentials\n154: \n155: \n156: def test_ray_init_credentials_with_client(monkeypatch):\n157:     def mock_init(\n158:         self,\n159:         conn_str=\"\",",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"__init__(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "raydp.rst",
+          "path": "doc/source/ray-more-libs/raydp.rst",
+          "sha": "a227ef1f60461642e42107ff2fabc5b42ea925dd",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/doc/source/ray-more-libs/raydp.rst",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 117,
+          "end_line": 141,
+          "excerpt": "117:   df = spark.range(1, 1000)\n118:   # calculate z = x + 2y + 1000\n119:   df = df.withColumn(\"x\", col(\"id\")*2)\\\n120:     .withColumn(\"y\", col(\"id\") + 200)\\\n121:     .withColumn(\"z\", col(\"x\") + 2*col(\"y\") + 1000)\n122:   \n123:   from raydp.utils import random_split\n124:   train_df, test_df = random_split(df, [0.7, 0.3])\n125: \n126:   # PyTorch Code\n127:   import torch\n128:   class LinearModel(torch.nn.Module):\n129:       def __init__(self):\n130:           super(LinearModel, self).__init__()\n131:           self.linear = torch.nn.Linear(2, 1)\n132: \n133:       def forward(self, x, y):\n134:           x = torch.cat([x, y], dim=1)\n135:           return self.linear(x)\n136: \n137:   model = LinearModel()\n138:   optimizer = torch.optim.Adam(model.parameters())\n139:   loss_fn = torch.nn.MSELoss()\n140: \n141:   def lr_scheduler_creator(optimizer, config):",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "misc.py",
+          "path": "rllib/models/torch/misc.py",
+          "sha": "d91e52c02107157d9b85750261da43bd53eb1497",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/rllib/models/torch/misc.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 319,
+          "end_line": 321,
+          "excerpt": "    def __init__(self, shape: List):\n        super().__init__()\n        self.shape = shape",
+          "symbol_name": "__init__",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "reporters.rst",
+          "path": "doc/source/tune/api/reporters.rst",
+          "sha": "a28c591e18d25e4e6adb8ba4beac5e7900657bf7",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/doc/source/tune/api/reporters.rst",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 48,
+          "end_line": 72,
+          "excerpt": "48: \n49:     from ray.tune.experiment.trial import Trial\n50: \n51:     class ExperimentTerminationReporter(CLIReporter):\n52:         def should_report(self, trials, done=False):\n53:             \"\"\"Reports only on experiment termination.\"\"\"\n54:             return done\n55: \n56:     tuner = tune.Tuner(my_trainable, run_config=ray.tune.RunConfig(progress_reporter=ExperimentTerminationReporter()))\n57:     results = tuner.fit()\n58: \n59:     class TrialTerminationReporter(CLIReporter):\n60:         def __init__(self):\n61:             super(TrialTerminationReporter, self).__init__()\n62:             self.num_terminated = 0\n63: \n64:         def should_report(self, trials, done=False):\n65:             \"\"\"Reports only on trial termination events.\"\"\"\n66:             old_num_terminated = self.num_terminated\n67:             self.num_terminated = len([t for t in trials if t.status == Trial.TERMINATED])\n68:             return self.num_terminated > old_num_terminated\n69: \n70:     tuner = tune.Tuner(my_trainable, run_config=ray.tune.RunConfig(progress_reporter=TrialTerminationReporter()))\n71:     results = tuner.fit()\n72: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "mock.py",
+          "path": "python/ray/tune/utils/mock.py",
+          "sha": "5d7f7c8d2624d00910c170b84d27185f876f3b31",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/python/ray/tune/utils/mock.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 75,
+          "end_line": 76,
+          "excerpt": "    def __init__(self):\n        self._snapshot = []",
+          "symbol_name": "__init__",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "python/ray/data/_internal/planner/exchange",
+      "count": 8,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/data/_internal/planner/exchange/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "aggregate_task_spec.py",
+          "path": "python/ray/data/_internal/planner/exchange/aggregate_task_spec.py",
+          "type": "file"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "python/ray/data/_internal/planner/exchange/interfaces.py",
+          "type": "file"
+        },
+        {
+          "name": "pull_based_shuffle_task_scheduler.py",
+          "path": "python/ray/data/_internal/planner/exchange/pull_based_shuffle_task_scheduler.py",
+          "type": "file"
+        },
+        {
+          "name": "push_based_shuffle_task_scheduler.py",
+          "path": "python/ray/data/_internal/planner/exchange/push_based_shuffle_task_scheduler.py",
+          "type": "file"
+        },
+        {
+          "name": "shuffle_task_spec.py",
+          "path": "python/ray/data/_internal/planner/exchange/shuffle_task_spec.py",
+          "type": "file"
+        },
+        {
+          "name": "sort_task_spec.py",
+          "path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+          "type": "file"
+        },
+        {
+          "name": "split_repartition_task_scheduler.py",
+          "path": "python/ray/data/_internal/planner/exchange/split_repartition_task_scheduler.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/data/_internal/planner/exchange/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "aggregate_task_spec.py",
+          "path": "python/ray/data/_internal/planner/exchange/aggregate_task_spec.py",
+          "match_reason": "symbol_match",
+          "start_line": 32,
+          "end_line": 42,
+          "excerpt": "    def __init__(\n        self,\n        boundaries: List[KeyType],\n        key: SortKey,\n        aggs: List[AggregateFn],\n        batch_format: str,\n    ):\n        super().__init__(\n            map_args=[boundaries, key, aggs],\n            reduce_args=[key, aggs, batch_format],\n        )"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "python/ray/data/_internal/planner/exchange/interfaces.py",
+          "match_reason": "symbol_match",
+          "start_line": 40,
+          "end_line": 44,
+          "excerpt": "    def __init__(self, map_args: List[Any] = None, reduce_args: List[Any] = None):\n        self._map_args = map_args or []\n        self._reduce_args = reduce_args or []\n        assert isinstance(self._map_args, list)\n        assert isinstance(self._reduce_args, list)"
+        },
+        {
+          "name": "pull_based_shuffle_task_scheduler.py",
+          "path": "python/ray/data/_internal/planner/exchange/pull_based_shuffle_task_scheduler.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import logging\n2: from typing import Any, Dict, List, Optional, Tuple\n3: \n4: from ray._private.ray_constants import CALLER_MEMORY_USAGE_PER_OBJECT_REF\n5: from ray.data._internal.execution.interfaces import RefBundle, TaskContext\n6: from ray.data._internal.planner.exchange.interfaces import (\n7:     ExchangeTaskScheduler,\n8:     ExchangeTaskSpec,\n9: )\n10: from ray.data._internal.remote_fn import cached_remote_fn\n11: from ray.data._internal.stats import StatsDict\n12: from ray.data._internal.util import (\n13:     convert_bytes_to_human_readable_str,"
+        },
+        {
+          "name": "push_based_shuffle_task_scheduler.py",
+          "path": "python/ray/data/_internal/planner/exchange/push_based_shuffle_task_scheduler.py",
+          "match_reason": "symbol_match",
+          "start_line": 245,
+          "end_line": 251,
+          "excerpt": "    def __init__(self, input_blocks_list, shuffle_map, map_args):\n        self._input_blocks_list = input_blocks_list\n        self._shuffle_map = shuffle_map\n        self._map_args = map_args\n\n        self._mapper_idx = 0\n        self._map_results = []"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "0906625f0d80cc9d6d60aa7f9e8b1a51b7c04650",
+          "html_url": "https://github.com/ray-project/ray/commit/0906625f0d80cc9d6d60aa7f9e8b1a51b7c04650",
+          "message": "[Data] Added metrics to track task scheduling time, output backpressure (#61192)\n\n## Description\n\nThis change adds ability to track\n\n- *Cumulative tasks output back-pressure*: tracks how many time\nindividual task had results ready to be consumed but there was no Object\nStore budget to consume it\n- *",
+          "author": "Alexey Kudinkin",
+          "date": "2026-02-27T02:39:29Z"
+        },
+        {
+          "sha": "f6140ce9b27d6bd9507a5a4014060856843293f2",
+          "html_url": "https://github.com/ray-project/ray/commit/f6140ce9b27d6bd9507a5a4014060856843293f2",
+          "message": "[Data] Progress Reporting Refactor 2 (#59629)\n\n## Description\nFollow up to #59350\n- motivation: better abstraction for progress bars and type checking in\ngeneral.\n\n## Related issues\nN/A\n\n## Additional information\nN/A\n\n---------\n\nSigned-off-by: kyuds <kyuseung1016@gmail.com>\nSigned-off-by: Daniel Shi",
+          "author": "Daniel Shin",
+          "date": "2025-12-26T19:01:44Z"
+        },
+        {
+          "sha": "a1b9dc627c7ab0b31ae5df03892f4d49192463e4",
+          "html_url": "https://github.com/ray-project/ray/commit/a1b9dc627c7ab0b31ae5df03892f4d49192463e4",
+          "message": "Remove Schema From BlockMetadata (#53454)\n\nCurrently, each block has a schema. If there are many blocks in a ref\nbundle, then that schema is duplicated everywhere. we should attach the\nconcept of schema at the dataset/operator level, not block/bundle level.\nThis PR removes schema from blockmetadata,",
+          "author": "iamjustinhsu",
+          "date": "2025-06-12T20:27:26Z"
+        },
+        {
+          "sha": "2cc71a821b1b3d24d233b70dd3c7388cdfc82c87",
+          "html_url": "https://github.com/ray-project/ray/commit/2cc71a821b1b3d24d233b70dd3c7388cdfc82c87",
+          "message": "[Data] Abstracting common methods, removing duplication in `ArrowBlockAccessor`, `PandasBlockAccessor` (#50498)\n\n## Why are these changes needed?\n\nAbstracting common methods, removing duplication in\n`ArrowBlockAccessor`, `PandasBlockAccessor`.\n\n---------\n\nSigned-off-by: Alexey Kudinkin <ak@anyscale.",
+          "author": "Alexey Kudinkin",
+          "date": "2025-02-14T00:10:17Z"
+        },
+        {
+          "sha": "4fae7f2df167755431a21426178910c1b5433b13",
+          "html_url": "https://github.com/ray-project/ray/commit/4fae7f2df167755431a21426178910c1b5433b13",
+          "message": "[Data] Added support for type promotions  (#50231)\n\n\r\n- Adds support for type promotions when unifying schemas b/w the blocks (not supported for PA < 14.0)\r\n- Fixes semantic around np.nan handling for Pandas/Arrow blocks\r\n- Enables all tests to run against every implementation of shuffling\r\n- Makes ",
+          "author": "Alexey Kudinkin",
+          "date": "2025-02-05T18:32:14Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "__init__ TODO Clark Support multiple boundary",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "satd_line": 30,
+      "last_commit": {
+        "sha": "0906625f0d80cc9d6d60aa7f9e8b1a51b7c04650",
+        "html_url": "https://github.com/ray-project/ray/commit/0906625f0d80cc9d6d60aa7f9e8b1a51b7c04650",
+        "message": "[Data] Added metrics to track task scheduling time, output backpressure (#61192)\n\n## Description\n\nThis change adds ability to track\n\n- *Cumulative tasks output back-pressure*: tracks how many time\nindividual task had results ready to be consumed but there was no Object\nStore budget to consume it\n- *",
+        "author": "Alexey Kudinkin",
+        "date": "2026-02-27T02:39:29Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "__init__",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

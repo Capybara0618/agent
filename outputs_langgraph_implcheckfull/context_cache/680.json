@@ -1,0 +1,370 @@
+{
+  "task_id": "680",
+  "repo_owner": "centerforopenscience",
+  "repo_name": "osf.io",
+  "file_path": "framework/auth/views.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T14:37:45+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 1,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T14:38:21+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T14:38:27+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "framework/auth/views.py",
+    "original_code": "def forgot_password_post():\n    \"\"\"Attempt to send user password reset or return respective error.\n    \"\"\"\n    form = ForgotPasswordForm(request.form, prefix='forgot_password')\n\n    if form.validate():\n        email = form.email.data\n        status_message = ('If there is an OSF account associated with {0}, an email with instructions on how to reset '\n                          'the OSF password has been sent to {0}. If you do not receive an email and believe you '\n                          'should have, please contact OSF Support. ').format(email)\n        user_obj = get_user(email=email)\n        if user_obj:\n            #TODO: Remove this rate limiting and replace it with something that doesn't write to the User model\n            now = datetime.datetime.utcnow()\n            last_attempt = user_obj.forgot_password_last_post or now - datetime.timedelta(seconds=FORGOT_PASSWORD_MINIMUM_TIME)\n            user_obj.forgot_password_last_post = now\n            time_since_last_attempt = now - last_attempt\n            if time_since_last_attempt.seconds >= FORGOT_PASSWORD_MINIMUM_TIME:\n                user_obj.verification_key = security.random_string(20)\n                user_obj.save()\n                reset_link = \"http://{0}{1}\".format(\n                    request.host,\n                    web_url_for(\n                        'reset_password',\n                        verification_key=user_obj.verification_key\n                    )\n                )\n                mails.send_mail(\n                    to_addr=email,\n                    mail=mails.FORGOT_PASSWORD,\n                    reset_link=reset_link\n                )\n                status.push_status_message(status_message, 'success')\n            else:\n                user_obj.save()\n                status.push_status_message('You have recently requested to change your password. Please wait a little '\n                                           'while before trying again.', 'error')\n        else:\n            status.push_status_message(status_message, 'success')\n    forms.push_errors_to_status(form.errors)\n    return auth_login(forgot_password_form=form)",
+    "original_signature": "def forgot_password_post():",
+    "satd_comment": "#TODO: Remove this rate limiting and replace it with something that doesn't write to the User model",
+    "target_file": {
+      "ok": true,
+      "path": "framework/auth/views.py",
+      "sha": "aefb1b4f0e858192d53e79da8a631a09d277b9ce",
+      "download_url": "https://raw.githubusercontent.com/CenterForOpenScience/osf.io/develop/framework/auth/views.py",
+      "content_excerpt": "from furl import furl, urljoin\nfrom rest_framework import status as http_status\nfrom urllib.parse import urlencode\n\nimport markupsafe\nfrom django.core.exceptions import ValidationError\nfrom django.utils import timezone\nfrom flask import request\n\nfrom addons.osfstorage.models import Region\nfrom framework import forms, sentry, status\nfrom framework import auth as framework_auth\nfrom framework.auth import exceptions\nfrom framework.auth import cas, campaigns\nfrom framework.auth import logout as osf_logout\nfrom framework.auth import get_user\nfrom framework.auth.exceptions import DuplicateEmailError, ExpiredTokenError, InvalidTokenError\nfrom framework.auth.core import generate_verification_key\nfrom framework.auth.decorators import block_bing_preview, collect_auth, must_be_logged_in\nfrom framework.auth.forms import ResendConfirmationForm, ForgotPasswordForm, ResetPasswordForm\nfrom framework.auth.utils import ensure_external_identity_uniqueness, validate_recaptcha\nfrom framework.celery_tasks.handlers import enqueue_task\nfrom framework.exceptions import HTTPError\nfrom framework.flask import redirect  # VOL-aware redirect\nfrom framework.postcommit_tasks.handlers import enqueue_postcommit_task\nfrom framework.sessions.utils import remove_sessions_for_user\nfrom framework.sessions import get_session\nfrom framework.utils import throttle_period_expired\nfrom osf.models import OSFUser, NotificationTypeEnum\nfrom osf.utils.sanitize import strip_html\nfrom website import settings, language\nfrom website.util import web_url_for\nfrom osf.exceptions import ValidationValueError, BlockedEmailError\nfrom osf.models.provider import PreprintProvider\nfrom osf.models.tag import Tag\nfrom osf.utils.requests import check_select_for_update\nfrom website.util.metrics import CampaignClaimedTags, CampaignSourceTags\nfrom website.ember_osf_web.decorators import ember_flag_is_active\nfrom osf import features\n\n\n@block_bing_preview\n@collect_auth\ndef reset_password_get(auth, uid=None, token=None):\n    \"\"\"Identical to ``reset_password_institution_get`` b/c ``website/routes.py`` framework requires\n    unique view methods for routes using the same renderer/template.\"\"\"\n    return _reset_password_get(auth, uid=uid, token=token)\n\n\n@block_bing_preview\n@collect_auth\ndef reset_password_institution_get(auth, uid=None, token=None):\n    \"\"\"Identical to ``reset_password_get`` b/c ``website/routes.py`` framework requires unique view\n    methods for routes using the same renderer/template.\"\"\"\n    return _reset_password_get(auth, uid=uid, token=token, institutional=True)\n\n\ndef _reset_password_get(auth, uid=None, token=None, institutional=False):\n    \"\"\"\n    View for user to land on the reset password page.  Takes a unique token generated by the\n    forgot-password page and (if valid) grants the user a new temporary token to allow them to\n    reset their password.  User is redirected to the reset password page.  If token is not valid,\n    returns an error page and 400 Bad Request status code.\n\n    HTTP Method: GET\n\n    :param auth: the authentication state\n    :param uid: the user id\n    :param token: the token in verification key\n    :param institutional: is this the institutional reset password page?\n    :return\n    :raises: HTTPError(http_status.HTTP_400_BAD_REQUEST) if verification key for the user is invalid, has expired or was used\n    \"\"\"\n\n    # if users are logged in, log them out and redirect back to this page\n    if auth.logged_in:\n        return auth_logout(redirect_url=request.url)\n\n    # Check if request bears a valid pair of `uid` and `token`\n    user_obj = OSFUser.load(uid)\n    if not (user_obj and user_obj.verify_password_token(token=token)):\n        error_data = {\n            'message_short': 'Invalid Request.',\n            'message_long': 'The requested URL is invalid, has expired, or was already used',\n        }\n        raise HTTPError(http_status.HTTP_400_BAD_REQUEST, data=error_data)\n\n    # override routes.py login_url to redirect to dashboard\n    service_url = web_url_for('dashboard', _absolute=True)\n\n    return {\n        'uid': user_obj._id,\n        'token': user_obj.verification_key_v2['token'],\n        'login_url': service_url,\n        'isInstitutional': institutional,\n        # view knows paths better than template\n        'resetPath': 'resetpassword-institution' if institutional else 'resetpassword',\n    }\n\n\ndef reset_password_post(uid=None, token=None):\n    \"\"\"\n    View for user to submit reset password form.  Accepts a temporary password token.  If password\n    token is valid, reset user's password to the value from the submitted form.\n\n    HTTP Method: POST\n\n    :param uid: the user id\n    :param token: the token in verification key\n    :return:\n    :raises: HTTPError(http_status.HTTP_400_BAD_REQUEST) if verification key for the user is invalid, has expired or was used\n    \"\"\"\n\n    form = ResetPasswordForm(request.form)\n\n    # Check if request bears a valid pair of `uid` and `token`\n    user_obj = OSFUser.load(uid)\n    if not (user_obj and user_obj.verify_password_token(token=token)):\n        error_data = {\n            'message_short': 'Invalid Request.',\n            'message_long': 'The requested URL is invalid, has expired, or was already used',\n        }\n        raise HTTPError(http_status.HTTP_400_BAD_REQUEST, data=error_data)\n\n    if not form.validate():\n        # Don't go anywhere\n        forms.push_errors_to_status(form.errors)\n    else:\n        # clear verification key (v2)\n        user_obj.verification_key_v2 = {}\n        # new verification key (v1) for CAS\n        user_obj.verification_key = generate_verification_key(verification_type=None)\n        try:\n            user_obj.set_password(form.password.data)\n            osf4m_source_tag, created = Tag.all_tags.get_or_create(name=CampaignSourceTags.Osf4m.value, system=True)\n            osf4m_claimed_tag, created = Tag.all_tags.get_or_create(name=CampaignClaimedTags.Osf4m.value, system=True)\n            if user_obj.all_tags.filter(id=osf4m_source_tag.id, system=True).exists():\n                user_obj.add_system_tag(osf4m_claimed_tag)\n            user_obj.save()\n        except exceptions.ChangePasswordError as error:\n            for message in error.messages:\n                status.push_status_message(message, kind='warning', trust=False)\n        else:\n            status.push_status_message('Password reset', kind='success', trust=False)\n            # redirect to CAS and authenticate the user automatically with one-time verification key.\n            return redirect(cas.get_login_url(\n                web_url_for('user_account', _absolute=True),\n                username=user_obj.username,\n                verification_key=user_obj.verification_key\n            ))\n\n    return {\n        'uid': user_obj._id,\n        'token': user_obj.verification_key_v2['token'],\n    }\n\n\ndef reset_password_institution_post(uid=None, token=None):\n    \"\"\"Behaves identically to ``reset_password_post``, so just dispatch to that method\"\"\"\n    return reset_password_post(uid=uid, token=token)\n\n\n@collect_auth\ndef forgot_password_get(auth):\n    \"\"\"\n    View for user to land on the forgot password page.  Logs user out if they are already logged\n    in.\n\n    HTTP Method: GET\n\n    :param auth: the authentication context\n    :return\n    \"\"\"\n\n    # if users are logged in, log them out and redirect back to this page\n    if auth.logged_in:\n        return auth_logout(redirect_url=request.url)\n\n    #overriding the routes.py sign in url to redirect to the dashboard after login\n    context = {}\n    context['login_url'] = web_url_for('dashboard', _absolute=True)\n\n    return context\n\n\n@collect_auth\ndef redirect_unsupported_institution(auth):\n    \"\"\"\n    Sends user back to the \"Unsupported Institution\" page on CAS. Logs user out if they are\n    already logged in.\n\n    HTTP Method: GET\n\n    :param auth: the authentication context\n    :return\n    \"\"\"\n\n    cas_unsupp_inst_url = cas.get_login_url('', campaign='unsupportedinstitution')\n\n    # if users are logged in, log them out and redirect back to this page\n    if auth.logged_in:\n        return auth_logout(redirect_url=cas_unsupp_inst_url)\n\n    return redirect(cas_unsupp_inst_url)\n\n\ndef forgot_password_post():\n    \"\"\"Dispatches to ``_forgot_password_post`` passing non-institutional user mail template\n    and reset action.\"\"\"\n    return _forgot_password_post(\n        notificaton_type=NotificationTypeEnum.USER_FORGOT_PASSWORD,\n        reset_route='reset_password_get'\n    )\n\n\ndef forgot_password_institution_post():\n    \"\"\"Dispatches to `_forgot_password_post` passing institutional user mail template, reset\n    action, and setting the ``institutional`` flag.\"\"\"\n    return _forgot_password_post(\n        notificaton_type=NotificationTypeEnum.USER_FORGOT_PASSWORD_INSTITUTION,\n        reset_route='reset_password_institution_get',\n        institutional=True\n    )\n\n\ndef _forgot_password_post(notificaton_type, reset_route, institutional=False):\n    \"\"\"\n    View for user to submit forgot password form (standard or institutional).  Validates submitted\n    form and sends reset-password link via email if valid.  If user has submitted another password\n    reset request recently, declines to create a new one and asks the user to not submit again for\n    awhile.\n\n    Standard and institutional forgot-password requests behave similarly but use slightly different\n    language and interfaces. When an institution is deactivated, the user should be given the\n    opportunity to reclaim their account. CAS co-ops the forgot-password functionality to send a\n    \"set a new password\" email link to the institutional user.  The language of the email has been\n    adjusted from the standard context, the response html the status message from the reset\n    action is displayed as regular text, and the password form is not shown.\n\n    HTTP Method: POST\n    :return {}\n    \"\"\"\n\n    form = ForgotPasswordForm(request.form, prefix='forgot_password')\n\n    if not form.validate():\n        # Don't go anywhere\n        forms.push_errors_to_status(form.errors)\n    else:\n        email = form.email.data\n        status_message = (\n            f'If there is an OSF account associated with {email}, an email with instructions on how to '\n            f'reset the OSF password has been sent to {email}. If you do not receive an email and believe '\n            'you should have, please contact OSF Support. '\n        )\n        kind = 'success'\n        # check if the user exists\n        user_obj = get_user(email=email)\n        if user_obj:\n            # rate limit forgot_password_post\n            if not throttle_period_expired(user_obj.email_last_sent, settings.SEND_EMAIL_THROTTLE):\n                status_message = 'You have recently requested to change your password. Please wait a few minutes ' \\\n                                 'before trying again.'\n                kind = 'error'\n            # TODO [OSF-6673]: Use the feature in [OSF-6998] for user to resend claim email.\n            elif user_obj.is_active:\n                # new random verification key (v2)\n                user_obj.verification_key_v2 = generate_verification_key(verification_type='password')\n                user_obj.email_last_sent = timezone.now()\n                user_obj.save()\n                reset_link = urljoin(\n                    settings.DOMAIN,\n                    web_url_for(\n                        reset_route,\n                        uid=user_obj._id,\n                        token=user_obj.verification_key_v2['token']\n                    )\n                )\n                notificaton_type.instance.emit(\n                    user=user_obj,\n                    event_context={\n                        'reset_link': reset_link,\n                    },\n                )\n\n        # institutional forgot password page displays the message as main text, not as an alert\n        if institutional:\n            # pass isError instead of kind to template to decouple python error flag from template's\n            # css class\n            return {'me",
+      "total_lines": 1251
+    },
+    "satd_window": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "satd_comment_not_found"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 207,
+      "end_line": 213,
+      "excerpt": "def forgot_password_post():\n    \"\"\"Dispatches to ``_forgot_password_post`` passing non-institutional user mail template\n    and reset action.\"\"\"\n    return _forgot_password_post(\n        notificaton_type=NotificationTypeEnum.USER_FORGOT_PASSWORD,\n        reset_route='reset_password_get'\n    )",
+      "symbol_name": "forgot_password_post",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "framework/auth/views.py",
+      "sha": "aefb1b4f0e858192d53e79da8a631a09d277b9ce",
+      "download_url": "https://raw.githubusercontent.com/CenterForOpenScience/osf.io/develop/framework/auth/views.py"
+    },
+    "imports": {
+      "imports": [
+        "furl:furl",
+        "furl:urljoin",
+        "rest_framework:status",
+        "urllib.parse:urlencode",
+        "markupsafe",
+        "django.core.exceptions:ValidationError",
+        "django.utils:timezone",
+        "flask:request",
+        "addons.osfstorage.models:Region",
+        "framework:forms",
+        "framework:sentry",
+        "framework:status",
+        "framework:auth",
+        "framework.auth:exceptions",
+        "framework.auth:cas",
+        "framework.auth:campaigns",
+        "framework.auth:logout",
+        "framework.auth:get_user",
+        "framework.auth.exceptions:DuplicateEmailError",
+        "framework.auth.exceptions:ExpiredTokenError",
+        "framework.auth.exceptions:InvalidTokenError",
+        "framework.auth.core:generate_verification_key",
+        "framework.auth.decorators:block_bing_preview",
+        "framework.auth.decorators:collect_auth",
+        "framework.auth.decorators:must_be_logged_in",
+        "framework.auth.forms:ResendConfirmationForm",
+        "framework.auth.forms:ForgotPasswordForm",
+        "framework.auth.forms:ResetPasswordForm",
+        "framework.auth.utils:ensure_external_identity_uniqueness",
+        "framework.auth.utils:validate_recaptcha"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/CenterForOpenScience/osf.io/develop/README.md",
+      "content_excerpt": "# OSF\n\nThe code for [https://osf.io](https://osf.io).\n\n- `master` ![Build Status](https://github.com/CenterForOpenScience/osf.io/workflows/osf.io/badge.svg?branch=master)\n- `develop` ![Build Status](https://github.com/CenterForOpenScience/osf.io/workflows/osf.io/badge.svg?branch=develop)\n- Versioning Scheme:  [![CalVer Scheme](https://img.shields.io/badge/calver-YY.MINOR.MICRO-22bfda.svg)](http://calver.org)\n- Issues: https://github.com/CenterForOpenScience/osf.io/issues?state=open\n- COS Development Docs: http://cosdev.readthedocs.org/\n\n## Running the OSF For Development\n\nTo run the OSF for local development, see [README-docker-compose.md](https://github.com/CenterForOpenScience/osf.io/blob/develop/README-docker-compose.md).\n\nOptional, but recommended: To set up pre-commit hooks (will run\nformatters and linters on staged files):\n\n```\npip install pre-commit\n\npre-commit install --allow-missing-config\n```\n\n## More Resources\n\nThe [COS Development Docs](http://cosdev.readthedocs.org/) provide detailed information about all aspects of OSF development.\nThis includes style guides, process docs, troubleshooting, and more.\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "forgot_password_post test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_forgot_password.py",
+          "path": "tests/test_forgot_password.py",
+          "sha": "3e8bacaf1a1a3b24375235a1bc46b254661029eb",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/blob/231bf1bab8ae418b2436f6a114640b39ca578d2b/tests/test_forgot_password.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 8,
+          "end_line": 32,
+          "excerpt": "8: )\n9: from tests.utils import capture_notifications\n10: from website.util import web_url_for\n11: from tests.test_webtests import assert_in_html, assert_not_in_html\n12: \n13: class TestForgotPassword(OsfTestCase):\n14: \n15:     def setUp(self):\n16:         super().setUp()\n17:         self.user = UserFactory()\n18:         self.auth_user = AuthUserFactory()\n19:         self.get_url = web_url_for('forgot_password_get')\n20:         self.post_url = web_url_for('forgot_password_post')\n21:         self.user.verification_key_v2 = {}\n22:         self.user.save()\n23: \n24: \n25:     # log users out before they land on forgot password page\n26:     def test_forgot_password_logs_out_user(self):\n27:         # visit forgot password link while another user is logged in\n28:         res = self.app.get(self.get_url, auth=self.auth_user.auth)\n29:         # check redirection to CAS logout\n30:         assert res.status_code == 302\n31:         location = res.headers.get('Location')\n32:         assert 'reauth' not in location",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"forgot_password_post(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "views.py",
+          "path": "framework/auth/views.py",
+          "sha": "aefb1b4f0e858192d53e79da8a631a09d277b9ce",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/blob/231bf1bab8ae418b2436f6a114640b39ca578d2b/framework/auth/views.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 207,
+          "end_line": 213,
+          "excerpt": "def forgot_password_post():\n    \"\"\"Dispatches to ``_forgot_password_post`` passing non-institutional user mail template\n    and reset action.\"\"\"\n    return _forgot_password_post(\n        notificaton_type=NotificationTypeEnum.USER_FORGOT_PASSWORD,\n        reset_route='reset_password_get'\n    )",
+          "symbol_name": "forgot_password_post",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "framework/auth",
+      "count": 13,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "framework/auth/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "campaigns.py",
+          "path": "framework/auth/campaigns.py",
+          "type": "file"
+        },
+        {
+          "name": "cas.py",
+          "path": "framework/auth/cas.py",
+          "type": "file"
+        },
+        {
+          "name": "core.py",
+          "path": "framework/auth/core.py",
+          "type": "file"
+        },
+        {
+          "name": "decorators.py",
+          "path": "framework/auth/decorators.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "framework/auth/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "forms.py",
+          "path": "framework/auth/forms.py",
+          "type": "file"
+        },
+        {
+          "name": "oauth_scopes.py",
+          "path": "framework/auth/oauth_scopes.py",
+          "type": "file"
+        },
+        {
+          "name": "signals.py",
+          "path": "framework/auth/signals.py",
+          "type": "file"
+        },
+        {
+          "name": "signing.py",
+          "path": "framework/auth/signing.py",
+          "type": "file"
+        },
+        {
+          "name": "tasks.py",
+          "path": "framework/auth/tasks.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "framework/auth/utils.py",
+          "type": "file"
+        },
+        {
+          "name": "views.py",
+          "path": "framework/auth/views.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "framework/auth/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import uuid\n2: \n3: from django.utils import timezone\n4: \n5: from framework import bcrypt, sentry\n6: from framework.auth import signals\n7: from framework.auth.core import Auth\n8: from framework.auth.core import get_user, generate_verification_key\n9: from framework.auth.exceptions import DuplicateEmailError, MultipleSSOEmailError\n10: from framework.auth.tasks import update_user_from_activity\n11: from framework.auth.utils import LogLevel, print_cas_log\n12: from framework.celery_tasks.handlers import enqueue_task\n13: from framework.sessions import get_session, create_session"
+        },
+        {
+          "name": "campaigns.py",
+          "path": "framework/auth/campaigns.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from furl import furl\n2: import threading\n3: \n4: from django.utils import timezone\n5: \n6: from website import settings\n7: from osf.models import PreprintProvider, NotificationTypeEnum\n8: from website.settings import DOMAIN, CAMPAIGN_REFRESH_THRESHOLD\n9: from website.util.metrics import OsfSourceTags, OsfClaimedTags, CampaignSourceTags, CampaignClaimedTags, provider_source_tag\n10: from framework.utils import throttle_period_expired\n11: \n12: \n13: mutex = threading.Lock()"
+        },
+        {
+          "name": "cas.py",
+          "path": "framework/auth/cas.py",
+          "match_reason": "anchor_text",
+          "start_line": 11,
+          "end_line": 35,
+          "excerpt": "11: from framework.auth import authenticate, external_first_login_authenticate\n12: from framework.auth.core import get_user, generate_verification_key\n13: from framework.auth.utils import print_cas_log, LogLevel\n14: from framework.celery_tasks.handlers import enqueue_task\n15: from framework.flask import redirect\n16: from framework.exceptions import HTTPError\n17: from website import settings\n18: \n19: \n20: class CasError(HTTPError):\n21:     \"\"\"General CAS-related error.\"\"\"\n22: \n23:     pass\n24: \n25: \n26: class CasHTTPError(CasError):\n27:     \"\"\"Error raised when an unexpected error is returned from the CAS server.\"\"\"\n28: \n29:     def __init__(self, code, message, headers, content):\n30:         super().__init__(code, message)\n31:         self.headers = headers\n32:         self.content = content\n33: \n34:     def __repr__(self):\n35:         return ('CasHTTPError({self.message!r}, {self.code}, '"
+        },
+        {
+          "name": "core.py",
+          "path": "framework/auth/core.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import datetime as dt\n2: \n3: import logging\n4: \n5: from django.utils import timezone\n6: from django.db.models import Q\n7: from django.db.models import Subquery\n8: from django.core.validators import URLValidator\n9: from flask import request\n10: \n11: from framework.sessions import get_session\n12: from osf.exceptions import ValidationValueError, ValidationError\n13: from osf.utils.requests import check_select_for_update"
+        },
+        {
+          "name": "decorators.py",
+          "path": "framework/auth/decorators.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from time import time\n2: from rest_framework import status as http_status\n3: from functools import wraps\n4: from flask import request\n5: \n6: from framework.auth import cas\n7: from framework.auth import signing\n8: from framework.flask import redirect\n9: from framework.exceptions import HTTPError\n10: from framework.auth.core import Auth\n11: from website import settings\n12: \n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "framework/auth/views.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "31048c7e2ede4df78828f52ca3b2a97959ec9bad",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/commit/31048c7e2ede4df78828f52ca3b2a97959ec9bad",
+          "message": "[ENG-10538] Post-NR Project PR (#11623)\n\n* Create global_file_updated and global_reviews subscriptions if missing\n* Use USER_FILE_UPDATED for group global_file_updated\n* Use REVIEWS_SUBMISSION_STATUS for group global_reviews\n* Add missing `is_digest=True` for new OSF user subscriptions\n* Extend otf ",
+          "author": "Ostap-Zherebetskyi",
+          "date": "2026-03-13T13:43:07Z"
+        },
+        {
+          "sha": "7f351e2e1729995f5ab3d33140040cd45f67544c",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/commit/7f351e2e1729995f5ab3d33140040cd45f67544c",
+          "message": "Add logout query parameter to confirmation email URL",
+          "author": "Ostap Zherebetskyi",
+          "date": "2026-01-02T14:06:05Z"
+        },
+        {
+          "sha": "c40438fe6dab8ab2b4f7d1fc7b6b94d33ccfc31a",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/commit/c40438fe6dab8ab2b4f7d1fc7b6b94d33ccfc31a",
+          "message": "[ENG-7812] Notification Refactor Phase 2 - Project PR (#11498)\n\nNotification refactor project - phase 2\n\n---------\n\nCo-authored-by: Ostap Zherebetskyi <ozherebetskyi@exoft.net>\nCo-authored-by: Bohdan Odintsov <bodintsov@exoft.net>\nCo-authored-by: John Tordoff <>",
+          "author": "Longze Chen",
+          "date": "2026-01-01T18:00:07Z"
+        },
+        {
+          "sha": "64f0d9a6b1cb9da7a04160970c515de1faa880d9",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/commit/64f0d9a6b1cb9da7a04160970c515de1faa880d9",
+          "message": "Feature/pbs 25 21 (#11468)\n\n* [ENG-8769] Update waitress (#11290)\n\n* [ENG-8177] Institution dashboard not showing user affiliations for Projects, Registrations and Preprints tabs (#11276)\n\n* display only institution-specific user metrics reports\n\n* add missing exlude statement\n\n* [ENG-9015] Redesign",
+          "author": "Yuhuai Liu",
+          "date": "2025-12-02T15:10:57Z"
+        },
+        {
+          "sha": "4c35e474cc9e0cdd310a3a7d107bff0f5b587e41",
+          "html_url": "https://github.com/CenterForOpenScience/osf.io/commit/4c35e474cc9e0cdd310a3a7d107bff0f5b587e41",
+          "message": "Revert \"[ENG-8064] Add New Notifications Data Model (Refactor Notifications P…\"\n\nThis reverts commit a179750cb50ba119df05513324eedbd669ce81ec.",
+          "author": "Brian J. Geiger",
+          "date": "2025-09-18T14:44:38Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "forgot_password_post TODO Remove this rate limiting",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "framework/auth/views.py",
+      "satd_line": null,
+      "last_commit": {
+        "sha": "31048c7e2ede4df78828f52ca3b2a97959ec9bad",
+        "html_url": "https://github.com/CenterForOpenScience/osf.io/commit/31048c7e2ede4df78828f52ca3b2a97959ec9bad",
+        "message": "[ENG-10538] Post-NR Project PR (#11623)\n\n* Create global_file_updated and global_reviews subscriptions if missing\n* Use USER_FILE_UPDATED for group global_file_updated\n* Use REVIEWS_SUBMISSION_STATUS for group global_reviews\n* Add missing `is_digest=True` for new OSF user subscriptions\n* Extend otf ",
+        "author": "Ostap-Zherebetskyi",
+        "date": "2026-03-13T13:43:07Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 1,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "mismatch",
+      "repair_evidence_mode": "weak"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "weak_repair_evidence"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "weak",
+      "snapshot_alignment_status": "mismatch"
+    }
+  }
+}

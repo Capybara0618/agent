@@ -1,0 +1,329 @@
+{
+  "task_id": "538",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/tune/execution/tune_controller.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-24T12:40:51+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": null,
+    "satd_line": 28,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "partial",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-24T12:41:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-24T12:41:10+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "python/ray/tune/execution/tune_controller.py",
+    "original_code": "def _create_checkpoint_manager(self):\n    return _ExperimentCheckpointManager(\n        checkpoint_period=self._checkpoint_period,\n        sync_every_n_trial_checkpoints=self._trial_checkpoint_config.num_to_keep,\n        storage=self._storage,\n        # TODO(justinvyu): Remove these.\n        local_checkpoint_dir=self._legacy_local_experiment_path,\n        remote_checkpoint_dir=self._legacy_remote_experiment_path,\n        sync_config=self._legacy_sync_config,\n    )",
+    "original_signature": "def _create_checkpoint_manager(self):",
+    "satd_comment": "# TODO(justinvyu): Remove these.",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/tune/execution/tune_controller.py",
+      "sha": "1bd76de1ad22d514a3421065f734f62f3f32341f",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/python/ray/tune/execution/tune_controller.py",
+      "content_excerpt": "import copy\nimport json\nimport logging\nimport os\nimport time\nimport traceback\nimport warnings\nfrom collections import defaultdict, deque\nfrom datetime import datetime\nfrom pathlib import Path\nfrom typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union\n\nimport ray\nfrom ray.air import ResourceRequest\nfrom ray.air.constants import TIME_THIS_ITER_S\nfrom ray.air.execution import PlacementGroupResourceManager, ResourceManager\nfrom ray.air.execution._internal import RayActorManager, TrackedActor\nfrom ray.exceptions import RayActorError, RayTaskError\nfrom ray.train._internal.session import _FutureTrainingResult, _TrainingResult\nfrom ray.train._internal.storage import StorageContext\nfrom ray.tune import CheckpointConfig\nfrom ray.tune.callback import Callback, CallbackList\nfrom ray.tune.error import TuneError, _AbortTrialExecution, _TuneStopTrialError\nfrom ray.tune.execution.class_cache import _ActorClassCache\nfrom ray.tune.execution.experiment_state import (\n    _ExperimentCheckpointManager,\n    _find_newest_experiment_checkpoint,\n)\nfrom ray.tune.execution.insufficient_resources_manager import (\n    _InsufficientResourcesManager,\n)\nfrom ray.tune.execution.placement_groups import PlacementGroupFactory\nfrom ray.tune.experiment import Experiment, Trial\nfrom ray.tune.experiment.trial import (\n    _get_trainable_kwargs,\n    _Location,\n    _TrialInfo,\n)\nfrom ray.tune.result import (\n    DEBUG_METRICS,\n    DEFAULT_METRIC,\n    DONE,\n    RESULT_DUPLICATE,\n    SHOULD_CHECKPOINT,\n    STDERR_FILE,\n    STDOUT_FILE,\n    TRIAL_INFO,\n)\nfrom ray.tune.schedulers import FIFOScheduler, TrialScheduler\nfrom ray.tune.search import BasicVariantGenerator, SearchAlgorithm\nfrom ray.tune.stopper import NoopStopper, Stopper\nfrom ray.tune.tune_config import ResumeConfig\nfrom ray.tune.utils import flatten_dict, warn_if_slow\nfrom ray.tune.utils.log import Verbosity, _dedup_logs, has_verbosity\nfrom ray.tune.utils.object_cache import _ObjectCache\nfrom ray.tune.utils.resource_updater import _ResourceUpdater\nfrom ray.tune.utils.serialization import TuneFunctionDecoder, TuneFunctionEncoder\nfrom ray.util.annotations import DeveloperAPI\nfrom ray.util.debug import log_once\n\nlogger = logging.getLogger(__name__)\n\n\n@DeveloperAPI\nclass TuneController:\n    CKPT_FILE_TMPL = \"experiment_state-{}.json\"\n    RAISE = \"RAISE\"\n\n    def __init__(\n        self,\n        *,\n        search_alg: Optional[SearchAlgorithm] = None,\n        placeholder_resolvers: Optional[Dict[Tuple, Any]] = None,\n        scheduler: Optional[TrialScheduler] = None,\n        stopper: Optional[Stopper] = None,\n        resume_config: Optional[ResumeConfig] = None,\n        fail_fast: bool = False,\n        checkpoint_period: Union[str, int] = None,\n        callbacks: Optional[List[Callback]] = None,\n        metric: Optional[str] = None,\n        trial_checkpoint_config: Optional[CheckpointConfig] = None,\n        storage: Optional[StorageContext] = None,\n        reuse_actors: bool = False,\n        resource_manager_factory: Optional[Callable[[], ResourceManager]] = None,\n        _trainer_api: bool = False,\n    ):\n        if resource_manager_factory:\n            resource_manager = resource_manager_factory()\n        else:\n            resource_manager = PlacementGroupResourceManager()\n\n        self._actor_manager = RayActorManager(resource_manager=resource_manager)\n\n        self._class_cache = _ActorClassCache()\n\n        # Resource status\n        self._resource_updater = _ResourceUpdater(None)\n\n        # Actor <-> Trial mappings\n        self._actor_to_trial: Dict[TrackedActor, Trial] = {}\n        self._trial_to_actor: Dict[Trial, TrackedActor] = {}\n\n        # Resources <-> Trial\n        self._resources_to_pending_trials: Dict[\n            ResourceRequest, Set[Trial]\n        ] = defaultdict(set)\n\n        # Keep track of actor states\n        self._pending_trials: Set[Trial] = set()\n        self._pending_trials_list: List[Trial] = []\n\n        self._running_trials: Set[Trial] = set()\n\n        self._paused_trials: Set[Trial] = set()\n\n        self._stopped_trials: Set[Trial] = set()\n        self._failed_trials: Set[Trial] = set()\n\n        self._resetting_trials: Set[Trial] = set()\n        self._staged_trials: Set[Trial] = set()\n\n        # Removed actors\n        self._started_actors: Set[TrackedActor] = set()\n\n        # Map of tracked actors -> timestamp\n        # The timestamp is when we requested the stop.\n        # We track these actors here to force a\n        # cleanup after some time (as they might be hanging).\n        # Todo: This timeout logic should be moved into the actor manager.\n        # This map is populated whenever we request an actor stop:\n        #  - Regular STOP decision\n        #  - Removing an actor because its trial REUSEs a different trial's actor\n        #  - Removing a cached actor because it's not needed anymore\n        # Actors are only tracked in this map if they actually started (not if they\n        # were only requested but never started).\n        # Actors are removed from this map:\n        #  - When the STOP resolved and the actor actually stopped\n        #  - When they are forcefully cleaned up after the timeout.\n        self._stopping_actors: Dict[TrackedActor, float] = {}\n        self._earliest_stopping_actor: float = float(\"inf\")\n        self._actor_cleanup_timeout: int = int(\n            os.environ.get(\"TUNE_FORCE_TRIAL_CLEANUP_S\", \"600\")\n        )\n        self._actor_force_cleanup_timeout: int = 10\n\n        # Reuse actors\n        self._reuse_actors = reuse_actors\n        self._actor_cache = _ObjectCache(may_keep_one=True)\n\n        # Trial metadata for experiment checkpoints\n        self._trials_to_cache: Set[Trial] = set()\n        self._trial_metadata: Dict[str, str] = {}\n\n        # TRAINING\n        self._buffer_length = int(os.getenv(\"TUNE_RESULT_BUFFER_LENGTH\", 1))\n        self._buffer_min_time_s = float(os.getenv(\"TUNE_RESULT_BUFFER_MIN_TIME_S\", 0.0))\n        self._buffer_max_time_s = float(\n            os.getenv(\"TUNE_RESULT_BUFFER_MAX_TIME_S\", 100.0)\n        )\n\n        # Legacy TrialRunner init\n        self._search_alg = search_alg or BasicVariantGenerator()\n        self._placeholder_resolvers = placeholder_resolvers\n        self._scheduler_alg = scheduler or FIFOScheduler()\n        self._callbacks = CallbackList(callbacks or [])\n        self._insufficient_resources_manager = _InsufficientResourcesManager(\n            for_train=_trainer_api\n        )\n        self._pending_trial_queue_times = {}\n\n        self._max_pending_trials = _get_max_pending_trials(self._search_alg)\n\n        self._storage = storage\n        self._metric = metric\n\n        self._total_time = 0\n        self._iteration = 0\n        self._has_errored = False\n        self._fail_fast = fail_fast\n        if isinstance(self._fail_fast, str):\n            self._fail_fast = self._fail_fast.upper()\n            if self._fail_fast == self.RAISE:\n                warnings.warn(\n                    \"fail_fast='raise' detected. Be careful when using this \"\n                    \"mode as resources (such as Ray processes, \"\n                    \"file descriptors, and temporary files) may not be \"\n                    \"cleaned up properly. To use \"\n                    \"a safer mode, use fail_fast=True.\"\n                )\n            else:\n                raise ValueError(\n                    \"fail_fast must be one of {bool, RAISE}. \" f\"Got {self._fail_fast}.\"\n                )\n\n        self._print_trial_errors = bool(\n            int(os.environ.get(\"TUNE_PRINT_ALL_TRIAL_ERRORS\", \"1\"))\n        )\n\n        self._trials: List[Trial] = []\n        self._live_trials: Set[Trial] = set()  # Set of non-terminated trials\n        self._cached_trial_decisions = {}\n        self._queued_trial_decisions = {}\n\n        self._stop_queue = []\n        self._should_stop_experiment = False  # used by TuneServer\n\n        self._stopper = stopper or NoopStopper()\n\n        self._start_time = time.time()\n\n        self._session_str = datetime.fromtimestamp(self._start_time).strftime(\n            \"%Y-%m-%d_%H-%M-%S\"\n        )\n\n        if checkpoint_period is None:\n            checkpoint_period = os.getenv(\"TUNE_GLOBAL_CHECKPOINT_S\", \"auto\")\n\n        self._checkpoint_period = checkpoint_period\n        self._trial_checkpoint_config = trial_checkpoint_config or CheckpointConfig()\n        self._checkpoint_manager = self._create_checkpoint_manager()\n\n        self._resumed = False\n\n        if resume_config is not None:\n            # Use the metadata file to restore TuneController state\n            try:\n                self.resume(resume_config=resume_config)\n                self._resumed = True\n            except Exception as e:\n                if has_verbosity(Verbosity.V3_TRIAL_DETAILS):\n                    logger.error(str(e))\n                logger.exception(\"Failed to restore the run state.\")\n                if self._fail_fast:\n                    raise\n                logger.info(\"Restarting experiment.\")\n        else:\n            logger.debug(\"Starting a new experiment.\")\n\n    def _wrapped(self):\n        \"\"\"Return wrapped tune controller to be passed to scheduler/searchers.\"\"\"\n        return TrialRunnerWrapper(\n            self,\n            trial_executor=_FakeRayTrialExecutor(self),\n            runner_whitelist_attr={\n                \"search_alg\",\n                \"get_trials\",\n                \"get_live_trials\",\n                \"_set_trial_status\",\n                \"pause_trial\",\n                \"stop_trial\",\n                \"_schedule_trial_save\",\n            },\n            executor_whitelist_attr={\n                \"has_resources_for_trial\",\n                \"pause_trial\",\n                \"save\",\n                \"_resource_updater\",\n            },\n        )\n\n    @property\n    def resumed(self):\n        return self._resumed\n\n    @property\n    def search_alg(self):\n        return self._search_alg\n\n    @property\n    def scheduler_alg(self):\n        return self._scheduler_alg\n\n    def setup_experiments(\n        self, experiments: List[Experiment], total_num_samples: int\n    ) -> None:\n        \"\"\"Obtains any necessary information from experiments.\n\n        Mainly used to setup callbacks.\n\n        Args:\n            experiments: List of Experiments\n                to use.\n            total_num_samples: Total number of samples\n                factoring in grid search samplers.\n        \"\"\"\n        experiment = experiments[0]\n        spec = experiment.public_spec if experiment else {}\n        spec[\"total_num_samples\"] = total_num_samples\n        self._callbacks.setup(**spec)\n\n    def end_experiment_callbacks(self) -> None:\n        \"\"\"Calls ``on_experiment_end`` method in callbacks.\"\"\"\n        self._callbacks.on_experiment_end(trials=self._trials)\n\n    @property\n    def experiment_state_file_name(self) -> str:\n        return self.CKPT_FILE_TMPL.format(self._session_str)\n\n    @property\n    def experiment_state_path(self) -> str:\n        \"\"\"Returns the local experiment checkpoint path.\"\"\"\n        return Path(\n            self._storage.experiment_driver_staging_path,\n            self.experiment_state_file_name,\n        ).as_posix()\n\n    @property\n    def experiment_path(self) -> str:\n        return self._storage.experiment_fs_path\n\n    def _create_checkpoint_manager(self):\n        return _ExperimentCheckpointManager(\n            storage=self._storage,\n            checkpoint_period=self._checkpoint_period,\n            sync_every_n_trial_checkpoints=self._trial_checkpoint_config.num_to_keep,\n        )\n\n    def save_to_dir(self):\n        \"\"\"Save TuneController state to the local staging experiment directory.\n\n        This includes:\n        - trial states\n        - TuneController internal state (all the serializable attributes)\n        - the searcher state\n        - the callback states\n        \"\"\"\n        # Get state from trial executor and runner\n        runner_state = {\n            # Trials\n            \"trial_data\": list(self._get_trial_checkpoints().values()),\n            # Experiment data\n            \"runner_data\": self",
+      "total_lines": 2174
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 28,
+      "start_line": 8,
+      "end_line": 48,
+      "matched_line": ")",
+      "excerpt": "8: from collections import defaultdict, deque\n9: from datetime import datetime\n10: from pathlib import Path\n11: from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union\n12: \n13: import ray\n14: from ray.air import ResourceRequest\n15: from ray.air.constants import TIME_THIS_ITER_S\n16: from ray.air.execution import PlacementGroupResourceManager, ResourceManager\n17: from ray.air.execution._internal import RayActorManager, TrackedActor\n18: from ray.exceptions import RayActorError, RayTaskError\n19: from ray.train._internal.session import _FutureTrainingResult, _TrainingResult\n20: from ray.train._internal.storage import StorageContext\n21: from ray.tune import CheckpointConfig\n22: from ray.tune.callback import Callback, CallbackList\n23: from ray.tune.error import TuneError, _AbortTrialExecution, _TuneStopTrialError\n24: from ray.tune.execution.class_cache import _ActorClassCache\n25: from ray.tune.execution.experiment_state import (\n26:     _ExperimentCheckpointManager,\n27:     _find_newest_experiment_checkpoint,\n28: )\n29: from ray.tune.execution.insufficient_resources_manager import (\n30:     _InsufficientResourcesManager,\n31: )\n32: from ray.tune.execution.placement_groups import PlacementGroupFactory\n33: from ray.tune.experiment import Experiment, Trial\n34: from ray.tune.experiment.trial import (\n35:     _get_trainable_kwargs,\n36:     _Location,\n37:     _TrialInfo,\n38: )\n39: from ray.tune.result import (\n40:     DEBUG_METRICS,\n41:     DEFAULT_METRIC,\n42:     DONE,\n43:     RESULT_DUPLICATE,\n44:     SHOULD_CHECKPOINT,\n45:     STDERR_FILE,\n46:     STDOUT_FILE,\n47:     TRIAL_INFO,\n48: )"
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 311,
+      "end_line": 316,
+      "excerpt": "    def _create_checkpoint_manager(self):\n        return _ExperimentCheckpointManager(\n            storage=self._storage,\n            checkpoint_period=self._checkpoint_period,\n            sync_every_n_trial_checkpoints=self._trial_checkpoint_config.num_to_keep,\n        )",
+      "symbol_name": "_create_checkpoint_manager",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "python/ray/tune/execution/tune_controller.py",
+      "sha": "1bd76de1ad22d514a3421065f734f62f3f32341f",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/python/ray/tune/execution/tune_controller.py"
+    },
+    "imports": {
+      "imports": [
+        "copy",
+        "json",
+        "logging",
+        "os",
+        "time",
+        "traceback",
+        "warnings",
+        "collections:defaultdict",
+        "collections:deque",
+        "datetime:datetime",
+        "pathlib:Path",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:List",
+        "typing:Optional",
+        "typing:Set",
+        "typing:Tuple",
+        "typing:Union",
+        "ray",
+        "ray.air:ResourceRequest",
+        "ray.air.constants:TIME_THIS_ITER_S",
+        "ray.air.execution:PlacementGroupResourceManager",
+        "ray.air.execution:ResourceManager",
+        "ray.air.execution._internal:RayActorManager",
+        "ray.air.execution._internal:TrackedActor",
+        "ray.exceptions:RayActorError",
+        "ray.exceptions:RayTaskError",
+        "ray.train._internal.session:_FutureTrainingResult",
+        "ray.train._internal.session:_TrainingResult"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/master/README.rst",
+      "content_excerpt": ".. image:: https://github.com/ray-project/ray/raw/master/doc/source/images/ray_header_logo.png\n\n.. image:: https://readthedocs.org/projects/ray/badge/?version=master\n    :target: http://docs.ray.io/en/master/?badge=master\n\n.. image:: https://img.shields.io/badge/Ray-Join%20Slack-blue\n    :target: https://www.ray.io/join-slack\n\n.. image:: https://img.shields.io/badge/Discuss-Ask%20Questions-blue\n    :target: https://discuss.ray.io/\n\n.. image:: https://img.shields.io/twitter/follow/raydistributed.svg?style=social&logo=twitter\n    :target: https://x.com/raydistributed\n\n.. image:: https://img.shields.io/badge/Get_started_for_free-3C8AE9?logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8%2F9hAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAEKADAAQAAAABAAAAEAAAAAA0VXHyAAABKElEQVQ4Ea2TvWoCQRRGnWCVWChIIlikC9hpJdikSbGgaONbpAoY8gKBdAGfwkfwKQypLQ1sEGyMYhN1Pd%2B6A8PqwBZeOHt%2FvsvMnd3ZXBRFPQjBZ9K6OY8ZxF%2B0IYw9PW3qz8aY6lk92bZ%2BVqSI3oC9T7%2FyCVnrF1ngj93us%2B540sf5BrCDfw9b6jJ5lx%2FyjtGKBBXc3cnqx0INN4ImbI%2Bl%2BPnI8zWfFEr4chLLrWHCp9OO9j19Kbc91HX0zzzBO8EbLK2Iv4ZvNO3is3h6jb%2BCwO0iL8AaWqB7ILPTxq3kDypqvBuYuwswqo6wgYJbT8XxBPZ8KS1TepkFdC79TAHHce%2F7LbVioi3wEfTpmeKtPRGEeoldSP%2FOeoEftpP4BRbgXrYZefsAI%2BP9JU7ImyEAAAAASUVORK5CYII%3D\n   :target: https://www.anyscale.com/ray-on-anyscale?utm_source=github&utm_medium=ray_readme&utm_campaign=get_started_badge\n\nRay is a unified framework for scaling AI and Python applications. Ray consists of a core distributed runtime and a set of AI libraries for simplifying ML compute:\n\n.. imag"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "_create_checkpoint_manager test",
+      "count": 0,
+      "items": []
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"_create_checkpoint_manager(\"",
+      "count": 1,
+      "items": [
+        {
+          "name": "tune_controller.py",
+          "path": "python/ray/tune/execution/tune_controller.py",
+          "sha": "1bd76de1ad22d514a3421065f734f62f3f32341f",
+          "html_url": "https://github.com/ray-project/ray/blob/fe32fba28631f3a471239e68779ccba6739a21ae/python/ray/tune/execution/tune_controller.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 311,
+          "end_line": 316,
+          "excerpt": "    def _create_checkpoint_manager(self):\n        return _ExperimentCheckpointManager(\n            storage=self._storage,\n            checkpoint_period=self._checkpoint_period,\n            sync_every_n_trial_checkpoints=self._trial_checkpoint_config.num_to_keep,\n        )",
+          "symbol_name": "_create_checkpoint_manager",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "python/ray/tune/execution",
+      "count": 7,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/tune/execution/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "class_cache.py",
+          "path": "python/ray/tune/execution/class_cache.py",
+          "type": "file"
+        },
+        {
+          "name": "cluster_info.py",
+          "path": "python/ray/tune/execution/cluster_info.py",
+          "type": "file"
+        },
+        {
+          "name": "experiment_state.py",
+          "path": "python/ray/tune/execution/experiment_state.py",
+          "type": "file"
+        },
+        {
+          "name": "insufficient_resources_manager.py",
+          "path": "python/ray/tune/execution/insufficient_resources_manager.py",
+          "type": "file"
+        },
+        {
+          "name": "placement_groups.py",
+          "path": "python/ray/tune/execution/placement_groups.py",
+          "type": "file"
+        },
+        {
+          "name": "tune_controller.py",
+          "path": "python/ray/tune/execution/tune_controller.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/tune/execution/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "class_cache.py",
+          "path": "python/ray/tune/execution/class_cache.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import os\n2: \n3: import ray\n4: from ray.air.constants import COPY_DIRECTORY_CHECKPOINTS_INSTEAD_OF_MOVING_ENV\n5: from ray.train.constants import (\n6:     ENABLE_V2_MIGRATION_WARNINGS_ENV_VAR,\n7:     RAY_CHDIR_TO_TRIAL_DIR,\n8: )\n9: from ray.train.v2._internal.constants import (\n10:     ENV_VARS_TO_PROPAGATE as TRAIN_ENV_VARS_TO_PROPAGATE,\n11: )\n12: \n13: DEFAULT_ENV_VARS = {"
+        },
+        {
+          "name": "cluster_info.py",
+          "path": "python/ray/tune/execution/cluster_info.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 12,
+          "excerpt": "1: from functools import lru_cache\n2: from pathlib import Path\n3: \n4: \n5: @lru_cache()\n6: def _is_ray_cluster():\n7:     \"\"\"Checks if the bootstrap config file exists.\n8: \n9:     This will always exist if using an autoscaling cluster/started\n10:     with the ray cluster launcher.\n11:     \"\"\"\n12:     return Path(\"~/ray_bootstrap_config.yaml\").expanduser().exists()"
+        },
+        {
+          "name": "experiment_state.py",
+          "path": "python/ray/tune/execution/experiment_state.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import fnmatch\n2: import logging\n3: import os\n4: import time\n5: from collections import Counter\n6: from pathlib import Path\n7: from typing import Callable, Dict, Optional, Union\n8: \n9: import pyarrow.fs\n10: \n11: from ray.train._internal.storage import (\n12:     StorageContext,\n13:     _download_from_fs_path,"
+        },
+        {
+          "name": "insufficient_resources_manager.py",
+          "path": "python/ray/tune/execution/insufficient_resources_manager.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import logging\n2: import os\n3: import time\n4: from functools import lru_cache\n5: from typing import Dict, Optional, Tuple\n6: \n7: import ray\n8: from ray.tune.execution.cluster_info import _is_ray_cluster\n9: from ray.tune.experiment import Trial\n10: \n11: logger = logging.getLogger(__name__)\n12: \n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "python/ray/tune/execution/tune_controller.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+          "html_url": "https://github.com/ray-project/ray/commit/154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+          "message": "[tune/rllib] Remove deprecated `Logger` interface and `logger_creator` (#61181)\n\n## Summary\n\nCompletes the removal of the `ray.tune.logger.Logger` interface and\n`logger_creator` parameter, which were soft-deprecated in #35162 (May\n2023) targeting Ray 2.7.\n\n### Tune changes\n- Remove `Logger` base cla",
+          "author": "Xinyuan",
+          "date": "2026-03-19T20:49:48Z"
+        },
+        {
+          "sha": "db822f500e163f100e2c09f526619307feeb8659",
+          "html_url": "https://github.com/ray-project/ray/commit/db822f500e163f100e2c09f526619307feeb8659",
+          "message": "[core] Remove support for `local_mode` (un-revert) (#60647)\n\nUn-revert https://github.com/ray-project/ray/pull/60543, which was\nreverted because rllib code was not updated appropriately.\n\n---------\n\nSigned-off-by: Edward Oakes <ed.nmi.oakes@gmail.com>",
+          "author": "Edward Oakes",
+          "date": "2026-02-06T14:03:13Z"
+        },
+        {
+          "sha": "d0b1d151d8ea964a711e451d0ae736f8bf95b629",
+          "html_url": "https://github.com/ray-project/ray/commit/d0b1d151d8ea964a711e451d0ae736f8bf95b629",
+          "message": "Revert \"[core] Remove support for `local_mode`\" (#60629)\n\nReverts ray-project/ray#60543\n\nbreaks almost all rllib tests.",
+          "author": "Lonnie Liu",
+          "date": "2026-01-31T04:49:27Z"
+        },
+        {
+          "sha": "22499d7dbd2e5eec127cffa7bd649bdcddab2840",
+          "html_url": "https://github.com/ray-project/ray/commit/22499d7dbd2e5eec127cffa7bd649bdcddab2840",
+          "message": "[core] Remove support for `local_mode` (#60543)\n\nThis PR fully deprecates `local_mode` and raises an error if the option\nis specified by the user. It also removes the implementation from core\nC++ & Python code, as well as lingering library logic & tests.\n\nOriginally, I attempted to split this into t",
+          "author": "Edward Oakes",
+          "date": "2026-01-30T19:01:34Z"
+        },
+        {
+          "sha": "9bd06d04434f00175a0fb8b1e3d8f0d950873e41",
+          "html_url": "https://github.com/ray-project/ray/commit/9bd06d04434f00175a0fb8b1e3d8f0d950873e41",
+          "message": "[tune] Trigger Checkpointing via Trial / Tuner Callback (#55527)\n\nCurrently a user cannot implement a custom trigger to schedule a\ncheckpoint - an exception is to add `should_checkpoint` to the result,\nthis however must be done from *within the trainable* and is not\ncontrolled by the `Tuner`/`Trial`",
+          "author": "Daniel Sperber",
+          "date": "2025-09-26T21:06:28Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_create_checkpoint_manager TODO justinvyu Remove these",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "python/ray/tune/execution/tune_controller.py",
+      "satd_line": 28,
+      "last_commit": {
+        "sha": "154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+        "html_url": "https://github.com/ray-project/ray/commit/154535fdf9b2d4a3baef26c6322dcc8b30905c7b",
+        "message": "[tune/rllib] Remove deprecated `Logger` interface and `logger_creator` (#61181)\n\n## Summary\n\nCompletes the removal of the `ray.tune.logger.Logger` interface and\n`logger_creator` parameter, which were soft-deprecated in #35162 (May\n2023) targeting Ray 2.7.\n\n### Tune changes\n- Remove `Logger` base cla",
+        "author": "Xinyuan",
+        "date": "2026-03-19T20:49:48Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 0,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "partial",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch",
+      "no_related_tests_found"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "partial"
+    }
+  }
+}

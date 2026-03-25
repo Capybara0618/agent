@@ -1,0 +1,341 @@
+{
+  "task_id": "994",
+  "repo_owner": "meituan-dianping",
+  "repo_name": "lyrebird",
+  "file_path": "lyrebird/db/database_server.py",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-03-25T04:14:18+00:00",
+    "base_cache_source": "github_fetch",
+    "symbol_name": "reset",
+    "satd_line": 261,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 1,
+    "call_sites_count": 4,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 1,
+    "retrieved_callsite_snippets_count": 4,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-03-25T04:16:36+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-03-25T04:17:21+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "lyrebird/db/database_server.py",
+    "original_code": "def reset(self):\n    self.stop()\n    self.database_uri.unlink()\n    self.init_engine()\n    # TODO After self.stop() could terminate Thread, change `self.running = True` into self.start()\n    self.running = True",
+    "original_signature": "def reset(self):",
+    "satd_comment": "# TODO After self.stop() could terminate Thread, change `self.running = True` into self.start()",
+    "target_file": {
+      "ok": true,
+      "path": "lyrebird/db/database_server.py",
+      "sha": "e27f9ac719980923dce06d78dcf9a58607470023",
+      "download_url": "https://raw.githubusercontent.com/Meituan-Dianping/lyrebird/master/lyrebird/db/database_server.py",
+      "content_excerpt": "import json\nimport math\nimport datetime\nimport traceback\nimport time\nimport copy\nfrom pathlib import Path\nfrom lyrebird import application\nfrom lyrebird import log\nfrom lyrebird.utils import convert_size, convert_size_to_byte, JSONFormat\nfrom lyrebird.base_server import ThreadServer\nfrom lyrebird.mock import context\nfrom sqlalchemy import event, and_\nfrom sqlalchemy.orm import sessionmaker, scoped_session\nfrom sqlalchemy.ext.hybrid import hybrid_property\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy import Column, String, Integer, Text, DateTime, create_engine, Table, MetaData\nfrom sqlalchemy.orm.attributes import InstrumentedAttribute\nfrom sqlalchemy.exc import OperationalError\n\n\n\"\"\"\nDatabase server\n\nWorked as a background thread\nstorage all event message into database\n\"\"\"\n\nlogger = log.get_logger()\n\nBase = declarative_base()\n\n\nclass LyrebirdDatabaseServer(ThreadServer):\n    def __init__(self, path=None):\n        self.database_uri = None\n        self.error_log = []\n        self.error_log_threshold = application.config.get('event.db_connection_recover_threshold', 0)\n        super().__init__()\n\n        if not path or path.isspace():\n            ROOT_DIR = application.root_dir()\n            DEFAULT_NAME = 'lyrebird.db'\n            self.database_uri = ROOT_DIR/DEFAULT_NAME\n        else:\n            self.database_uri = Path(path).expanduser().absolute()\n        \n        # Check whether the current database is broken\n        personal_config = application._cm.personal_config\n        if str(self.database_uri) in personal_config[\"event.broken_database_path_list\"]:\n            if self.database_uri.exists():\n                self.database_uri.unlink()\n                logger.warning(f\"The broken DB has been deleted: {self.database_uri}\")\n            personal_config[\"event.broken_database_path_list\"].remove(str(self.database_uri))\n            application._cm.update_personal_config(personal_config)\n\n        init_engine_success = self.init_engine()\n        if not init_engine_success:\n            logger.error(\"Lyrebird database has been broken! Current startup has been stopped, please restart Lyrebird.\")\n            logger.warning(\"Restarting will delete the broken database by default, historical events in inspector-pro will be lost, please be careful.\")\n\n        # init queue\n        self.storage_queue = application.sync_manager.get_queue()\n\n        # subscribe all channel\n        application.server['event'].subscribe({\n            'name': 'event_receiver',\n            'origin': self,\n            'channel': 'any',\n            'func': self.event_receiver\n        })\n    \n    def auto_alter_tables(self, engine):\n        metadata = MetaData()\n        tables = {\n            table_name: {\n                column.name: column for column in Table(table_name, metadata, autoload=True, autoload_with=engine).c\n            }\n            for table_name in engine.table_names()\n        }\n        for model_class in Base.__subclasses__():\n            table_name = model_class.__table__.name\n            if table_name not in tables:\n                continue\n            table = tables[table_name]\n            for attr_name in dir(model_class):\n                try:\n                    attr = getattr(model_class, attr_name)\n                except:\n                    logger.warning(f'[Local DB]Cannot get attr:{attr_name} from {model_class}')\n                    continue\n                if not isinstance(attr, InstrumentedAttribute):\n                    continue\n                if not hasattr(attr, 'type'):\n                    continue\n                if not hasattr(attr, 'compile'):\n                    continue\n                attr_name = attr.name \n                if attr_name in table:\n                    continue\n                column_type = attr.type.compile(dialect=engine.dialect)\n                engine.execute(f'ALTER TABLE {table_name} ADD COLUMN {attr_name} {column_type}')\n\n    def init_engine(self):\n        sqlite_path = 'sqlite:///'+str(self.database_uri)+'?check_same_thread=False'\n\n        engine = create_engine(str(sqlite_path))\n\n        # Set pragma on connect\n        # https://www.sqlite.org/pragma.html\n        event.listen(engine, 'connect', self._fk_pragma_on_connect)\n\n        # Create all tables\n        try:\n            Base.metadata.create_all(engine)\n        except Exception:\n            # sqlalchemy.exc.DatabaseError (sqlite3.DatabaseError)\n            personal_config = application._cm.personal_config\n            personal_config[\"event.broken_database_path_list\"].append(str(self.database_uri))\n            application._cm.update_personal_config(personal_config)\n            logger.info(f'{traceback.format_exc()}')\n            return False\n        \n        # Create session factory\n        session_factory = sessionmaker(bind=engine)\n        Session = scoped_session(session_factory)\n        self._scoped_session = Session\n        self.auto_alter_tables(engine=engine)\n\n        logger.info(f'Init DB engine: {self.database_uri}')\n        return True\n\n    def _fk_pragma_on_connect(self, dbapi_con, con_record):\n        # https://www.sqlite.org/pragma.html#pragma_journal_mode\n        dbapi_con.execute('PRAGMA journal_mode=MEMORY')\n        # https://www.sqlite.org/pragma.html#pragma_synchronous\n        dbapi_con.execute('PRAGMA synchronous=OFF')\n\n    def event_receiver(self, event, channel=None, event_id=None):\n        # event is decoded , which should be encoded when save\n        # deepcopy to avoid affecting checker running\n        if channel == 'flow':\n            event = copy.deepcopy(event)\n            application.encoders_decoders.encoder_handler(event['flow'])\n\n        content = json.dumps(event, ensure_ascii=False)\n        if isinstance(event, dict):\n            message = event.get('message')\n        else:\n            message = None\n        flow = Event(event_id=event_id, channel=channel, content=content, message=message)\n        self.storage_queue.put(flow)\n\n    def start(self):\n        super().start()\n\n    def run(self):\n        session = self._scoped_session()\n        while self.running:\n            try:\n                event = self.storage_queue.get()\n                if event is None:\n                    break\n                session.add(event)\n                session.commit()\n                context.emit('db_action', 'add event log')\n            except OperationalError as e:\n                logger.error(f'Save event failed. {traceback.format_exc()}')\n                self.error_log.append(e)\n                if len(self.error_log) > self.error_log_threshold:\n                    logger.warning(f'DB would be reset: {self.database_uri}')\n                    self.error_log = []\n                    self.reset()\n                    session = self._scoped_session()\n                else:\n                    session.rollback()\n            except Exception:\n                logger.error(f'Save event failed. {traceback.format_exc()}')\n                session.rollback()\n\n    def stop(self):\n        super().stop()\n\n    @property\n    def session(self):\n        return self._scoped_session()\n\n    def get_event(self, channel_rules, offset=0, limit=20, search_str=''):\n        search_str_list = [item.strip() for item in search_str.strip().split('+')] if search_str else []\n        session = self._scoped_session()\n        _subquery = session.query(Event.id).order_by(Event.id.desc())\n        if len(channel_rules) > 0:\n            _subquery = _subquery.filter(Event.channel.in_(channel_rules))\n        if len(search_str_list) > 0:\n            _subquery = _subquery.filter(Event.message != None)\n            and_cond = []\n            for search_str in search_str_list:\n                and_cond.append(Event.message.like(f'%%{search_str}%%'))\n            _subquery = _subquery.filter(and_(*and_cond))\n        _subquery = _subquery.offset(offset).limit(limit).subquery()\n        result = session.query(Event).filter(Event.id == _subquery.c.id).all()\n        self._scoped_session.remove()\n        return result\n\n    def get_page_index_by_event_id(self, event_id, channel_rules, limit=20):\n\n        session = self._scoped_session()\n        _subquery = session.query(Event).filter(Event.event_id == event_id).subquery()\n        query = session.query(Event.id)\n        if len(channel_rules) > 0:\n            query = query.filter(Event.channel.in_(channel_rules))\n        # Fix bug: event_id in page end, return next page\n        # Wrong code: query.filter(Event.id>=subquery.c.id).count()\n        result = query.filter(Event.id > _subquery.c.id).count()\n        return int(result/limit)\n\n    def get_channel_list(self):\n        session = self._scoped_session()\n        result = session.query(Event.channel) \\\n            .group_by(Event.channel) \\\n            .all()\n        self._scoped_session.remove()\n        return result\n\n    def get_page_count(self, channel_rules, page_size=20, search_str=''):\n        session = self._scoped_session()\n        query = session.query(Event.id)\n        search_str_list = [item.strip() for item in search_str.strip().split('+')] if search_str else []\n        if len(channel_rules) > 0:\n            query = query.filter(Event.channel.in_(channel_rules))\n        if len(search_str_list) > 0:\n            query = query.filter(Event.message != None)\n            and_cond = []\n            for search_str in search_str_list:\n                and_cond.append(Event.message.like(f'%%{search_str}%%'))\n            query = query.filter(and_(*and_cond))\n        result = query.count()\n        self._scoped_session.remove()\n        return math.ceil(result / page_size)\n    \n    def get_database_info(self):\n        database_path = str(self.database_uri)\n        size = self.database_uri.stat().st_size\n        readable_size = convert_size(size)\n        database_info = {\n            'path': database_path,\n            'size': readable_size,\n            'oversized': False\n        }\n\n        threshold_str = application._cm.config.get('event.file_size_threshold')\n        if threshold_str is not None:\n            threshold_byte = convert_size_to_byte(threshold_str)\n            oversized = threshold_byte and size > threshold_byte\n            database_info['threshold'] = threshold_str\n            database_info['oversized'] = oversized\n        \n        return database_info\n\n    def reset(self):\n        self.stop()\n        self.database_uri.unlink()\n        self.init_engine()\n        if not self.server_thread.is_alive():\n            self.start()\n        self.running = True\n\n\nclass Event(Base, JSONFormat):\n    __tablename__ = 'event'\n\n    id = Column(Integer, primary_key=True, autoincrement=True)\n    channel = Column(String(16), index=True)\n    event_id = Column(String(32), index=True)\n    content = Column(Text)\n    message = Column(Text, default=None)\n    _timestamp = Column('timestamp', DateTime(timezone=True), default=datetime.datetime.utcnow)\n\n    @hybrid_property\n    def timestamp(self):\n        seconds_offset = time.localtime().tm_gmtoff\n        return self._timestamp.timestamp() + seconds_offset\n",
+      "total_lines": 282
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 261,
+      "start_line": 241,
+      "end_line": 281,
+      "matched_line": "        self.stop()",
+      "excerpt": "241:     def get_database_info(self):\n242:         database_path = str(self.database_uri)\n243:         size = self.database_uri.stat().st_size\n244:         readable_size = convert_size(size)\n245:         database_info = {\n246:             'path': database_path,\n247:             'size': readable_size,\n248:             'oversized': False\n249:         }\n250: \n251:         threshold_str = application._cm.config.get('event.file_size_threshold')\n252:         if threshold_str is not None:\n253:             threshold_byte = convert_size_to_byte(threshold_str)\n254:             oversized = threshold_byte and size > threshold_byte\n255:             database_info['threshold'] = threshold_str\n256:             database_info['oversized'] = oversized\n257:         \n258:         return database_info\n259: \n260:     def reset(self):\n261:         self.stop()\n262:         self.database_uri.unlink()\n263:         self.init_engine()\n264:         if not self.server_thread.is_alive():\n265:             self.start()\n266:         self.running = True\n267: \n268: \n269: class Event(Base, JSONFormat):\n270:     __tablename__ = 'event'\n271: \n272:     id = Column(Integer, primary_key=True, autoincrement=True)\n273:     channel = Column(String(16), index=True)\n274:     event_id = Column(String(32), index=True)\n275:     content = Column(Text)\n276:     message = Column(Text, default=None)\n277:     _timestamp = Column('timestamp', DateTime(timezone=True), default=datetime.datetime.utcnow)\n278: \n279:     @hybrid_property\n280:     def timestamp(self):\n281:         seconds_offset = time.localtime().tm_gmtoff"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "reset",
+      "start_line": 260,
+      "end_line": 266,
+      "source": "    def reset(self):\n        self.stop()\n        self.database_uri.unlink()\n        self.init_engine()\n        if not self.server_thread.is_alive():\n            self.start()\n        self.running = True"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 260,
+      "end_line": 266,
+      "excerpt": "    def reset(self):\n        self.stop()\n        self.database_uri.unlink()\n        self.init_engine()\n        if not self.server_thread.is_alive():\n            self.start()\n        self.running = True",
+      "symbol_name": "reset",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "lyrebird/db/database_server.py",
+      "sha": "e27f9ac719980923dce06d78dcf9a58607470023",
+      "download_url": "https://raw.githubusercontent.com/Meituan-Dianping/lyrebird/master/lyrebird/db/database_server.py"
+    },
+    "imports": {
+      "imports": [
+        "json",
+        "math",
+        "datetime",
+        "traceback",
+        "time",
+        "copy",
+        "pathlib:Path",
+        "lyrebird:application",
+        "lyrebird:log",
+        "lyrebird.utils:convert_size",
+        "lyrebird.utils:convert_size_to_byte",
+        "lyrebird.utils:JSONFormat",
+        "lyrebird.base_server:ThreadServer",
+        "lyrebird.mock:context",
+        "sqlalchemy:event",
+        "sqlalchemy:and_",
+        "sqlalchemy.orm:sessionmaker",
+        "sqlalchemy.orm:scoped_session",
+        "sqlalchemy.ext.hybrid:hybrid_property",
+        "sqlalchemy.ext.declarative:declarative_base",
+        "sqlalchemy:Column",
+        "sqlalchemy:String",
+        "sqlalchemy:Integer",
+        "sqlalchemy:Text",
+        "sqlalchemy:DateTime",
+        "sqlalchemy:create_engine",
+        "sqlalchemy:Table",
+        "sqlalchemy:MetaData",
+        "sqlalchemy.orm.attributes:InstrumentedAttribute",
+        "sqlalchemy.exc:OperationalError"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/Meituan-Dianping/lyrebird/master/README.md",
+      "content_excerpt": "<p align=\"center\"><a herf=\"https://meituan-dianping.github.io/lyrebird/\"><img src=\"./image/lyrebird.png\" width=\"220\"></a></p>\n<h1 align=\"center\">Lyrebird</h1>\n\n![Tests](https://github.com/Meituan-Dianping/lyrebird/workflows/Tests/badge.svg)\n![Publish](https://github.com/Meituan-Dianping/lyrebird/workflows/Publish/badge.svg)\n![CodeQL](https://github.com/Meituan-Dianping/lyrebird/workflows/CodeQL/badge.svg)\n\n# [PYPI](https://pypi.org/project/lyrebird/)\n\n[![PyPI](https://img.shields.io/pypi/v/lyrebird.svg)](https://pypi.python.org/pypi/lyrebird)\n![PyPI](https://img.shields.io/pypi/pyversions/lyrebird.svg)\n![PyPI - Downloads](https://img.shields.io/pypi/dm/lyrebird.svg)\n\n```\npip install lyrebird\n```\n\n# [DockerHub](https://hub.docker.com/r/overbridge/lyrebird)\n\n![Docker Image Version (latest semver)](https://img.shields.io/docker/v/overbridge/lyrebird?sort=semver)\n![Docker Image Size (latest by date)](https://img.shields.io/docker/image-size/overbridge/lyrebird?sort=date)\n\n```\ndocker pull overbridge/lyrebird\n```\n\n# [Docs](https://meituan-dianping.github.io/lyrebird)\n\n[![Doc](https://img.shields.io/badge/docs-github_page-green.svg)](https://meituan-dianping.github.io/lyrebird/)\n[![Backers on Open Collective](https://opencollective.com/lyrebird/backers/badge.svg)](#backers)\n[![Sponsors on Open Collective](https://opencollective.com/lyrebird/sponsors/badge.svg)](#sponsors)\n![GitHub](https://img.shields.io/github/license/meituan/lyrebird.svg)\n\n---\n\n- [简介](#简介)\n- [快速开始](#快速开始)\n  - [环境要求](#环境要求)\n  - [安装](#安装)\n  - [启动](#启动)\n  - [连接移动设备](#连接移动设备)\n  - [查看及录制数据](#查看及录制数据)\n  - [使用 Mock 数据]"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "reset test",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_db.py",
+          "path": "tests/test_db.py",
+          "sha": "bfbefcdb270b1453a2d5b5819d8edaee1c96f24a",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/blob/91f0db7716dd66ade5b026a3545ed19ef6148cc7/tests/test_db.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 37,
+          "end_line": 61,
+          "excerpt": "37:     lyrebird.application.server['task'] = FakeBackgroundTaskServer()\n38: \n39: \n40: @pytest.fixture\n41: def db_server():\n42:     server = LyrebirdDatabaseServer()\n43:     server.start()\n44:     application.server['db'] = server\n45:     yield server\n46:     server.stop()\n47: \n48: \n49: def test_reset(event_server, task_server, db_server):\n50:     publish_time = 3\n51:     channel_name = 'Test'\n52:     message = {\n53:         'message': 'test',\n54:     }\n55: \n56:     for _ in range(publish_time):\n57:         event_server.publish(channel_name, message)\n58:     time.sleep(0.2)\n59:     events = db_server.get_event([])\n60:     assert len(events) == publish_time\n61: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "\"reset(\"",
+      "count": 4,
+      "items": [
+        {
+          "name": "event.py",
+          "path": "lyrebird/mock/blueprints/apis/event.py",
+          "sha": "c0dc2aaf6e00193b3b6a795a46d863a3c1081319",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/blob/91f0db7716dd66ade5b026a3545ed19ef6148cc7/lyrebird/mock/blueprints/apis/event.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 33,
+          "end_line": 57,
+          "excerpt": "33: \n34:             result.append(event_str)\n35:         return application.make_ok_response(events=result, page=page, page_count=page_count, page_size=PAGE_SIZE, channel=channel_rules)\n36: \n37:     def post(self, channel):\n38:         message = request.json\n39:         event_manager = application.server['event']\n40:         event_manager.publish(channel, message)\n41:         return application.make_ok_response()\n42: \n43:     def delete(self):\n44:         db_server = application.server['db']\n45:         db_server.reset()\n46:         return application.make_ok_response()\n47: \n48: \n49: class Channel(Resource):\n50: \n51:     def get(self, mode=None):\n52:         if not mode:\n53:             db = application.server['db']\n54:             channel_list = db.get_channel_list()\n55:             return jsonify([item[0] for item in channel_list])\n56: \n57:         elif mode == 'default':",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "database_server.py",
+          "path": "lyrebird/db/database_server.py",
+          "sha": "e27f9ac719980923dce06d78dcf9a58607470023",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/blob/91f0db7716dd66ade5b026a3545ed19ef6148cc7/lyrebird/db/database_server.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 260,
+          "end_line": 266,
+          "excerpt": "    def reset(self):\n        self.stop()\n        self.database_uri.unlink()\n        self.init_engine()\n        if not self.server_thread.is_alive():\n            self.start()\n        self.running = True",
+          "symbol_name": "reset",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "handler.py",
+          "path": "lyrebird/project_builder/lyrebird_plugin_demo/$_plugin_name/handler.py",
+          "sha": "a7b789f5903ec4f251645293d8885e637711a659",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/blob/91f0db7716dd66ade5b026a3545ed19ef6148cc7/lyrebird/project_builder/lyrebird_plugin_demo/$_plugin_name/handler.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 41,
+          "end_line": 44,
+          "excerpt": "def reset():\n    global requestList\n    requestList = []\n    return application.make_ok_response()",
+          "symbol_name": "reset",
+          "symbol_type": "FunctionDef"
+        },
+        {
+          "name": "__init__.py",
+          "path": "lyrebird/mock/dm/__init__.py",
+          "sha": "0f0679684e6d4637d74ea80610d3fae4def301a5",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/blob/91f0db7716dd66ade5b026a3545ed19ef6148cc7/lyrebird/mock/dm/__init__.py",
+          "score": 1.0,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 1308,
+          "end_line": 1310,
+          "excerpt": "    def reset(self):\n        self.open_nodes = [self._adapter.root_id]\n        self.deactivate()",
+          "symbol_name": "reset",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "lyrebird/db",
+      "count": 3,
+      "entries": [
+        {
+          "name": "__init__.py",
+          "path": "lyrebird/db/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "database_server.py",
+          "path": "lyrebird/db/database_server.py",
+          "type": "file"
+        },
+        {
+          "name": "event_converter.py",
+          "path": "lyrebird/db/event_converter.py",
+          "type": "file"
+        }
+      ]
+    },
+    "neighbor_files": {
+      "count": 2,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "lyrebird/db/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "event_converter.py",
+          "path": "lyrebird/db/event_converter.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import json\n2: from io import BytesIO\n3: from lyrebird.mock.dm.jsonpath import jsonpath\n4: \n5: \n6: class EventFileConverter:\n7:     \n8:     def __init__(self, data, target_node_path=None):\n9:         self.data = data\n10:         self.target_node_path = target_node_path\n11:         self.suffix = 'json'\n12: \n13:     @property"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "lyrebird/db/database_server.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "76791cc4bd4a3713310dad0d792738cce69aedd0",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/commit/76791cc4bd4a3713310dad0d792738cce69aedd0",
+          "message": "add sqlite db reset threshold (#868)\n\n* add sqlite db reset threshold\r\n\r\n* refresh session\r\n\r\n---------\r\n\r\nCo-authored-by: noO0ob <wujiasheng03@meituan.com>",
+          "author": "noO0oOo0ob",
+          "date": "2024-07-04T08:38:53Z"
+        },
+        {
+          "sha": "3b11287ef354c6af5761814413678af1a6e3d399",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/commit/3b11287ef354c6af5761814413678af1a6e3d399",
+          "message": "Feature/add enable mulitprocess (#842)\n\n* change post processing\r\n\r\n* version\r\n\r\n* add report in eventserver\r\n\r\n* fix bug\r\n\r\n* fix unit test\r\n\r\n* add enable multiprocess\r\n\r\n* fix bug\r\n\r\n* fix bug\r\n\r\n* fix e2e and bug\r\n\r\n* fix e2e\r\n\r\n* fix e2e\r\n\r\n* dockerfile\r\n\r\n* add config\r\n\r\n* remove usless code\r\n",
+          "author": "noO0oOo0ob",
+          "date": "2024-05-20T11:40:58Z"
+        },
+        {
+          "sha": "fb4e76ba550b7d16988141830e77e9f748ea38fc",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/commit/fb4e76ba550b7d16988141830e77e9f748ea38fc",
+          "message": "fix dm encode flow make checker msg change (#854)\n\n* add deepcopy in dm event_receiver\r\n\r\n* deepcopy all event\r\n\r\n* limit deepcopy scope\r\n\r\n---------\r\n\r\nCo-authored-by: noO0ob <wujiasheng03@meituan.com>",
+          "author": "noO0oOo0ob",
+          "date": "2024-05-20T11:28:34Z"
+        },
+        {
+          "sha": "00748446ba3bf1aae651e16648beb83ec59a5e62",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/commit/00748446ba3bf1aae651e16648beb83ec59a5e62",
+          "message": "extension supports searching (#781)\n\n* extension supports searching\r\n\r\n* fix error when database uri is not existed\r\n\r\n* change setting of multiple search strings\r\n\r\n* remove extra div\r\n\r\n* remove extra whitespace\r\n\r\n* set tab according to the state of selected checker",
+          "author": "ZhaoYangyang0403",
+          "date": "2023-08-30T04:58:35Z"
+        },
+        {
+          "sha": "b1ec5b081660c63e696454b63dd2f3c2b93a85d9",
+          "html_url": "https://github.com/Meituan-Dianping/lyrebird/commit/b1ec5b081660c63e696454b63dd2f3c2b93a85d9",
+          "message": "fix convert error when threshold is none (#780)",
+          "author": "ZhaoYangyang0403",
+          "date": "2023-08-23T10:04:00Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "reset TODO After self stop could",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "lyrebird/db/database_server.py",
+      "satd_line": 261,
+      "last_commit": {
+        "sha": "76791cc4bd4a3713310dad0d792738cce69aedd0",
+        "html_url": "https://github.com/Meituan-Dianping/lyrebird/commit/76791cc4bd4a3713310dad0d792738cce69aedd0",
+        "message": "add sqlite db reset threshold (#868)\n\n* add sqlite db reset threshold\r\n\r\n* refresh session\r\n\r\n---------\r\n\r\nCo-authored-by: noO0ob <wujiasheng03@meituan.com>",
+        "author": "noO0oOo0ob",
+        "date": "2024-07-04T08:38:53Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 1,
+      "call_sites_count": 4,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "reset",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

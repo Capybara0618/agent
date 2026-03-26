@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from satd_langgraph import LangGraphSATDWorkflow
-
+ 
 
 # python run_langgraph_workflow.py --input code.csv --output-dir outputs_langgraph_smoke5 --limit 5 --model gpt-4o-mini --verbose --write-batch-size 10 --resume
 
@@ -31,6 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print per-task and per-stage progress logs while running.",
     )
     parser.add_argument(
+        "--acceptance-profile",
+        choices=("baseline", "balanced_em"),
+        default="baseline",
+        help="Reviewer acceptance profile.",
+    )
+    parser.add_argument(
         "--write-batch-size",
         type=int,
         default=10,
@@ -51,6 +57,7 @@ def main() -> None:
         model=args.model,
         verbose=args.verbose,
         write_batch_size=args.write_batch_size,
+        acceptance_profile=args.acceptance_profile,
     )
     summary = workflow.run_csv(args.input, args.output_dir, limit=args.limit, resume=args.resume)
 
@@ -67,6 +74,10 @@ def main() -> None:
     print(f"Recall: {summary['recall']}")
     print(f"Written tasks: {summary['written_tasks']}")
     print(f"Write batch size: {summary['write_batch_size']}")
+    print(f"Acceptance profile: {summary['acceptance_profile']}")
+    print(f"Round 2 attempt count: {summary['round2_attempt_count']}")
+    print(f"Softened accept count: {summary['softened_gate_accept_count']}")
+    print(f"Exact-prone override count: {summary['exact_prone_override_accept_count']}")
     print(f"Resume mode: {args.resume}")
     print(f"Main trajectory file: {args.output_dir / 'trajectory_overview.csv'}")
     print(f"Context cache index: {args.output_dir / 'context_cache.csv'}")

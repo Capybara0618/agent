@@ -1,0 +1,400 @@
+{
+  "task_id": "58",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/rllib/optimizers/apex_optimizer.py",
+  "commit": "b41bdcefa0351a4bf77f0c46917663b5014a364b",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:19:26+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "b41bdcefa0351a4bf77f0c46917663b5014a364b",
+    "symbol_name": "_init",
+    "satd_line": 166,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 2,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:20:03+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:20:11+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "python/ray/rllib/optimizers/apex_optimizer.py",
+    "original_code": "def _init(\n        self, learning_starts=1000, buffer_size=10000,\n        prioritized_replay=True, prioritized_replay_alpha=0.6,\n        prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n        train_batch_size=512, sample_batch_size=50,\n        num_replay_buffer_shards=1, max_weight_sync_delay=400,\n        clip_rewards=True, debug=False):\n\n    self.debug = debug\n    self.replay_starts = learning_starts\n    self.prioritized_replay_beta = prioritized_replay_beta\n    self.prioritized_replay_eps = prioritized_replay_eps\n    self.train_batch_size = train_batch_size\n    self.sample_batch_size = sample_batch_size\n    self.max_weight_sync_delay = max_weight_sync_delay\n\n    self.learner = LearnerThread(self.local_evaluator)\n    self.learner.start()\n\n    # TODO(ekl) use create_colocated() for these actors once\n    # https://github.com/ray-project/ray/issues/1734 is fixed\n    self.replay_actors = [\n        ReplayActor.remote(\n            num_replay_buffer_shards, learning_starts, buffer_size,\n            train_batch_size, prioritized_replay_alpha,\n            prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n        for _ in range(num_replay_buffer_shards)\n    ]\n    assert len(self.remote_evaluators) > 0\n\n    # Stats\n    self.timers = {k: TimerStat() for k in [\n        \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n        \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n    self.num_weight_syncs = 0\n    self.learning_started = False\n\n    # Number of worker steps since the last weight update\n    self.steps_since_update = {}\n\n    # Otherwise kick of replay tasks for local gradient updates\n    self.replay_tasks = TaskPool()\n    for ra in self.replay_actors:\n        for _ in range(REPLAY_QUEUE_DEPTH):\n            self.replay_tasks.add(ra, ra.replay.remote())\n\n    # Kick off async background sampling\n    self.sample_tasks = TaskPool()\n    weights = self.local_evaluator.get_weights()\n    for ev in self.remote_evaluators:\n        ev.set_weights.remote(weights)\n        self.steps_since_update[ev] = 0\n        for _ in range(SAMPLE_QUEUE_DEPTH):\n            self.sample_tasks.add(ev, ev.sample.remote())",
+    "original_signature": "def _init(",
+    "satd_comment": "# TODO(ekl) use create_colocated() for these actors once\n# https://github.com/ray-project/ray/issues/1734 is fixed",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/rllib/optimizers/apex_optimizer.py",
+      "sha": "dc9a9752fa167940b5689a67318d799264e2ded2",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/rllib/optimizers/apex_optimizer.py",
+      "content_excerpt": "\"\"\"Implements Distributed Prioritized Experience Replay.\n\nhttps://arxiv.org/abs/1803.00933\"\"\"\n\nfrom __future__ import absolute_import\nfrom __future__ import division\nfrom __future__ import print_function\n\nimport os\nimport queue\nimport random\nimport time\nimport threading\n\nimport numpy as np\n\nimport ray\nfrom ray.rllib.optimizers.policy_optimizer import PolicyOptimizer\nfrom ray.rllib.optimizers.replay_buffer import PrioritizedReplayBuffer\nfrom ray.rllib.optimizers.sample_batch import SampleBatch\nfrom ray.rllib.utils.actors import TaskPool\nfrom ray.rllib.utils.timer import TimerStat\nfrom ray.rllib.utils.window_stat import WindowStat\n\nSAMPLE_QUEUE_DEPTH = 2\nREPLAY_QUEUE_DEPTH = 4\nLEARNER_QUEUE_MAX_SIZE = 16\n\n\n@ray.remote\nclass ReplayActor(object):\n    \"\"\"A replay buffer shard.\n\n    Ray actors are single-threaded, so for scalability multiple replay actors\n    may be created to increase parallelism.\"\"\"\n\n    def __init__(\n            self, num_shards, learning_starts, buffer_size, train_batch_size,\n            prioritized_replay_alpha, prioritized_replay_beta,\n            prioritized_replay_eps, clip_rewards):\n        self.replay_starts = learning_starts // num_shards\n        self.buffer_size = buffer_size // num_shards\n        self.train_batch_size = train_batch_size\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n\n        self.replay_buffer = PrioritizedReplayBuffer(\n            self.buffer_size, alpha=prioritized_replay_alpha,\n            clip_rewards=clip_rewards)\n\n        # Metrics\n        self.add_batch_timer = TimerStat()\n        self.replay_timer = TimerStat()\n        self.update_priorities_timer = TimerStat()\n\n    def get_host(self):\n        return os.uname()[1]\n\n    def add_batch(self, batch):\n        with self.add_batch_timer:\n            for row in batch.rows():\n                self.replay_buffer.add(\n                    row[\"obs\"], row[\"actions\"], row[\"rewards\"], row[\"new_obs\"],\n                    row[\"dones\"], row[\"weights\"])\n\n    def replay(self):\n        with self.replay_timer:\n            if len(self.replay_buffer) < self.replay_starts:\n                return None\n\n            (obses_t, actions, rewards, obses_tp1,\n                dones, weights, batch_indexes) = self.replay_buffer.sample(\n                    self.train_batch_size,\n                    beta=self.prioritized_replay_beta)\n\n            batch = SampleBatch({\n                \"obs\": obses_t, \"actions\": actions, \"rewards\": rewards,\n                \"new_obs\": obses_tp1, \"dones\": dones, \"weights\": weights,\n                \"batch_indexes\": batch_indexes})\n            return batch\n\n    def update_priorities(self, batch_indexes, td_errors):\n        with self.update_priorities_timer:\n            new_priorities = (\n                np.abs(td_errors) + self.prioritized_replay_eps)\n            self.replay_buffer.update_priorities(batch_indexes, new_priorities)\n\n    def stats(self):\n        stat = {\n            \"add_batch_time_ms\": round(\n                1000 * self.add_batch_timer.mean, 3),\n            \"replay_time_ms\": round(\n                1000 * self.replay_timer.mean, 3),\n            \"update_priorities_time_ms\": round(\n                1000 * self.update_priorities_timer.mean, 3),\n        }\n        stat.update(self.replay_buffer.stats())\n        return stat\n\n\nclass LearnerThread(threading.Thread):\n    \"\"\"Background thread that updates the local model from replay data.\n\n    The learner thread communicates with the main thread through Queues. This\n    is needed since Ray operations can only be run on the main thread. In\n    addition, moving heavyweight gradient ops session runs off the main thread\n    improves overall throughput.\n    \"\"\"\n\n    def __init__(self, local_evaluator):\n        threading.Thread.__init__(self)\n        self.learner_queue_size = WindowStat(\"size\", 50)\n        self.local_evaluator = local_evaluator\n        self.inqueue = queue.Queue(maxsize=LEARNER_QUEUE_MAX_SIZE)\n        self.outqueue = queue.Queue()\n        self.queue_timer = TimerStat()\n        self.grad_timer = TimerStat()\n        self.daemon = True\n        self.weights_updated = False\n\n    def run(self):\n        while True:\n            self.step()\n\n    def step(self):\n        with self.queue_timer:\n            ra, replay = self.inqueue.get()\n        if replay is not None:\n            with self.grad_timer:\n                td_error = self.local_evaluator.compute_apply(replay)[\n                    \"td_error\"]\n            self.outqueue.put((ra, replay, td_error))\n        self.learner_queue_size.push(self.inqueue.qsize())\n        self.weights_updated = True\n\n\nclass ApexOptimizer(PolicyOptimizer):\n    \"\"\"Main event loop of the Ape-X optimizer.\n\n    This class coordinates the data transfers between the learner thread,\n    remote evaluators (Ape-X actors), and replay buffer actors.\n\n    This optimizer requires that policy evaluators return an additional\n    \"td_error\" array in the info return of compute_gradients(). This error\n    term will be used for sample prioritization.\"\"\"\n\n    def _init(\n            self, learning_starts=1000, buffer_size=10000,\n            prioritized_replay=True, prioritized_replay_alpha=0.6,\n            prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n            train_batch_size=512, sample_batch_size=50,\n            num_replay_buffer_shards=1, max_weight_sync_delay=400,\n            clip_rewards=True, debug=False):\n\n        self.debug = debug\n        self.replay_starts = learning_starts\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n        self.train_batch_size = train_batch_size\n        self.sample_batch_size = sample_batch_size\n        self.max_weight_sync_delay = max_weight_sync_delay\n\n        self.learner = LearnerThread(self.local_evaluator)\n        self.learner.start()\n\n        # TODO(ekl) use create_colocated() for these actors once\n        # https://github.com/ray-project/ray/issues/1734 is fixed\n        self.replay_actors = [\n            ReplayActor.remote(\n                num_replay_buffer_shards, learning_starts, buffer_size,\n                train_batch_size, prioritized_replay_alpha,\n                prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n            for _ in range(num_replay_buffer_shards)\n        ]\n        assert len(self.remote_evaluators) > 0\n\n        # Stats\n        self.timers = {k: TimerStat() for k in [\n            \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n            \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n        self.num_weight_syncs = 0\n        self.learning_started = False\n\n        # Number of worker steps since the last weight update\n        self.steps_since_update = {}\n\n        # Otherwise kick of replay tasks for local gradient updates\n        self.replay_tasks = TaskPool()\n        for ra in self.replay_actors:\n            for _ in range(REPLAY_QUEUE_DEPTH):\n                self.replay_tasks.add(ra, ra.replay.remote())\n\n        # Kick off async background sampling\n        self.sample_tasks = TaskPool()\n        weights = self.local_evaluator.get_weights()\n        for ev in self.remote_evaluators:\n            ev.set_weights.remote(weights)\n            self.steps_since_update[ev] = 0\n            for _ in range(SAMPLE_QUEUE_DEPTH):\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n    def step(self):\n        start = time.time()\n        sample_timesteps, train_timesteps = self._step()\n        time_delta = time.time() - start\n        self.timers[\"sample\"].push(time_delta)\n        self.timers[\"sample\"].push_units_processed(sample_timesteps)\n        if train_timesteps > 0:\n            self.learning_started = True\n        if self.learning_started:\n            self.timers[\"train\"].push(time_delta)\n            self.timers[\"train\"].push_units_processed(train_timesteps)\n        self.num_steps_sampled += sample_timesteps\n        self.num_steps_trained += train_timesteps\n\n    def _step(self):\n        sample_timesteps, train_timesteps = 0, 0\n        weights = None\n\n        with self.timers[\"sample_processing\"]:\n            for ev, sample_batch in self.sample_tasks.completed():\n                sample_timesteps += self.sample_batch_size\n\n                # Send the data to the replay buffer\n                random.choice(self.replay_actors).add_batch.remote(\n                    sample_batch)\n\n                # Update weights if needed\n                self.steps_since_update[ev] += self.sample_batch_size\n                if self.steps_since_update[ev] >= self.max_weight_sync_delay:\n                    # Note that it's important to pull new weights once\n                    # updated to avoid excessive correlation between actors\n                    if weights is None or self.learner.weights_updated:\n                        self.learner.weights_updated = False\n                        with self.timers[\"put_weights\"]:\n                            weights = ray.put(\n                                self.local_evaluator.get_weights())\n                    ev.set_weights.remote(weights)\n                    self.num_weight_syncs += 1\n                    self.steps_since_update[ev] = 0\n\n                # Kick off another sample request\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n        with self.timers[\"replay_processing\"]:\n            for ra, replay in self.replay_tasks.completed():\n                self.replay_tasks.add(ra, ra.replay.remote())\n                with self.timers[\"get_samples\"]:\n                    samples = ray.get(replay)\n                with self.timers[\"enqueue\"]:\n                    self.learner.inqueue.put((ra, samples))\n\n        with self.timers[\"update_priorities\"]:\n            while not self.learner.outqueue.empty():\n                ra, replay, td_error = self.learner.outqueue.get()\n                ra.update_priorities.remote(replay[\"batch_indexes\"], td_error)\n                train_timesteps += self.train_batch_size\n\n        return sample_timesteps, train_timesteps\n\n    def stats(self):\n        replay_stats = ray.get(self.replay_actors[0].stats.remote())\n        timing = {\n            \"{}_time_ms\".format(k): round(1000 * self.timers[k].mean, 3)\n            for k in self.timers\n        }\n        timing[\"learner_grad_time_ms\"] = round(\n            1000 * self.learner.grad_timer.mean, 3)\n        timing[\"learner_dequeue_time_ms\"] = round(\n            1000 * self.learner.queue_timer.mean, 3)\n        stats = {\n            \"sample_throughput\": round(\n                self.timers[\"sample\"].mean_throughput, 3),\n            \"train_throughput\": round(self.timers[\"train\"].mean_throughput, 3),\n            \"num_weight_syncs\": self.num_weight_syncs,\n        }\n        debug_stats = {\n            \"replay_shard_0\": replay_stats,\n            \"timing_breakdown\": timing,\n            \"pending_sample_tasks\": self.sample_tasks.count,\n            \"pending_replay_tasks\": self.replay_tasks.count,\n            \"learner_queue\": self.learner.learner_queue_size.stats(),\n        }\n        if self.debug:\n            stats.update(debug_stats)\n        return dict(PolicyOptimizer.stats(self), **stats)\n",
+      "total_lines": 286,
+      "ref": "b41bdcefa0351a4bf77f0c46917663b5014a364b"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 166,
+      "start_line": 146,
+      "end_line": 186,
+      "matched_line": "        # TODO(ekl) use create_colocated() for these actors once",
+      "excerpt": "146: \n147:     def _init(\n148:             self, learning_starts=1000, buffer_size=10000,\n149:             prioritized_replay=True, prioritized_replay_alpha=0.6,\n150:             prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n151:             train_batch_size=512, sample_batch_size=50,\n152:             num_replay_buffer_shards=1, max_weight_sync_delay=400,\n153:             clip_rewards=True, debug=False):\n154: \n155:         self.debug = debug\n156:         self.replay_starts = learning_starts\n157:         self.prioritized_replay_beta = prioritized_replay_beta\n158:         self.prioritized_replay_eps = prioritized_replay_eps\n159:         self.train_batch_size = train_batch_size\n160:         self.sample_batch_size = sample_batch_size\n161:         self.max_weight_sync_delay = max_weight_sync_delay\n162: \n163:         self.learner = LearnerThread(self.local_evaluator)\n164:         self.learner.start()\n165: \n166:         # TODO(ekl) use create_colocated() for these actors once\n167:         # https://github.com/ray-project/ray/issues/1734 is fixed\n168:         self.replay_actors = [\n169:             ReplayActor.remote(\n170:                 num_replay_buffer_shards, learning_starts, buffer_size,\n171:                 train_batch_size, prioritized_replay_alpha,\n172:                 prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n173:             for _ in range(num_replay_buffer_shards)\n174:         ]\n175:         assert len(self.remote_evaluators) > 0\n176: \n177:         # Stats\n178:         self.timers = {k: TimerStat() for k in [\n179:             \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n180:             \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n181:         self.num_weight_syncs = 0\n182:         self.learning_started = False\n183: \n184:         # Number of worker steps since the last weight update\n185:         self.steps_since_update = {}\n186: "
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_init",
+      "start_line": 147,
+      "end_line": 200,
+      "source": "    def _init(\n            self, learning_starts=1000, buffer_size=10000,\n            prioritized_replay=True, prioritized_replay_alpha=0.6,\n            prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n            train_batch_size=512, sample_batch_size=50,\n            num_replay_buffer_shards=1, max_weight_sync_delay=400,\n            clip_rewards=True, debug=False):\n\n        self.debug = debug\n        self.replay_starts = learning_starts\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n        self.train_batch_size = train_batch_size\n        self.sample_batch_size = sample_batch_size\n        self.max_weight_sync_delay = max_weight_sync_delay\n\n        self.learner = LearnerThread(self.local_evaluator)\n        self.learner.start()\n\n        # TODO(ekl) use create_colocated() for these actors once\n        # https://github.com/ray-project/ray/issues/1734 is fixed\n        self.replay_actors = [\n            ReplayActor.remote(\n                num_replay_buffer_shards, learning_starts, buffer_size,\n                train_batch_size, prioritized_replay_alpha,\n                prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n            for _ in range(num_replay_buffer_shards)\n        ]\n        assert len(self.remote_evaluators) > 0\n\n        # Stats\n        self.timers = {k: TimerStat() for k in [\n            \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n            \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n        self.num_weight_syncs = 0\n        self.learning_started = False\n\n        # Number of worker steps since the last weight update\n        self.steps_since_update = {}\n\n        # Otherwise kick of replay tasks for local gradient updates\n        self.replay_tasks = TaskPool()\n        for ra in self.replay_actors:\n            for _ in range(REPLAY_QUEUE_DEPTH):\n                self.replay_tasks.add(ra, ra.replay.remote())\n\n        # Kick off async background sampling\n        self.sample_tasks = TaskPool()\n        weights = self.local_evaluator.get_weights()\n        for ev in self.remote_evaluators:\n            ev.set_weights.remote(weights)\n            self.steps_since_update[ev] = 0\n            for _ in range(SAMPLE_QUEUE_DEPTH):\n                self.sample_tasks.add(ev, ev.sample.remote())"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 147,
+      "end_line": 200,
+      "excerpt": "    def _init(\n            self, learning_starts=1000, buffer_size=10000,\n            prioritized_replay=True, prioritized_replay_alpha=0.6,\n            prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n            train_batch_size=512, sample_batch_size=50,\n            num_replay_buffer_shards=1, max_weight_sync_delay=400,\n            clip_rewards=True, debug=False):\n\n        self.debug = debug\n        self.replay_starts = learning_starts\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n        self.train_batch_size = train_batch_size\n        self.sample_batch_size = sample_batch_size\n        self.max_weight_sync_delay = max_weight_sync_delay\n\n        self.learner = LearnerThread(self.local_evaluator)\n        self.learner.start()\n\n        # TODO(ekl) use create_colocated() for these actors once\n        # https://github.com/ray-project/ray/issues/1734 is fixed\n        self.replay_actors = [\n            ReplayActor.remote(\n                num_replay_buffer_shards, learning_starts, buffer_size,\n                train_batch_size, prioritized_replay_alpha,\n                prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n            for _ in range(num_replay_buffer_shards)\n        ]\n        assert len(self.remote_evaluators) > 0\n\n        # Stats\n        self.timers = {k: TimerStat() for k in [\n            \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n            \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n        self.num_weight_syncs = 0\n        self.learning_started = False\n\n        # Number of worker steps since the last weight update\n        self.steps_since_update = {}\n\n        # Otherwise kick of replay tasks for local gradient updates\n        self.replay_tasks = TaskPool()\n        for ra in self.replay_actors:\n            for _ in range(REPLAY_QUEUE_DEPTH):\n                self.replay_tasks.add(ra, ra.replay.remote())\n\n        # Kick off async background sampling\n        self.sample_tasks = TaskPool()\n        weights = self.local_evaluator.get_weights()\n        for ev in self.remote_evaluators:\n            ev.set_weights.remote(weig",
+      "symbol_name": "_init",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "python/ray/rllib/optimizers/apex_optimizer.py",
+      "sha": "dc9a9752fa167940b5689a67318d799264e2ded2",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/rllib/optimizers/apex_optimizer.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "__future__:division",
+        "__future__:print_function",
+        "os",
+        "queue",
+        "random",
+        "time",
+        "threading",
+        "numpy",
+        "ray",
+        "ray.rllib.optimizers.policy_optimizer:PolicyOptimizer",
+        "ray.rllib.optimizers.replay_buffer:PrioritizedReplayBuffer",
+        "ray.rllib.optimizers.sample_batch:SampleBatch",
+        "ray.rllib.utils.actors:TaskPool",
+        "ray.rllib.utils.timer:TimerStat",
+        "ray.rllib.utils.window_stat:WindowStat"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/b41bdcefa0351a4bf77f0c46917663b5014a364b/README.rst",
+      "content_excerpt": "Ray\n===\n\n.. image:: https://travis-ci.org/ray-project/ray.svg?branch=master\n    :target: https://travis-ci.org/ray-project/ray\n\n.. image:: https://readthedocs.org/projects/ray/badge/?version=latest\n    :target: http://ray.readthedocs.io/en/latest/?badge=latest\n\n|\n\nRay is a flexible, high-performance distributed execution framework.\n\n\nRay is easy to install: ``pip install ray``\n\nExample Use\n-----------\n\n+------------------------------------------------+----------------------------------------------------+\n| **Basic Python**                               | **Distributed with Ray**                           |\n+------------------------------------------------+----------------------------------------------------+\n|.. code-block:: python                          |.. code-block:: python                              |\n|                                                |                                                    |\n|  # Execute f serially.                         |  # Execute f in parallel.                          |\n|                                                |                                                    |\n|                                                |  @ray.remote                                       |\n|  def f():                                      |  def f():                                          |\n|      time.sleep(1)                             |      time.sleep(1)                                 |\n|      return 1                                  |      return 1                                      |\n|                                                |"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "_init",
+      "count": 4,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/rllib/test/__init__.py",
+          "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+          "html_url": "https://github.com/ray-project/ray/blob/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/rllib/test/__init__.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": "",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "__init__.py",
+          "path": "python/ray/test/__init__.py",
+          "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+          "html_url": "https://github.com/ray-project/ray/blob/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/test/__init__.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": "",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_dataframe.py",
+          "path": "python/ray/dataframe/test/test_dataframe.py",
+          "sha": "3813d0baf97152b554d6fb0fb28b5e7100f09835",
+          "html_url": "https://github.com/ray-project/ray/blob/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/dataframe/test/test_dataframe.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 20,
+          "end_line": 44,
+          "excerpt": "20:     return to_pandas(ray_df).sort_index().equals(pandas_df.sort_index())\n21: \n22: \n23: @pytest.fixture\n24: def ray_df_equals(ray_df1, ray_df2):\n25:     return to_pandas(ray_df1).sort_index().equals(\n26:         to_pandas(ray_df2).sort_index()\n27:     )\n28: \n29: \n30: @pytest.fixture\n31: def test_roundtrip(ray_df, pandas_df):\n32:     assert(ray_df_equals_pandas(ray_df, pandas_df))\n33: \n34: \n35: @pytest.fixture\n36: def test_index(ray_df, pandas_df):\n37:     assert(ray_df.index.equals(pandas_df.index))\n38:     ray_df_cp = ray_df.copy()\n39:     pandas_df_cp = pandas_df.copy()\n40: \n41:     ray_df_cp.index = [str(i) for i in ray_df_cp.index]\n42:     pandas_df_cp.index = [str(i) for i in pandas_df_cp.index]\n43:     assert(ray_df_cp.index.sort_values().equals(pandas_df_cp.index))\n44: ",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_io.py",
+          "path": "python/ray/dataframe/test/test_io.py",
+          "sha": "0f2cc57acde1318451a84ef461e9592445dce61c",
+          "html_url": "https://github.com/ray-project/ray/blob/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/dataframe/test/test_io.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 53,
+          "end_line": 77,
+          "excerpt": "53: @pytest.fixture\n54: def teardown_csv_file():\n55:     if os.path.exists(TEST_CSV_FILENAME):\n56:         os.remove(TEST_CSV_FILENAME)\n57: \n58: \n59: def test_from_parquet_small():\n60: \n61:     setup_parquet_file(SMALL_ROW_SIZE)\n62: \n63:     pd_df = pd.read_parquet(TEST_PARQUET_FILENAME)\n64:     ray_df = io.read_parquet(TEST_PARQUET_FILENAME)\n65:     assert ray_df_equals_pandas(ray_df, pd_df)\n66: \n67:     teardown_parquet_file()\n68: \n69: \n70: def test_from_parquet_large():\n71:     setup_parquet_file(LARGE_ROW_SIZE)\n72: \n73:     pd_df = pd.read_parquet(TEST_PARQUET_FILENAME)\n74:     ray_df = io.read_parquet(TEST_PARQUET_FILENAME)\n75: \n76:     assert ray_df_equals_pandas(ray_df, pd_df)\n77: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "_init",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "python/ray/rllib/optimizers",
+      "count": 15,
+      "entries": [
+        {
+          "name": "optimizers",
+          "path": "python/ray/rllib/optimizers",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "python/ray/rllib/optimizers/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "apex_optimizer.py",
+          "path": "python/ray/rllib/optimizers/apex_optimizer.py",
+          "type": "file"
+        },
+        {
+          "name": "async_optimizer.py",
+          "path": "python/ray/rllib/optimizers/async_optimizer.py",
+          "type": "file"
+        },
+        {
+          "name": "local_sync.py",
+          "path": "python/ray/rllib/optimizers/local_sync.py",
+          "type": "file"
+        },
+        {
+          "name": "local_sync_replay.py",
+          "path": "python/ray/rllib/optimizers/local_sync_replay.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_gpu.py",
+          "path": "python/ray/rllib/optimizers/multi_gpu.py",
+          "type": "file"
+        },
+        {
+          "name": "multi_gpu_impl.py",
+          "path": "python/ray/rllib/optimizers/multi_gpu_impl.py",
+          "type": "file"
+        },
+        {
+          "name": "policy_evaluator.py",
+          "path": "python/ray/rllib/optimizers/policy_evaluator.py",
+          "type": "file"
+        },
+        {
+          "name": "policy_optimizer.py",
+          "path": "python/ray/rllib/optimizers/policy_optimizer.py",
+          "type": "file"
+        },
+        {
+          "name": "replay_buffer.py",
+          "path": "python/ray/rllib/optimizers/replay_buffer.py",
+          "type": "file"
+        },
+        {
+          "name": "sample_batch.py",
+          "path": "python/ray/rllib/optimizers/sample_batch.py",
+          "type": "file"
+        },
+        {
+          "name": "segment_tree.py",
+          "path": "python/ray/rllib/optimizers/segment_tree.py",
+          "type": "file"
+        },
+        {
+          "name": "tests",
+          "path": "python/ray/rllib/optimizers/tests",
+          "type": "dir"
+        },
+        {
+          "name": "test_segment_tree.py",
+          "path": "python/ray/rllib/optimizers/tests/test_segment_tree.py",
+          "type": "file"
+        }
+      ],
+      "ref": "b41bdcefa0351a4bf77f0c46917663b5014a364b"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "python/ray/rllib/optimizers/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from ray.rllib.optimizers.apex_optimizer import ApexOptimizer\n2: from ray.rllib.optimizers.async_optimizer import AsyncOptimizer\n3: from ray.rllib.optimizers.local_sync import LocalSyncOptimizer\n4: from ray.rllib.optimizers.local_sync_replay import LocalSyncReplayOptimizer\n5: from ray.rllib.optimizers.multi_gpu import LocalMultiGPUOptimizer\n6: from ray.rllib.optimizers.sample_batch import SampleBatch\n7: from ray.rllib.optimizers.policy_evaluator import PolicyEvaluator, \\\n8:     TFMultiGPUSupport\n9: \n10: \n11: __all__ = [\n12:     \"ApexOptimizer\", \"AsyncOptimizer\", \"LocalSyncOptimizer\",\n13:     \"LocalSyncReplayOptimizer\", \"LocalMultiGPUOptimizer\", \"SampleBatch\","
+        },
+        {
+          "name": "async_optimizer.py",
+          "path": "python/ray/rllib/optimizers/async_optimizer.py",
+          "match_reason": "symbol_match",
+          "start_line": 17,
+          "end_line": 22,
+          "excerpt": "    def _init(self, grads_per_step=100, batch_size=10):\n        self.apply_timer = TimerStat()\n        self.wait_timer = TimerStat()\n        self.dispatch_timer = TimerStat()\n        self.grads_per_step = grads_per_step\n        self.batch_size = batch_size"
+        },
+        {
+          "name": "local_sync.py",
+          "path": "python/ray/rllib/optimizers/local_sync.py",
+          "match_reason": "symbol_match",
+          "start_line": 20,
+          "end_line": 25,
+          "excerpt": "    def _init(self, batch_size=32):\n        self.update_weights_timer = TimerStat()\n        self.sample_timer = TimerStat()\n        self.grad_timer = TimerStat()\n        self.throughput = RunningStat()\n        self.batch_size = batch_size"
+        },
+        {
+          "name": "local_sync_replay.py",
+          "path": "python/ray/rllib/optimizers/local_sync_replay.py",
+          "match_reason": "symbol_match",
+          "start_line": 23,
+          "end_line": 49,
+          "excerpt": "    def _init(\n            self, learning_starts=1000, buffer_size=10000,\n            prioritized_replay=True, prioritized_replay_alpha=0.6,\n            prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n            train_batch_size=32, sample_batch_size=4, clip_rewards=True):\n\n        self.replay_starts = learning_starts\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n        self.train_batch_size = train_batch_size\n\n        # Stats\n        self.update_weights_timer = TimerStat()\n        self.sample_timer = TimerStat()\n        self.replay_timer = TimerStat()\n        self.grad_timer = TimerStat()\n        self.throughput = RunningStat()\n\n        # Set up replay buffer\n        if prioritized_replay:\n            self.replay_buffer = PrioritizedReplayBuffer(\n                buffer_size, alpha=prioritized_replay_alpha,\n                clip_rewards=clip_rewards)\n        else:\n            self.replay_buffer = ReplayBuffer(buffer_size, clip_rewards)\n\n        assert buffer_size >= self.replay_starts"
+        },
+        {
+          "name": "multi_gpu.py",
+          "path": "python/ray/rllib/optimizers/multi_gpu.py",
+          "match_reason": "symbol_match",
+          "start_line": 29,
+          "end_line": 64,
+          "excerpt": "    def _init(self, sgd_batch_size=128, sgd_stepsize=5e-5, num_sgd_iter=10):\n        assert isinstance(self.local_evaluator, TFMultiGPUSupport)\n        self.batch_size = sgd_batch_size\n        self.sgd_stepsize = sgd_stepsize\n        self.num_sgd_iter = num_sgd_iter\n        gpu_ids = ray.get_gpu_ids()\n        if not gpu_ids:\n            self.devices = [\"/cpu:0\"]\n        else:\n            self.devices = [\"/gpu:{}\".format(i) for i in range(len(gpu_ids))]\n        assert self.batch_size > len(self.devices), \"batch size too small\"\n        self.per_device_batch_size = self.batch_size // len(self.devices)\n        self.sample_timer = TimerStat()\n        self.load_timer = TimerStat()\n        self.grad_timer = TimerStat()\n        self.update_weights_timer = TimerStat()\n\n        print(\"LocalMultiGPUOptimizer devices\", self.devices)\n        print(\"LocalMultiGPUOptimizer batch size\", self.batch_size)\n\n        # List of (feature name, feature placeholder) tuples\n        self.loss_inputs = self.local_evaluator.tf_loss_inputs()\n\n        # per-GPU graph copies created below must share vars with the policy\n        tf.get_variable_scope().reuse_variables()\n\n        self.par_opt = LocalSyncParallelOptimizer(\n            tf.train.AdamOptimizer(self.sgd_stepsize),\n            self.devices,\n            [ph for _, ph in self.loss_inputs],\n            self.per_device_batch_size,\n            lambda *ph: self.local_evaluator.build_tf_loss(ph),\n            os.getcwd())\n\n        self.sess = self.local_evaluator.sess\n        self.sess.run(tf.global_variables_initializer())"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "python/ray/rllib/optimizers/apex_optimizer.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "44f5f0520b241366c28e5db976d8d89b30a5ac00",
+          "html_url": "https://github.com/ray-project/ray/commit/44f5f0520b241366c28e5db976d8d89b30a5ac00",
+          "message": "[rllib] Rename optimizers for clarity (#2303)\n\n* rename\r\n\r\n* fix\r\n\r\n* update\r\n\r\n* mgpu\r\n\r\n* Update a3c.py\r\n\r\n* Update bc.py\r\n\r\n* Update a3c.py\r\n\r\n* Update test_optimizers.py\r\n\r\n* Update a3c.py",
+          "author": "Eric Liang",
+          "date": "2018-06-27T09:30:15Z"
+        },
+        {
+          "sha": "a9a26b756098dcbd108966c52e3e7e9c9bfaf7ee",
+          "html_url": "https://github.com/ray-project/ray/commit/a9a26b756098dcbd108966c52e3e7e9c9bfaf7ee",
+          "message": "[rllib] Part 2 of multiagent support (#2286)\n\n* wip\r\n\r\n* cls\r\n\r\n* re\r\n\r\n* wip\r\n\r\n* wip\r\n\r\n* a3c working\r\n\r\n* torch support\r\n\r\n* pg works\r\n\r\n* lint\r\n\r\n* rm v2\r\n\r\n* consumer id\r\n\r\n* clean up pg\r\n\r\n* clean up more\r\n\r\n* fix python 2.7\r\n\r\n* tf session management\r\n\r\n* docs\r\n\r\n* dqn wip\r\n\r\n* fix compile\r\n\r",
+          "author": "Eric Liang",
+          "date": "2018-06-26T05:33:57Z"
+        },
+        {
+          "sha": "68bec0f6fb239a426614e623509474d49f3af273",
+          "html_url": "https://github.com/ray-project/ray/commit/68bec0f6fb239a426614e623509474d49f3af273",
+          "message": "[rllib] Queue lib for python 2.7 (#2057)\n\n* Queue lib for python 2.7\r\n\r\n* use six.moves.queue instead",
+          "author": "alexbao",
+          "date": "2018-05-15T22:27:52Z"
+        },
+        {
+          "sha": "7ab890f4a1d5b67f36bbc4d8cd72f5093c632940",
+          "html_url": "https://github.com/ray-project/ray/commit/7ab890f4a1d5b67f36bbc4d8cd72f5093c632940",
+          "message": "[tune] [rllib] Automatically determine RLlib resources and add queueing mechanism for autoscaling (#1848)",
+          "author": "Eric Liang",
+          "date": "2018-04-16T23:58:15Z"
+        },
+        {
+          "sha": "b41bdcefa0351a4bf77f0c46917663b5014a364b",
+          "html_url": "https://github.com/ray-project/ray/commit/b41bdcefa0351a4bf77f0c46917663b5014a364b",
+          "message": "[rllib] Update RLlib to work with new actor scheduling behavior (#1754)\n\n* Mon Mar 19 21:23:01 PDT 2018\r\n\r\n* Mon Mar 19 21:23:07 PDT 2018\r\n\r\n* Mon Mar 19 21:30:49 PDT 2018\r\n\r\n* Mon Mar 19 21:32:05 PDT 2018\r\n\r\n* Mon Mar 19 21:35:43 PDT 2018\r\n\r\n* fix cpu limits\r\n\r\n* Mon Mar 19 22:25:07 PDT 2018",
+          "author": "Eric Liang",
+          "date": "2018-03-21T02:29:52Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_init TODO create_colocated these actors once",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "python/ray/rllib/optimizers/apex_optimizer.py",
+      "satd_line": 166,
+      "last_commit": {
+        "sha": "44f5f0520b241366c28e5db976d8d89b30a5ac00",
+        "html_url": "https://github.com/ray-project/ray/commit/44f5f0520b241366c28e5db976d8d89b30a5ac00",
+        "message": "[rllib] Rename optimizers for clarity (#2303)\n\n* rename\r\n\r\n* fix\r\n\r\n* update\r\n\r\n* mgpu\r\n\r\n* Update a3c.py\r\n\r\n* Update bc.py\r\n\r\n* Update a3c.py\r\n\r\n* Update test_optimizers.py\r\n\r\n* Update a3c.py",
+        "author": "Eric Liang",
+        "date": "2018-06-27T09:30:15Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_init",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

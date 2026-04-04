@@ -1,0 +1,379 @@
+{
+  "task_id": "68",
+  "repo_owner": "sphinx-doc",
+  "repo_name": "sphinx",
+  "file_path": "sphinx/domains/cpp.py",
+  "commit": "4bcaf137667c734a2640c66e0a538432cebb2167",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:26:54+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "4bcaf137667c734a2640c66e0a538432cebb2167",
+    "symbol_name": "_parse_expression",
+    "satd_line": 4084,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:27:15+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:27:18+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "sphinx/domains/cpp.py",
+    "original_code": "def _parse_expression(self, inTemplate: bool) -> ASTExpression:\n    # -> assignment-expression\n    #  | expression \",\" assignment-expresion\n    # TODO: actually parse the second production\n    return self._parse_assignment_expression(inTemplate=inTemplate)",
+    "original_signature": "def _parse_expression(self, inTemplate: bool) -> ASTExpression:",
+    "satd_comment": "# TODO: actually parse the second production",
+    "target_file": {
+      "ok": true,
+      "path": "sphinx/domains/cpp.py",
+      "sha": "e95de4be952a242d3b5e90c91ea809c911ee0a7f",
+      "download_url": "https://raw.githubusercontent.com/sphinx-doc/sphinx/4bcaf137667c734a2640c66e0a538432cebb2167/sphinx/domains/cpp.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n\"\"\"\n    sphinx.domains.cpp\n    ~~~~~~~~~~~~~~~~~~\n\n    The C++ language domain.\n\n    :copyright: Copyright 2007-2017 by the Sphinx team, see AUTHORS.\n    :license: BSD, see LICENSE for details.\n\"\"\"\n\nimport re\nfrom copy import deepcopy\n\nfrom six import iteritems, text_type\n\nfrom docutils import nodes\nfrom docutils.parsers.rst import Directive, directives\n\nfrom sphinx import addnodes\nfrom sphinx.roles import XRefRole\nfrom sphinx.locale import l_, _\nfrom sphinx.domains import Domain, ObjType\nfrom sphinx.directives import ObjectDescription\nfrom sphinx.util import logging\nfrom sphinx.util.nodes import make_refnode\nfrom sphinx.util.pycompat import UnicodeMixin\nfrom sphinx.util.docfields import Field, GroupedField\n\nif False:\n    # For type annotation\n    from typing import Any, Callable, Dict, Iterator, List, Match, Pattern, Tuple, Union  # NOQA\n    from sphinx.application import Sphinx  # NOQA\n    from sphinx.builders import Builder  # NOQA\n    from sphinx.config import Config  # NOQA\n    from sphinx.environment import BuildEnvironment  # NOQA\n\nlogger = logging.getLogger(__name__)\n\n\"\"\"\n    Important note on ids\n    ----------------------------------------------------------------------------\n\n    Multiple id generation schemes are used due to backwards compatibility.\n    - v1: 1.2.3 <= version < 1.3\n          The style used before the rewrite.\n          It is not the actual old code, but a replication of the behaviour.\n    - v2: 1.3 <= version < now\n          Standardised mangling scheme from\n          http://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling\n          though not completely implemented.\n    All versions are generated and attached to elements. The newest is used for\n    the index. All of the versions should work as permalinks.\n\n\n    Signature Nodes and Tagnames\n    ----------------------------------------------------------------------------\n\n    Each signature is in a desc_signature node, where all children are\n    desc_signature_line nodes. Each of these lines will have the attribute\n    'sphinx_cpp_tagname' set to one of the following (prioritized):\n    - 'declarator', if the line contains the name of the declared object.\n    - 'templateParams', if the line starts a template parameter list,\n    - 'templateParams', if the line has template parameters\n      Note: such lines might get a new tag in the future.\n    - 'templateIntroduction, if the line is on the form 'conceptName{...}'\n    No other desc_signature nodes should exist (so far).\n\n\n    Grammar\n    ----------------------------------------------------------------------------\n\n    See http://www.nongnu.org/hcb/ for the grammar,\n    and https://github.com/cplusplus/draft/blob/master/source/grammar.tex,\n    and https://github.com/cplusplus/concepts-ts\n    for the newest grammar.\n\n    common grammar things:\n        template-declaration ->\n            \"template\" \"<\" template-parameter-list \">\" declaration\n        template-parameter-list ->\n              template-parameter\n            | template-parameter-list \",\" template-parameter\n        template-parameter ->\n              type-parameter\n            | parameter-declaration # i.e., same as a function argument\n\n        type-parameter ->\n              \"class\"    \"...\"[opt] identifier[opt]\n            | \"class\"               identifier[opt] \"=\" type-id\n            | \"typename\" \"...\"[opt] identifier[opt]\n            | \"typename\"            identifier[opt] \"=\" type-id\n            | \"template\" \"<\" template-parameter-list \">\"\n                \"class\"  \"...\"[opt] identifier[opt]\n            | \"template\" \"<\" template-parameter-list \">\"\n                \"class\"             identifier[opt] \"=\" id-expression\n            # also, from C++17 we can have \"typename\" in template templates\n        templateDeclPrefix ->\n            \"template\" \"<\" template-parameter-list \">\"\n\n        simple-declaration ->\n            attribute-specifier-seq[opt] decl-specifier-seq[opt]\n                init-declarator-list[opt] ;\n        # Drop the semi-colon. For now: drop the attributes (TODO).\n        # Use at most 1 init-declarator.\n        -> decl-specifier-seq init-declarator\n        -> decl-specifier-seq declarator initializer\n\n        decl-specifier ->\n              storage-class-specifier ->\n                 (  \"static\" (only for member_object and function_object)\n                  | \"extern\" (only for member_object and function_object)\n                  | \"register\"\n                 )\n                 thread_local[opt] (only for member_object)\n                                   (it can also appear before the others)\n\n            | type-specifier -> trailing-type-specifier\n            | function-specifier -> \"inline\" | \"virtual\" | \"explicit\" (only\n              for function_object)\n            | \"friend\" (only for function_object)\n            | \"constexpr\" (only for member_object and function_object)\n        trailing-type-specifier ->\n              simple-type-specifier\n            | elaborated-type-specifier\n            | typename-specifier\n            | cv-qualifier -> \"const\" | \"volatile\"\n        stricter grammar for decl-specifier-seq (with everything, each object\n        uses a subset):\n            visibility storage-class-specifier function-specifier \"friend\"\n            \"constexpr\" \"volatile\" \"const\" trailing-type-specifier\n            # where trailing-type-specifier can no be cv-qualifier\n        # Inside e.g., template paramters a strict subset is used\n        # (see type-specifier-seq)\n        trailing-type-specifier ->\n              simple-type-specifier ->\n                ::[opt] nested-name-specifier[opt] type-name\n              | ::[opt] nested-name-specifier \"template\" simple-template-id\n              | \"char\" | \"bool\" | ect.\n              | decltype-specifier\n            | elaborated-type-specifier ->\n                class-key attribute-specifier-seq[opt] ::[opt]\n                nested-name-specifier[opt] identifier\n              | class-key ::[opt] nested-name-specifier[opt] template[opt]\n                simple-template-id\n              | \"enum\" ::[opt] nested-name-specifier[opt] identifier\n            | typename-specifier ->\n                \"typename\" ::[opt] nested-name-specifier identifier\n              | \"typename\" ::[opt] nested-name-specifier template[opt]\n                simple-template-id\n        class-key -> \"class\" | \"struct\" | \"union\"\n        type-name ->* identifier | simple-template-id\n        # ignoring attributes and decltype, and then some left-factoring\n        trailing-type-specifier ->\n            rest-of-trailing\n            (\"class\" | \"struct\" | \"union\" | \"typename\") rest-of-trailing\n            build-in -> \"char\" | \"bool\" | ect.\n            decltype-specifier\n        rest-of-trailing -> (with some simplification)\n            \"::\"[opt] list-of-elements-separated-by-::\n        element ->\n            \"template\"[opt] identifier (\"<\" template-argument-list \">\")[opt]\n        template-argument-list ->\n              template-argument \"...\"[opt]\n            | template-argument-list \",\" template-argument \"...\"[opt]\n        template-argument ->\n              constant-expression\n            | type-specifier-seq abstract-declarator\n            | id-expression\n\n\n        declarator ->\n              ptr-declarator\n            | noptr-declarator parameters-and-qualifiers trailing-return-type\n              (TODO: for now we don't support trailing-eturn-type)\n        ptr-declarator ->\n              noptr-declarator\n            | ptr-operator ptr-declarator\n        noptr-declarator ->\n              declarator-id attribute-specifier-seq[opt] ->\n                    \"...\"[opt] id-expression\n                  | rest-of-trailing\n            | noptr-declarator parameters-and-qualifiers\n            | noptr-declarator \"[\" constant-expression[opt] \"]\"\n              attribute-specifier-seq[opt]\n            | \"(\" ptr-declarator \")\"\n        ptr-operator ->\n              \"*\"  attribute-specifier-seq[opt] cv-qualifier-seq[opt]\n            | \"&   attribute-specifier-seq[opt]\n            | \"&&\" attribute-specifier-seq[opt]\n            | \"::\"[opt] nested-name-specifier \"*\" attribute-specifier-seq[opt]\n                cv-qualifier-seq[opt]\n        # function_object must use a parameters-and-qualifiers, the others may\n        # use it (e.g., function poitners)\n        parameters-and-qualifiers ->\n            \"(\" parameter-clause \")\" attribute-specifier-seq[opt]\n            cv-qualifier-seq[opt] ref-qualifier[opt]\n            exception-specification[opt]\n        ref-qualifier -> \"&\" | \"&&\"\n        exception-specification ->\n            \"noexcept\" (\"(\" constant-expression \")\")[opt]\n            \"throw\" (\"(\" type-id-list \")\")[opt]\n        # TODO: we don't implement attributes\n        # member functions can have initializers, but we fold them into here\n        memberFunctionInit -> \"=\" \"0\"\n        # (note: only \"0\" is allowed as the value, according to the standard,\n        # right?)\n\n        enum-head ->\n            enum-key attribute-specifier-seq[opt] nested-name-specifier[opt]\n                identifier enum-base[opt]\n        enum-key -> \"enum\" | \"enum struct\" | \"enum class\"\n        enum-base ->\n            \":\" type\n        enumerator-definition ->\n              identifier\n            | identifier \"=\" constant-expression\n\n    We additionally add the possibility for specifying the visibility as the\n    first thing.\n\n    concept_object:\n        goal:\n            just a declaration of the name (for now)\n            either a variable concept or function concept\n\n        grammar: only a single template parameter list, and the nested name\n            may not have any template argument lists\n\n            \"template\" \"<\" template-parameter-list \">\"\n            nested-name-specifier \"()\"[opt]\n\n    type_object:\n        goal:\n            either a single type (e.g., \"MyClass:Something_T\" or a typedef-like\n            thing (e.g. \"Something Something_T\" or \"int I_arr[]\"\n        grammar, single type: based on a type in a function parameter, but\n        without a name:\n               parameter-declaration\n            -> attribute-specifier-seq[opt] decl-specifier-seq\n               abstract-declarator[opt]\n            # Drop the attributes\n            -> decl-specifier-seq abstract-declarator[opt]\n        grammar, typedef-like: no initilizer\n            decl-specifier-seq declarator\n        Can start with a templateDeclPrefix.\n\n    member_object:\n        goal: as a type_object which must have a declarator, and optionally\n        with a initializer\n        grammar:\n            decl-specifier-seq declarator initializer\n        Can start with a templateDeclPrefix.\n\n    function_object:\n        goal: a function declaration, TODO: what about templates? for now: skip\n        grammar: no initializer\n           decl-specifier-seq declarator\n        Can start with a templateDeclPrefix.\n\n    class_object:\n        goal: a class declaration, but with specification of a base class\n        grammar:\n              nested-name \"final\"[opt] (\":\" base-specifier-list)[opt]\n            base-specifier-list ->\n              base-specifier \"...\"[opt]\n            | base-specifier-list, base-specifier \"...\"[opt]\n            base-specifier ->\n              base-type-specifier\n            | \"virtual\" access-spe\"cifier[opt]    base-type-specifier\n            | access-specifier[opt] \"virtual\"[opt] base-type-specifier\n        Can start with a templateDeclPrefix.\n\n    enum_object:\n        goal: an unscoped enum or a scoped enum, optionally with the underlying\n              type specified\n        grammar:\n            (\"class\" | \"struct\")[opt] visibility[opt] nested-name (\":\" type)[opt]\n    enumerator_object:\n        goal: an element in a scoped or unscoped enum. The name should be\n              injected according to the scopedness.\n        grammar:\n            nested-name (\"=\" constant-expression)\n\n    namespace_object:\n        goal: a directive to put all following declarations in a specific scope\n        grammar:",
+      "total_lines": 5742,
+      "ref": "4bcaf137667c734a2640c66e0a538432cebb2167"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 4084,
+      "start_line": 4064,
+      "end_line": 4104,
+      "matched_line": "        # TODO: actually parse the second production",
+      "excerpt": "4064:                 expr = self._parse_logical_or_expression(False)\n4065:                 exprs.append(expr)\n4066:                 ops.append(op)\n4067:                 oneMore = True\n4068:             if not oneMore:\n4069:                 break\n4070:         if len(ops) == 0:\n4071:             return orExpr\n4072:         else:\n4073:             return ASTAssignmentExpr(exprs, ops)\n4074: \n4075:     def _parse_constant_expression(self, inTemplate):\n4076:         # -> conditional-expression\n4077:         orExpr = self._parse_logical_or_expression(inTemplate=inTemplate)\n4078:         # TODO: use _parse_conditional_expression_tail\n4079:         return orExpr\n4080: \n4081:     def _parse_expression(self, inTemplate):\n4082:         # -> assignment-expression\n4083:         #  | expression \",\" assignment-expresion\n4084:         # TODO: actually parse the second production\n4085:         return self._parse_assignment_expression(inTemplate=inTemplate)\n4086: \n4087:     def _parse_expression_fallback(self, end, parser):\n4088:         # type: (List[unicode]) -> unicode\n4089:         # Stupidly \"parse\" an expression.\n4090:         # 'end' should be a list of characters which ends the expression.\n4091: \n4092:         # first try to use the provided parser\n4093:         prevPos = self.pos\n4094:         try:\n4095:             return parser()\n4096:         except DefinitionError as e:\n4097:             raise\n4098:             self.warn(\"Parsing of expression failed. Using fallback parser.\"\n4099:                       \" Error was:\\n%s\" % e.description)\n4100:             self.pos = prevPos\n4101:         # and then the fallback scanning\n4102:         assert end is not None\n4103:         self.skip_ws()\n4104:         startPos = self.pos"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_parse_expression",
+      "start_line": 4081,
+      "end_line": 4085,
+      "source": "    def _parse_expression(self, inTemplate):\n        # -> assignment-expression\n        #  | expression \",\" assignment-expresion\n        # TODO: actually parse the second production\n        return self._parse_assignment_expression(inTemplate=inTemplate)"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 4081,
+      "end_line": 4085,
+      "excerpt": "    def _parse_expression(self, inTemplate):\n        # -> assignment-expression\n        #  | expression \",\" assignment-expresion\n        # TODO: actually parse the second production\n        return self._parse_assignment_expression(inTemplate=inTemplate)",
+      "symbol_name": "_parse_expression",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "sphinx/domains/cpp.py",
+      "sha": "e95de4be952a242d3b5e90c91ea809c911ee0a7f",
+      "download_url": "https://raw.githubusercontent.com/sphinx-doc/sphinx/4bcaf137667c734a2640c66e0a538432cebb2167/sphinx/domains/cpp.py"
+    },
+    "imports": {
+      "imports": [
+        "re",
+        "copy:deepcopy",
+        "six:iteritems",
+        "six:text_type",
+        "docutils:nodes",
+        "docutils.parsers.rst:Directive",
+        "docutils.parsers.rst:directives",
+        "sphinx:addnodes",
+        "sphinx.roles:XRefRole",
+        "sphinx.locale:l_",
+        "sphinx.locale:_",
+        "sphinx.domains:Domain",
+        "sphinx.domains:ObjType",
+        "sphinx.directives:ObjectDescription",
+        "sphinx.util:logging",
+        "sphinx.util.nodes:make_refnode",
+        "sphinx.util.pycompat:UnicodeMixin",
+        "sphinx.util.docfields:Field",
+        "sphinx.util.docfields:GroupedField",
+        "typing:Any",
+        "typing:Callable",
+        "typing:Dict",
+        "typing:Iterator",
+        "typing:List",
+        "typing:Match",
+        "typing:Pattern",
+        "typing:Tuple",
+        "typing:Union",
+        "sphinx.application:Sphinx",
+        "sphinx.builders:Builder"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/sphinx-doc/sphinx/4bcaf137667c734a2640c66e0a538432cebb2167/README.rst",
+      "content_excerpt": ".. image:: https://img.shields.io/pypi/v/sphinx.svg\n   :target: http://pypi.python.org/pypi/sphinx\n.. image:: https://readthedocs.org/projects/sphinx/badge/\n   :target: http://www.sphinx-doc.org/\n   :alt: Documentation Status\n.. image:: https://travis-ci.org/sphinx-doc/sphinx.svg?branch=master\n   :target: https://travis-ci.org/sphinx-doc/sphinx\n\n=================\nREADME for Sphinx\n=================\n\nThis is the Sphinx documentation generator, see http://www.sphinx-doc.org/.\n\n\nInstalling\n==========\n\nInstall from PyPI to use stable version::\n\n   pip install -U sphinx\n\nInstall from PyPI to use beta version::\n\n   pip install -U --pre sphinx\n\nInstall from newest dev version in stable branch::\n\n   pip install git+https://github.com/sphinx-doc/sphinx@stable\n\nInstall from newest dev version in master branch::\n\n   pip install git+https://github.com/sphinx-doc/sphinx\n\nInstall from cloned source::\n\n   pip install .\n\nInstall from cloned source as editable::\n\n   pip install -e .\n\n\nRelease signatures\n==================\n\nReleases are signed with following keys:\n\n* `498D6B9E <https://pgp.mit.edu/pks/lookup?op=vindex&search=0x102C2C17498D6B9E>`_\n* `5EBA0E07 <https://pgp.mit.edu/pks/lookup?op=vindex&search=0x1425F8CE5EBA0E07>`_\n\nReading the docs\n================\n\nYou can read them online at <http://www.sphinx-doc.org/>.\n\nOr, after installing::\n\n   cd doc\n   make html\n\nThen, direct your browser to ``_build/html/index.html``.\n\nTesting\n=======\n\nTo run the tests with the interpreter available as ``python``, use::\n\n    make test\n\nIf you want to use a different interpreter, e.g. ``python3``, use::"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "_parse_expression",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_autodoc_py35.py",
+          "path": "tests/py35/test_autodoc_py35.py",
+          "sha": "984ec603ad8fc36e3c13a38165ae9f35555a8ec5",
+          "html_url": "https://github.com/sphinx-doc/sphinx/blob/4bcaf137667c734a2640c66e0a538432cebb2167/tests/py35/test_autodoc_py35.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 100,
+          "end_line": 124,
+          "excerpt": "100: \n101: def skip_member(app, what, name, obj, skip, options):\n102:     if name in ('__special1__', '__special2__'):\n103:         return skip\n104:     if name.startswith('_'):\n105:         return True\n106:     if name == 'skipmeth':\n107:         return True\n108: \n109: \n110: @pytest.mark.usefixtures('setup_test')\n111: def test_generate():\n112:     def assert_warns(warn_str, objtype, name, **kw):\n113:         inst = AutoDirective._registry[objtype](directive, name)\n114:         inst.generate(**kw)\n115:         assert len(directive.result) == 0, directive.result\n116:         assert len(_warnings) == 1, _warnings\n117:         assert warn_str in _warnings[0], _warnings\n118:         del _warnings[:]\n119: \n120:     def assert_works(objtype, name, **kw):\n121:         inst = AutoDirective._registry[objtype](directive, name)\n122:         inst.generate(**kw)\n123:         assert directive.result\n124:         # print '\\n'.join(directive.result)",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_api_translator.py",
+          "path": "tests/test_api_translator.py",
+          "sha": "dadea50e5dfb31ef9646adcba042c6a65d83752e",
+          "html_url": "https://github.com/sphinx-doc/sphinx/blob/4bcaf137667c734a2640c66e0a538432cebb2167/tests/test_api_translator.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 18,
+          "end_line": 42,
+          "excerpt": "18: def setup_module():\n19:     sys.path.insert(0, rootdir / 'roots' / 'test-api-set-translator')\n20: \n21: \n22: def teardown_module():\n23:     sys.path.remove(rootdir / 'roots' / 'test-api-set-translator')\n24: \n25: \n26: @pytest.mark.sphinx('html')\n27: def test_html_translator(app, status, warning):\n28:     # no set_translator()\n29:     translator_class = app.builder.get_translator_class()\n30:     assert translator_class\n31:     assert translator_class.__name__ == 'HTMLTranslator'\n32: \n33: \n34: @pytest.mark.sphinx('html', testroot='api-set-translator')\n35: def test_html_with_set_translator_for_html_(app, status, warning):\n36:     # use set_translator()\n37:     translator_class = app.builder.get_translator_class()\n38:     assert translator_class\n39:     assert translator_class.__name__ == 'ConfHTMLTranslator'\n40: \n41: \n42: @pytest.mark.sphinx('singlehtml', testroot='api-set-translator')",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_apidoc.py",
+          "path": "tests/test_apidoc.py",
+          "sha": "358df42839b56e6f748eab6c687227246f05d5eb",
+          "html_url": "https://github.com/sphinx-doc/sphinx/blob/4bcaf137667c734a2640c66e0a538432cebb2167/tests/test_apidoc.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 40,
+          "end_line": 64,
+          "excerpt": "40:         for info in reversed(list(markers)):\n41:             for i, a in enumerate(info.args):\n42:                 pargs[i] = a\n43:             kwargs.update(info.kwargs)\n44: \n45:     args = [pargs[i] for i in sorted(pargs.keys())]\n46:     return args, kwargs\n47: \n48: \n49: @pytest.mark.apidoc(coderoot=(rootdir / 'root'))\n50: def test_simple(make_app, apidoc):\n51:     outdir = apidoc.outdir\n52:     assert (outdir / 'conf.py').isfile()\n53:     assert (outdir / 'autodoc_fodder.rst').isfile()\n54:     assert (outdir / 'index.rst').isfile()\n55: \n56:     app = make_app('text', srcdir=outdir)\n57:     app.build()\n58:     print(app._status.getvalue())\n59:     print(app._warning.getvalue())\n60: \n61: \n62: @pytest.mark.apidoc(\n63:     coderoot=(rootdir / 'roots' / 'test-apidoc-pep420'),\n64:     options=[\"--implicit-namespaces\"],",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_application.py",
+          "path": "tests/test_application.py",
+          "sha": "736ce42ac218e2552f07c58be68debfabb184a4c",
+          "html_url": "https://github.com/sphinx-doc/sphinx/blob/4bcaf137667c734a2640c66e0a538432cebb2167/tests/test_application.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 15,
+          "end_line": 39,
+          "excerpt": "15: from sphinx.application import ExtensionError\n16: from sphinx.domains import Domain\n17: \n18: from util import strip_escseq\n19: import pytest\n20: \n21: \n22: def test_events(app, status, warning):\n23:     def empty():\n24:         pass\n25:     with pytest.raises(ExtensionError) as excinfo:\n26:         app.connect(\"invalid\", empty)\n27:     assert \"Unknown event name: invalid\" in str(excinfo.value)\n28: \n29:     app.add_event(\"my_event\")\n30:     with pytest.raises(ExtensionError) as excinfo:\n31:         app.add_event(\"my_event\")\n32:     assert \"Event 'my_event' already present\" in str(excinfo.value)\n33: \n34:     def mock_callback(a_app, *args):\n35:         assert a_app is app\n36:         assert emit_args == args\n37:         return \"ret\"\n38:     emit_args = (1, 3, \"string\")\n39:     listener_id = app.connect(\"my_event\", mock_callback)",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "_parse_expression",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "sphinx/domains",
+      "count": 8,
+      "entries": [
+        {
+          "name": "domains",
+          "path": "sphinx/domains",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "sphinx/domains/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "c.py",
+          "path": "sphinx/domains/c.py",
+          "type": "file"
+        },
+        {
+          "name": "cpp.py",
+          "path": "sphinx/domains/cpp.py",
+          "type": "file"
+        },
+        {
+          "name": "javascript.py",
+          "path": "sphinx/domains/javascript.py",
+          "type": "file"
+        },
+        {
+          "name": "python.py",
+          "path": "sphinx/domains/python.py",
+          "type": "file"
+        },
+        {
+          "name": "rst.py",
+          "path": "sphinx/domains/rst.py",
+          "type": "file"
+        },
+        {
+          "name": "std.py",
+          "path": "sphinx/domains/std.py",
+          "type": "file"
+        }
+      ],
+      "ref": "4bcaf137667c734a2640c66e0a538432cebb2167"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "sphinx/domains/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     sphinx.domains\n4:     ~~~~~~~~~~~~~~\n5: \n6:     Support for domains, which are groupings of description directives\n7:     and roles describing e.g. constructs of one programming language.\n8: \n9:     :copyright: Copyright 2007-2017 by the Sphinx team, see AUTHORS.\n10:     :license: BSD, see LICENSE for details.\n11: \"\"\"\n12: \n13: import copy"
+        },
+        {
+          "name": "c.py",
+          "path": "sphinx/domains/c.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     sphinx.domains.c\n4:     ~~~~~~~~~~~~~~~~\n5: \n6:     The C language domain.\n7: \n8:     :copyright: Copyright 2007-2017 by the Sphinx team, see AUTHORS.\n9:     :license: BSD, see LICENSE for details.\n10: \"\"\"\n11: \n12: import re\n13: import string"
+        },
+        {
+          "name": "javascript.py",
+          "path": "sphinx/domains/javascript.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     sphinx.domains.javascript\n4:     ~~~~~~~~~~~~~~~~~~~~~~~~~\n5: \n6:     The JavaScript domain.\n7: \n8:     :copyright: Copyright 2007-2017 by the Sphinx team, see AUTHORS.\n9:     :license: BSD, see LICENSE for details.\n10: \"\"\"\n11: \n12: from docutils import nodes\n13: from docutils.parsers.rst import Directive, directives"
+        },
+        {
+          "name": "python.py",
+          "path": "sphinx/domains/python.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     sphinx.domains.python\n4:     ~~~~~~~~~~~~~~~~~~~~~\n5: \n6:     The Python domain.\n7: \n8:     :copyright: Copyright 2007-2017 by the Sphinx team, see AUTHORS.\n9:     :license: BSD, see LICENSE for details.\n10: \"\"\"\n11: \n12: import re\n13: "
+        },
+        {
+          "name": "rst.py",
+          "path": "sphinx/domains/rst.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: \"\"\"\n3:     sphinx.domains.rst\n4:     ~~~~~~~~~~~~~~~~~~\n5: \n6:     The reStructuredText domain.\n7: \n8:     :copyright: Copyright 2007-2017 by the Sphinx team, see AUTHORS.\n9:     :license: BSD, see LICENSE for details.\n10: \"\"\"\n11: \n12: import re\n13: "
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "sphinx/domains/cpp.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "41b79ee4ffea57c640977e6d1b0ea6d715063f61",
+          "html_url": "https://github.com/sphinx-doc/sphinx/commit/41b79ee4ffea57c640977e6d1b0ea6d715063f61",
+          "message": "Move some domains into packages",
+          "author": "Adam Turner",
+          "date": "2024-01-19T02:30:51Z"
+        },
+        {
+          "sha": "f195c4ae8767ad41f23dc39a75fb0cc8a39bcb4e",
+          "html_url": "https://github.com/sphinx-doc/sphinx/commit/f195c4ae8767ad41f23dc39a75fb0cc8a39bcb4e",
+          "message": "Various C++ domain performance improvements (#11895)\n\nAuthored-by: Jakob Lykke Andersen <Jakob@caput.dk>\r\nCo-authored-by: Jakob Lykke Andersen <Jakob@caput.dk>",
+          "author": "Adam Turner",
+          "date": "2024-01-19T02:20:43Z"
+        },
+        {
+          "sha": "d69d19103fac01b781e4b7f8f138f0d2440b54c1",
+          "html_url": "https://github.com/sphinx-doc/sphinx/commit/d69d19103fac01b781e4b7f8f138f0d2440b54c1",
+          "message": "Improve cross-reference resolution performance in the C++ domain (#11892)\n\nCo-authored-by: Adam Turner <9087854+aa-turner@users.noreply.github.com>",
+          "author": "Rouslan Korneychuk",
+          "date": "2024-01-18T21:10:54Z"
+        },
+        {
+          "sha": "55f3089981fc95efeb2f7f35b8933f5e51fdf6c0",
+          "html_url": "https://github.com/sphinx-doc/sphinx/commit/55f3089981fc95efeb2f7f35b8933f5e51fdf6c0",
+          "message": "Improve uses of ``str.join`` with a throwaway list",
+          "author": "Adam Turner",
+          "date": "2024-01-16T22:06:34Z"
+        },
+        {
+          "sha": "f7fbfaa4717f7dad907671e42c9cfba615b90c05",
+          "html_url": "https://github.com/sphinx-doc/sphinx/commit/f7fbfaa4717f7dad907671e42c9cfba615b90c05",
+          "message": "Enable various pydocstyle (D) rules (#11878)\n\nCo-authored-by: Adam Turner <9087854+aa-turner@users.noreply.github.com>",
+          "author": "danieleades",
+          "date": "2024-01-14T21:13:46Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_parse_expression TODO actually parse second production",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "sphinx/domains/cpp.py",
+      "satd_line": 4084,
+      "last_commit": {
+        "sha": "41b79ee4ffea57c640977e6d1b0ea6d715063f61",
+        "html_url": "https://github.com/sphinx-doc/sphinx/commit/41b79ee4ffea57c640977e6d1b0ea6d715063f61",
+        "message": "Move some domains into packages",
+        "author": "Adam Turner",
+        "date": "2024-01-19T02:30:51Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_parse_expression",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

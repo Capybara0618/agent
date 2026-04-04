@@ -1,0 +1,398 @@
+{
+  "task_id": "72",
+  "repo_owner": "openstack",
+  "repo_name": "senlin",
+  "file_path": "senlin/db/sqlalchemy/api.py",
+  "commit": "1c195e9664af883e75949c6f6a43f6ca807abaa6",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:29:34+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "1c195e9664af883e75949c6f6a43f6ca807abaa6",
+    "symbol_name": null,
+    "satd_line": 56,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 4,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "partial",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:30:15+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:30:20+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "senlin/db/sqlalchemy/api.py",
+    "original_code": "# TODO(Yanyan Hu): Set default value of project_safe to True\ndef query_by_short_id(context, model, short_id, project_safe=False):\n    q = model_query(context, model)\n    q = q.filter(model.id.like('%s%%' % short_id))\n\n    if project_safe:\n        q = q.filter_by(project=context.project)\n\n    if q.count() == 1:\n        return q.first()\n    elif q.count() == 0:\n        return None\n    else:\n        raise exception.MultipleChoices(arg=short_id)",
+    "original_signature": "def query_by_short_id(context, model, short_id, project_safe=False):",
+    "satd_comment": "# TODO(Yanyan Hu): Set default value of project_safe to True",
+    "target_file": {
+      "ok": true,
+      "path": "senlin/db/sqlalchemy/api.py",
+      "sha": "b87bd4fe6275e11b47d142b99ef46325e8b007eb",
+      "download_url": "https://raw.githubusercontent.com/openstack-archive/senlin/1c195e9664af883e75949c6f6a43f6ca807abaa6/senlin/db/sqlalchemy/api.py",
+      "content_excerpt": "# Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n# not use this file except in compliance with the License. You may obtain\n# a copy of the License at\n#\n#         http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n# License for the specific language governing permissions and limitations\n# under the License.\n\n'''\nImplementation of SQLAlchemy backend.\n'''\n\nimport six\nimport sys\n\nfrom oslo_config import cfg\nfrom oslo_db.sqlalchemy import session as db_session\nfrom oslo_db.sqlalchemy import utils\nfrom oslo_log import log as logging\nfrom oslo_utils import timeutils\n\nfrom sqlalchemy.orm import session as orm_session\n\nfrom senlin.common import consts\nfrom senlin.common import exception\nfrom senlin.common.i18n import _\nfrom senlin.db.sqlalchemy import filters as db_filters\nfrom senlin.db.sqlalchemy import migration\nfrom senlin.db.sqlalchemy import models\n\nLOG = logging.getLogger(__name__)\n\n\nCONF = cfg.CONF\nCONF.import_opt('max_events_per_cluster', 'senlin.common.config')\n\n# Action status definitions:\n#  ACTION_INIT:      Not ready to be executed because fields are being\n#                    modified, or dependency with other actions are being\n#                    analyzed.\n#  ACTION_READY:     Initialized and ready to be executed by a worker.\n#  ACTION_RUNNING:   Being executed by a worker thread.\n#  ACTION_SUCCEEDED: Completed with success.\n#  ACTION_FAILED:    Completed with failure.\n#  ACTION_CANCELLED: Action cancelled because worker thread was cancelled.\nACTION_STATUSES = (\n    ACTION_INIT, ACTION_WAITING, ACTION_READY, ACTION_RUNNING,\n    ACTION_SUCCEEDED, ACTION_FAILED, ACTION_CANCELED\n) = (\n    'INIT', 'WAITING', 'READY', 'RUNNING',\n    'SUCCEEDED', 'FAILED', 'CANCELLED',\n)\n\n_facade = None\n\n\ndef get_facade():\n    global _facade\n\n    if not _facade:\n        _facade = db_session.EngineFacade.from_config(CONF)\n    return _facade\n\nget_engine = lambda: get_facade().get_engine()\nget_session = lambda: get_facade().get_session()\n\n\ndef get_backend():\n    \"\"\"The backend is this module itself.\"\"\"\n    return sys.modules[__name__]\n\n\ndef model_query(context, *args):\n    session = _session(context)\n    query = session.query(*args)\n    return query\n\n\ndef _get_sort_keys(sort_keys, mapping):\n    '''Returns an array containing only whitelisted keys\n\n    :param sort_keys: an array of strings\n    :param mapping: a mapping from keys to DB column names\n    :returns: filtered list of sort keys\n    '''\n    if isinstance(sort_keys, six.string_types):\n        sort_keys = [sort_keys]\n    return [mapping[key] for key in sort_keys or [] if key in mapping]\n\n\ndef _paginate_query(context, query, model, limit=None, marker=None,\n                    sort_keys=None, sort_dir=None, default_sort_keys=None):\n    if not sort_keys:\n        sort_keys = default_sort_keys or []\n        if not sort_dir:\n            sort_dir = 'asc'\n\n    # This assures the order of the clusters will always be the same\n    # even for sort_key values that are not unique in the database\n    sort_keys = sort_keys + ['id']\n\n    model_marker = None\n    if marker:\n        model_marker = model_query(context, model).get(marker)\n    try:\n        query = utils.paginate_query(query, model, limit, sort_keys,\n                                     model_marker, sort_dir)\n    except utils.InvalidSortKey:\n        raise exception.InvalidParameter(name='sort_keys', value=sort_keys)\n    return query\n\n\ndef soft_delete_aware_query(context, *args, **kwargs):\n    \"\"\"Object query helper that accounts for the `show_deleted` field.\n\n    :param show_deleted: if True, overrides context's show_deleted field.\n    \"\"\"\n\n    query = model_query(context, *args)\n    show_deleted = kwargs.get('show_deleted') or context.show_deleted\n\n    if (not show_deleted) or show_deleted in ('False', 'false', 'no', 'No'):\n        query = query.filter_by(deleted_time=None)\n    return query\n\n\n# TODO(Yanyan Hu): Set default value of project_safe to True\ndef query_by_short_id(context, model, short_id, project_safe=False,\n                      show_deleted=False):\n    q = soft_delete_aware_query(context, model, show_deleted=show_deleted)\n    q = q.filter(model.id.like('%s%%' % short_id))\n\n    if project_safe:\n        q = q.filter_by(project=context.project)\n\n    if q.count() == 1:\n        return q.first()\n    elif q.count() == 0:\n        return None\n    else:\n        raise exception.MultipleChoices(arg=short_id)\n\n\n# TODO(Yanyan Hu): Set default value of project_safe to True\ndef query_by_name(context, model, name, project_safe=False,\n                  show_deleted=False):\n    q = soft_delete_aware_query(context, model, show_deleted=show_deleted)\n    q = q.filter_by(name=name)\n\n    if project_safe:\n        q = q.filter_by(project=context.project)\n\n    if q.count() == 1:\n        return q.first()\n    elif q.count() == 0:\n        return None\n    else:\n        raise exception.MultipleChoices(arg=name)\n\n\ndef _session(context):\n    return (context and context.session) or get_session()\n\n\n# Clusters\ndef cluster_create(context, values):\n    cluster_ref = models.Cluster()\n    cluster_ref.update(values)\n    cluster_ref.save(_session(context))\n    return cluster_ref\n\n\ndef cluster_get(context, cluster_id, show_deleted=False, project_safe=True):\n    query = model_query(context, models.Cluster)\n    cluster = query.get(cluster_id)\n\n    deleted_ok = show_deleted or context.show_deleted\n    if cluster is None or cluster.deleted_time is not None and not deleted_ok:\n        return None\n\n    if project_safe and (cluster is not None):\n        if context.project != cluster.project:\n            return None\n    return cluster\n\n\ndef cluster_get_by_name(context, name, project_safe=True):\n    return query_by_name(context, models.Cluster, name,\n                         project_safe=project_safe)\n\n\ndef cluster_get_by_short_id(context, short_id, project_safe=True):\n    return query_by_short_id(context, models.Cluster, short_id,\n                             project_safe=project_safe)\n\n\ndef _query_cluster_get_all(context, project_safe=True, show_deleted=False,\n                           show_nested=False):\n    query = soft_delete_aware_query(context, models.Cluster,\n                                    show_deleted=show_deleted)\n\n    if not show_nested:\n        query = query.filter_by(parent=None)\n\n    if project_safe:\n        query = query.filter_by(project=context.project)\n    return query\n\n\ndef cluster_get_all(context, limit=None, marker=None, sort_keys=None,\n                    sort_dir=None, filters=None, project_safe=True,\n                    show_deleted=False, show_nested=False):\n    query = _query_cluster_get_all(context, project_safe=project_safe,\n                                   show_deleted=show_deleted,\n                                   show_nested=show_nested)\n    if filters is None:\n        filters = {}\n\n    sort_key_map = {\n        consts.CLUSTER_NAME: models.Cluster.name.key,\n        consts.CLUSTER_STATUS: models.Cluster.status.key,\n        consts.CLUSTER_CREATED_TIME: models.Cluster.created_time.key,\n        consts.CLUSTER_UPDATED_TIME: models.Cluster.updated_time.key,\n    }\n    keys = _get_sort_keys(sort_keys, sort_key_map)\n\n    query = db_filters.exact_filter(query, models.Cluster, filters)\n    return _paginate_query(context, query, models.Cluster, limit=limit,\n                           marker=marker, sort_keys=keys, sort_dir=sort_dir,\n                           default_sort_keys=['init_time']).all()\n\n\ndef cluster_next_index(context, cluster_id):\n    session = _session(context)\n    cluster = session.query(models.Cluster).get(cluster_id)\n    if cluster is None:\n        return 0\n\n    next_index = cluster.next_index\n    cluster.next_index += 1\n    cluster.save(session)\n    return next_index\n\n\ndef cluster_count_all(context, filters=None, project_safe=True,\n                      show_deleted=False, show_nested=False):\n    query = _query_cluster_get_all(context, project_safe=project_safe,\n                                   show_deleted=show_deleted,\n                                   show_nested=show_nested)\n    query = db_filters.exact_filter(query, models.Cluster, filters)\n    return query.count()\n\n\ndef cluster_update(context, cluster_id, values):\n    cluster = cluster_get(context, cluster_id)\n\n    if not cluster:\n        raise exception.ClusterNotFound(cluster=cluster_id)\n\n    cluster.update(values)\n    cluster.save(_session(context))\n\n\ndef cluster_delete(context, cluster_id):\n    session = _session(context)\n\n    cluster = session.query(models.Cluster).get(cluster_id)\n    if cluster is None or cluster.deleted_time is not None:\n        raise exception.ClusterNotFound(cluster=cluster_id)\n\n    query = session.query(models.Node).filter_by(cluster_id=cluster_id)\n    nodes = query.all()\n\n    if len(nodes) != 0:\n        for node in nodes:\n            session.delete(node)\n\n    # Delete all related cluster_policies records\n    for cp in cluster.policies:\n        session.delete(cp)\n\n    # Do soft delete and set the status\n    cluster.update_and_save({'deleted_time': timeutils.utcnow(),\n                             'status': 'DELETED',\n                             'status_reason': 'Cluster deletion succeeded'\n                             }, session=session)\n\n\n# Nodes\ndef node_create(context, values):\n    # This operation is always called with cluster and node locked\n    session = _session(context)\n    node = models.Node()\n    node.update(values)\n    node.save(session)\n    return node\n\n\ndef node_get(context, node_id, show_deleted=False):\n    node = model_query(context, models.Node).get(node_id)\n    if not node:\n        return None\n\n    if not show_deleted and node.deleted_time is not None:\n        return None\n\n    return node\n\n\ndef node_get_by_name(context, name, show_deleted=False):\n    return query_by_name(context, models.Node, name, show_deleted=show_deleted)\n\n\ndef node_get_by_short_id(context, short_id, show_deleted=False):\n    return query_by_short_id(context, models.Node, short_id,\n                             show_deleted=show_deleted)\n\n\ndef _query_node_get_all(context, show_deleted=False, cluster_id=None):\n    query = soft_delete_aware_query(context, models.Node,\n                                    show_deleted=show_deleted)\n\n    if cluster_id:\n        query = query.filter_by(cluster_id=cluster_id)\n\n    return query\n\n\ndef node_get_all(context, cluster_id=None, show_deleted=False,\n                 limit=None, marker=None, sort_keys=None, sort_dir=None,\n                 filters=None, project_safe=True):\n    if cluster_id is None:\n        query = _query_node_get_all(context, show_deleted=show_deleted)\n    else:\n        query = _query_node_get_all(context, show_deleted=show_deleted,\n                                    cluster_id=cluster_id)\n\n    if project_safe:\n        query = query.filter_by(project=context.project)\n\n    if filters is None:\n        filters = {}\n\n    sort_key_map = {\n        consts.NODE_INDEX: models.Node.index.key,\n        consts.NODE_NAME: models.Node.name.key,\n        consts.NODE_CREATED_TIME: models.Node.created_time.key,\n        consts.NODE_UPDATED_TIME: models.Node.updated_time.key,\n        consts.NODE_DELETED_TIME: models.Node.deleted_time.key,\n        consts.NODE_STATUS: models.Node.status.key,\n    }\n    keys = _get_sort_keys(sort_keys, sort_key_map)\n    query = db_filters.exact_filter(query, models.Node, filters)\n    return _paginate_query(context, query, models.Node,\n                           limit=limit, marker=marker,\n                           sort_keys=keys, sort_dir=sort_dir,\n                           default_sort_keys=['init_time']).all()\n\n\ndef node_get_all_by_cluster(context, cluster_id, show_deleted=False):\n    if show_deleted:\n        query = model_query(context,\n                            models.Node).filter_by(cluster_id=cluster_id)\n  ",
+      "total_lines": 1497,
+      "ref": "1c195e9664af883e75949c6f6a43f6ca807abaa6"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 56,
+      "start_line": 36,
+      "end_line": 76,
+      "matched_line": ")",
+      "excerpt": "36: \n37: \n38: CONF = cfg.CONF\n39: CONF.import_opt('max_events_per_cluster', 'senlin.common.config')\n40: \n41: # Action status definitions:\n42: #  ACTION_INIT:      Not ready to be executed because fields are being\n43: #                    modified, or dependency with other actions are being\n44: #                    analyzed.\n45: #  ACTION_READY:     Initialized and ready to be executed by a worker.\n46: #  ACTION_RUNNING:   Being executed by a worker thread.\n47: #  ACTION_SUCCEEDED: Completed with success.\n48: #  ACTION_FAILED:    Completed with failure.\n49: #  ACTION_CANCELLED: Action cancelled because worker thread was cancelled.\n50: ACTION_STATUSES = (\n51:     ACTION_INIT, ACTION_WAITING, ACTION_READY, ACTION_RUNNING,\n52:     ACTION_SUCCEEDED, ACTION_FAILED, ACTION_CANCELED\n53: ) = (\n54:     'INIT', 'WAITING', 'READY', 'RUNNING',\n55:     'SUCCEEDED', 'FAILED', 'CANCELLED',\n56: )\n57: \n58: _facade = None\n59: \n60: \n61: def get_facade():\n62:     global _facade\n63: \n64:     if not _facade:\n65:         _facade = db_session.EngineFacade.from_config(CONF)\n66:     return _facade\n67: \n68: get_engine = lambda: get_facade().get_engine()\n69: get_session = lambda: get_facade().get_session()\n70: \n71: \n72: def get_backend():\n73:     \"\"\"The backend is this module itself.\"\"\"\n74:     return sys.modules[__name__]\n75: \n76: "
+    },
+    "enclosing_symbol": {
+      "found": false,
+      "error": "no_enclosing_symbol"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 132,
+      "end_line": 145,
+      "excerpt": "def query_by_short_id(context, model, short_id, project_safe=False,\n                      show_deleted=False):\n    q = soft_delete_aware_query(context, model, show_deleted=show_deleted)\n    q = q.filter(model.id.like('%s%%' % short_id))\n\n    if project_safe:\n        q = q.filter_by(project=context.project)\n\n    if q.count() == 1:\n        return q.first()\n    elif q.count() == 0:\n        return None\n    else:\n        raise exception.MultipleChoices(arg=short_id)",
+      "symbol_name": "query_by_short_id",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "senlin/db/sqlalchemy/api.py",
+      "sha": "b87bd4fe6275e11b47d142b99ef46325e8b007eb",
+      "download_url": "https://raw.githubusercontent.com/openstack-archive/senlin/1c195e9664af883e75949c6f6a43f6ca807abaa6/senlin/db/sqlalchemy/api.py"
+    },
+    "imports": {
+      "imports": [
+        "six",
+        "sys",
+        "oslo_config:cfg",
+        "oslo_db.sqlalchemy:session",
+        "oslo_db.sqlalchemy:utils",
+        "oslo_log:log",
+        "oslo_utils:timeutils",
+        "sqlalchemy.orm:session",
+        "senlin.common:consts",
+        "senlin.common:exception",
+        "senlin.common.i18n:_",
+        "senlin.db.sqlalchemy:filters",
+        "senlin.db.sqlalchemy:migration",
+        "senlin.db.sqlalchemy:models"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/openstack-archive/senlin/1c195e9664af883e75949c6f6a43f6ca807abaa6/README.rst",
+      "content_excerpt": "Senlin\n======\n\n--------\nOverview\n--------\n\nSenlin is a clustering service for OpenStack clouds. It creates and operates\nclusters of homogenous objects exposed by other OpenStack services. The goal\nis to make the orchestration of collections of similar objects easier.\n\nSenlin provides RESTful APIs to users so that they can associate various\npolicies to a cluster.  Sample policies include placement policy, load\nbalancing policy, health policy, scaling policy, update policy and so on.\n\nSenlin is designed to be capable of managing different types of objects. An\nobject's lifecycle is managed using profile type implementations, which are\nthemselves plugins.\n\n---------\nFor Users\n---------\n\nIf you want to install Senlin for a try out, please refer to the documents\nunder the ``doc/source/getting_started/`` subdirectory.\n\n--------------\nFor Developers\n--------------\n\nThere are many ways to help improve the software, for example, filing a bug,\nsubmitting or reviewing a patch, writing or reviewing some documents. There\nare documents under the ``doc/source/developer/`` subdirectory.\n\n---------\nResources\n---------\n\nLaunchpad Projects\n------------------\n- Server: https://launchpad.net/senlin\n- Client: https://launchpad.net/python-senlinclient\n\nCode Repository\n---------------\n- Server: https://git.openstack.org/cgit/stackforge/senlin\n- Client: https://git.openstack.org/cgit/stackforge/python-senlinclient\n\nBlueprints\n----------\n- Blueprints: https://blueprints.launchpad.net/senlin\n\nBug Tracking\n------------\n- Bugs: https://bugs.launchpad.net/senlin\n\nWeekly Meetings\n---------------\n- Schedul"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "weak",
+    "related_tests": {
+      "ok": true,
+      "query": "query_by_short_id",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_cluster_basic.py",
+          "path": "senlin/tests/functional/test_cluster_basic.py",
+          "sha": "13c73090a2e51539db7896fad985497a77ffc3b8",
+          "html_url": "https://github.com/openstack/senlin/blob/1c195e9664af883e75949c6f6a43f6ca807abaa6/senlin/tests/functional/test_cluster_basic.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 25,
+          "end_line": 49,
+          "excerpt": "25:         # Create profile\n26:         self.profile = test_api.create_profile(self.client, 'test-profile',\n27:                                                test_utils.spec_nova_server)\n28: \n29:     def tearDown(self):\n30:         # Delete profile\n31:         test_api.delete_profile(self.client, self.profile['id'])\n32:         super(TestClusterBasic, self).tearDown()\n33: \n34:     def test_get_clusters(self):\n35:         # Check that listing clusters works.\n36:         clusters = test_api.list_clusters(self.client)\n37:         self.assertEqual([], clusters)\n38: \n39:     def test_cluster_create_delete(self):\n40:         # Create cluster\n41:         desired_capacity = 2\n42:         min_size = 1\n43:         max_size = 3\n44:         cluster = test_api.create_cluster(self.client, 'test-cluster',\n45:                                           self.profile['id'], desired_capacity,\n46:                                           min_size, max_size)\n47: \n48:         # Wait and verify cluster creation result\n49:         cluster = test_utils.wait_for_status(test_api.get_cluster, self.client,",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_cluster_scaling.py",
+          "path": "senlin/tests/functional/test_cluster_scaling.py",
+          "sha": "1098ac427eaaf4c8adb4ad1c2b6243f9d8f67cfc",
+          "html_url": "https://github.com/openstack/senlin/blob/1c195e9664af883e75949c6f6a43f6ca807abaa6/senlin/tests/functional/test_cluster_scaling.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 43,
+          "end_line": 67,
+          "excerpt": "43:                                           min_size, max_size)\n44:         cluster = test_utils.wait_for_status(test_api.get_cluster, self.client,\n45:                                              cluster['id'], 'ACTIVE')\n46: \n47:         # Scale out cluster without params\n48:         action_id = test_api.action_cluster(self.client, cluster['id'],\n49:                                             'scale_out')\n50:         test_utils.wait_for_status(test_api.get_action, self.client,\n51:                                    action_id, 'SUCCEEDED')\n52: \n53:         # Verify cluster scale out result\n54:         cluster = test_api.get_cluster(self.client, cluster['id'])\n55:         self.assertEqual('ACTIVE', cluster['status'])\n56:         self.assertEqual(3, len(cluster['nodes']))\n57: \n58:         # Scale out with count set to 2\n59:         action_id = test_api.action_cluster(self.client, cluster['id'],\n60:                                             'scale_out', {'count': 2})\n61:         test_utils.wait_for_status(test_api.get_action, self.client,\n62:                                    action_id, 'SUCCEEDED')\n63: \n64:         # Verify cluster scale out result\n65:         cluster = test_api.get_cluster(self.client, cluster['id'])\n66:         self.assertEqual('ACTIVE', cluster['status'])\n67:         self.assertEqual(5, len(cluster['nodes']))",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_lb_policy.py",
+          "path": "senlin/tests/functional/test_lb_policy.py",
+          "sha": "2bd262af75170633ef45674976605d0c9a674e83",
+          "html_url": "https://github.com/openstack/senlin/blob/1c195e9664af883e75949c6f6a43f6ca807abaa6/senlin/tests/functional/test_lb_policy.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 37,
+          "end_line": 61,
+          "excerpt": "37:         min_size = 1\n38:         max_size = 5\n39:         cluster = test_api.create_cluster(self.client, 'test-cluster',\n40:                                           self.profile['id'], desired_capacity,\n41:                                           min_size, max_size)\n42:         cluster = test_utils.wait_for_status(test_api.get_cluster, self.client,\n43:                                              cluster['id'], 'ACTIVE')\n44: \n45:         # Verify there is no lb information in node data\n46:         cluster = test_api.get_cluster(self.client, cluster['id'])\n47:         for n in cluster['nodes']:\n48:             node = test_api.get_node(self.client, n)\n49:             self.assertNotIn('lb_member', node['data'])\n50: \n51:         # Create a lb policy\n52:         spec = test_utils.spec_lb_policy\n53:         lb_policy = test_api.create_policy(self.client, 'test-lb-policy', spec,\n54:                                            0, 0)\n55: \n56:         # Attach scaling in/out policies to cluster\n57:         params = {\n58:             \"priority\": 50,\n59:             \"level\": 50,\n60:             \"enabled\": True,\n61:             \"cooldown\": 0,",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_node.py",
+          "path": "senlin/tests/functional/test_node.py",
+          "sha": "51201a2b91c7d9d1f42e6771829aee1f2c07f194",
+          "html_url": "https://github.com/openstack/senlin/blob/1c195e9664af883e75949c6f6a43f6ca807abaa6/senlin/tests/functional/test_node.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 24,
+          "end_line": 48,
+          "excerpt": "24:         super(TestNode, self).setUp()\n25:         # Create profile\n26:         self.profile = test_api.create_profile(self.client, 'test-profile',\n27:                                                test_utils.spec_nova_server)\n28: \n29:     def tearDown(self):\n30:         # Delete profile\n31:         test_api.delete_profile(self.client, self.profile['id'])\n32:         super(TestNode, self).tearDown()\n33: \n34:     def test_get_nodes(self):\n35:         nodes = test_api.list_nodes(self.client)\n36:         self.assertEqual([], nodes)\n37: \n38:     def test_node_create_delete_with_target_cluster(self):\n39:         # Create a cluster\n40:         desired_capacity = 1\n41:         min_size = 1\n42:         max_size = 3\n43:         cluster = test_api.create_cluster(self.client, 'test-cluster',\n44:                                           self.profile['id'], desired_capacity,\n45:                                           min_size, max_size)\n46:         cluster = test_utils.wait_for_status(test_api.get_cluster, self.client,\n47:                                              cluster['id'], 'ACTIVE')\n48: ",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "query_by_short_id",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "senlin/db/sqlalchemy",
+      "count": 15,
+      "entries": [
+        {
+          "name": "sqlalchemy",
+          "path": "senlin/db/sqlalchemy",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "senlin/db/sqlalchemy/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "api.py",
+          "path": "senlin/db/sqlalchemy/api.py",
+          "type": "file"
+        },
+        {
+          "name": "filters.py",
+          "path": "senlin/db/sqlalchemy/filters.py",
+          "type": "file"
+        },
+        {
+          "name": "migrate_repo",
+          "path": "senlin/db/sqlalchemy/migrate_repo",
+          "type": "dir"
+        },
+        {
+          "name": "README",
+          "path": "senlin/db/sqlalchemy/migrate_repo/README",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "senlin/db/sqlalchemy/migrate_repo/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "manage.py",
+          "path": "senlin/db/sqlalchemy/migrate_repo/manage.py",
+          "type": "file"
+        },
+        {
+          "name": "migrate.cfg",
+          "path": "senlin/db/sqlalchemy/migrate_repo/migrate.cfg",
+          "type": "file"
+        },
+        {
+          "name": "versions",
+          "path": "senlin/db/sqlalchemy/migrate_repo/versions",
+          "type": "dir"
+        },
+        {
+          "name": "001_first_version.py",
+          "path": "senlin/db/sqlalchemy/migrate_repo/versions/001_first_version.py",
+          "type": "file"
+        },
+        {
+          "name": "__init__.py",
+          "path": "senlin/db/sqlalchemy/migrate_repo/versions/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "migration.py",
+          "path": "senlin/db/sqlalchemy/migration.py",
+          "type": "file"
+        },
+        {
+          "name": "models.py",
+          "path": "senlin/db/sqlalchemy/models.py",
+          "type": "file"
+        },
+        {
+          "name": "types.py",
+          "path": "senlin/db/sqlalchemy/types.py",
+          "type": "file"
+        }
+      ],
+      "ref": "1c195e9664af883e75949c6f6a43f6ca807abaa6"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "senlin/db/sqlalchemy/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "filters.py",
+          "path": "senlin/db/sqlalchemy/filters.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n2: # not use this file except in compliance with the License. You may obtain\n3: # a copy of the License at\n4: #\n5: #         http://www.apache.org/licenses/LICENSE-2.0\n6: #\n7: # Unless required by applicable law or agreed to in writing, software\n8: # distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n9: # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n10: # License for the specific language governing permissions and limitations\n11: # under the License.\n12: \n13: import six"
+        },
+        {
+          "name": "README",
+          "path": "senlin/db/sqlalchemy/migrate_repo/README",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 4,
+          "excerpt": "1: This is a database migration repository.\n2: \n3: More information at\n4: http://code.google.com/p/sqlalchemy-migrate/"
+        },
+        {
+          "name": "__init__.py",
+          "path": "senlin/db/sqlalchemy/migrate_repo/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "manage.py",
+          "path": "senlin/db/sqlalchemy/migrate_repo/manage.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 5,
+          "excerpt": "1: #!/usr/bin/env python\n2: from migrate.versioning.shell import main\n3: \n4: if __name__ == '__main__':\n5:     main(debug='False')"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "senlin/db/sqlalchemy/api.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "3acf9ce11fde57e31e24364309e77ebf40b5373e",
+          "html_url": "https://github.com/openstack-archive/senlin/commit/3acf9ce11fde57e31e24364309e77ebf40b5373e",
+          "message": "Retire Senlin: remove repo content\n\nSenlin project is retiring\n- https://review.opendev.org/c/openstack/governance/+/919347\n\nthis commit remove the content of this project repo\n\nDepends-On: https://review.opendev.org/c/openstack/project-config/+/919348/\nChange-Id: I5f524835683b10a8472ee90e5de5087b37",
+          "author": "Ghanshyam Mann",
+          "date": "2024-05-10T21:29:29Z"
+        },
+        {
+          "sha": "6b15b9768991b62af1019f6c7b01384c5958bc3a",
+          "html_url": "https://github.com/openstack-archive/senlin/commit/6b15b9768991b62af1019f6c7b01384c5958bc3a",
+          "message": "Remove executable permissions from files that don't need it\n\nMany python files have their executable permissions flag set but they shouldn't Removed executable flag from files that did not need it\n\nCloses-Bug: #2055736\nChange-Id: Ic04051fdc597b2f915f76e4c4c47f392354ddfe1",
+          "author": "Tyler Adams",
+          "date": "2024-03-02T00:14:48Z"
+        },
+        {
+          "sha": "de1ab6d96b2e6a7e3e1fa02a245a795a9a44a538",
+          "html_url": "https://github.com/openstack-archive/senlin/commit/de1ab6d96b2e6a7e3e1fa02a245a795a9a44a538",
+          "message": "Fixed sqlalchemy 2.x support\n\nRe-arranged sessions to always be at the top level to make\nit easier to know the origin of the current session. This\nis important now that we no longer have autocommit enabled.\n\n- Added zuul job testing sqlalchemy 2.x.\n- Added new db api for service cleanup.\n- Removed b",
+          "author": "Erik Olof Gunnar Andersson",
+          "date": "2023-12-28T19:17:56Z"
+        },
+        {
+          "sha": "18540721f4dd4741dce8e914446bfca19da8a334",
+          "html_url": "https://github.com/openstack-archive/senlin/commit/18540721f4dd4741dce8e914446bfca19da8a334",
+          "message": "Switch Senlin to Alembic database migrations\n\nsqlalchemy-migrate is no longer supported and we need to switch\nto alembic for database migrations.\n\nChange-Id: I2e51b4027f7af63944b5504ddcf50e9e48818259",
+          "author": "Erik Olof Gunnar Andersson",
+          "date": "2023-03-25T20:11:39Z"
+        },
+        {
+          "sha": "55ac1c9928c6d348be17bca4afe5bf9c550b960b",
+          "html_url": "https://github.com/openstack-archive/senlin/commit/55ac1c9928c6d348be17bca4afe5bf9c550b960b",
+          "message": "Add cleanup step for orphaned health checks\n\nThis adds a cleanup task on the health manager to\nhelp prevent orphaned health checks.\n\nChange-Id: Ia5d7a3afdb1e610b0f8463857c69ce35efb966ed",
+          "author": "Erik Olof Gunnar Andersson",
+          "date": "2023-03-06T05:38:43Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": false,
+      "query": "query_by_short_id TODO Yanyan default value project_safe",
+      "error": "HTTP Error 422: Unprocessable Entity",
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "senlin/db/sqlalchemy/api.py",
+      "satd_line": 56,
+      "last_commit": {
+        "sha": "3acf9ce11fde57e31e24364309e77ebf40b5373e",
+        "html_url": "https://github.com/openstack-archive/senlin/commit/3acf9ce11fde57e31e24364309e77ebf40b5373e",
+        "message": "Retire Senlin: remove repo content\n\nSenlin project is retiring\n- https://review.opendev.org/c/openstack/governance/+/919347\n\nthis commit remove the content of this project repo\n\nDepends-On: https://review.opendev.org/c/openstack/project-config/+/919348/\nChange-Id: I5f524835683b10a8472ee90e5de5087b37",
+        "author": "Ghanshyam Mann",
+        "date": "2024-05-10T21:29:29Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [
+        "github_snapshot_mismatch"
+      ],
+      "related_tests_count": 4,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "partial",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [
+      "historical_snapshot_mismatch"
+    ],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": null,
+      "symbol_type": null,
+      "historical_snapshot_mismatch": true
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "partial"
+    }
+  }
+}

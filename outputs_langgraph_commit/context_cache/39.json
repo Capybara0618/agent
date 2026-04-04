@@ -1,0 +1,554 @@
+{
+  "task_id": "39",
+  "repo_owner": "mozillazg",
+  "repo_name": "pypy",
+  "file_path": "rpython/jit/backend/x86/regalloc.py",
+  "commit": "09ad28542f5d63961c51b0c0513a04da50cd740b",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T01:30:29+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "09ad28542f5d63961c51b0c0513a04da50cd740b",
+    "symbol_name": "compute_hint_frame_locations",
+    "satd_line": 1181,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T01:30:57+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T01:31:01+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "rpython/jit/backend/x86/regalloc.py",
+    "original_code": "def compute_hint_frame_locations(self, operations):\n    # optimization only: fill in the 'hint_frame_locations' dictionary\n    # of 'fm' based on the JUMP at the end of the loop, by looking\n    # at where we would like the boxes to be after the jump.\n    return # XXX disabled for now\n    op = operations[-1]\n    if op.getopnum() != rop.JUMP:\n        return\n    self.final_jump_op = op\n    descr = op.getdescr()\n    assert isinstance(descr, TargetToken)\n    if descr._ll_loop_code != 0:\n        # if the target LABEL was already compiled, i.e. if it belongs\n        # to some already-compiled piece of code\n        self._compute_hint_frame_locations_from_descr(descr)",
+    "original_signature": "def compute_hint_frame_locations(self, operations):",
+    "satd_comment": "# XXX disabled for now",
+    "target_file": {
+      "ok": true,
+      "path": "rpython/jit/backend/x86/regalloc.py",
+      "sha": "62096925739b0b46af54dd3b4b270066912385e9",
+      "download_url": "https://raw.githubusercontent.com/mozillazg/pypy/09ad28542f5d63961c51b0c0513a04da50cd740b/rpython/jit/backend/x86/regalloc.py",
+      "content_excerpt": "\n\"\"\" Register allocation scheme.\n\"\"\"\n\nimport os\nfrom rpython.jit.metainterp.history import (Box, Const, ConstInt, ConstPtr,\n                                            ConstFloat, BoxInt,\n                                            BoxFloat, INT, REF, FLOAT,\n                                            TargetToken)\nfrom rpython.jit.backend.x86.regloc import *\nfrom rpython.rtyper.lltypesystem import lltype, rffi, rstr\nfrom rpython.rtyper.annlowlevel import cast_instance_to_gcref\nfrom rpython.rlib.objectmodel import we_are_translated\nfrom rpython.rlib import rgc\nfrom rpython.jit.backend.llsupport import symbolic\nfrom rpython.jit.backend.x86.jump import remap_frame_layout_mixed\nfrom rpython.jit.codewriter import longlong\nfrom rpython.jit.codewriter.effectinfo import EffectInfo\nfrom rpython.jit.metainterp.resoperation import rop\nfrom rpython.jit.backend.llsupport.descr import ArrayDescr\nfrom rpython.jit.backend.llsupport.descr import CallDescr\nfrom rpython.jit.backend.llsupport.descr import unpack_arraydescr\nfrom rpython.jit.backend.llsupport.descr import unpack_fielddescr\nfrom rpython.jit.backend.llsupport.descr import unpack_interiorfielddescr\nfrom rpython.jit.backend.llsupport.gcmap import allocate_gcmap\nfrom rpython.jit.backend.llsupport.regalloc import FrameManager, BaseRegalloc,\\\n     RegisterManager, TempBox, compute_vars_longevity, is_comparison_or_ovf_op\nfrom rpython.jit.backend.x86.arch import WORD, JITFRAME_FIXED_SIZE\nfrom rpython.jit.backend.x86.arch import IS_X86_32, IS_X86_64\nfrom rpython.jit.backend.x86 import rx86\nfrom rpython.rlib.rarithmetic import r_longlong, r_uint\n\nclass X86RegisterManager(RegisterManager):\n\n    box_types = [INT, REF]\n    all_regs = [ecx, eax, edx, ebx, esi, edi]\n    no_lower_byte_regs = [esi, edi]\n    save_around_call_regs = [eax, edx, ecx]\n    frame_reg = ebp\n\n    def call_result_location(self, v):\n        return eax\n\n    def convert_to_imm(self, c):\n        if isinstance(c, ConstInt):\n            return imm(c.value)\n        elif isinstance(c, ConstPtr):\n            if we_are_translated() and c.value and rgc.can_move(c.value):\n                not_implemented(\"convert_to_imm: ConstPtr needs special care\")\n            return imm(rffi.cast(lltype.Signed, c.value))\n        else:\n            not_implemented(\"convert_to_imm: got a %s\" % c)\n\nclass X86_64_RegisterManager(X86RegisterManager):\n    # r11 omitted because it's used as scratch\n    all_regs = [ecx, eax, edx, ebx, esi, edi, r8, r9, r10, r12, r13, r14, r15]\n    \n    no_lower_byte_regs = []\n    save_around_call_regs = [eax, ecx, edx, esi, edi, r8, r9, r10]\n\nclass X86XMMRegisterManager(RegisterManager):\n\n    box_types = [FLOAT]\n    all_regs = [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7]\n    # we never need lower byte I hope\n    save_around_call_regs = all_regs\n\n    def convert_to_imm(self, c):\n        adr = self.assembler.datablockwrapper.malloc_aligned(8, 8)\n        x = c.getfloatstorage()\n        rffi.cast(rffi.CArrayPtr(longlong.FLOATSTORAGE), adr)[0] = x\n        return ConstFloatLoc(adr)\n\n    def convert_to_imm_16bytes_align(self, c):\n        adr = self.assembler.datablockwrapper.malloc_aligned(16, 16)\n        x = c.getfloatstorage()\n        y = longlong.ZEROF\n        rffi.cast(rffi.CArrayPtr(longlong.FLOATSTORAGE), adr)[0] = x\n        rffi.cast(rffi.CArrayPtr(longlong.FLOATSTORAGE), adr)[1] = y\n        return ConstFloatLoc(adr)\n\n    def after_call(self, v):\n        # the result is stored in st0, but we don't have this around,\n        # so genop_call will move it to some frame location immediately\n        # after the call\n        return self.frame_manager.loc(v)\n\nclass X86_64_XMMRegisterManager(X86XMMRegisterManager):\n    # xmm15 reserved for scratch use\n    all_regs = [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14]\n    save_around_call_regs = all_regs\n\n    def call_result_location(self, v):\n        return xmm0\n\n    def after_call(self, v):\n        # We use RegisterManager's implementation, since X86XMMRegisterManager\n        # places the result on the stack, which we don't need to do when the\n        # calling convention places the result in xmm0\n        return RegisterManager.after_call(self, v)\n\nclass X86FrameManager(FrameManager):\n    def __init__(self, base_ofs):\n        FrameManager.__init__(self)\n        self.base_ofs = base_ofs\n    \n    def frame_pos(self, i, box_type):\n        return FrameLoc(i, get_ebp_ofs(self.base_ofs, i), box_type)\n\n    @staticmethod\n    def frame_size(box_type):\n        if IS_X86_32 and box_type == FLOAT:\n            return 2\n        else:\n            return 1\n\n    @staticmethod\n    def get_loc_index(loc):\n        assert isinstance(loc, FrameLoc)\n        return loc.position\n\nif WORD == 4:\n    gpr_reg_mgr_cls = X86RegisterManager\n    xmm_reg_mgr_cls = X86XMMRegisterManager\nelif WORD == 8:\n    gpr_reg_mgr_cls = X86_64_RegisterManager\n    xmm_reg_mgr_cls = X86_64_XMMRegisterManager\nelse:\n    raise AssertionError(\"Word size should be 4 or 8\")\n\ngpr_reg_mgr_cls.all_reg_indexes = [-1] * WORD * 2 # eh, happens to be true\nfor _i, _reg in enumerate(gpr_reg_mgr_cls.all_regs):\n    gpr_reg_mgr_cls.all_reg_indexes[_reg.value] = _i\n\nclass RegAlloc(BaseRegalloc):\n\n    def __init__(self, assembler, translate_support_code=False):\n        assert isinstance(translate_support_code, bool)\n        # variables that have place in register\n        self.assembler = assembler\n        self.translate_support_code = translate_support_code\n        # to be read/used by the assembler too\n        self.jump_target_descr = None\n        self.final_jump_op = None\n\n    def _prepare(self, inputargs, operations, allgcrefs):\n        cpu = self.assembler.cpu\n        self.fm = X86FrameManager(cpu.get_baseofs_of_frame_field())\n        operations = cpu.gc_ll_descr.rewrite_assembler(cpu, operations,\n                                                       allgcrefs)\n        # compute longevity of variables\n        longevity, last_real_usage = compute_vars_longevity(\n                                                    inputargs, operations)\n        self.longevity = longevity\n        self.last_real_usage = last_real_usage\n        self.rm = gpr_reg_mgr_cls(self.longevity,\n                                  frame_manager = self.fm,\n                                  assembler = self.assembler)\n        self.xrm = xmm_reg_mgr_cls(self.longevity, frame_manager = self.fm,\n                                   assembler = self.assembler)\n        return operations\n\n    def prepare_loop(self, inputargs, operations, looptoken, allgcrefs):\n        operations = self._prepare(inputargs, operations, allgcrefs)\n        self._set_initial_bindings(inputargs, looptoken)\n        # note: we need to make a copy of inputargs because possibly_free_vars\n        # is also used on op args, which is a non-resizable list\n        self.possibly_free_vars(list(inputargs))\n        if WORD == 4:       # see redirect_call_assembler()\n            self.min_bytes_before_label = 5\n        else:\n            self.min_bytes_before_label = 13\n        return operations\n\n    def prepare_bridge(self, inputargs, arglocs, operations, allgcrefs,\n                       frame_info):\n        operations = self._prepare(inputargs, operations, allgcrefs)\n        self._update_bindings(arglocs, inputargs)\n        self.min_bytes_before_label = 0\n        return operations\n\n    def ensure_next_label_is_at_least_at_position(self, at_least_position):\n        self.min_bytes_before_label = max(self.min_bytes_before_label,\n                                          at_least_position)\n\n    def get_final_frame_depth(self):\n        return self.fm.get_frame_depth()\n\n    def possibly_free_var(self, var):\n        if var.type == FLOAT:\n            self.xrm.possibly_free_var(var)\n        else:\n            self.rm.possibly_free_var(var)\n\n    def possibly_free_vars_for_op(self, op):\n        for i in range(op.numargs()):\n            var = op.getarg(i)\n            if var is not None: # xxx kludgy\n                self.possibly_free_var(var)\n        if op.result:\n            self.possibly_free_var(op.result)\n\n    def possibly_free_vars(self, vars):\n        for var in vars:\n            if var is not None: # xxx kludgy\n                self.possibly_free_var(var)\n\n    def make_sure_var_in_reg(self, var, forbidden_vars=[],\n                             selected_reg=None, need_lower_byte=False):\n        if var.type == FLOAT:\n            if isinstance(var, ConstFloat):\n                return FloatImmedLoc(var.getfloatstorage())\n            return self.xrm.make_sure_var_in_reg(var, forbidden_vars,\n                                                 selected_reg, need_lower_byte)\n        else:\n            return self.rm.make_sure_var_in_reg(var, forbidden_vars,\n                                                selected_reg, need_lower_byte)\n\n    def force_allocate_reg(self, var, forbidden_vars=[], selected_reg=None,\n                           need_lower_byte=False):\n        if var.type == FLOAT:\n            return self.xrm.force_allocate_reg(var, forbidden_vars,\n                                               selected_reg, need_lower_byte)\n        else:\n            return self.rm.force_allocate_reg(var, forbidden_vars,\n                                              selected_reg, need_lower_byte)\n\n    def force_spill_var(self, var):\n        if var.type == FLOAT:\n            return self.xrm.force_spill_var(var)\n        else:\n            return self.rm.force_spill_var(var)\n\n    def load_xmm_aligned_16_bytes(self, var, forbidden_vars=[]):\n        # Load 'var' in a register; but if it is a constant, we can return\n        # a 16-bytes-aligned ConstFloatLoc.\n        if isinstance(var, Const):\n            return self.xrm.convert_to_imm_16bytes_align(var)\n        else:\n            return self.xrm.make_sure_var_in_reg(var, forbidden_vars)\n\n    def _frame_bindings(self, locs, inputargs):\n        bindings = {}\n        i = 0\n        for loc in locs:\n            if loc is None:\n                continue\n            arg = inputargs[i]\n            i += 1\n            if not isinstance(loc, RegLoc):\n                bindings[arg] = loc\n        return bindings\n\n    def _update_bindings(self, locs, inputargs):\n        # XXX this should probably go to llsupport/regalloc.py\n        used = {}\n        i = 0\n        for loc in locs:\n            if loc is None: # xxx bit kludgy\n                loc = ebp\n            arg = inputargs[i]\n            i += 1\n            if isinstance(loc, RegLoc):\n                if arg.type == FLOAT:\n                    self.xrm.reg_bindings[arg] = loc\n                    used[loc] = None\n                else:\n                    if loc is ebp:\n                        self.rm.bindings_to_frame_reg[arg] = None\n                    else:\n                        self.rm.reg_bindings[arg] = loc\n                        used[loc] = None\n            else:\n                self.fm.bind(arg, loc)\n        self.rm.free_regs = []\n        for reg in self.rm.all_regs:\n            if reg not in used:\n                self.rm.free_regs.append(reg)\n        self.xrm.free_regs = []\n        for reg in self.xrm.all_regs:\n            if reg not in used:\n                self.xrm.free_regs.append(reg)\n        self.possibly_free_vars(list(inputargs))\n        self.fm.finish_binding()\n        self.rm._check_invariants()\n        self.xrm._check_invariants()\n\n    def perform(self, op, arglocs, result_loc):\n        if not we_are_translated():\n            self.assembler.dump('%s <- %s(%s)' % (result_loc, op, arglocs))\n        self.assembler.regalloc_perform(op, arglocs, result_loc)\n\n    def perform_llong(self, op, arglocs, result_loc):\n        if not we_are_translated():\n            self.assembler.dump('%s <- %s(%s)' % (result_loc, op, arglocs))\n        self.assembler.regalloc_perform_llong(op, arglocs, result_loc)\n\n    def perform_math(self, op, arglocs, result_loc):\n        if not we_are_translated():\n            self.assembler.dump('%s <- %s(%s)' % (result_loc, op, arglocs))\n     ",
+      "total_lines": 1369,
+      "ref": "09ad28542f5d63961c51b0c0513a04da50cd740b"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 1181,
+      "start_line": 1161,
+      "end_line": 1201,
+      "matched_line": "        return # XXX disabled for now",
+      "excerpt": "1161:                                                     selected_reg=edx)\n1162:             self.perform(op, [], result_loc)\n1163:         else:\n1164:             # on 32-bit, use both eax and edx as temporary registers,\n1165:             # use a temporary xmm register, and returns the result in\n1166:             # another xmm register.\n1167:             tmpbox_low = TempBox()\n1168:             self.rm.force_allocate_reg(tmpbox_low, selected_reg=edx)\n1169:             xmmtmpbox = TempBox()\n1170:             xmmtmploc = self.xrm.force_allocate_reg(xmmtmpbox)\n1171:             result_loc = self.xrm.force_allocate_reg(op.result)\n1172:             self.perform(op, [xmmtmploc], result_loc)\n1173:             self.xrm.possibly_free_var(xmmtmpbox)\n1174:             self.rm.possibly_free_var(tmpbox_low)\n1175:         self.rm.possibly_free_var(tmpbox_high)\n1176: \n1177:     def compute_hint_frame_locations(self, operations):\n1178:         # optimization only: fill in the 'hint_frame_locations' dictionary\n1179:         # of 'fm' based on the JUMP at the end of the loop, by looking\n1180:         # at where we would like the boxes to be after the jump.\n1181:         return # XXX disabled for now\n1182:         op = operations[-1]\n1183:         if op.getopnum() != rop.JUMP:\n1184:             return\n1185:         self.final_jump_op = op\n1186:         descr = op.getdescr()\n1187:         assert isinstance(descr, TargetToken)\n1188:         if descr._ll_loop_code != 0:\n1189:             # if the target LABEL was already compiled, i.e. if it belongs\n1190:             # to some already-compiled piece of code\n1191:             self._compute_hint_frame_locations_from_descr(descr)\n1192:         #else:\n1193:         #   The loop ends in a JUMP going back to a LABEL in the same loop.\n1194:         #   We cannot fill 'hint_frame_locations' immediately, but we can\n1195:         #   wait until the corresponding consider_label() to know where the\n1196:         #   we would like the boxes to be after the jump.\n1197: \n1198:     def _compute_hint_frame_locations_from_descr(self, descr):\n1199:         arglocs = descr._x86_arglocs\n1200:         jump_op = self.final_jump_op\n1201:         assert len(arglocs) == jump_op.numargs()"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "compute_hint_frame_locations",
+      "start_line": 1177,
+      "end_line": 1191,
+      "source": "    def compute_hint_frame_locations(self, operations):\n        # optimization only: fill in the 'hint_frame_locations' dictionary\n        # of 'fm' based on the JUMP at the end of the loop, by looking\n        # at where we would like the boxes to be after the jump.\n        return # XXX disabled for now\n        op = operations[-1]\n        if op.getopnum() != rop.JUMP:\n            return\n        self.final_jump_op = op\n        descr = op.getdescr()\n        assert isinstance(descr, TargetToken)\n        if descr._ll_loop_code != 0:\n            # if the target LABEL was already compiled, i.e. if it belongs\n            # to some already-compiled piece of code\n            self._compute_hint_frame_locations_from_descr(descr)"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 1177,
+      "end_line": 1191,
+      "excerpt": "    def compute_hint_frame_locations(self, operations):\n        # optimization only: fill in the 'hint_frame_locations' dictionary\n        # of 'fm' based on the JUMP at the end of the loop, by looking\n        # at where we would like the boxes to be after the jump.\n        return # XXX disabled for now\n        op = operations[-1]\n        if op.getopnum() != rop.JUMP:\n            return\n        self.final_jump_op = op\n        descr = op.getdescr()\n        assert isinstance(descr, TargetToken)\n        if descr._ll_loop_code != 0:\n            # if the target LABEL was already compiled, i.e. if it belongs\n            # to some already-compiled piece of code\n            self._compute_hint_frame_locations_from_descr(descr)",
+      "symbol_name": "compute_hint_frame_locations",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "rpython/jit/backend/x86/regalloc.py",
+      "sha": "62096925739b0b46af54dd3b4b270066912385e9",
+      "download_url": "https://raw.githubusercontent.com/mozillazg/pypy/09ad28542f5d63961c51b0c0513a04da50cd740b/rpython/jit/backend/x86/regalloc.py"
+    },
+    "imports": {
+      "imports": [
+        "os",
+        "rpython.jit.metainterp.history:Box",
+        "rpython.jit.metainterp.history:Const",
+        "rpython.jit.metainterp.history:ConstInt",
+        "rpython.jit.metainterp.history:ConstPtr",
+        "rpython.jit.metainterp.history:ConstFloat",
+        "rpython.jit.metainterp.history:BoxInt",
+        "rpython.jit.metainterp.history:BoxFloat",
+        "rpython.jit.metainterp.history:INT",
+        "rpython.jit.metainterp.history:REF",
+        "rpython.jit.metainterp.history:FLOAT",
+        "rpython.jit.metainterp.history:TargetToken",
+        "rpython.jit.backend.x86.regloc:*",
+        "rpython.rtyper.lltypesystem:lltype",
+        "rpython.rtyper.lltypesystem:rffi",
+        "rpython.rtyper.lltypesystem:rstr",
+        "rpython.rtyper.annlowlevel:cast_instance_to_gcref",
+        "rpython.rlib.objectmodel:we_are_translated",
+        "rpython.rlib:rgc",
+        "rpython.jit.backend.llsupport:symbolic",
+        "rpython.jit.backend.x86.jump:remap_frame_layout_mixed",
+        "rpython.jit.codewriter:longlong",
+        "rpython.jit.codewriter.effectinfo:EffectInfo",
+        "rpython.jit.metainterp.resoperation:rop",
+        "rpython.jit.backend.llsupport.descr:ArrayDescr",
+        "rpython.jit.backend.llsupport.descr:CallDescr",
+        "rpython.jit.backend.llsupport.descr:unpack_arraydescr",
+        "rpython.jit.backend.llsupport.descr:unpack_fielddescr",
+        "rpython.jit.backend.llsupport.descr:unpack_interiorfielddescr",
+        "rpython.jit.backend.llsupport.gcmap:allocate_gcmap"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.rst",
+      "download_url": "https://raw.githubusercontent.com/mozillazg/pypy/09ad28542f5d63961c51b0c0513a04da50cd740b/README.rst",
+      "content_excerpt": "=====================================\nPyPy: Python in Python Implementation \n=====================================\n\nWelcome to PyPy!\n\nPyPy is both an implementation of the Python programming language, and\nan extensive compiler framework for dynamic language implementations.\nYou can build self-contained Python implementations which execute\nindependently from CPython.\n\nThe home page is:\n\n    http://pypy.org/\n\nThe getting-started document will help guide you:\n\n    http://doc.pypy.org/en/latest/getting-started.html\n\nIt will also point you to the rest of the documentation which is generated\nfrom files in the pypy/doc directory within the source repositories. Enjoy\nand send us feedback!\n\n    the pypy-dev team <pypy-dev@python.org>\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "compute_hint_frame_locations",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_configure.py",
+          "path": "ctypes_configure/test/test_configure.py",
+          "sha": "34d0bb57a0a86240f258e6c4466bc74ce8effde1",
+          "html_url": "https://github.com/mozillazg/pypy/blob/09ad28542f5d63961c51b0c0513a04da50cd740b/ctypes_configure/test/test_configure.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 6,
+          "end_line": 30,
+          "excerpt": "6: def test_dirent():\n7:     dirent = configure.getstruct(\"struct dirent\",\n8:                                        \"\"\"\n9:            struct dirent  /* for this example only, not the exact dirent */\n10:            {\n11:                long d_ino;\n12:                int d_off;\n13:                unsigned short d_reclen;\n14:                char d_name[32];\n15:            };\n16:                                        \"\"\",\n17:                                        [(\"d_reclen\", ctypes.c_ushort)])\n18:     assert issubclass(dirent, ctypes.Structure)\n19:     ssize = (ctypes.sizeof(ctypes.c_long) +\n20:              ctypes.sizeof(ctypes.c_int) +\n21:              ctypes.sizeof(ctypes.c_ushort) +\n22:              32)\n23:     extra_padding = (-ssize) % ctypes.alignment(ctypes.c_long)\n24: \n25:     assert dirent._fields_ == [('_alignment', ctypes.c_long),\n26:                                ('_pad0', ctypes.c_char),\n27:                                ('_pad1', ctypes.c_char),\n28:                                ('_pad2', ctypes.c_char),\n29:                                ('_pad3', ctypes.c_char),\n30:                                ('d_reclen', ctypes.c_ushort),",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_dumpcache.py",
+          "path": "ctypes_configure/test/test_dumpcache.py",
+          "sha": "8373f63224e9eb2891b429b8731faefd1800d24f",
+          "html_url": "https://github.com/mozillazg/pypy/blob/09ad28542f5d63961c51b0c0513a04da50cd740b/ctypes_configure/test/test_dumpcache.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 22,
+          "end_line": 46,
+          "excerpt": "22:         XYZZY = configure.ConstantInteger('XYZZY')\n23:         XUZ = configure.Has('XUZ')\n24:         large = configure.DefinedConstantInteger('large')\n25:         undef = configure.Defined('really_undefined')\n26: \n27:     res = configure.configure(CConfig)\n28: \n29:     cachefile = configdir.join('cache')\n30:     dumpcache.dumpcache('', str(cachefile), res)\n31: \n32:     d = {}\n33:     execfile(str(cachefile), d)\n34:     assert d['XYZZY'] == res['XYZZY']\n35:     assert d['ushort'] == res['ushort']\n36:     assert d['FILE']._fields_ == res['FILE']._fields_\n37:     assert d['FILE'].__mro__[1:] == res['FILE'].__mro__[1:]\n38:     assert d['undef'] == res['undef']\n39:     assert d['large'] == res['large']\n40:     assert d['XUZ'] == res['XUZ']\n41: \n42: \n43: def test_cache_array():\n44:     configdir = configure.configdir\n45:     res = {'foo': ctypes.c_short * 27}\n46:     cachefile = configdir.join('cache_array')",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_interactive.py",
+          "path": "dotviewer/test/test_interactive.py",
+          "sha": "2948ca3aca2a1f51d2f6dfa565c41820013cc1f5",
+          "html_url": "https://github.com/mozillazg/pypy/blob/09ad28542f5d63961c51b0c0513a04da50cd740b/dotviewer/test/test_interactive.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 45,
+          "end_line": 69,
+          "excerpt": "45:     mod.udir = udir\n46: \n47:     try:\n48:         del os.environ['GRAPHSERVER']\n49:     except KeyError:\n50:         pass\n51: \n52: \n53: def test_dotviewer():\n54:     print \"=== dotviewer.py graph1.dot\"\n55:     err = os.system('\"%s\" \"%s\"' % (pkgdir.join('dotviewer.py'),\n56:                                    udir.join('graph1.dot')))\n57:     assert err == 0\n58:     os.system('dot -Tplain \"%s\" > \"%s\"' % (udir.join('graph1.dot'),\n59:                                            udir.join('graph1.plain')))\n60:     print \"=== dotviewer.py graph1.plain\"\n61:     err = os.system('\"%s\" \"%s\"' % (pkgdir.join('dotviewer.py'),\n62:                                    udir.join('graph1.plain')))\n63:     assert err == 0\n64: \n65: def test_display_dot_file():\n66:     FILES = [    # one thread per file - each thread calls display_dot_file()\n67:         'graph1.dot',\n68:         'clock.dot']\n69:     locks = []",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_interactive_unicode.py",
+          "path": "dotviewer/test/test_interactive_unicode.py",
+          "sha": "9afcf12473331119e49558e3a48d4627b8ba9331",
+          "html_url": "https://github.com/mozillazg/pypy/blob/09ad28542f5d63961c51b0c0513a04da50cd740b/dotviewer/test/test_interactive_unicode.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 27,
+          "end_line": 51,
+          "excerpt": "27:     mod.udir = udir\n28: \n29:     try:\n30:         del os.environ['GRAPHSERVER']\n31:     except KeyError:\n32:         pass\n33: \n34: \n35: def test_dotviewer():\n36:     print \"=== dotviewer.py %s\" % FILENAME\n37:     err = os.system('\"%s\" \"%s\"' % (pkgdir.join('dotviewer.py'),\n38:                                    udir.join(FILENAME)))\n39:     assert err == 0\n40: \n41:     plain_name = FILENAME.replace('.dot','.plain')\n42:     \n43:     os.system('dot -Tplain \"%s\" > \"%s\"' % (udir.join(FILENAME),\n44:                                            udir.join(plain_name)))\n45:     print \"=== dotviewer.py %s\" % plain_name\n46:     err = os.system('\"%s\" \"%s\"' % (pkgdir.join('dotviewer.py'),\n47:                                    udir.join(plain_name)))\n48:     assert err == 0\n49: \n50: def test_display_dot_file():\n51:     from dotviewer.graphclient import display_dot_file",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "compute_hint_frame_locations",
+      "count": 1,
+      "items": [
+        {
+          "name": "assembler.py",
+          "path": "rpython/jit/backend/x86/assembler.py",
+          "sha": "0dcc5eb8a14c127263301e1877bd2cde32d1f5c2",
+          "html_url": "https://github.com/mozillazg/pypy/blob/09ad28542f5d63961c51b0c0513a04da50cd740b/rpython/jit/backend/x86/assembler.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 770,
+          "end_line": 794,
+          "excerpt": "770:             self._append_debugging_code(newoperations, tp, number,\n771:                                         None)\n772:             for op in operations:\n773:                 newoperations.append(op)\n774:                 if op.getopnum() == rop.LABEL:\n775:                     self._append_debugging_code(newoperations, 'l', number,\n776:                                                 op.getdescr())\n777:             operations = newoperations\n778:         return operations\n779: \n780:     def _assemble(self, regalloc, inputargs, operations):\n781:         self._regalloc = regalloc\n782:         regalloc.compute_hint_frame_locations(operations)\n783:         regalloc.walk_operations(inputargs, operations)\n784:         if we_are_translated() or self.cpu.dont_keepalive_stuff:\n785:             self._regalloc = None   # else keep it around for debugging\n786:         frame_depth = regalloc.get_final_frame_depth()\n787:         jump_target_descr = regalloc.jump_target_descr\n788:         if jump_target_descr is not None:\n789:             tgt_depth = jump_target_descr._x86_clt.frame_info.jfi_frame_depth\n790:             target_frame_depth = tgt_depth - JITFRAME_FIXED_SIZE\n791:             frame_depth = max(frame_depth, target_frame_depth)\n792:         return frame_depth\n793: \n794:     def _call_header(self):",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "rpython/jit/backend/x86",
+      "count": 40,
+      "entries": [
+        {
+          "name": "x86",
+          "path": "rpython/jit/backend/x86",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "rpython/jit/backend/x86/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "arch.py",
+          "path": "rpython/jit/backend/x86/arch.py",
+          "type": "file"
+        },
+        {
+          "name": "assembler.py",
+          "path": "rpython/jit/backend/x86/assembler.py",
+          "type": "file"
+        },
+        {
+          "name": "codebuf.py",
+          "path": "rpython/jit/backend/x86/codebuf.py",
+          "type": "file"
+        },
+        {
+          "name": "detect_sse2.py",
+          "path": "rpython/jit/backend/x86/detect_sse2.py",
+          "type": "file"
+        },
+        {
+          "name": "jump.py",
+          "path": "rpython/jit/backend/x86/jump.py",
+          "type": "file"
+        },
+        {
+          "name": "oprofile.py",
+          "path": "rpython/jit/backend/x86/oprofile.py",
+          "type": "file"
+        },
+        {
+          "name": "profagent.py",
+          "path": "rpython/jit/backend/x86/profagent.py",
+          "type": "file"
+        },
+        {
+          "name": "regalloc.py",
+          "path": "rpython/jit/backend/x86/regalloc.py",
+          "type": "file"
+        },
+        {
+          "name": "regloc.py",
+          "path": "rpython/jit/backend/x86/regloc.py",
+          "type": "file"
+        },
+        {
+          "name": "runner.py",
+          "path": "rpython/jit/backend/x86/runner.py",
+          "type": "file"
+        },
+        {
+          "name": "rx86.py",
+          "path": "rpython/jit/backend/x86/rx86.py",
+          "type": "file"
+        },
+        {
+          "name": "support.py",
+          "path": "rpython/jit/backend/x86/support.py",
+          "type": "file"
+        },
+        {
+          "name": "test",
+          "path": "rpython/jit/backend/x86/test",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "rpython/jit/backend/x86/test/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "conftest.py",
+          "path": "rpython/jit/backend/x86/test/conftest.py",
+          "type": "file"
+        },
+        {
+          "name": "test_assembler.py",
+          "path": "rpython/jit/backend/x86/test/test_assembler.py",
+          "type": "file"
+        },
+        {
+          "name": "test_basic.py",
+          "path": "rpython/jit/backend/x86/test/test_basic.py",
+          "type": "file"
+        },
+        {
+          "name": "test_calling_convention.py",
+          "path": "rpython/jit/backend/x86/test/test_calling_convention.py",
+          "type": "file"
+        },
+        {
+          "name": "test_del.py",
+          "path": "rpython/jit/backend/x86/test/test_del.py",
+          "type": "file"
+        },
+        {
+          "name": "test_dict.py",
+          "path": "rpython/jit/backend/x86/test/test_dict.py",
+          "type": "file"
+        },
+        {
+          "name": "test_exception.py",
+          "path": "rpython/jit/backend/x86/test/test_exception.py",
+          "type": "file"
+        },
+        {
+          "name": "test_fficall.py",
+          "path": "rpython/jit/backend/x86/test/test_fficall.py",
+          "type": "file"
+        },
+        {
+          "name": "test_float.py",
+          "path": "rpython/jit/backend/x86/test/test_float.py",
+          "type": "file"
+        },
+        {
+          "name": "test_jump.py",
+          "path": "rpython/jit/backend/x86/test/test_jump.py",
+          "type": "file"
+        },
+        {
+          "name": "test_list.py",
+          "path": "rpython/jit/backend/x86/test/test_list.py",
+          "type": "file"
+        },
+        {
+          "name": "test_longlong.py",
+          "path": "rpython/jit/backend/x86/test/test_longlong.py",
+          "type": "file"
+        },
+        {
+          "name": "test_loop_unroll.py",
+          "path": "rpython/jit/backend/x86/test/test_loop_unroll.py",
+          "type": "file"
+        },
+        {
+          "name": "test_quasiimmut.py",
+          "path": "rpython/jit/backend/x86/test/test_quasiimmut.py",
+          "type": "file"
+        },
+        {
+          "name": "test_rawmem.py",
+          "path": "rpython/jit/backend/x86/test/test_rawmem.py",
+          "type": "file"
+        },
+        {
+          "name": "test_recompilation.py",
+          "path": "rpython/jit/backend/x86/test/test_recompilation.py",
+          "type": "file"
+        },
+        {
+          "name": "test_recursive.py",
+          "path": "rpython/jit/backend/x86/test/test_recursive.py",
+          "type": "file"
+        },
+        {
+          "name": "test_regalloc2.py",
+          "path": "rpython/jit/backend/x86/test/test_regalloc2.py",
+          "type": "file"
+        },
+        {
+          "name": "test_regloc.py",
+          "path": "rpython/jit/backend/x86/test/test_regloc.py",
+          "type": "file"
+        },
+        {
+          "name": "test_runner.py",
+          "path": "rpython/jit/backend/x86/test/test_runner.py",
+          "type": "file"
+        },
+        {
+          "name": "test_rx86.py",
+          "path": "rpython/jit/backend/x86/test/test_rx86.py",
+          "type": "file"
+        },
+        {
+          "name": "test_rx86_32_auto_encoding.py",
+          "path": "rpython/jit/backend/x86/test/test_rx86_32_auto_encoding.py",
+          "type": "file"
+        },
+        {
+          "name": "test_rx86_64_auto_encoding.py",
+          "path": "rpython/jit/backend/x86/test/test_rx86_64_auto_encoding.py",
+          "type": "file"
+        },
+        {
+          "name": "test_send.py",
+          "path": "rpython/jit/backend/x86/test/test_send.py",
+          "type": "file"
+        }
+      ],
+      "ref": "09ad28542f5d63961c51b0c0513a04da50cd740b"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "rpython/jit/backend/x86/__init__.py",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "arch.py",
+          "path": "rpython/jit/backend/x86/arch.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # Constants that depend on whether we are on 32-bit or 64-bit\n2: # the frame is absolutely standard. Stores callee-saved registers,\n3: # return address and some scratch space for arguments.\n4: \n5: import sys\n6: if sys.maxint == (2**31 - 1):\n7:     WORD = 4\n8:     IS_X86_32 = True\n9:     IS_X86_64 = False\n10: else:\n11:     WORD = 8\n12:     IS_X86_32 = False\n13:     IS_X86_64 = True"
+        },
+        {
+          "name": "assembler.py",
+          "path": "rpython/jit/backend/x86/assembler.py",
+          "match_reason": "anchor_text",
+          "start_line": 770,
+          "end_line": 794,
+          "excerpt": "770:             self._append_debugging_code(newoperations, tp, number,\n771:                                         None)\n772:             for op in operations:\n773:                 newoperations.append(op)\n774:                 if op.getopnum() == rop.LABEL:\n775:                     self._append_debugging_code(newoperations, 'l', number,\n776:                                                 op.getdescr())\n777:             operations = newoperations\n778:         return operations\n779: \n780:     def _assemble(self, regalloc, inputargs, operations):\n781:         self._regalloc = regalloc\n782:         regalloc.compute_hint_frame_locations(operations)\n783:         regalloc.walk_operations(inputargs, operations)\n784:         if we_are_translated() or self.cpu.dont_keepalive_stuff:\n785:             self._regalloc = None   # else keep it around for debugging\n786:         frame_depth = regalloc.get_final_frame_depth()\n787:         jump_target_descr = regalloc.jump_target_descr\n788:         if jump_target_descr is not None:\n789:             tgt_depth = jump_target_descr._x86_clt.frame_info.jfi_frame_depth\n790:             target_frame_depth = tgt_depth - JITFRAME_FIXED_SIZE\n791:             frame_depth = max(frame_depth, target_frame_depth)\n792:         return frame_depth\n793: \n794:     def _call_header(self):"
+        },
+        {
+          "name": "codebuf.py",
+          "path": "rpython/jit/backend/x86/codebuf.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from rpython.rtyper.lltypesystem import lltype, rffi\n2: from rpython.rlib.rarithmetic import intmask\n3: from rpython.rlib.debug import debug_start, debug_print, debug_stop\n4: from rpython.rlib.debug import have_debug_prints\n5: from rpython.jit.backend.llsupport.asmmemmgr import BlockBuilderMixin\n6: from rpython.jit.backend.x86.rx86 import X86_32_CodeBuilder, X86_64_CodeBuilder\n7: from rpython.jit.backend.x86.regloc import LocationCodeBuilder\n8: from rpython.jit.backend.x86.arch import IS_X86_32, IS_X86_64, WORD\n9: from rpython.jit.backend.x86 import valgrind\n10: \n11: # XXX: Seems nasty to change the superclass of MachineCodeBlockWrapper\n12: # like this\n13: if IS_X86_32:"
+        },
+        {
+          "name": "detect_sse2.py",
+          "path": "rpython/jit/backend/x86/detect_sse2.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from rpython.rtyper.lltypesystem import lltype, rffi\n2: from rpython.rlib.rmmap import alloc, free\n3: \n4: \n5: def detect_sse2():\n6:     data = alloc(4096)\n7:     pos = 0\n8:     for c in (\"\\xB8\\x01\\x00\\x00\\x00\"     # MOV EAX, 1\n9:               \"\\x53\"                     # PUSH EBX\n10:               \"\\x0F\\xA2\"                 # CPUID\n11:               \"\\x5B\"                     # POP EBX\n12:               \"\\x92\"                     # XCHG EAX, EDX\n13:               \"\\xC3\"):                   # RET"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "rpython/jit/backend/x86/regalloc.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "9bd0997367f41a70a693ff679f9403e9f7bd21e3",
+          "html_url": "https://github.com/mozillazg/pypy/commit/9bd0997367f41a70a693ff679f9403e9f7bd21e3",
+          "message": "backport changes from py3.10 to rpython",
+          "author": "Matti Picus",
+          "date": "2023-02-14T08:51:12Z"
+        },
+        {
+          "sha": "af42cfecc0813e3143ef852d7dc6e4357bd6ae54",
+          "html_url": "https://github.com/mozillazg/pypy/commit/af42cfecc0813e3143ef852d7dc6e4357bd6ae54",
+          "message": "fix comment",
+          "author": "Matti Picus",
+          "date": "2022-05-29T04:42:30Z"
+        },
+        {
+          "sha": "740b009a90ce63d90a29c9fc744761ada10c0f17",
+          "html_url": "https://github.com/mozillazg/pypy/commit/740b009a90ce63d90a29c9fc744761ada10c0f17",
+          "message": "fix xmm scratch register on win64 (issue 3753)",
+          "author": "Matti Picus",
+          "date": "2022-05-29T03:52:58Z"
+        },
+        {
+          "sha": "08af1591876eaffe672c9879bb207e249ed91993",
+          "html_url": "https://github.com/mozillazg/pypy/commit/08af1591876eaffe672c9879bb207e249ed91993",
+          "message": "fix logic (isuruf)",
+          "author": "Matti Picus",
+          "date": "2021-07-18T14:37:54Z"
+        },
+        {
+          "sha": "3f5a5f9625bd6c9f6c645cbfd3cab8e82a54870e",
+          "html_url": "https://github.com/mozillazg/pypy/commit/3f5a5f9625bd6c9f6c645cbfd3cab8e82a54870e",
+          "message": "remove duplicate value",
+          "author": "Matti Picus",
+          "date": "2021-07-18T10:37:18Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "compute_hint_frame_locations disabled",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "rpython/jit/backend/x86/regalloc.py",
+      "satd_line": 1181,
+      "last_commit": {
+        "sha": "9bd0997367f41a70a693ff679f9403e9f7bd21e3",
+        "html_url": "https://github.com/mozillazg/pypy/commit/9bd0997367f41a70a693ff679f9403e9f7bd21e3",
+        "message": "backport changes from py3.10 to rpython",
+        "author": "Matti Picus",
+        "date": "2023-02-14T08:51:12Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "compute_hint_frame_locations",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

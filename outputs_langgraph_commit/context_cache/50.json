@@ -1,0 +1,428 @@
+{
+  "task_id": "50",
+  "repo_owner": "ethereum",
+  "repo_name": "trinity",
+  "file_path": "evm/p2p/peer.py",
+  "commit": "b3c6282b8e0c4a2052e82f1285a37f68cf234df2",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:13:24+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "b3c6282b8e0c4a2052e82f1285a37f68cf234df2",
+    "symbol_name": "process_msg",
+    "satd_line": 119,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:14:09+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:14:14+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "evm/p2p/peer.py",
+    "original_code": "def process_msg(self, msg):\n    cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n    self.logger.debug(\"Processing msg with cmd_id: {}\".format(cmd_id))\n    proto = self.get_protocol_for(cmd_id)\n    if proto is None:\n        self.logger.warn(\"No protocol found for cmd_id {}\".format(cmd_id))\n        return\n    decoded_msg = proto.process(cmd_id, msg)\n    if cmd_id == Hello.id:\n        # TODO: Populate self.sub_protocols based on self.capabilities and\n        # hello['capabilities']\n        self.logger.debug(\"Got hello: {}\".format(decoded_msg))",
+    "original_signature": "def process_msg(self, msg):",
+    "satd_comment": "# TODO: Populate self.sub_protocols based on self.capabilities and\n# hello['capabilities']",
+    "target_file": {
+      "ok": true,
+      "path": "evm/p2p/peer.py",
+      "sha": "71878bb2b0a20b391b901aa2c8b302ad8179af9a",
+      "download_url": "https://raw.githubusercontent.com/ethereum/trinity/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/peer.py",
+      "content_excerpt": "import asyncio\nimport logging\nimport struct\n\nimport rlp\nfrom rlp import sedes\n\nfrom cryptography.hazmat.backends import default_backend\nfrom cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\nfrom cryptography.hazmat.primitives.constant_time import bytes_eq\n\nfrom eth_utils import (\n    decode_hex,\n)\n\nfrom eth_keys import keys\n\nfrom evm.p2p import ecies\nfrom evm.p2p.constants import (\n    HEADER_LEN,\n    MAC_LEN,\n)\nfrom evm.p2p.exceptions import (\n    AuthenticationError,\n    PeerDisconnected,\n)\nfrom evm.p2p.utils import (\n    roundup_16,\n    sxor,\n)\nfrom evm.p2p.les import LESProtocol\nfrom evm.p2p.p2p_proto import (\n    Hello,\n    P2PProtocol,\n)\n\n\nclass Peer:\n    logger = logging.getLogger(\"evm.p2p.peer.Peer\")\n    _sub_protocols = [LESProtocol]\n    # FIXME: Must be configurable.\n    listen_port = 30303\n\n    def __init__(self, remote, privkey, reader, writer, aes_secret, mac_secret,\n                 egress_mac, ingress_mac):\n        self.remote = remote\n        self.privkey = privkey\n        self.reader = reader\n        self.writer = writer\n        self.base_protocol = P2PProtocol(self)\n\n        self.egress_mac = egress_mac\n        self.ingress_mac = ingress_mac\n        # FIXME: Yes, the encryption is insecure, see: https://github.com/ethereum/devp2p/issues/32\n        iv = b\"\\x00\" * 16\n        aes_cipher = Cipher(algorithms.AES(aes_secret), modes.CTR(iv), default_backend())\n        self.aes_enc = aes_cipher.encryptor()\n        self.aes_dec = aes_cipher.decryptor()\n        mac_cipher = Cipher(algorithms.AES(mac_secret), modes.ECB(), default_backend())\n        self.mac_enc = mac_cipher.encryptor().update\n\n    @property\n    def capabilities(self):\n        return [(klass.name, klass.version) for klass in self._sub_protocols]\n\n    def get_protocol_for(self, cmd_id):\n        if cmd_id >= self.base_protocol.cmd_length:\n            # TODO: Return the appropriate sub-protocol\n            return None\n        return self.base_protocol\n\n    @asyncio.coroutine\n    def read(self, n):\n        self.logger.debug(\"Waiting for {} bytes from {}\".format(n, self.remote))\n        try:\n            data = yield from self.reader.readexactly(n)\n        except asyncio.IncompleteReadError:\n            raise PeerDisconnected()\n        return data\n\n    @asyncio.coroutine\n    def start(self):\n        yield from self.read_loop()\n\n    def stop(self):\n        self.writer.close()\n\n    @asyncio.coroutine\n    def read_loop(self):\n        while True:\n            try:\n                msg = yield from self.read_msg()\n            except PeerDisconnected:\n                self.logger.debug(\"Remote disconnected, stopping: {}\".format(self.remote))\n                self.stop()\n                return\n            self.process_msg(msg)\n\n    @asyncio.coroutine\n    def read_msg(self):\n        header_data = yield from self.read(HEADER_LEN + MAC_LEN)\n        header = self.decrypt_header(header_data)\n        frame_size = self.get_frame_size(header)\n        # The frame_size specified in the header does not include the padding to 16-byte boundary,\n        # so need to do this here to ensure we read all the frame's data.\n        read_size = roundup_16(frame_size)\n        frame_data = yield from self.read(read_size + MAC_LEN)\n        return self.decrypt_body(frame_data, frame_size)\n\n    def process_msg(self, msg):\n        cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n        self.logger.debug(\"Processing msg with cmd_id: {}\".format(cmd_id))\n        proto = self.get_protocol_for(cmd_id)\n        if proto is None:\n            self.logger.warn(\"No protocol found for cmd_id {}\".format(cmd_id))\n            return\n        decoded_msg = proto.process(cmd_id, msg)\n        if cmd_id == Hello.id:\n            # TODO: Populate self.sub_protocols based on self.capabilities and\n            # hello['capabilities']\n            self.logger.debug(\"Got hello: {}\".format(decoded_msg))\n\n    def encrypt(self, header, frame):\n        if len(header) != HEADER_LEN:\n            raise ValueError(\"Unexpected header length: {}\".format(len(header)))\n\n        header_ciphertext = self.aes_enc.update(header)\n        mac_secret = self.egress_mac.digest()[:HEADER_LEN]\n        self.egress_mac.update(sxor(self.mac_enc(mac_secret), header_ciphertext))\n        header_mac = self.egress_mac.digest()[:HEADER_LEN]\n\n        frame_ciphertext = self.aes_enc.update(frame)\n        self.egress_mac.update(frame_ciphertext)\n        fmac_seed = self.egress_mac.digest()[:HEADER_LEN]\n\n        mac_secret = self.egress_mac.digest()[:HEADER_LEN]\n        self.egress_mac.update(sxor(self.mac_enc(mac_secret), fmac_seed))\n        frame_mac = self.egress_mac.digest()[:HEADER_LEN]\n\n        return header_ciphertext + header_mac + frame_ciphertext + frame_mac\n\n    def decrypt_header(self, data):\n        if len(data) != HEADER_LEN + MAC_LEN:\n            raise ValueError(\"Unexpected header length: {}\".format(len(data)))\n\n        header_ciphertext = data[:HEADER_LEN]\n        header_mac = data[HEADER_LEN:]\n        mac_secret = self.ingress_mac.digest()[:HEADER_LEN]\n        aes = self.mac_enc(mac_secret)[:HEADER_LEN]\n        self.ingress_mac.update(sxor(aes, header_ciphertext))\n        expected_header_mac = self.ingress_mac.digest()[:HEADER_LEN]\n        if not bytes_eq(expected_header_mac, header_mac):\n            raise AuthenticationError('Invalid header mac')\n        return self.aes_dec.update(header_ciphertext)\n\n    def decrypt_body(self, data, body_size):\n        read_size = roundup_16(body_size)\n        if len(data) < read_size + MAC_LEN:\n            raise ValueError('Insufficient body length; Got {}, wanted {}'.format(\n                len(data), (read_size + MAC_LEN)))\n\n        frame_ciphertext = data[:read_size]\n        frame_mac = data[read_size:read_size + MAC_LEN]\n\n        self.ingress_mac.update(frame_ciphertext)\n        fmac_seed = self.ingress_mac.digest()[:MAC_LEN]\n        self.ingress_mac.update(sxor(self.mac_enc(fmac_seed), fmac_seed))\n        expected_frame_mac = self.ingress_mac.digest()[:MAC_LEN]\n        if not bytes_eq(expected_frame_mac, frame_mac):\n            raise AuthenticationError('Invalid frame mac')\n        return self.aes_dec.update(frame_ciphertext)[:body_size]\n\n    def get_frame_size(self, header):\n        # The frame size is encoded in the header as a 3-byte int, so before we unpack we need\n        # to prefix it with an extra byte.\n        encoded_size = b'\\x00' + header[:3]\n        (size,) = struct.unpack(b'>I', encoded_size)\n        return size\n\n    def send(self, header, body):\n        cmd_id = rlp.decode(body[:1], sedes=sedes.big_endian_int)\n        self.logger.debug(\"Sending msg with cmd_id: {}\".format(cmd_id))\n        self.writer.write(self.encrypt(header, body))\n\n    def send_hello(self):\n        header, body = self.base_protocol.get_hello_message()\n        self.send(header, body)\n\n\nif __name__ == \"__main__\":\n    # Run geth like this to be able to do a handshake and get a Peer connected to it.\n    # ./build/bin/geth -verbosity 9 \\\n    #   --nodekeyhex 45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8 \\\n    #   --port 30301 --nat none --testnet --nodiscover --light\n\n    from evm.p2p import kademlia\n    from evm.p2p import auth\n    logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')\n    remote_pubkey = keys.PrivateKey(decode_hex(\n        \"0x45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8\")).public_key\n    remote = kademlia.Node(remote_pubkey, kademlia.Address('127.0.0.1', 30301, 30301))\n\n    loop = asyncio.get_event_loop()\n    loop.set_debug(True)\n\n    peers = []\n\n    @asyncio.coroutine\n    def do_handshake():\n        peer = yield from auth.handshake(remote, ecies.generate_privkey())\n        peers.append(peer)\n\n    count = 1  # Number of peers to start\n    try:\n        loop.run_until_complete(asyncio.gather(\n            *[do_handshake() for _ in range(count)]))\n        loop.run_until_complete(asyncio.gather(\n            *[peer.start() for peer in peers]))\n    except KeyboardInterrupt:\n        pass\n\n    for peer in peers:\n        peer.stop()\n    loop.close()\n",
+      "total_lines": 224,
+      "ref": "b3c6282b8e0c4a2052e82f1285a37f68cf234df2"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 119,
+      "start_line": 99,
+      "end_line": 139,
+      "matched_line": "            # TODO: Populate self.sub_protocols based on self.capabilities and",
+      "excerpt": "99:     @asyncio.coroutine\n100:     def read_msg(self):\n101:         header_data = yield from self.read(HEADER_LEN + MAC_LEN)\n102:         header = self.decrypt_header(header_data)\n103:         frame_size = self.get_frame_size(header)\n104:         # The frame_size specified in the header does not include the padding to 16-byte boundary,\n105:         # so need to do this here to ensure we read all the frame's data.\n106:         read_size = roundup_16(frame_size)\n107:         frame_data = yield from self.read(read_size + MAC_LEN)\n108:         return self.decrypt_body(frame_data, frame_size)\n109: \n110:     def process_msg(self, msg):\n111:         cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n112:         self.logger.debug(\"Processing msg with cmd_id: {}\".format(cmd_id))\n113:         proto = self.get_protocol_for(cmd_id)\n114:         if proto is None:\n115:             self.logger.warn(\"No protocol found for cmd_id {}\".format(cmd_id))\n116:             return\n117:         decoded_msg = proto.process(cmd_id, msg)\n118:         if cmd_id == Hello.id:\n119:             # TODO: Populate self.sub_protocols based on self.capabilities and\n120:             # hello['capabilities']\n121:             self.logger.debug(\"Got hello: {}\".format(decoded_msg))\n122: \n123:     def encrypt(self, header, frame):\n124:         if len(header) != HEADER_LEN:\n125:             raise ValueError(\"Unexpected header length: {}\".format(len(header)))\n126: \n127:         header_ciphertext = self.aes_enc.update(header)\n128:         mac_secret = self.egress_mac.digest()[:HEADER_LEN]\n129:         self.egress_mac.update(sxor(self.mac_enc(mac_secret), header_ciphertext))\n130:         header_mac = self.egress_mac.digest()[:HEADER_LEN]\n131: \n132:         frame_ciphertext = self.aes_enc.update(frame)\n133:         self.egress_mac.update(frame_ciphertext)\n134:         fmac_seed = self.egress_mac.digest()[:HEADER_LEN]\n135: \n136:         mac_secret = self.egress_mac.digest()[:HEADER_LEN]\n137:         self.egress_mac.update(sxor(self.mac_enc(mac_secret), fmac_seed))\n138:         frame_mac = self.egress_mac.digest()[:HEADER_LEN]\n139: "
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "process_msg",
+      "start_line": 110,
+      "end_line": 121,
+      "source": "    def process_msg(self, msg):\n        cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n        self.logger.debug(\"Processing msg with cmd_id: {}\".format(cmd_id))\n        proto = self.get_protocol_for(cmd_id)\n        if proto is None:\n            self.logger.warn(\"No protocol found for cmd_id {}\".format(cmd_id))\n            return\n        decoded_msg = proto.process(cmd_id, msg)\n        if cmd_id == Hello.id:\n            # TODO: Populate self.sub_protocols based on self.capabilities and\n            # hello['capabilities']\n            self.logger.debug(\"Got hello: {}\".format(decoded_msg))"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 110,
+      "end_line": 121,
+      "excerpt": "    def process_msg(self, msg):\n        cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n        self.logger.debug(\"Processing msg with cmd_id: {}\".format(cmd_id))\n        proto = self.get_protocol_for(cmd_id)\n        if proto is None:\n            self.logger.warn(\"No protocol found for cmd_id {}\".format(cmd_id))\n            return\n        decoded_msg = proto.process(cmd_id, msg)\n        if cmd_id == Hello.id:\n            # TODO: Populate self.sub_protocols based on self.capabilities and\n            # hello['capabilities']\n            self.logger.debug(\"Got hello: {}\".format(decoded_msg))",
+      "symbol_name": "process_msg",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "evm/p2p/peer.py",
+      "sha": "71878bb2b0a20b391b901aa2c8b302ad8179af9a",
+      "download_url": "https://raw.githubusercontent.com/ethereum/trinity/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/peer.py"
+    },
+    "imports": {
+      "imports": [
+        "asyncio",
+        "logging",
+        "struct",
+        "rlp",
+        "rlp:sedes",
+        "cryptography.hazmat.backends:default_backend",
+        "cryptography.hazmat.primitives.ciphers:Cipher",
+        "cryptography.hazmat.primitives.ciphers:algorithms",
+        "cryptography.hazmat.primitives.ciphers:modes",
+        "cryptography.hazmat.primitives.constant_time:bytes_eq",
+        "eth_utils:decode_hex",
+        "eth_keys:keys",
+        "evm.p2p:ecies",
+        "evm.p2p.constants:HEADER_LEN",
+        "evm.p2p.constants:MAC_LEN",
+        "evm.p2p.exceptions:AuthenticationError",
+        "evm.p2p.exceptions:PeerDisconnected",
+        "evm.p2p.utils:roundup_16",
+        "evm.p2p.utils:sxor",
+        "evm.p2p.les:LESProtocol",
+        "evm.p2p.p2p_proto:Hello",
+        "evm.p2p.p2p_proto:P2PProtocol",
+        "evm.p2p:kademlia",
+        "evm.p2p:auth"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/ethereum/trinity/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/README.md",
+      "content_excerpt": "# Python Implementation of the EVM\n\n## Introducing Py-EVM\nPy-EVM is a new implementation of the Ethereum Virtual Machine written in python. It is currently in active development but is quickly progressing through the test suite provided by ethereum/tests. I have Vitalik, and the existing PyEthereum code to thank for the quick progress I’ve made as many design decisions were inspired, or even directly ported from the PyEthereum codebase.\nPy-EVM aims to eventually become the defacto python implementation of the EVM, enabling a wide array of use cases for both public and private chains. Development will focus on creating an EVM with a well defined API, friendly and easy to digest documentation which can be run as a fully functional mainnet node.\n\n### Step 1: Alpha Release\nThe plan is to begin with an MVP, alpha-level release that is suitable for testing purposes. We’ll be looking for early adopters to provide feedback on our architecture and API choices as well as general feedback and bug finding.\n\n#### Blog posts:\n\n- https://medium.com/@pipermerriam/py-evm-part-1-origins-25d9ad390b\n\n#### Join the chat on gitter:\n\n- [![Join the chat at https://gitter.im/pipermerriam/py-evm](https://badges.gitter.im/pipermerriam/py-evm.svg)](https://gitter.im/pipermerriam/py-evm?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)\n"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "process_msg",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_auth.py",
+          "path": "evm/p2p/test_auth.py",
+          "sha": "a2c89400f84db23e17f99e0d4caf49a56981b977",
+          "html_url": "https://github.com/ethereum/trinity/blob/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/test_auth.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 129,
+          "end_line": 153,
+          "excerpt": "129:     responder_peer = Peer(\n130:         remote=responder.remote, privkey=responder.privkey, reader=responder_reader,\n131:         writer=responder_writer, aes_secret=aes_secret, mac_secret=mac_secret,\n132:         egress_mac=egress_mac, ingress_mac=ingress_mac)\n133: \n134:     # The hello msg sent by the initiator is going to be fed directly into the responder's\n135:     # reader, and thus read_msg() will return immediately.\n136:     initiator_peer.send_hello()\n137:     msg = yield from responder_peer.read_msg()\n138: \n139:     cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n140:     assert cmd_id == Hello.id\n141:     responder_peer.process_msg(msg)\n142: \n143: \n144: def test_handshake_eip8():\n145:     # Data taken from https://github.com/ethereum/EIPs/blob/master/EIPS/eip-8.md\n146:     test_values = {\n147:         \"initiator_private_key\": \"49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee\",\n148:         \"receiver_private_key\": \"b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291\",\n149:         \"initiator_ephemeral_private_key\":\n150:             \"869d6ecf5211f1cc60418a13b9d870b22959d0c16f02bec714c960dd2298a32d\",\n151:         \"receiver_ephemeral_private_key\":\n152:             \"e238eb8e04fee6511ab04c6dd3c89ce097b11f25d584863ac2b6d5b35b1847e4\",\n153:         \"initiator_nonce\": \"7e968bba13b6c50e2c4cd7f241cc0d64d1ac25c7f5952df231ac6a2bda8ee5d6\",",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_discovery.py",
+          "path": "evm/p2p/test_discovery.py",
+          "sha": "7a3539f0a26135fac58cef898f04c221f58cbad1",
+          "html_url": "https://github.com/ethereum/trinity/blob/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/test_discovery.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 20,
+          "end_line": 44,
+          "excerpt": "20:     alice = get_discovery_protocol(b\"alice\")\n21:     bob = get_discovery_protocol(b\"bob\")\n22: \n23:     # Connect alice's and bob's transports directly so we don't need to deal with the complexities\n24:     # of going over the wire.\n25:     link_transports(alice, bob)\n26:     # Collect all pongs received by alice in a list for later inspection.\n27:     received_pongs = []\n28:     alice.recv_pong = lambda node, payload, hash_: received_pongs.append((node, payload))\n29: \n30:     token = alice.send_ping(bob.this_node)\n31: \n32:     assert len(received_pongs) == 1\n33:     node, payload = received_pongs[0]\n34:     assert node.id == bob.this_node.id\n35:     assert token == payload[1]\n36: \n37: \n38: def test_find_node_neighbours():\n39:     alice = get_discovery_protocol(b\"alice\")\n40:     bob = get_discovery_protocol(b\"bob\")\n41:     # Add some nodes to bob's routing table so that it has something to use when replying to\n42:     # alice's find_node.\n43:     for _ in range(kademlia.k_bucket_size * 2):\n44:         bob.kademlia.update_routing_table(random_node())",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_ecies.py",
+          "path": "evm/p2p/test_ecies.py",
+          "sha": "357c4c3aa73c94f7bbd93451e79c2a9b34094a0f",
+          "html_url": "https://github.com/ethereum/trinity/blob/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/test_ecies.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 24,
+          "end_line": 48,
+          "excerpt": "24:     (\"0x7ebbc6a8358bc76dd73ebc557056702c8cfc34e5cfcd90eb83af0347575fd2ad\",\n25:      \"0x83ede0f19c3c98649265956a4193677b14c338a22de2086a08d84e4446fe37e4e233478259ec90dbeef52f4f6c890f8c38660ec7b61b9d439b8a6d1c323dc025\",  # noqa: E501\n26:      \"0x167ccc13ac5e8a26b131c3446030c60fbfac6aa8e31149d0869f93626a4cdf62\",\n27:      ),\n28: ]\n29: \n30: \n31: def test_encrypt_decrypt():\n32:     msg = b'test yeah'\n33:     privkey = ecies.generate_privkey()\n34:     ciphertext = ecies.encrypt(msg, privkey.public_key)\n35:     decrypted = ecies.decrypt(ciphertext, privkey)\n36:     assert decrypted == msg\n37: \n38:     privkey2 = ecies.generate_privkey()\n39:     with pytest.raises(ecies.DecryptionError):\n40:         decrypted = ecies.decrypt(ciphertext, privkey2)\n41: \n42: \n43: def test_decrypt_known_good_handshake():\n44:     # Data taken from https://gist.github.com/fjl/3a78780d17c755d22df2\n45:     privkey = keys.PrivateKey(\n46:         decode_hex(\"c45f950382d542169ea207959ee0220ec1491755abe405cd7498d6b16adb6df8\"))\n47:     auth_ciphertext = decode_hex(\n48:         \"04a0274c5951e32132e7f088c9bdfdc76c9d91f0dc6078e848f8e3361193dbdc43b94351ea3d89e4ff33ddcefbc80070498824857f499656c4f79bbd97b6c51a514251d69fd1785ef8764bd1d262a883f780964cce6a14ff206daf1206aa073a2d35ce2697ebf3514225bef186631b2fd2316a4b7bcdefec8d75a1025ba2c5404a34e7795e1dd4bc01c6113ece07b0df13b69d3ba654a36e35e69ff9d482d88d2f0228e7d96fe11dccbb465a1831c7d4ad3a026924b182fc2bdfe016a6944312021da5cc459713b13b86a686cf34d6fe6615020e4acf26bf0d5b7579ba813e7723eb95b3cef9942f01a58bd61baee7c9bdd438956b426a4ffe238e61746a8c93d5e10680617c82e48d706ac4953f5e1c4c4f7d013c87d34a06626f498f34576dc017fdd3d581e83cfd26cf125b6d2bda1f1d56\")  # noqa: E501",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_kademlia.py",
+          "path": "evm/p2p/test_kademlia.py",
+          "sha": "df78747abd13f641138a07f27140e918188f1577",
+          "html_url": "https://github.com/ethereum/trinity/blob/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/test_kademlia.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 13,
+          "end_line": 37,
+          "excerpt": "13: @pytest.fixture(autouse=True)\n14: def short_timeout(monkeypatch):\n15:     monkeypatch.setattr(kademlia, 'k_request_timeout', 0.01)\n16: \n17: \n18: @pytest.mark.asyncio\n19: def test_protocol_bootstrap():\n20:     proto = get_wired_protocol()\n21:     node1, node2 = [random_node(), random_node()]\n22: \n23:     @asyncio.coroutine\n24:     def bond(node):\n25:         assert proto.routing.add_node(node) is None\n26:         return True\n27: \n28:     # Pretend we bonded successfully with our bootstrap nodes.\n29:     proto.bond = bond\n30: \n31:     yield from proto.bootstrap([node1, node2])\n32: \n33:     assert len(proto.wire.messages) == 2\n34:     # We don't care in which order the bootstrap nodes are contacted, so we sort them both in the\n35:     # assert here.\n36:     assert sorted(proto.wire.messages) == sorted([\n37:         (node1, 'find_node', proto.routing.this_node.id),",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "process_msg",
+      "count": 1,
+      "items": [
+        {
+          "name": "test_auth.py",
+          "path": "evm/p2p/test_auth.py",
+          "sha": "a2c89400f84db23e17f99e0d4caf49a56981b977",
+          "html_url": "https://github.com/ethereum/trinity/blob/b3c6282b8e0c4a2052e82f1285a37f68cf234df2/evm/p2p/test_auth.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 129,
+          "end_line": 153,
+          "excerpt": "129:     responder_peer = Peer(\n130:         remote=responder.remote, privkey=responder.privkey, reader=responder_reader,\n131:         writer=responder_writer, aes_secret=aes_secret, mac_secret=mac_secret,\n132:         egress_mac=egress_mac, ingress_mac=ingress_mac)\n133: \n134:     # The hello msg sent by the initiator is going to be fed directly into the responder's\n135:     # reader, and thus read_msg() will return immediately.\n136:     initiator_peer.send_hello()\n137:     msg = yield from responder_peer.read_msg()\n138: \n139:     cmd_id = rlp.decode(msg[:1], sedes=sedes.big_endian_int)\n140:     assert cmd_id == Hello.id\n141:     responder_peer.process_msg(msg)\n142: \n143: \n144: def test_handshake_eip8():\n145:     # Data taken from https://github.com/ethereum/EIPs/blob/master/EIPS/eip-8.md\n146:     test_values = {\n147:         \"initiator_private_key\": \"49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee\",\n148:         \"receiver_private_key\": \"b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291\",\n149:         \"initiator_ephemeral_private_key\":\n150:             \"869d6ecf5211f1cc60418a13b9d870b22959d0c16f02bec714c960dd2298a32d\",\n151:         \"receiver_ephemeral_private_key\":\n152:             \"e238eb8e04fee6511ab04c6dd3c89ce097b11f25d584863ac2b6d5b35b1847e4\",\n153:         \"initiator_nonce\": \"7e968bba13b6c50e2c4cd7f241cc0d64d1ac25c7f5952df231ac6a2bda8ee5d6\",",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "evm/p2p",
+      "count": 16,
+      "entries": [
+        {
+          "name": "p2p",
+          "path": "evm/p2p",
+          "type": "dir"
+        },
+        {
+          "name": "auth.py",
+          "path": "evm/p2p/auth.py",
+          "type": "file"
+        },
+        {
+          "name": "constants.py",
+          "path": "evm/p2p/constants.py",
+          "type": "file"
+        },
+        {
+          "name": "discovery.py",
+          "path": "evm/p2p/discovery.py",
+          "type": "file"
+        },
+        {
+          "name": "ecies.py",
+          "path": "evm/p2p/ecies.py",
+          "type": "file"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "evm/p2p/exceptions.py",
+          "type": "file"
+        },
+        {
+          "name": "kademlia.py",
+          "path": "evm/p2p/kademlia.py",
+          "type": "file"
+        },
+        {
+          "name": "les.py",
+          "path": "evm/p2p/les.py",
+          "type": "file"
+        },
+        {
+          "name": "p2p_proto.py",
+          "path": "evm/p2p/p2p_proto.py",
+          "type": "file"
+        },
+        {
+          "name": "peer.py",
+          "path": "evm/p2p/peer.py",
+          "type": "file"
+        },
+        {
+          "name": "protocol.py",
+          "path": "evm/p2p/protocol.py",
+          "type": "file"
+        },
+        {
+          "name": "test_auth.py",
+          "path": "evm/p2p/test_auth.py",
+          "type": "file"
+        },
+        {
+          "name": "test_discovery.py",
+          "path": "evm/p2p/test_discovery.py",
+          "type": "file"
+        },
+        {
+          "name": "test_ecies.py",
+          "path": "evm/p2p/test_ecies.py",
+          "type": "file"
+        },
+        {
+          "name": "test_kademlia.py",
+          "path": "evm/p2p/test_kademlia.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "evm/p2p/utils.py",
+          "type": "file"
+        }
+      ],
+      "ref": "b3c6282b8e0c4a2052e82f1285a37f68cf234df2"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "auth.py",
+          "path": "evm/p2p/auth.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import asyncio\n2: import logging\n3: import os\n4: import random\n5: import sha3\n6: import struct\n7: \n8: import rlp\n9: from rlp import sedes\n10: \n11: from eth_keys import keys\n12: \n13: from evm.utils.keccak import ("
+        },
+        {
+          "name": "constants.py",
+          "path": "evm/p2p/constants.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: CLIENT_VERSION_STRING = \"Py-EVM\"\n2: \n3: SUPPORTED_RLPX_VERSION = 4\n4: \n5: # Overhead added by ECIES encryption\n6: ENCRYPT_OVERHEAD_LENGTH = 113\n7: \n8: # Lentgh of elliptic S256 signatures\n9: SIGNATURE_LEN = 65\n10: \n11: # Length of public keys: 512 bit keys in uncompressed form, without format byte\n12: PUBKEY_LEN = 64\n13: "
+        },
+        {
+          "name": "discovery.py",
+          "path": "evm/p2p/discovery.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: The Node Discovery protocol provides a way to find RLPx nodes that can be connected to. It uses a\n3: Kademlia-like protocol to maintain a distributed database of the IDs and endpoints of all\n4: listening nodes.\n5: \n6: More information at https://github.com/ethereum/devp2p/blob/master/rlpx.md#node-discovery\n7: \"\"\"\n8: import asyncio\n9: import logging\n10: import time\n11: \n12: import rlp\n13: from eth_utils import ("
+        },
+        {
+          "name": "ecies.py",
+          "path": "evm/p2p/ecies.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import os\n2: import struct\n3: from hashlib import sha256\n4: \n5: from cryptography.hazmat.backends import default_backend\n6: from cryptography.hazmat.primitives import hashes, hmac\n7: from cryptography.hazmat.primitives.asymmetric import ec\n8: from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes\n9: from cryptography.hazmat.primitives.constant_time import bytes_eq\n10: \n11: from eth_utils import force_bytes\n12: \n13: from eth_keys import keys"
+        },
+        {
+          "name": "exceptions.py",
+          "path": "evm/p2p/exceptions.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 10,
+          "excerpt": "1: class AuthenticationError(Exception):\n2:     pass\n3: \n4: \n5: class DecryptionError(Exception):\n6:     pass\n7: \n8: \n9: class PeerDisconnected(Exception):\n10:     pass"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "evm/p2p/peer.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "8a2b468922d28d686f2a844afe935788324de636",
+          "html_url": "https://github.com/ethereum/trinity/commit/8a2b468922d28d686f2a844afe935788324de636",
+          "message": "Piper/reorganize networking code (#394)\n\n* initial configuration change\r\n\r\n* move the p2p folder to top level\r\n\r\n* update evm.p2p imports\r\n\r\n* move p2p tests to be under tests/ dir\r\n\r\n* modify integration test helpers import path\r\n\r\n* move evm.rpc module to trinity.rpc\r\n\r\n* move p2p tests\r\n\r\n* clean",
+          "author": "Piper Merriam",
+          "date": "2018-02-23T16:24:40Z"
+        },
+        {
+          "sha": "f7c848e27d89fa3c7813a5ba7bfdf8fbae6c7bfc",
+          "html_url": "https://github.com/ethereum/trinity/commit/f7c848e27d89fa3c7813a5ba7bfdf8fbae6c7bfc",
+          "message": "p2p: Implement CancelToken and use it everywhere\n\nCancelTokens should be passed to any async operation, and whenever\nthey are trigger()ed they cause those operations to be cancelled. It was\ninspired by http://goo.gl/MUFMKU and right now is used mainly to ensure\nwe cancel pending operations when term",
+          "author": "Guilherme Salgado",
+          "date": "2018-02-02T16:23:24Z"
+        },
+        {
+          "sha": "8f0ffbafe9e1f8725dd733a3c7d11481e11f659d",
+          "html_url": "https://github.com/ethereum/trinity/commit/8f0ffbafe9e1f8725dd733a3c7d11481e11f659d",
+          "message": "Compatibility with eth-utils v1b2 (#389)\n\n* pin version of dependencies within major version ranges\r\n\r\n* bump for latest eth-keys version\r\n\r\n* updates for upstream library changes in eth-utils\r\n\r\n* abort tests after 50 failures in CI environment\r\n\r\n* update for eth-hash based kecak\r\n\r\n* update eth-h",
+          "author": "Jason Carver",
+          "date": "2018-02-22T02:55:28Z"
+        },
+        {
+          "sha": "019497cad33f9c8acbd1d946f29f48255d283e24",
+          "html_url": "https://github.com/ethereum/trinity/commit/019497cad33f9c8acbd1d946f29f48255d283e24",
+          "message": "Backport changes from trinity branch to master (#377)",
+          "author": "Piper Merriam",
+          "date": "2018-02-20T02:45:38Z"
+        },
+        {
+          "sha": "e5110af8d5dfafcc7c43a58df73ff1d6cd07c8bf",
+          "html_url": "https://github.com/ethereum/trinity/commit/e5110af8d5dfafcc7c43a58df73ff1d6cd07c8bf",
+          "message": "Rename BaseChainDB to ChainDB and establish base API (#360)\n\n* Rename BaseChainDB to ChainDB and establish base API\r\n\r\n* revert change to test_chaindb for exists method",
+          "author": "Piper Merriam",
+          "date": "2018-02-08T00:03:07Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "process_msg TODO Populate self sub_protocols based",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "evm/p2p/peer.py",
+      "satd_line": 119,
+      "last_commit": {
+        "sha": "8a2b468922d28d686f2a844afe935788324de636",
+        "html_url": "https://github.com/ethereum/trinity/commit/8a2b468922d28d686f2a844afe935788324de636",
+        "message": "Piper/reorganize networking code (#394)\n\n* initial configuration change\r\n\r\n* move the p2p folder to top level\r\n\r\n* update evm.p2p imports\r\n\r\n* move p2p tests to be under tests/ dir\r\n\r\n* modify integration test helpers import path\r\n\r\n* move evm.rpc module to trinity.rpc\r\n\r\n* move p2p tests\r\n\r\n* clean",
+        "author": "Piper Merriam",
+        "date": "2018-02-23T16:24:40Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "process_msg",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

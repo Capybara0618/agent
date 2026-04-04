@@ -20,6 +20,7 @@ def load_satd_csv(path: Path, limit: int | None = None) -> list[SATDRecord]:
                     user=str(row.get("user", "")).strip(),
                     project=str(row.get("project", "")).strip(),
                     file_path=str(row.get("file_path", "")).strip(),
+                    commit=str(row.get("commit", "")).strip(),
                     em_label=str(row.get("EM", "")).strip().upper(),
                 )
             )

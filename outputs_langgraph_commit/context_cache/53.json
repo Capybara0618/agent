@@ -1,0 +1,343 @@
+{
+  "task_id": "53",
+  "repo_owner": "devitocodes",
+  "repo_name": "devito",
+  "file_path": "devito/yask/operator.py",
+  "commit": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:16:11+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5",
+    "symbol_name": "apply",
+    "satd_line": 116,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:16:37+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:16:41+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "devito/yask/operator.py",
+    "original_code": "def apply(self, **kwargs):\n    # Build the arguments list to invoke the kernel function\n    arguments, dim_sizes = self.arguments(**kwargs)\n\n    # Share the grids from the hook solution\n    for kgrid in self.ksoln.grids:\n        hgrid = self.context.grids[kgrid.get_name()]\n        kgrid.share_storage(hgrid)\n        log(\"Shared storage from hook grid <%s>\" % hgrid.get_name())\n\n    # Print some info about the solution.\n    log(\"Stencil-solution '%s':\" % self.ksoln.name)\n    log(\"  Step dimension: %s\" % self.context.time_dimension)\n    log(\"  Domain dimensions: %s\" % str(self.context.space_dimensions))\n    log(\"  Grids:\")\n    for grid in self.ksoln.grids:\n        pad = str([grid.get_pad_size(i) for i in self.context.space_dimensions])\n        log(\"    %s%s, pad=%s\" % (grid.get_name(), str(grid.get_dim_names()), pad))\n\n    log(\"Running Operator through YASK...\")\n    self.ksoln.prepare()\n    # TODO: getting number of timesteps in a hacky way\n    self.ksoln.run(arguments[\"%s_size\" % self.context.time_dimension])\n    log(\"YASK Operator successfully run!\")",
+    "original_signature": "def apply(self, **kwargs):",
+    "satd_comment": "# TODO: getting number of timesteps in a hacky way",
+    "target_file": {
+      "ok": true,
+      "path": "devito/yask/operator.py",
+      "sha": "e9ef85c1ac2deff985ac98f9d7f18ece99126f2b",
+      "download_url": "https://raw.githubusercontent.com/devitocodes/devito/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/devito/yask/operator.py",
+      "content_excerpt": "from __future__ import absolute_import\n\nfrom sympy import Indexed\n\nfrom devito.dimension import LoweredDimension\nfrom devito.dle import retrieve_iteration_tree\nfrom devito.logger import debug, info, warning\nfrom devito.operator import OperatorRunnable\n\nfrom devito.yask.kernel import YASK, namespace, yask_jit, _force_exit\n\n__all__ = ['Operator']\n\n\nclass Operator(OperatorRunnable):\n\n    \"\"\"\n    A special :class:`OperatorCore` to JIT-compile and run operators through YASK.\n    \"\"\"\n\n    def __init__(self, expressions, **kwargs):\n        kwargs['dle'] = 'noop'\n        super(Operator, self).__init__(expressions, **kwargs)\n\n    def _specialize(self, nodes, elemental_functions):\n        \"\"\"\n        Create a YASK representation of this Iteration/Expression tree.\n        \"\"\"\n\n        warning(\"Converting a Devito AST into a YASK AST\")\n\n        # Set up the YASK solution\n        self.soln = YASK.cfac.new_solution(namespace['kernel-real'])\n\n        # Silence YASK\n        self.yask_compiler_output = YASK.ofac.new_string_output()\n        self.soln.set_debug_output(self.yask_compiler_output)\n\n        trees = retrieve_iteration_tree(nodes)\n        if len(trees) > 1:\n            _force_exit(\"Currently unable to handle Operators w/ more than 1 loop nests\")\n\n        tree = trees[0]\n        candidate = tree[-1]\n\n        # Perform the translation on an expression basis\n        transform = sympy2yask(self.soln)\n        expressions = [e for e in candidate.nodes if e.is_Expression]\n        try:\n            for i in expressions:\n                ast = transform(i.expr)\n                info(\"Converted %s into YASK ast [%s]\", str(i.expr), ast.format_simple())\n        except:\n            _force_exit(\"Couldn't convert %s into YASK format\" % str(i.expr))\n\n        # Print some useful information about the newly constructed Yask solution\n        info(\"Solution '\" + self.soln.get_name() + \"' contains \" +\n             str(self.soln.get_num_grids()) + \" grid(s), and \" +\n             str(self.soln.get_num_equations()) + \" equation(s).\")\n\n        # Set necessary run-time parameters\n        self.soln.set_step_dim_name(YASK.time_dimension)\n        self.soln.set_domain_dim_names(YASK.space_dimensions)\n        self.soln.set_element_bytes(4)\n\n        # JIT YASK kernel\n        name = 'kernel%d' % YASK.nkernels\n        yk = yask_jit(self.soln, name)\n\n        # Build an empty kernel solution\n        kfac = yk.yk_factory()\n        env = kfac.new_env()\n        self.ksoln = kfac.new_solution(env)\n\n        # Silence YASK\n        self.yask_kernel_output = yk.yask_output_factory().new_string_output()\n        self.ksoln.set_debug_output(self.yask_kernel_output)\n\n        self.ksoln.set_num_ranks(self.ksoln.get_domain_dim_name(0), env.get_num_ranks())\n\n        # Track this Operator\n        YASK.add_kernel(name, self)\n\n        # TODO: need to update nodes and elemental_functions\n\n        return nodes, elemental_functions\n\n    def apply(self, *args, **kwargs):\n        # Build the arguments list to invoke the kernel function\n        arguments, dim_sizes = self.arguments(*args, **kwargs)\n\n        # Set the domain sizes\n        for dm in self.ksoln.get_domain_dim_names():\n            self.ksoln.set_rank_domain_size(dm, dim_sizes[dm])\n\n        # Share the grids from the hook solution\n        for kgrid in self.ksoln.get_grids():\n            name = kgrid.get_name()\n            try:\n                hook_grid = YASK.grids[name]\n            except KeyError:\n                _force_exit(\"Unknown grid %s\" % name)\n            kgrid.share_storage(hook_grid)\n            debug(\"Shared storage from grid <%s>\" % hook_grid.get_name())\n\n        # Print some info about the solution.\n        debug(\"YASK Stencil-solution '\" + self.ksoln.get_name() + \"':\")\n        debug(\"  Step dimension: \" + repr(self.ksoln.get_step_dim_name()))\n        debug(\"  Domain dimensions: \" + repr(self.ksoln.get_domain_dim_names()))\n        debug(\"  Grids:\")\n        for grid in self.ksoln.get_grids():\n            debug(\"    \" + grid.get_name() + repr(grid.get_dim_names()))\n\n        debug(\"Running Operator through YASK...\")\n        self.ksoln.prepare_solution()\n        # TODO: getting number of timesteps in a hacky way\n        self.ksoln.run_solution(arguments[\"%s_size\" % YASK.time_dimension])\n\n\nclass sympy2yask(object):\n    \"\"\"\n    Convert a SymPy expression into a YASK abstract syntax tree and create any\n    necessay YASK grids.\n    \"\"\"\n\n    def __init__(self, soln):\n        self.soln = soln\n        self.mapper = {}\n\n    def __call__(self, expr):\n\n        def nary2binary(args, op):\n            r = run(args[0])\n            return r if len(args) == 1 else op(r, nary2binary(args[1:], op))\n\n        def run(expr):\n            if expr.is_Integer:\n                return YASK.nfac.new_const_number_node(int(expr))\n            elif expr.is_Float:\n                return YASK.nfac.new_const_number_node(float(expr))\n            elif expr.is_Symbol:\n                assert expr in self.mapper\n                return self.mapper[expr]\n            elif isinstance(expr, Indexed):\n                function = expr.base.function\n                name = function.name\n                if name not in YASK.grids:\n                    function.data  # Create uninitialized grid (i.e., 0.0 everywhere)\n                if name not in self.mapper:\n                    dimensions = YASK.grids[name].get_dim_names()\n                    self.mapper[name] = self.soln.new_grid(name, dimensions)\n                indices = [int((i.origin if isinstance(i, LoweredDimension) else i) - j)\n                           for i, j in zip(expr.indices, function.indices)]\n                return self.mapper[name].new_relative_grid_point(*indices)\n            elif expr.is_Add:\n                return nary2binary(expr.args, YASK.nfac.new_add_node)\n            elif expr.is_Mul:\n                return nary2binary(expr.args, YASK.nfac.new_multiply_node)\n            elif expr.is_Pow:\n                num, den = expr.as_numer_denom()\n                if num == 1:\n                    return YASK.nfac.new_divide_node(run(num), run(den))\n            elif expr.is_Equality:\n                if expr.lhs.is_Symbol:\n                    assert expr.lhs not in self.mapper\n                    self.mapper[expr.lhs] = run(expr.rhs)\n                else:\n                    return YASK.nfac.new_equation_node(*[run(i) for i in expr.args])\n            else:\n                warning(\"Missing handler in Devito-YASK translation\")\n                raise NotImplementedError\n\n        return run(expr)\n",
+      "total_lines": 173,
+      "ref": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 116,
+      "start_line": 96,
+      "end_line": 136,
+      "matched_line": "        # TODO: getting number of timesteps in a hacky way",
+      "excerpt": "96:         # Share the grids from the hook solution\n97:         for kgrid in self.ksoln.get_grids():\n98:             name = kgrid.get_name()\n99:             try:\n100:                 hook_grid = YASK.grids[name]\n101:             except KeyError:\n102:                 _force_exit(\"Unknown grid %s\" % name)\n103:             kgrid.share_storage(hook_grid)\n104:             debug(\"Shared storage from grid <%s>\" % hook_grid.get_name())\n105: \n106:         # Print some info about the solution.\n107:         debug(\"YASK Stencil-solution '\" + self.ksoln.get_name() + \"':\")\n108:         debug(\"  Step dimension: \" + repr(self.ksoln.get_step_dim_name()))\n109:         debug(\"  Domain dimensions: \" + repr(self.ksoln.get_domain_dim_names()))\n110:         debug(\"  Grids:\")\n111:         for grid in self.ksoln.get_grids():\n112:             debug(\"    \" + grid.get_name() + repr(grid.get_dim_names()))\n113: \n114:         debug(\"Running Operator through YASK...\")\n115:         self.ksoln.prepare_solution()\n116:         # TODO: getting number of timesteps in a hacky way\n117:         self.ksoln.run_solution(arguments[\"%s_size\" % YASK.time_dimension])\n118: \n119: \n120: class sympy2yask(object):\n121:     \"\"\"\n122:     Convert a SymPy expression into a YASK abstract syntax tree and create any\n123:     necessay YASK grids.\n124:     \"\"\"\n125: \n126:     def __init__(self, soln):\n127:         self.soln = soln\n128:         self.mapper = {}\n129: \n130:     def __call__(self, expr):\n131: \n132:         def nary2binary(args, op):\n133:             r = run(args[0])\n134:             return r if len(args) == 1 else op(r, nary2binary(args[1:], op))\n135: \n136:         def run(expr):"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "apply",
+      "start_line": 88,
+      "end_line": 117,
+      "source": "    def apply(self, *args, **kwargs):\n        # Build the arguments list to invoke the kernel function\n        arguments, dim_sizes = self.arguments(*args, **kwargs)\n\n        # Set the domain sizes\n        for dm in self.ksoln.get_domain_dim_names():\n            self.ksoln.set_rank_domain_size(dm, dim_sizes[dm])\n\n        # Share the grids from the hook solution\n        for kgrid in self.ksoln.get_grids():\n            name = kgrid.get_name()\n            try:\n                hook_grid = YASK.grids[name]\n            except KeyError:\n                _force_exit(\"Unknown grid %s\" % name)\n            kgrid.share_storage(hook_grid)\n            debug(\"Shared storage from grid <%s>\" % hook_grid.get_name())\n\n        # Print some info about the solution.\n        debug(\"YASK Stencil-solution '\" + self.ksoln.get_name() + \"':\")\n        debug(\"  Step dimension: \" + repr(self.ksoln.get_step_dim_name()))\n        debug(\"  Domain dimensions: \" + repr(self.ksoln.get_domain_dim_names()))\n        debug(\"  Grids:\")\n        for grid in self.ksoln.get_grids():\n            debug(\"    \" + grid.get_name() + repr(grid.get_dim_names()))\n\n        debug(\"Running Operator through YASK...\")\n        self.ksoln.prepare_solution()\n        # TODO: getting number of timesteps in a hacky way\n        self.ksoln.run_solution(arguments[\"%s_size\" % YASK.time_dimension])"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 88,
+      "end_line": 117,
+      "excerpt": "    def apply(self, *args, **kwargs):\n        # Build the arguments list to invoke the kernel function\n        arguments, dim_sizes = self.arguments(*args, **kwargs)\n\n        # Set the domain sizes\n        for dm in self.ksoln.get_domain_dim_names():\n            self.ksoln.set_rank_domain_size(dm, dim_sizes[dm])\n\n        # Share the grids from the hook solution\n        for kgrid in self.ksoln.get_grids():\n            name = kgrid.get_name()\n            try:\n                hook_grid = YASK.grids[name]\n            except KeyError:\n                _force_exit(\"Unknown grid %s\" % name)\n            kgrid.share_storage(hook_grid)\n            debug(\"Shared storage from grid <%s>\" % hook_grid.get_name())\n\n        # Print some info about the solution.\n        debug(\"YASK Stencil-solution '\" + self.ksoln.get_name() + \"':\")\n        debug(\"  Step dimension: \" + repr(self.ksoln.get_step_dim_name()))\n        debug(\"  Domain dimensions: \" + repr(self.ksoln.get_domain_dim_names()))\n        debug(\"  Grids:\")\n        for grid in self.ksoln.get_grids():\n            debug(\"    \" + grid.get_name() + repr(grid.get_dim_names()))\n\n        debug(\"Running Operator through YASK...\")\n        self.ksoln.prepare_solution()\n        # TODO: getting number of timesteps in a hacky way\n        self.ksoln.run_solution(arguments[\"%s_size\" % YASK.time_dimension])",
+      "symbol_name": "apply",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "devito/yask/operator.py",
+      "sha": "e9ef85c1ac2deff985ac98f9d7f18ece99126f2b",
+      "download_url": "https://raw.githubusercontent.com/devitocodes/devito/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/devito/yask/operator.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:absolute_import",
+        "sympy:Indexed",
+        "devito.dimension:LoweredDimension",
+        "devito.dle:retrieve_iteration_tree",
+        "devito.logger:debug",
+        "devito.logger:info",
+        "devito.logger:warning",
+        "devito.operator:OperatorRunnable",
+        "devito.yask.kernel:YASK",
+        "devito.yask.kernel:namespace",
+        "devito.yask.kernel:yask_jit",
+        "devito.yask.kernel:_force_exit"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/devitocodes/devito/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/README.md",
+      "content_excerpt": "# Devito: Fast Finite Difference Computation from Symbolic Specification\n\n[Devito](http://www.opesci.org/devito-public) is a tool to\nperform optimised finite difference (FD) computation from\nhigh-level symbolic problem definitions. Starting from symbolic\nequations defined in [SymPy](http://www.sympy.org/en/index.html),\nDevito employs automated code generation and just-in-time (JIT)\ncompilation to execute FD kernels on multiple computer platforms.\n\nDevito is part of the [OPESCI](http://www.opesci.org) seismic imaging\nproject. A general overview of Devito features and capabilities can be\nfound [here](http://www.opesci.org/devito-public), including a\ndetailed [API documentation](http://www.opesci.org/devito).\n\n## Quickstart\n\nThe recommended way to install Devito uses the Conda package manager\nfor installation of the necessary software dependencies. Please\ninstall either [Anaconda](https://www.continuum.io/downloads) or\n[Miniconda](https://conda.io/miniconda.html) using the instructions\nprovided at the download links.\n\nTo install the editable development version Devito, including examples,\ntests and tutorial notebooks, please run the following commands:\n```\ngit clone https://github.com/opesci/devito.git\ncd devito\nconda env create -f environment.yml\nsource activate devito\npip install -e .\n```\n\nIf you don't want to use the Conda environment manager, Devito can\nalso be installed directly from GitHub via pip:\n```\npip install --user git+https://github.com/opesci/devito.git\n```\n\n## Examples\n\nAt the core of the Devito API are the so-called `Operator` objects that\nallow users to create"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "apply",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_01_convection.ipynb",
+          "path": "examples/cfd/test_01_convection.ipynb",
+          "sha": "9bc991da1627d4535e7fbaeba833409438a0cda3",
+          "html_url": "https://github.com/devitocodes/devito/blob/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/examples/cfd/test_01_convection.ipynb",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 116,
+          "end_line": 140,
+          "excerpt": "116:    \"source\": [\n117:     \"# Repeat initialisation, so we can re-run the cell\\n\",\n118:     \"init_hat(field=u, dx=dx, dy=dy, value=2.)\\n\",\n119:     \"\\n\",\n120:     \"for n in range(nt + 1):\\n\",\n121:     \"    # Copy previous result into a new buffer\\n\",\n122:     \"    un = u.copy()\\n\",\n123:     \"    \\n\",\n124:     \"    # Update the new result with a 3-point stencil\\n\",\n125:     \"    u[1:, 1:] = (un[1:, 1:] - (c * dt / dx * (un[1:, 1:] - un[1:, :-1])) -\\n\",\n126:     \"                              (c * dt / dy * (un[1:, 1:] - un[:-1, 1:])))\\n\",\n127:     \"\\n\",\n128:     \"    # Apply boundary conditions\\n\",\n129:     \"    u[0, :] = 1.\\n\",\n130:     \"    u[-1, :] = 1.\\n\",\n131:     \"    u[:, 0] = 1.\\n\",\n132:     \"    u[:, -1] = 1.\\n\",\n133:     \"\\n\",\n134:     \"plot_field(u)\\n\",\n135:     \"\\n\",\n136:     \"# A small sanity check for auto-testing\\n\",\n137:     \"assert (u[45:55, 45:55] > 1.8).all()\\n\",\n138:     \"u_ref = u.copy()\"\n139:    ]\n140:   },",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_01_convection_revisited.ipynb",
+          "path": "examples/cfd/test_01_convection_revisited.ipynb",
+          "sha": "5b0c32c021ab0106a34887e175ac12c97be1877a",
+          "html_url": "https://github.com/devitocodes/devito/blob/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/examples/cfd/test_01_convection_revisited.ipynb",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 119,
+          "end_line": 143,
+          "excerpt": "119:    \"source\": [\n120:     \"# Repeat initialisation, so we can re-run the cell\\n\",\n121:     \"init_smooth(field=u, dx=dx, dy=dy)\\n\",\n122:     \"\\n\",\n123:     \"for n in range(nt + 1):\\n\",\n124:     \"    # Copy previous result into a new buffer\\n\",\n125:     \"    un = u.copy()\\n\",\n126:     \"    \\n\",\n127:     \"    # Update the new result with a 3-point stencil\\n\",\n128:     \"    u[1:, 1:] = (un[1:, 1:] - (c * dt / dx * (un[1:, 1:] - un[1:, :-1])) -\\n\",\n129:     \"                              (c * dt / dy * (un[1:, 1:] - un[:-1, 1:])))\\n\",\n130:     \"\\n\",\n131:     \"    # Apply boundary conditions\\n\",\n132:     \"    u[0, :] = 1.\\n\",\n133:     \"    u[-1, :] = 1.\\n\",\n134:     \"    u[:, 0] = 1.\\n\",\n135:     \"    u[:, -1] = 1.\\n\",\n136:     \"\\n\",\n137:     \"plot_field(u, zmax=4.)\\n\",\n138:     \"\\n\",\n139:     \"# A small sanity check for auto-testing\\n\",\n140:     \"assert (u[45:55, 45:55] > 1.8).all()\\n\",\n141:     \"u_ref = u.copy()\"\n142:    ]\n143:   },",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_05_laplace.ipynb",
+          "path": "examples/cfd/test_05_laplace.ipynb",
+          "sha": "457f54de87aaab3cd52c344a6c5ca4b541a4abad",
+          "html_url": "https://github.com/devitocodes/devito/blob/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/examples/cfd/test_05_laplace.ipynb",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 5,
+          "end_line": 29,
+          "excerpt": "5:    \"metadata\": {},\n6:    \"source\": [\n7:     \"### Example 5: Laplace equation\\n\",\n8:     \"\\n\",\n9:     \"In this tutorial we will look constructing the steady-state heat example using the Laplace equation. In contrast to the previous tutorials this example is entirely driven by the prescribed Dirichlet and Neumann boundary conditions, instead of an initial condition. We will also demonstrate how to use Devito to solve a steady-state problem without time derivatives and how to switch buffers explicitly without having to re-compile the kernel.\\n\",\n10:     \"\\n\",\n11:     \"First, we again define our governing equation:\\n\",\n12:     \"$$\\\\frac{\\\\partial ^2 p}{\\\\partial x^2} + \\\\frac{\\\\partial ^2 p}{\\\\partial y^2} = 0$$\\n\",\n13:     \"\\n\",\n14:     \"We are again discretizing second-order derivatives using a central difference scheme to construct a diffusion problem (see tutorial 3). This time we have no time-dependent term in our equation though, since there is no term $p_{i,j}^{n+1}$. This means that we are simply updating our field variable $p$ over and over again, until we have reached an equilibrium state. In a discretised form, after rearranging to update the central point $p_{i,j}^n$ we have\\n\",\n15:     \"$$p_{i,j}^n = \\\\frac{\\\\Delta y^2(p_{i+1,j}^n+p_{i-1,j}^n)+\\\\Delta x^2(p_{i,j+1}^n + p_{i,j-1}^n)}{2(\\\\Delta x^2 + \\\\Delta y^2)}$$\\n\",\n16:     \"\\n\",\n17:     \"And, as always, we first re-create the original implementation to see what we are aiming for. Here we initialise the field $p$ to $0$ and apply the following bounday conditions:\\n\",\n18:     \"\\n\",\n19:     \"$p=0$ at $x=0$\\n\",\n20:     \" \\n\",\n21:     \"$p=y$ at $x=2$\\n\",\n22:     \" \\n\",\n23:     \"$\\\\frac{\\\\partial p}{\\\\partial y}=0$ at $y=0, \\\\ 1$\\n\",\n24:     \"\\n\",\n25:     \"**Developer note:**\\n\",\n26:     \"The original tutorial stores the field data in the layout `(ny, nx)`. Until now we have used `(x, y)` notation for creating our Devito examples, but for this one we will adopt the `(y, x)` layout for compatibility reasons.\"\n27:    ]\n28:   },\n29:   {",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_06_poisson.ipynb",
+          "path": "examples/cfd/test_06_poisson.ipynb",
+          "sha": "d15b7c16ce78dc076421440aefb341542ce736bf",
+          "html_url": "https://github.com/devitocodes/devito/blob/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/examples/cfd/test_06_poisson.ipynb",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "anchor_text",
+          "start_line": 158,
+          "end_line": 182,
+          "excerpt": "158:     \"                                       a: 1.})\\n\",\n159:     \"\\n\",\n160:     \"# Run the outer loop explicitly in Python\\n\",\n161:     \"for i in range(nt):\\n\",\n162:     \"    # Determine buffer order\\n\",\n163:     \"    if i % 2 == 0:\\n\",\n164:     \"        _p = p\\n\",\n165:     \"        _pd = pd\\n\",\n166:     \"    else:\\n\",\n167:     \"        _p = pd\\n\",\n168:     \"        _pd = p\\n\",\n169:     \"\\n\",\n170:     \"    # Apply operator\\n\",\n171:     \"    op(p=_p, pd=_pd)\\n\",\n172:     \"     \\n\",\n173:     \"plot_field(p.data, xmax=xmax, ymax=ymax, view=(30, 225))\"\n174:    ]\n175:   },\n176:   {\n177:    \"cell_type\": \"markdown\",\n178:    \"metadata\": {},\n179:    \"source\": [\n180:     \"Nice, we get the same spikes as the pure NumPy implementation. But we still drive the time loop though Python, which is slow. So let's try and utilise Devito's time-stepping mechanism that we saw earlier for this \\\"pseudo-timestepping\\\". \\n\",\n181:     \"\\n\",\n182:     \"The trick here is to again use `TimeData` objects, despite the lack of a time-dependence. This will cause Devito to allocate two grid buffers instead of one, which we can directly address them via the terms `p` and `p.forward`. This will now create an internal time loop in the kernel that we can again control by supplying the `time` argument to the create operator during invocation.\\n\",",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "apply",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "devito/yask",
+      "count": 6,
+      "entries": [
+        {
+          "name": "yask",
+          "path": "devito/yask",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "devito/yask/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "devito/yask/interfaces.py",
+          "type": "file"
+        },
+        {
+          "name": "kernel.py",
+          "path": "devito/yask/kernel.py",
+          "type": "file"
+        },
+        {
+          "name": "operator.py",
+          "path": "devito/yask/operator.py",
+          "type": "file"
+        },
+        {
+          "name": "utils.py",
+          "path": "devito/yask/utils.py",
+          "type": "file"
+        }
+      ],
+      "ref": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5"
+    },
+    "neighbor_files": {
+      "count": 4,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "devito/yask/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 9,
+          "excerpt": "1: \"\"\"\n2: The ``yask`` Devito backend uses the YASK stencil optimizer to generate,\n3: JIT-compile, and run kernels.\n4: \"\"\"\n5: \n6: # The following used by backends.backendSelector\n7: from devito.pointdata import PointData  # noqa\n8: from devito.yask.interfaces import DenseData, TimeData  # noqa\n9: from devito.yask.operator import Operator  # noqa"
+        },
+        {
+          "name": "interfaces.py",
+          "path": "devito/yask/interfaces.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: import sys\n2: \n3: import numpy as np\n4: \n5: import devito.interfaces as interfaces\n6: from devito.logger import debug\n7: from devito.tools import as_tuple\n8: \n9: from devito.yask.kernel import YASK, init\n10: from devito.yask.utils import convert_multislice\n11: \n12: __all__ = ['DenseData', 'TimeData']\n13: "
+        },
+        {
+          "name": "kernel.py",
+          "path": "devito/yask/kernel.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from collections import OrderedDict\n2: import os\n3: import importlib\n4: \n5: from devito.compiler import make\n6: from devito.exceptions import CompilationError, InvalidOperator\n7: from devito.logger import info\n8: \n9: \n10: class YaskContext(object):\n11: \n12:     def __init__(self, arch, isa, cfac, nfac, ofac):\n13:         \"\"\""
+        },
+        {
+          "name": "utils.py",
+          "path": "devito/yask/utils.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: from devito.tools import as_tuple\n2: \n3: __all__ = ['convert_multislice']\n4: \n5: \n6: def convert_multislice(multislice, shape, mode='get'):\n7:     \"\"\"\n8:     Convert a multislice into a format suitable to YASK's get_elements_{...}\n9:     and set_elements_{...} grid routines.\n10: \n11:     A multislice is the typical object received by NumPy ndarray's __getitem__\n12:     and __setitem__ methods; this function, therefore, converts NumPy indices\n13:     into YASK indices."
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "devito/yask/operator.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "512d64eacfe59f49ac6f574228bbd64e7c32e7d0",
+          "html_url": "https://github.com/devitocodes/devito/commit/512d64eacfe59f49ac6f574228bbd64e7c32e7d0",
+          "message": "Remove yask and ops backends",
+          "author": "Fabio Luporini",
+          "date": "2020-03-31T14:46:14Z"
+        },
+        {
+          "sha": "421eaebe65a0a8ced1a0a4f1bea29c6590bb75ed",
+          "html_url": "https://github.com/devitocodes/devito/commit/421eaebe65a0a8ced1a0a4f1bea29c6590bb75ed",
+          "message": "passes,operator: Give users knob to control CIRE passes",
+          "author": "Fabio Luporini",
+          "date": "2020-03-17T10:57:48Z"
+        },
+        {
+          "sha": "b69298c71f1e1a5396e3a06fcefe9c40827a3277",
+          "html_url": "https://github.com/devitocodes/devito/commit/b69298c71f1e1a5396e3a06fcefe9c40827a3277",
+          "message": "ops/yask: Update _specialize_clusters",
+          "author": "Fabio Luporini",
+          "date": "2020-03-05T10:45:34Z"
+        },
+        {
+          "sha": "90bb0d599dc8e6e135e54c88bb3f0a0f5610693e",
+          "html_url": "https://github.com/devitocodes/devito/commit/90bb0d599dc8e6e135e54c88bb3f0a0f5610693e",
+          "message": "passes: Get rid of more DSE reminiscences",
+          "author": "Fabio Luporini",
+          "date": "2020-02-21T14:26:43Z"
+        },
+        {
+          "sha": "7b0b82e306850a88d0283096877e518978c47642",
+          "html_url": "https://github.com/devitocodes/devito/commit/7b0b82e306850a88d0283096877e518978c47642",
+          "message": "Drop some TODOs",
+          "author": "Fabio Luporini",
+          "date": "2020-01-06T09:30:18Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "apply TODO getting number timesteps hacky",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "devito/yask/operator.py",
+      "satd_line": 116,
+      "last_commit": {
+        "sha": "512d64eacfe59f49ac6f574228bbd64e7c32e7d0",
+        "html_url": "https://github.com/devitocodes/devito/commit/512d64eacfe59f49ac6f574228bbd64e7c32e7d0",
+        "message": "Remove yask and ops backends",
+        "author": "Fabio Luporini",
+        "date": "2020-03-31T14:46:14Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "apply",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

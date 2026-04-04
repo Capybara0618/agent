@@ -1,0 +1,539 @@
+{
+  "task_id": "75",
+  "repo_owner": "delmic",
+  "repo_name": "odemis",
+  "file_path": "src/odemis/driver/powerctrl.py",
+  "commit": "ab04958d61f74af7ab89d18a0075216a3178d4ec",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:31:59+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "ab04958d61f74af7ab89d18a0075216a3178d4ec",
+    "symbol_name": "_processMessage",
+    "satd_line": 374,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 1,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:32:44+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:32:50+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "src/odemis/driver/powerctrl.py",
+    "original_code": "def _processMessage(self, msg):\n    \"\"\"\n    process the msg, and put the result in the output buffer\n    msg (str): raw message (including header)\n    \"\"\"\n    res = None\n    wspaces = msg.count(' ')\n    qmarks = msg.count('?')\n    tokens = msg.split()\n    if ((wspaces > 1) and (qmarks > 0)) or (wspaces > 2) or (qmarks > 1):\n        res = \"ERROR: Cannot parse this command\\n\"\n    elif qmarks:\n        if tokens[0] == \"*IDN?\":\n            res = IDN + '\\n'\n        elif tokens[0] == \"PWR?\":\n            pin = int(tokens[1])\n            if (pin < 0) or (pin > 7):\n                res = \"ERROR: Out of range pin number\\n\"\n            else:\n                ans = (self._i2crcv >> pin) & MASK\n                res = str(ans) + '\\n'\n        else:\n            res = \"ERROR: Cannot parse this command\\n\"\n    elif wspaces:\n        pin = int(tokens[1])\n        val = int(tokens[2])\n        if tokens[0] == \"PWR\":\n            if (pin < 0) or (pin > 7):\n                res = \"ERROR: Out of range pin number\\n\"\n            else:\n                self._i2crcv = (self._i2crcv & ~(1 << pin)) | ((val << pin) & (1 << pin))\n                res = '\\n'\n        # TODO: add support for WMEM and RMEM\n        else:\n            res = \"ERROR: Cannot parse this command\\n\"\n    else:\n        res = \"ERROR: Cannot parse this command\\n\"\n\n    # add the response end\n    if res is not None:\n        self._output_buf += res",
+    "original_signature": "def _processMessage(self, msg):",
+    "satd_comment": "# TODO: add support for WMEM and RMEM",
+    "target_file": {
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "sha": "16687833c436a4c81ebbfc352efdb8cc858624c6",
+      "download_url": "https://raw.githubusercontent.com/delmic/odemis/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/driver/powerctrl.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n'''\nCreated on 1 Sep 2015\n\n@author: Kimon Tsitsikas\n\nCopyright © 2015 Kimon Tsitsikas, Delmic\n\nThis file is part of Odemis.\n\nOdemis is free software: you can redistribute it and/or modify it under the terms\nof the GNU General Public License version 2 as published by the Free Software\nFoundation.\n\nOdemis is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;\nwithout even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR\nPURPOSE. See the GNU General Public License for more details.\n\nYou should have received a copy of the GNU General Public License along with\nOdemis. If not, see http://www.gnu.org/licenses/.\n'''\nfrom __future__ import division\n\nimport fcntl\nimport glob\nimport logging\nfrom odemis import model\nfrom odemis.model import isasync, CancellableThreadPoolExecutor\nfrom odemis.model._components import HwError\nfrom odemis.util import driver\nimport os\nimport serial\nimport sys\nimport tempfile\nimport threading\nimport time\n\n\nclass PowerControlUnit(model.PowerSupplier):\n    '''\n    Implements the PowerSupplier class to regulate the power supply of the \n    components connected to the Power Control Unit board. It also takes care of\n    communication with the PCU firmware.\n    '''\n\n    def __init__(self, name, role, port, pin_map=None, powered=None, **kwargs):\n        '''\n        port (str): port name\n        pin_map (dict of str -> int): names of the components\n          and the pin where the component is connected.\n        powered (list of str): list of powered components\n        Raise an exception if the device cannot be opened\n        '''\n        powered = powered or {}\n        self.powered = powered\n        model.PowerSupplier.__init__(self, name, role, **kwargs)\n\n        # TODO: catch errors and convert to HwError\n        self._ser_access = threading.Lock()\n\n        self._port = self._findDevice(port)  # sets ._serial\n        logging.info(\"Found Power Control device on port %s\", self._port)\n\n        # Get identification of the Power control device\n        self._idn = self._getIdentification()\n\n        driver_name = driver.getSerialDriver(self._port)\n        self._swVersion = \"serial driver: %s\" % (driver_name,)\n        self._hwVersion = \"%s\" % (self._idn,)\n\n        pin_map = pin_map or {}\n        self._pin_map = pin_map\n\n        # will take care of executing switch asynchronously\n        self._executor = CancellableThreadPoolExecutor(max_workers=1)  # one task at a time\n\n        self._supplied = {}\n        self.supplied = model.VigilantAttribute(self._supplied, readonly=True)\n        self._updateSupplied()\n\n    @isasync\n    def supply(self, sup):\n        if not sup:\n            return model.InstantaneousFuture()\n        self._checkSupply(sup)\n\n        return self._executor.submit(self._doSupply, sup)\n\n    def _doSupply(self, sup):\n        \"\"\"\n        supply power\n        \"\"\"\n        for comp, val in sup.items():\n            # find pin and values corresponding to component\n            pin = self._pin_map[comp]\n            if val:\n                self._sendCommand(\"PWR \" + str(pin) + \" 1\")\n            else:\n                self._sendCommand(\"PWR \" + str(pin) + \" 0\")\n        self._updateSupplied()\n\n    def _updateSupplied(self):\n        \"\"\"\n        update the supplied VA\n        \"\"\"\n        pins_updated = set(self._pin_map.values())  # to avoid asking for the same pin multiple times\n        for pin in pins_updated:\n            ans = self._sendCommand(\"PWR? \" + str(pin))\n            # Update all components that are connected to the same pin\n            to_update = [c for c in self.powered if pin == self._pin_map[c]]\n            for c_update in to_update:\n                self._supplied[c_update] = (ans == \"1\")\n\n        # it's read-only, so we change it via _value\n        self.supplied._value = self._supplied\n        self.supplied.notify(self.supplied.value)\n\n    def terminate(self):\n        if self._executor:\n            self._executor.cancel()\n            self._executor.shutdown()\n            self._executor = None\n        with self._ser_access:\n            if self._serial:\n                self._serial.close()\n                self._serial = None\n\n    def _getIdentification(self):\n        return self._sendCommand(\"*IDN?\")\n\n    def _writeMemory(self, address, data):\n        \"\"\"\n        write data to EEPROM address\n        \"\"\"\n        self._sendCommand(\"WMEM %s %s\" % (address, data))\n\n    def _readMemory(self, address, length):\n        \"\"\"\n        read data of length from EEPROM address\n        \"\"\"\n        ans = self._sendCommand(\"RMEM %s %s\" % (address, length))\n        return ans\n\n    def _sendCommand(self, cmd):\n        \"\"\"\n        cmd (str): command to be sent to Power Control unit.\n        returns (str): answer received from the Power Control unit\n        raises:\n            IOError: if an ERROR is returned by the Power Control firmware.\n        \"\"\"\n        cmd = cmd + \"\\n\"\n        with self._ser_access:\n            logging.debug(\"Sending command %s\", cmd.encode('string_escape'))\n            self._serial.write(cmd)\n\n            ans = ''\n            char = None\n            while char != '\\n':\n                char = self._serial.read()\n                if not char:\n                    logging.error(\"Timeout after receiving %s\", ans.encode('string_escape'))\n                    # TODO: See how you should handle a timeout before you raise\n                    # an HWError\n                    raise HwError(\"Power Control Unit connection timeout. \"\n                                  \"Please turn off and on the power to the box.\")\n                # Handle ERROR coming from Power control unit firmware\n                ans += char\n\n            logging.debug(\"Received answer %s\", ans.encode('string_escape'))\n            if ans.startswith(\"ERROR\"):\n                raise PowerControlError(ans.split(' ', 1)[1])\n\n            return ans.rstrip()\n\n    @staticmethod\n    def _openSerialPort(port):\n        \"\"\"\n        Opens the given serial port the right way for a Power control device.\n        port (string): the name of the serial port (e.g., /dev/ttyACM0)\n        return (serial): the opened serial port\n        \"\"\"\n        ser = serial.Serial(\n            port=port,\n            timeout=5  # s\n        )\n\n        # Purge\n        ser.flush()\n        ser.flushInput()\n\n        # Try to read until timeout to be extra safe that we properly flushed\n        while True:\n            char = ser.read()\n            if char == '':\n                break\n        logging.debug(\"Nothing left to read, Power Control Unit can safely initialize.\")\n\n        return ser\n\n    def _findDevice(self, ports):\n        \"\"\"\n        Look for a compatible device\n        ports (str): pattern for the port name\n        return (str): the name of the port used\n        It also sets ._serial and ._idn to contain the opened serial port, and\n        the identification string.\n        raises:\n            IOError: if no device are found\n        \"\"\"\n        # For debugging purpose\n        if ports == \"/dev/fake\":\n            self._serial = PowerControlSimulator(timeout=1)\n            return ports\n\n        if os.name == \"nt\":\n            raise NotImplementedError(\"Windows not supported\")\n        else:\n            names = glob.glob(ports)\n\n        for n in names:\n            try:\n                self._serial = self._openSerialPort(n)\n                try:\n                    fcntl.flock(self._serial.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n                except IOError:\n                    logging.info(\"Port %s is busy, will wait and retry\", n)\n                    time.sleep(11)\n                    fcntl.flock(self._serial.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n\n                try:\n                    idn = self._getIdentification()\n                except PowerControlError:\n                    # Can happen if the device has received some weird characters\n                    # => try again (now that it's flushed)\n                    logging.info(\"Device answered by an error, will try again\")\n                    idn = self._getIdentification()\n                # Check that we connect to the right device\n                if not idn.startswith(\"Delmic Analog Power\"):\n                    logging.info(\"Connected to wrong device on %s, skipping.\", n)\n                    continue\n                return n\n            except (IOError, PowerControlError):\n                # not possible to use this port? next one!\n                continue\n        else:\n            raise HwError(\"Failed to find a Power Control device on ports '%s'. \"\n                          \"Check that the device is turned on and connected to \"\n                          \"the computer.\" % (ports,))\n\n    @classmethod\n    def scan(cls):\n        \"\"\"\n        returns (list of 2-tuple): name, args (sn)\n        Note: it's obviously not advised to call this function if a device is already under use\n        \"\"\"\n        logging.info(\"Serial ports scanning for Power control device in progress...\")\n        found = []  # (list of 2-tuple): name, kwargs\n\n        if sys.platform.startswith('linux'):\n            # Look for each ACM device, if the IDN is the expected one\n            acm_paths = glob.glob('/dev/ttyACM?')\n            for port in acm_paths:\n                # open and try to communicate\n                try:\n                    dev = cls(name=\"test\", role=\"test\", port=port)\n                    idn = dev._getIdentification()\n                    if idn.startswith(\"Delmic Analog Power\"):\n                        found.append({\"port\": port})\n                except Exception:\n                    pass\n        else:\n            # TODO: Windows version\n            raise NotImplementedError(\"OS not yet supported\")\n\n        return found\n\n\nclass PowerControlError(IOError):\n    \"\"\"\n    Exception used to indicate a problem coming from the Power Control Unit.\n    \"\"\"\n    pass\n\nIDN = \"Delmic Analog Power Control simulator 1.0\"\nMASK = 1  # mask for the first bit\n\n\nclass PowerControlSimulator(object):\n    \"\"\"\n    Simulates a PowerControl (+ serial port). Only used for testing.\n    Same interface as the serial port\n    \"\"\"\n    def __init__(self, timeout=0, *args, **kwargs):\n        self.timeout = timeout\n        self._f = tempfile.TemporaryFile()  # for fileno\n        self._output_buf = \"\"  # what the Power Control Unit sends back to the \"host computer\"\n        self._input_buf = \"\"  # what Power Control Unit receives from the \"host computer\"\n        self._i2crcv = 0  # fake expander response byte\n\n    def fileno(self):\n        return self._f.fileno()\n\n    def write(self, data):\n        self._input_buf += data\n\n        self._parseMessages()  # will update _input_buf\n\n    def read(self, size=1):\n        ret = self._output_buf[:size]\n        self._output_buf = self._output_buf[len(ret):]\n\n        if len(ret) < size:\n            # simulate timeout\n            time.sleep(self.timeout)\n        return ret\n\n    def flush(self):\n        pass\n\n    def flushInput(self):\n        self._output_buf = \"\"\n\n    def close(self):\n        # using read or write will fail after that\n        del self._output_buf\n        del self._input_buf\n\n    def _parseMessages(self):\n        \"\"\"\n        Parse as many messages available in the buffer\n        \"\"\"\n        while len(self._input_buf) >= 1:\n            # read until '\\n'\n            sep = self._input_buf.index('\\n')\n            msg = self._input_buf[0:sep + 1]\n\n            # remove the bytes we've just read\n            self._input_buf = self._input_buf[len(msg):]\n\n            self._processMessage(msg)\n\n    def _processMessage(self, msg):\n        \"\"\"\n        process the msg, and put the result in the output buffer\n        msg (str): raw message (including header)\n        \"\"\"\n        res = None\n        wspaces = msg.count(' ')\n        qmarks = msg.count('?')\n        tokens = msg.split()\n        if ((wspaces > 1) and (qmarks > 0)) or (wspaces > 2) or (qmarks > 1):\n            res = \"ERROR: Cannot parse this command\\n\"\n        el",
+      "total_lines": 382,
+      "ref": "ab04958d61f74af7ab89d18a0075216a3178d4ec"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 374,
+      "start_line": 354,
+      "end_line": 382,
+      "matched_line": "            # TODO: add support for WMEM and RMEM",
+      "excerpt": "354:             if tokens[0] == \"*IDN?\":\n355:                 res = IDN + '\\n'\n356:             elif tokens[0] == \"PWR?\":\n357:                 pin = int(tokens[1])\n358:                 if (pin < 0) or (pin > 7):\n359:                     res = \"ERROR: Out of range pin number\\n\"\n360:                 else:\n361:                     ans = (self._i2crcv >> pin) & MASK\n362:                     res = str(ans) + '\\n'\n363:             else:\n364:                 res = \"ERROR: Cannot parse this command\\n\"\n365:         elif wspaces:\n366:             pin = int(tokens[1])\n367:             val = int(tokens[2])\n368:             if tokens[0] == \"PWR\":\n369:                 if (pin < 0) or (pin > 7):\n370:                     res = \"ERROR: Out of range pin number\\n\"\n371:                 else:\n372:                     self._i2crcv = (self._i2crcv & ~(1 << pin)) | ((val << pin) & (1 << pin))\n373:                     res = '\\n'\n374:             # TODO: add support for WMEM and RMEM\n375:             else:\n376:                 res = \"ERROR: Cannot parse this command\\n\"\n377:         else:\n378:             res = \"ERROR: Cannot parse this command\\n\"\n379: \n380:         # add the response end\n381:         if res is not None:\n382:             self._output_buf += res"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "_processMessage",
+      "start_line": 342,
+      "end_line": 382,
+      "source": "    def _processMessage(self, msg):\n        \"\"\"\n        process the msg, and put the result in the output buffer\n        msg (str): raw message (including header)\n        \"\"\"\n        res = None\n        wspaces = msg.count(' ')\n        qmarks = msg.count('?')\n        tokens = msg.split()\n        if ((wspaces > 1) and (qmarks > 0)) or (wspaces > 2) or (qmarks > 1):\n            res = \"ERROR: Cannot parse this command\\n\"\n        elif qmarks:\n            if tokens[0] == \"*IDN?\":\n                res = IDN + '\\n'\n            elif tokens[0] == \"PWR?\":\n                pin = int(tokens[1])\n                if (pin < 0) or (pin > 7):\n                    res = \"ERROR: Out of range pin number\\n\"\n                else:\n                    ans = (self._i2crcv >> pin) & MASK\n                    res = str(ans) + '\\n'\n            else:\n                res = \"ERROR: Cannot parse this command\\n\"\n        elif wspaces:\n            pin = int(tokens[1])\n            val = int(tokens[2])\n            if tokens[0] == \"PWR\":\n                if (pin < 0) or (pin > 7):\n                    res = \"ERROR: Out of range pin number\\n\"\n                else:\n                    self._i2crcv = (self._i2crcv & ~(1 << pin)) | ((val << pin) & (1 << pin))\n                    res = '\\n'\n            # TODO: add support for WMEM and RMEM\n            else:\n                res = \"ERROR: Cannot parse this command\\n\"\n        else:\n            res = \"ERROR: Cannot parse this command\\n\"\n\n        # add the response end\n        if res is not None:\n            self._output_buf += res"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 342,
+      "end_line": 382,
+      "excerpt": "    def _processMessage(self, msg):\n        \"\"\"\n        process the msg, and put the result in the output buffer\n        msg (str): raw message (including header)\n        \"\"\"\n        res = None\n        wspaces = msg.count(' ')\n        qmarks = msg.count('?')\n        tokens = msg.split()\n        if ((wspaces > 1) and (qmarks > 0)) or (wspaces > 2) or (qmarks > 1):\n            res = \"ERROR: Cannot parse this command\\n\"\n        elif qmarks:\n            if tokens[0] == \"*IDN?\":\n                res = IDN + '\\n'\n            elif tokens[0] == \"PWR?\":\n                pin = int(tokens[1])\n                if (pin < 0) or (pin > 7):\n                    res = \"ERROR: Out of range pin number\\n\"\n                else:\n                    ans = (self._i2crcv >> pin) & MASK\n                    res = str(ans) + '\\n'\n            else:\n                res = \"ERROR: Cannot parse this command\\n\"\n        elif wspaces:\n            pin = int(tokens[1])\n            val = int(tokens[2])\n            if tokens[0] == \"PWR\":\n                if (pin < 0) or (pin > 7):\n                    res = \"ERROR: Out of range pin number\\n\"\n                else:\n                    self._i2crcv = (self._i2crcv & ~(1 << pin)) | ((val << pin) & (1 << pin))\n                    res = '\\n'\n            # TODO: add support for WMEM and RMEM\n            else:\n                res = \"ERROR: Cannot parse this command\\n\"\n        else:\n            res = \"ERROR: Cannot parse this command\\n\"\n\n        # add the response end\n        if res is not None:\n            self._output_buf += res",
+      "symbol_name": "_processMessage",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "sha": "16687833c436a4c81ebbfc352efdb8cc858624c6",
+      "download_url": "https://raw.githubusercontent.com/delmic/odemis/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/driver/powerctrl.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:division",
+        "fcntl",
+        "glob",
+        "logging",
+        "odemis:model",
+        "odemis.model:isasync",
+        "odemis.model:CancellableThreadPoolExecutor",
+        "odemis.model._components:HwError",
+        "odemis.util:driver",
+        "os",
+        "serial",
+        "sys",
+        "tempfile",
+        "threading",
+        "time"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.txt",
+      "download_url": "https://raw.githubusercontent.com/delmic/odemis/ab04958d61f74af7ab89d18a0075216a3178d4ec/README.txt",
+      "content_excerpt": "Odemis, Open Delmic Microscope Software\r\n\r\n= Requirements = \r\nLinux (tested on Ubuntu 12.04 x86 32-bits and 64-bits)\r\nPython (v2.7)\r\n\r\n= Installation =\r\nSee the doc/INSTALL.txt document for the complete installation procedure.\r\n\r\n= Basic usage =\r\nLaunch the \"Odemis\" program, or type on a terminal:\r\nodemis-start\r\nEventually the GUI (Graphical User Interface) will appear.\r\n\r\nIt is not usually necessary, but if you want, to fully stop odemis (GUI and back-end), type:\r\nodemis-stop\r\n\r\n= Advanced usage =\r\nodemisd is the command line interface to start and manage the Odemis backend. It\r\nshould be started first.\r\n\r\nRun as \"odemisd ...\", with ... replaced by the correct arguments. For all the \r\npossible commands see:\r\nodemisd --help\r\n\r\nFor example:\r\nodemisd --daemonize --log-level=2 src/odemis/odemisd/test/optical-sim.odm.yaml\r\n\r\n\r\n\r\nTo use the command line interface use:\r\nodemis-cli --help\r\n\r\nTo see the list of components:\r\nodemis-cli --list\r\n\r\nFor example, to set the emission values for the light engine \"Spectra\", type:\r\nodemis-cli --set-attr Spectra emissions \"0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0\"\r\n\r\n\r\n= License =\r\nGPLv2, see the LICENSE.txt file for the complete license.\r\n\r\n= Extending =\r\nFor information on how to extend the software, see the developer documentation.\r\nIt must be first compiled, with: \r\ncd doc/develop/\r\nmake html\r\n\r\nThen it can be opened with:\r\nfirefox _build/html/index.html\r\n\r\n= Testing =\r\nTo test the software, there are several unit-test classes in each directory (in \r\ntheir test/ sub-directory). There are also a few example microscope \r\nconfiguration file in the "
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "_processMessage",
+      "count": 4,
+      "items": [
+        {
+          "name": "coordinates_test.py",
+          "path": "src/odemis/acq/align/test/coordinates_test.py",
+          "sha": "580c37e999b3ed822b7bde5e565e50196c7d7323",
+          "html_url": "https://github.com/delmic/odemis/blob/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/acq/align/test/coordinates_test.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 54,
+          "end_line": 78,
+          "excerpt": "54: \n55:         spot_coordinates = coordinates.FindCenterCoordinates(subimages)\n56:         expected_coordinates = [(-0.00019439548586790034, -0.023174120210179554),\n57:                                 (0.41813787193469681, -0.77556146879261101),\n58:                                 (0.05418032832973009, -0.046573726263258203),\n59:                                 (0.15117173005078957, 0.20813259555303279),\n60:                                 (0.15372338817998937, -0.071307409462406962),\n61:                                 (0.22214464176322843, 1.5448851668913044),\n62:                                 (-1.3567379189595801, 0.20634334863259929),\n63:                                 (-0.068717256379618827, 0.76902400758882417),\n64:                                 (-0.064496044288789064, 0.14000630665134439),\n65:                                 (0.020941736978718473, -0.0071056828496776324)]\n66:         numpy.testing.assert_almost_equal(spot_coordinates, expected_coordinates, 3)\n67: \n68: # @unittest.skip(\"skip\")\n69: class TestDivideInNeighborhoods(unittest.TestCase):\n70:     \"\"\"\n71:     Test DivideInNeighborhoods\n72:     \"\"\"\n73:     def setUp(self):\n74:         random.seed(0)\n75: \n76:     # @unittest.skip(\"skip\")\n77:     def test_divide_and_find_center_grid(self):\n78:         \"\"\"",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "delphi_test.py",
+          "path": "src/odemis/acq/align/test/delphi_test.py",
+          "sha": "0c3c538d6fab05d60382c5f6552c47826c600771",
+          "html_url": "https://github.com/delmic/odemis/blob/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/acq/align/test/delphi_test.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 86,
+          "end_line": 110,
+          "excerpt": "86: \n87:     # @unittest.skip(\"skip\")\n88:     def test_find_hole_center(self):\n89:         \"\"\"\n90:         Test FindCircleCenter for holes\n91:         \"\"\"\n92:         data = hdf5.read_data(\"sem_hole.h5\")\n93:         C, T, Z, Y, X = data[0].shape\n94:         data[0].shape = Y, X\n95: \n96:         hole_coordinates = delphi.FindCircleCenter(data[0], 0.02032, 3)\n97:         expected_coordinates = (390.5, 258.5)\n98:         numpy.testing.assert_almost_equal(hole_coordinates, expected_coordinates)\n99: \n100: \n101:     # @unittest.skip(\"skip\")\n102:     def test_find_lens_center(self):\n103:         \"\"\"\n104:         Test FindCircleCenter for lenses\n105:         \"\"\"\n106:         data = hdf5.read_data(\"navcam-calib2.h5\")\n107:         Z, Y, X = data[0].shape\n108: \n109:         lens_coordinates = delphi.FindCircleCenter(data[0][0], delphi.LENS_RADIUS, 6)\n110:         expected_coordinates = (450.5, 445.5)",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "find_overlay_test.py",
+          "path": "src/odemis/acq/align/test/find_overlay_test.py",
+          "sha": "48cade3e74cd4b32b8759b668012425a674addea",
+          "html_url": "https://github.com/delmic/odemis/blob/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/acq/align/test/find_overlay_test.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 74,
+          "end_line": 98,
+          "excerpt": "74:     def setUp(self):\n75:         if self.backend_was_running:\n76:             self.skipTest(\"Running backend found\")\n77: \n78:     # @unittest.skip(\"skip\")\n79:     def test_find_overlay(self):\n80:         \"\"\"\n81:         Test FindOverlay\n82:         \"\"\"\n83:         f = align.FindOverlay((4, 4), 0.1, 10e-06, self.ebeam, self.ccd, self.sed, skew=True)\n84: \n85:         t, (opt_md, sem_md) = f.result()\n86:         self.assertEqual(len(t), 5)\n87:         self.assertIn(model.MD_PIXEL_SIZE_COR, opt_md)\n88:         self.assertIn(model.MD_SHEAR_COR, sem_md)\n89: \n90:     # @unittest.skip(\"skip\")\n91:     def test_find_overlay_failure(self):\n92:         \"\"\"\n93:         Test FindOverlay failure due to low maximum allowed difference\n94:         \"\"\"\n95:         f = align.FindOverlay((6, 6), 1e-6, 1e-08, self.ebeam, self.ccd, self.sed, skew=True)\n96: \n97:         with self.assertRaises(ValueError):\n98:             f.result()",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "focus_test.py",
+          "path": "src/odemis/acq/align/test/focus_test.py",
+          "sha": "ec468b0744cc6f89e7b0107bc0dca89460e26e8d",
+          "html_url": "https://github.com/delmic/odemis/blob/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/acq/align/test/focus_test.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 85,
+          "end_line": 109,
+          "excerpt": "85:             self.skipTest(\"Running backend found\")\n86: \n87:     def test_measure_focus(self):\n88:         \"\"\"\n89:         Test MeasureFocus\n90:         \"\"\"\n91:         input = self.fake_img\n92: \n93:         prev_res = autofocus.MeasureImageFocus(input)\n94:         for i in range(1, 10, 1):\n95:             input = ndimage.gaussian_filter(input, sigma=i)\n96:             res = autofocus.MeasureImageFocus(input)\n97:             self.assertGreater(prev_res, res)\n98:             prev_res = res\n99: \n100:     @timeout(1000)\n101:     def test_autofocus(self):\n102:         \"\"\"\n103:         Test AutoFocus\n104:         \"\"\"\n105:         focus = self.focus\n106:         ebeam = self.ebeam\n107:         ccd = self.ccd\n108:         focus.moveAbs({\"z\": 60e-06})\n109:         ccd.exposureTime.value = ccd.exposureTime.range[0]",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "_processMessage",
+      "count": 1,
+      "items": [
+        {
+          "name": "pmtctrl.py",
+          "path": "src/odemis/driver/pmtctrl.py",
+          "sha": "e2ef413f080bc19298b98618c71e6b8d7af53cdf",
+          "html_url": "https://github.com/delmic/odemis/blob/ab04958d61f74af7ab89d18a0075216a3178d4ec/src/odemis/driver/pmtctrl.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "symbol_match",
+          "start_line": 609,
+          "end_line": 700,
+          "excerpt": "    def _processMessage(self, msg):\n        \"\"\"\n        process the msg, and put the result in the output buffer\n        msg (str): raw message (including header)\n        \"\"\"\n        res = None\n        wspaces = msg.count(' ')\n        qmarks = msg.count('?')\n        tokens = msg.split()\n        if ((wspaces > 0) and (qmarks > 0)) or (wspaces > 1) or (qmarks > 1):\n            res = \"ERROR: Cannot parse this command\\n\"\n        elif wspaces:\n            value = float(tokens[1])\n            if tokens[0] == \"PWR\":\n                if (value != 0) and (value != 1):\n                    res = \"ERROR: Out of range set value\\n\"\n                else:\n                    if value:\n                        self._powerSupply = True\n                    else:\n                        self._powerSupply = False\n                    res = '\\n'\n            elif tokens[0] == \"SWITCH\":\n                if (value != 0) and (value != 1):\n                    res = \"ERROR: Out of range set value\\n\"\n                else:\n                    if value:\n                        self._protection = False\n                    else:\n                        self._protection = True\n                    res = '\\n'\n            elif tokens[0] == \"VOLT\":\n                if (value < MIN_VOLT) or (value > MAX_VOLT):\n                    res = \"ERROR: Out of range set value\\n\"\n                else:\n                    self._gain = value\n                    res = '\\n'\n            elif tokens[0] == \"PCURR\":\n                if (value < MIN_PCURR) or (value > MAX_PCURR):\n                    res = \"ERROR: Out of range set value\\n\"\n                else:\n                    self._prot_curr = value\n                    res = '\\n'\n            elif tokens[0] == \"PTIME\":\n                if (value < MIN_PTIME) or (value > MAX_PTIME):\n                    res = \"ERROR: Out of range set value\\n\"\n                else:\n                    self._prot_time = value\n                    res = '\\n'\n            elif tokens[0] == \"RELAY\":\n                if (value != 0) and (value != 1):\n                    res = \"ERROR: Out of range set value\\n\"\n                else:\n                    if value:\n                        self._contact = T",
+          "symbol_name": "_processMessage",
+          "symbol_type": "FunctionDef"
+        }
+      ]
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "src/odemis/driver",
+      "count": 40,
+      "entries": [
+        {
+          "name": "driver",
+          "path": "src/odemis/driver",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "src/odemis/driver/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "actuator.py",
+          "path": "src/odemis/driver/actuator.py",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2-fake-clara.tiff",
+          "path": "src/odemis/driver/andorcam2-fake-clara.tiff",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2-fake-spots-4x4.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots-4x4.h5",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2-fake-spots.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots.h5",
+          "type": "file"
+        },
+        {
+          "name": "andorcam2.py",
+          "path": "src/odemis/driver/andorcam2.py",
+          "type": "file"
+        },
+        {
+          "name": "andorcam3.py",
+          "path": "src/odemis/driver/andorcam3.py",
+          "type": "file"
+        },
+        {
+          "name": "andorshrk.py",
+          "path": "src/odemis/driver/andorshrk.py",
+          "type": "file"
+        },
+        {
+          "name": "blinkstick.py",
+          "path": "src/odemis/driver/blinkstick.py",
+          "type": "file"
+        },
+        {
+          "name": "comedi_simple.py",
+          "path": "src/odemis/driver/comedi_simple.py",
+          "type": "file"
+        },
+        {
+          "name": "light.py",
+          "path": "src/odemis/driver/light.py",
+          "type": "file"
+        },
+        {
+          "name": "lle.py",
+          "path": "src/odemis/driver/lle.py",
+          "type": "file"
+        },
+        {
+          "name": "nfpm.py",
+          "path": "src/odemis/driver/nfpm.py",
+          "type": "file"
+        },
+        {
+          "name": "nfpm_netscan.py",
+          "path": "src/odemis/driver/nfpm_netscan.py",
+          "type": "file"
+        },
+        {
+          "name": "omicronxx.py",
+          "path": "src/odemis/driver/omicronxx.py",
+          "type": "file"
+        },
+        {
+          "name": "phenom.py",
+          "path": "src/odemis/driver/phenom.py",
+          "type": "file"
+        },
+        {
+          "name": "pi.py",
+          "path": "src/odemis/driver/pi.py",
+          "type": "file"
+        },
+        {
+          "name": "pigcs.py",
+          "path": "src/odemis/driver/pigcs.py",
+          "type": "file"
+        },
+        {
+          "name": "pmtctrl.py",
+          "path": "src/odemis/driver/pmtctrl.py",
+          "type": "file"
+        },
+        {
+          "name": "powerctrl.py",
+          "path": "src/odemis/driver/powerctrl.py",
+          "type": "file"
+        },
+        {
+          "name": "pvcam.py",
+          "path": "src/odemis/driver/pvcam.py",
+          "type": "file"
+        },
+        {
+          "name": "pvcam_h.py",
+          "path": "src/odemis/driver/pvcam_h.py",
+          "type": "file"
+        },
+        {
+          "name": "semcomedi.py",
+          "path": "src/odemis/driver/semcomedi.py",
+          "type": "file"
+        },
+        {
+          "name": "simcam-fake-overview.h5",
+          "path": "src/odemis/driver/simcam-fake-overview.h5",
+          "type": "file"
+        },
+        {
+          "name": "simcam.py",
+          "path": "src/odemis/driver/simcam.py",
+          "type": "file"
+        },
+        {
+          "name": "simsem-fake-output.h5",
+          "path": "src/odemis/driver/simsem-fake-output.h5",
+          "type": "file"
+        },
+        {
+          "name": "simsem.py",
+          "path": "src/odemis/driver/simsem.py",
+          "type": "file"
+        },
+        {
+          "name": "simulated.py",
+          "path": "src/odemis/driver/simulated.py",
+          "type": "file"
+        },
+        {
+          "name": "songbird-sim-ccd.h5",
+          "path": "src/odemis/driver/songbird-sim-ccd.h5",
+          "type": "file"
+        },
+        {
+          "name": "songbird-sim-sem.h5",
+          "path": "src/odemis/driver/songbird-sim-sem.h5",
+          "type": "file"
+        },
+        {
+          "name": "sparc-ar-mirror-align.h5",
+          "path": "src/odemis/driver/sparc-ar-mirror-align.h5",
+          "type": "file"
+        },
+        {
+          "name": "sparc-etd-gold-balls.h5",
+          "path": "src/odemis/driver/sparc-etd-gold-balls.h5",
+          "type": "file"
+        },
+        {
+          "name": "sparc-spec-sim.h5",
+          "path": "src/odemis/driver/sparc-spec-sim.h5",
+          "type": "file"
+        },
+        {
+          "name": "spectrapro.py",
+          "path": "src/odemis/driver/spectrapro.py",
+          "type": "file"
+        },
+        {
+          "name": "spectrometer.py",
+          "path": "src/odemis/driver/spectrometer.py",
+          "type": "file"
+        },
+        {
+          "name": "static.py",
+          "path": "src/odemis/driver/static.py",
+          "type": "file"
+        },
+        {
+          "name": "tescan_sem.py",
+          "path": "src/odemis/driver/tescan_sem.py",
+          "type": "file"
+        },
+        {
+          "name": "test",
+          "path": "src/odemis/driver/test",
+          "type": "dir"
+        },
+        {
+          "name": "actuator_test.py",
+          "path": "src/odemis/driver/test/actuator_test.py",
+          "type": "file"
+        }
+      ],
+      "ref": "ab04958d61f74af7ab89d18a0075216a3178d4ec"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "src/odemis/driver/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: '''\n3: Created on 12 Mar 2012\n4: \n5: @author: Éric Piel\n6: \n7: Copyright © 2012-2015 Éric Piel, Delmic\n8: \n9: This file is part of Odemis.\n10: \n11: Odemis is free software: you can redistribute it and/or modify it under the terms \n12: of the GNU General Public License version 2 as published by the Free Software \n13: Foundation."
+        },
+        {
+          "name": "actuator.py",
+          "path": "src/odemis/driver/actuator.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: # -*- coding: utf-8 -*-\n2: '''\n3: Created on 9 Aug 2014\n4: \n5: @author: Kimon Tsitsikas and Éric Piel\n6: \n7: Copyright © 2012-2014 Kimon Tsitsikas, Éric Piel, Delmic\n8: \n9: This file is part of Odemis.\n10: \n11: Odemis is free software: you can redistribute it and/or modify it under the terms\n12: of the GNU General Public License version 2 as published by the Free Software\n13: Foundation."
+        },
+        {
+          "name": "andorcam2-fake-clara.tiff",
+          "path": "src/odemis/driver/andorcam2-fake-clara.tiff",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "andorcam2-fake-spots-4x4.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots-4x4.h5",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        },
+        {
+          "name": "andorcam2-fake-spots.h5",
+          "path": "src/odemis/driver/andorcam2-fake-spots.h5",
+          "match_reason": "empty_file",
+          "start_line": null,
+          "end_line": null,
+          "excerpt": ""
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+          "html_url": "https://github.com/delmic/odemis/commit/c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+          "message": "[feature] extend PCU driver to handle several PCUs connected\n\nSo far, the Power Control Unit (PCU) driver assumed only one PCU at most was connected\nto the computer. To support systems with multiple PCUs,\nwe need to be able to distinguish them. Still, each instance of the\ndriver will control just on",
+          "author": "Éric Piel",
+          "date": "2024-06-07T14:58:07Z"
+        },
+        {
+          "sha": "056a3b311f2036fa101d3496322772c205ff6f61",
+          "html_url": "https://github.com/delmic/odemis/commit/056a3b311f2036fa101d3496322772c205ff6f61",
+          "message": "driver powerctrl: add check_power option\n\nAllows to disable the check for power on hardware not connected to any\nEEPROM.",
+          "author": "Éric Piel",
+          "date": "2022-09-20T14:35:06Z"
+        },
+        {
+          "sha": "b4483ed61c60bd8dbc44d113d362f2a687de2652",
+          "html_url": "https://github.com/delmic/odemis/commit/b4483ed61c60bd8dbc44d113d362f2a687de2652",
+          "message": "Removed all __future__ imports because python2.7 is no longer supported.",
+          "author": "BasHolweg",
+          "date": "2022-08-23T08:32:33Z"
+        },
+        {
+          "sha": "91495bc289eeb1b229952ab2d979a62578328d88",
+          "html_url": "https://github.com/delmic/odemis/commit/91495bc289eeb1b229952ab2d979a62578328d88",
+          "message": "driver: add call to super in .terminate()\n\nThe Component class actually does some useful things on .terminate(),\nbut it can only do it if we call it. Admitedly, typically it all happens\nat the backend termination, so it's not a big loss, but let's do it\nproperly.\n\nNote that there are other drivers t",
+          "author": "Éric Piel",
+          "date": "2020-10-06T07:32:03Z"
+        },
+        {
+          "sha": "ddce4800cc3c3f3fa68a2e5d4f641c3d615324d3",
+          "html_url": "https://github.com/delmic/odemis/commit/ddce4800cc3c3f3fa68a2e5d4f641c3d615324d3",
+          "message": "driver: Add missing b's\n\nWe didn't get enough honey, so adding extra b's.\n\nThe migration to Python 3 missed a couple of places where the string\nshould now be bytes.\nThat happened mostly in the serial port opening functions because these\nare different in the simulator and the actual hardware.\n\nSevera",
+          "author": "Éric Piel",
+          "date": "2020-01-16T13:37:49Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "_processMessage TODO support WMEM RMEM",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "src/odemis/driver/powerctrl.py",
+      "satd_line": 374,
+      "last_commit": {
+        "sha": "c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+        "html_url": "https://github.com/delmic/odemis/commit/c7ddda288fe0321a93f7899ca55ea95d9b66f5df",
+        "message": "[feature] extend PCU driver to handle several PCUs connected\n\nSo far, the Power Control Unit (PCU) driver assumed only one PCU at most was connected\nto the computer. To support systems with multiple PCUs,\nwe need to be able to distinguish them. Still, each instance of the\ndriver will control just on",
+        "author": "Éric Piel",
+        "date": "2024-06-07T14:58:07Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 1,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "_processMessage",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

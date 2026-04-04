@@ -153,6 +153,15 @@ class OpenAICompatClient:
     def build_base_context(self, state: GraphState, existing_bundle: dict[str, Any] | None = None) -> dict[str, Any]:
         bundle = self._ensure_bundle(existing_bundle, state)
         metadata = bundle.setdefault("metadata", {})
+        active_commit = (state.get("commit") or "").strip()
+        cached_commit = str(metadata.get("context_commit") or bundle.get("commit") or "").strip()
+        if cached_commit != active_commit:
+            bundle["base_context"] = {}
+            bundle["repair_context"] = {}
+            bundle["review_context"] = {}
+            metadata["base_cached"] = False
+            metadata["repair_cached"] = False
+            metadata["review_cached"] = False
         if metadata.get("base_cached") and bundle.get("base_context"):
             if not metadata.get("base_cache_source"):
                 metadata["base_cache_source"] = "memory"
@@ -161,9 +170,10 @@ class OpenAICompatClient:
         owner = state["user"]
         repo = state["project"]
         path = state["file_path"]
+        ref = (state.get("commit") or "").strip() or None
         issue_numbers = self._extract_issue_numbers(state["satd_comment"])[:2]
         focus_symbol = self._fallback_symbol_name(state)
-        file_payload = self.toolbox.fetch_repo_file(owner, repo, path)
+        file_payload = self.toolbox.fetch_repo_file(owner, repo, path, ref=ref)
         file_content = file_payload.get("full_content", "") if file_payload.get("ok") else ""
         satd_window = self.toolbox.extract_satd_window(file_content, state["satd_comment"])
         enclosing_symbol = self.toolbox.extract_enclosing_symbol(file_content, state["satd_comment"])
@@ -173,6 +183,7 @@ class OpenAICompatClient:
             owner,
             repo,
             path,
+            ref=ref,
             anchor_text=state["satd_comment"],
             symbol_name=enclosing_symbol.get("symbol_name") or focus_symbol,
         )
@@ -188,7 +199,7 @@ class OpenAICompatClient:
             "current_file_focus": current_file_focus,
             "imports": imports,
             "issue_refs": [self.toolbox.fetch_issue_or_pr(owner, repo, number) for number in issue_numbers],
-            "module_docs": self.toolbox.fetch_readme_or_module_docs(owner, repo, module_prefix)
+            "module_docs": self.toolbox.fetch_readme_or_module_docs(owner, repo, module_prefix, ref=ref)
             if module_prefix
             else {"ok": False, "error": "no_module_prefix"},
         }
@@ -197,6 +208,7 @@ class OpenAICompatClient:
                 "base_cached": True,
                 "base_context_fetched_at": self._timestamp(),
                 "base_cache_source": metadata.get("base_cache_source") or "github_fetch",
+                "context_commit": state.get("commit") or "",
                 "symbol_name": enclosing_symbol.get("symbol_name") if isinstance(enclosing_symbol, dict) else None,
                 "satd_line": satd_window.get("satd_line") if isinstance(satd_window, dict) else None,
             }
@@ -214,6 +226,7 @@ class OpenAICompatClient:
         owner = state["user"]
         repo = state["project"]
         path = state["file_path"]
+        ref = (state.get("commit") or "").strip() or None
         symbol_name = metadata.get("symbol_name") or self._fallback_symbol_name(state)
         satd_line = metadata.get("satd_line")
         module_prefix = self._module_prefix(path)
@@ -225,16 +238,16 @@ class OpenAICompatClient:
             if history_query
             else {"ok": True, "query": "", "count": 0, "items": []}
         )
-        repo_tree = self.toolbox.fetch_repo_tree(owner, repo, module_prefix)
-        related_tests = self.toolbox.find_related_tests(owner, repo, symbol_name or path)
-        call_sites = self.toolbox.find_call_sites(owner, repo, symbol_name)
+        repo_tree = self.toolbox.fetch_repo_tree(owner, repo, module_prefix, ref=ref)
+        related_tests = self.toolbox.find_related_tests(owner, repo, symbol_name or path, ref=ref)
+        call_sites = self.toolbox.find_call_sites(owner, repo, symbol_name, ref=ref, current_path=path)
         related_pr_files = [
             self.toolbox.fetch_pr_files(owner, repo, item.get("number"))
             for item in similar_history.get("items", [])
             if item.get("is_pull_request")
         ][:2]
-        history_snippets = self._history_snippets(owner, repo, path, symbol_name, related_pr_files)
-        neighbor_files = self._neighbor_files(owner, repo, repo_tree, path, symbol_name)
+        history_snippets = self._history_snippets(owner, repo, path, symbol_name, related_pr_files, ref)
+        neighbor_files = self._neighbor_files(owner, repo, repo_tree, path, symbol_name, ref)
 
         bundle["repair_context"] = {
             "repair_evidence_mode": metadata.get("repair_evidence_mode"),
@@ -254,6 +267,7 @@ class OpenAICompatClient:
                 "repair_cached": True,
                 "repair_context_fetched_at": self._timestamp(),
                 "repair_cache_source": metadata.get("repair_cache_source") or "github_fetch",
+                "context_commit": state.get("commit") or "",
             }
         )
         return self._augment_bundle_metadata(bundle)
@@ -428,6 +442,7 @@ class OpenAICompatClient:
         current.setdefault("repo_owner", state["user"])
         current.setdefault("repo_name", state["project"])
         current.setdefault("file_path", state["file_path"])
+        current.setdefault("commit", state.get("commit") or "")
         current.setdefault("metadata", {})
         current.setdefault("base_context", {})
         current.setdefault("repair_context", {})
@@ -456,7 +471,12 @@ class OpenAICompatClient:
 
     def _summarize_file_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not payload.get("ok"):
-            return {"ok": False, "error": payload.get("error"), "path": payload.get("path")}
+            return {
+                "ok": False,
+                "error": payload.get("error"),
+                "path": payload.get("path"),
+                "ref": payload.get("ref"),
+            }
         full_content = payload.get("full_content") or ""
         return {
             "ok": True,
@@ -465,9 +485,18 @@ class OpenAICompatClient:
             "download_url": payload.get("download_url"),
             "content_excerpt": payload.get("content_excerpt"),
             "total_lines": len(full_content.splitlines()),
+            "ref": payload.get("ref"),
         }
 
-    def _neighbor_files(self, owner: str, repo: str, repo_tree: dict[str, Any], current_path: str, symbol_name: str) -> dict[str, Any]:
+    def _neighbor_files(
+        self,
+        owner: str,
+        repo: str,
+        repo_tree: dict[str, Any],
+        current_path: str,
+        symbol_name: str,
+        ref: str | None,
+    ) -> dict[str, Any]:
         entries = repo_tree.get("entries", []) if isinstance(repo_tree, dict) else []
         neighbors = []
         current = (current_path or "").replace("\\", "/")
@@ -476,7 +505,14 @@ class OpenAICompatClient:
             path = (item.get("path") or "").replace("\\", "/")
             if not path or path == current or item.get("type") != "file":
                 continue
-            snippet = self.toolbox.fetch_code_snippet(owner, repo, path, anchor_text=anchor_text, symbol_name=symbol_name)
+            snippet = self.toolbox.fetch_code_snippet(
+                owner,
+                repo,
+                path,
+                ref=ref,
+                anchor_text=anchor_text,
+                symbol_name=symbol_name,
+            )
             neighbors.append(
                 {
                     "name": item.get("name"),
@@ -498,6 +534,7 @@ class OpenAICompatClient:
         current_path: str,
         symbol_name: str,
         related_pr_files: list[dict[str, Any]],
+        ref: str | None,
     ) -> dict[str, Any]:
         snippets = []
         seen_paths = set()
@@ -515,6 +552,7 @@ class OpenAICompatClient:
                     owner,
                     repo,
                     filename,
+                    ref=ref,
                     anchor_text=symbol_name or current_basename,
                     symbol_name=symbol_name,
                 )
@@ -555,6 +593,7 @@ class OpenAICompatClient:
         commits_for_path = repair_context.get("commits_for_path", {}) if isinstance(repair_context, dict) else {}
         similar_history = repair_context.get("similar_history", {}) if isinstance(repair_context, dict) else {}
         history_snippets = repair_context.get("history_snippets", {}) if isinstance(repair_context, dict) else {}
+        context_commit = str(metadata.get("context_commit") or bundle.get("commit") or "")
 
         target_file_ok = bool(target_file.get("ok"))
         satd_window_found = bool(satd_window.get("found"))
@@ -567,12 +606,17 @@ class OpenAICompatClient:
         retrieved_callsite_snippets_count = sum(1 for item in call_sites.get("items", []) if item.get("excerpt"))
         retrieved_history_snippets_count = sum(1 for item in history_snippets.get("items", []) if item.get("excerpt"))
 
+        target_file_error = str(target_file.get("error") or "")
         if target_file_ok and satd_window_found and enclosing_symbol_found:
             snapshot_alignment_status = "aligned"
         elif target_file_ok and (satd_window_found or enclosing_symbol_found):
             snapshot_alignment_status = "partial"
+        elif context_commit and self._is_missing_ref_error(target_file_error):
+            snapshot_alignment_status = "historical_ref_missing"
+        elif context_commit and not target_file_ok:
+            snapshot_alignment_status = "historical_file_missing"
         else:
-            snapshot_alignment_status = "mismatch"
+            snapshot_alignment_status = "true_mismatch"
 
         historical_snapshot_mismatch = snapshot_alignment_status != "aligned"
         evidence_snippet_count = (
@@ -609,6 +653,7 @@ class OpenAICompatClient:
         metadata.update(
             {
                 "target_file_ok": target_file_ok,
+                "context_commit": context_commit,
                 "satd_window_found": satd_window_found,
                 "enclosing_symbol_found": enclosing_symbol_found,
                 "related_tests_count": related_tests_count,
@@ -629,6 +674,17 @@ class OpenAICompatClient:
         )
         bundle["metadata"] = metadata
         return bundle
+
+    def _is_missing_ref_error(self, error_text: str) -> bool:
+        lowered = (error_text or "").lower()
+        markers = (
+            "historical_ref_missing",
+            "no commit found for sha",
+            "invalid object requested",
+            "no tree found",
+            "reference does not exist",
+        )
+        return any(marker in lowered for marker in markers)
 
 
 class OpenAIAnalyzer:

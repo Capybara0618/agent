@@ -1,0 +1,539 @@
+{
+  "task_id": "77",
+  "repo_owner": "containerbuildsystem",
+  "repo_name": "atomic-reactor",
+  "file_path": "atomic_reactor/plugins/build_orchestrate_build.py",
+  "commit": "afee7c0f865923d3948033533d832a063955772f",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-04T02:33:54+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "afee7c0f865923d3948033533d832a063955772f",
+    "symbol_name": "validate_arrangement_version",
+    "satd_line": 434,
+    "target_file_ok": true,
+    "satd_window_found": true,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 4,
+    "call_sites_count": 0,
+    "commits_count": 5,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 4,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": true,
+    "repair_context_fetched_at": "2026-04-04T02:34:31+00:00",
+    "repair_cache_source": "github_fetch",
+    "review_context_fetched_at": "2026-04-04T02:34:35+00:00",
+    "review_cache_source": "derived"
+  },
+  "base_context": {
+    "file_path": "atomic_reactor/plugins/build_orchestrate_build.py",
+    "original_code": "def validate_arrangement_version(self):\n    \"\"\"Validate if the arrangement_version is supported\n\n    This is for autorebuilds to fail early otherwise they may failed\n    on workers because of osbs-client validation checks.\n\n    Method should be called after self.adjust_build_kwargs\n\n    Shows a warning when version is deprecated\n\n    :raises ValueError: when version is not supported\n    \"\"\"\n    arrangement_version = self.build_kwargs['arrangement_version']\n    if arrangement_version is None:\n        return\n\n    if arrangement_version <= 5:\n        # TODO: raise as ValueError in release 1.6.38+\n        self.log.warning(\"arrangement_version <= 5 is deprecated and will be removed\"\n                         \" in release 1.6.38\")",
+    "original_signature": "def validate_arrangement_version(self):",
+    "satd_comment": "# TODO: raise as ValueError in release 1.6.38+",
+    "target_file": {
+      "ok": true,
+      "path": "atomic_reactor/plugins/build_orchestrate_build.py",
+      "sha": "5fb114670a913ffea038bf754057842bca054ff5",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/atomic-reactor/afee7c0f865923d3948033533d832a063955772f/atomic_reactor/plugins/build_orchestrate_build.py",
+      "content_excerpt": "\"\"\"\nCopyright (c) 2017 Red Hat, Inc\nAll rights reserved.\n\nThis software may be modified and distributed under the terms\nof the BSD license. See the LICENSE file for details.\n\"\"\"\nfrom __future__ import unicode_literals, division\n\nfrom collections import namedtuple\nfrom copy import deepcopy\nfrom multiprocessing.pool import ThreadPool\nimport warnings\n\nimport json\nimport os\nfrom operator import attrgetter\nimport random\nfrom string import ascii_letters\nimport time\nimport logging\nfrom datetime import timedelta\nimport datetime as dt\nimport copy\nimport platform\n\nfrom atomic_reactor.build import BuildResult\nfrom atomic_reactor.plugin import BuildStepPlugin\nfrom atomic_reactor.plugins.pre_reactor_config import (get_config,\n                                                       get_arrangement_version, get_koji,\n                                                       get_odcs, get_pulp,\n                                                       get_prefer_schema1_digest, get_smtp,\n                                                       get_source_registry, get_sources_command,\n                                                       get_artifacts_allowed_domains,\n                                                       get_yum_proxy, get_image_equal_labels,\n                                                       get_content_versions, get_openshift_session,\n                                                       get_platform_descriptors,\n                                                       get_clusters_client_config_path,\n                                                       get_build_image_override,\n                                                       get_goarch_to_platform_mapping)\nfrom atomic_reactor.plugins.pre_check_and_set_rebuild import is_rebuild\nfrom atomic_reactor.util import (df_parser, get_build_json, get_manifest_list, get_platforms,\n                                 ImageName)\nfrom atomic_reactor.constants import (PLUGIN_ADD_FILESYSTEM_KEY, PLUGIN_BUILD_ORCHESTRATE_KEY)\nfrom osbs.api import OSBS\nfrom osbs.exceptions import OsbsException\nfrom osbs.conf import Configuration\nfrom osbs.constants import BUILD_FINISHED_STATES\nfrom osbs.utils import Labels, RegistryURI\n\n\nClusterInfo = namedtuple('ClusterInfo', ('cluster', 'platform', 'osbs', 'load'))\nWORKSPACE_KEY_BUILD_INFO = 'build_info'\nWORKSPACE_KEY_UPLOAD_DIR = 'koji_upload_dir'\nWORKSPACE_KEY_OVERRIDE_KWARGS = 'override_kwargs'\nFIND_CLUSTER_RETRY_DELAY = 15.0\nFAILURE_RETRY_DELAY = 10.0\nMAX_CLUSTER_FAILS = 20\n\n\ndef get_worker_build_info(workflow, platform):\n    \"\"\"\n    Obtain worker build information for a given platform\n    \"\"\"\n    workspace = workflow.plugin_workspace[OrchestrateBuildPlugin.key]\n    return workspace[WORKSPACE_KEY_BUILD_INFO][platform]\n\n\ndef get_koji_upload_dir(workflow):\n    \"\"\"\n    Obtain koji_upload_dir value used for worker builds\n    \"\"\"\n    workspace = workflow.plugin_workspace[OrchestrateBuildPlugin.key]\n    return workspace[WORKSPACE_KEY_UPLOAD_DIR]\n\n\ndef override_build_kwarg(workflow, k, v, platform=None):\n    \"\"\"\n    Override a build-kwarg for all worker builds\n    \"\"\"\n    key = OrchestrateBuildPlugin.key\n    # Use None to indicate an override for all platforms\n\n    workspace = workflow.plugin_workspace.setdefault(key, {})\n    override_kwargs = workspace.setdefault(WORKSPACE_KEY_OVERRIDE_KWARGS, {})\n    override_kwargs.setdefault(platform, {})\n    override_kwargs[platform][k] = v\n\n\nclass UnknownPlatformException(Exception):\n    \"\"\" No clusters could be found for a platform \"\"\"\n\n\nclass AllClustersFailedException(Exception):\n    \"\"\" Each cluster has reached max_cluster_fails \"\"\"\n\n\nclass UnknownKindException(Exception):\n    \"\"\" Build image from contains unknown kind \"\"\"\n\n\nclass ClusterRetryContext(object):\n    def __init__(self, max_cluster_fails):\n        # how many times this cluster has failed\n        self.fails = 0\n\n        # datetime at which attempts can resume\n        self.retry_at = dt.datetime.utcfromtimestamp(0)\n\n        # the number of fail counts before this cluster is considered dead\n        self.max_cluster_fails = max_cluster_fails\n\n    @property\n    def failed(self):\n        \"\"\"Is this cluster considered dead?\"\"\"\n        return self.fails >= self.max_cluster_fails\n\n    @property\n    def in_retry_wait(self):\n        \"\"\"Should we wait before trying this cluster again?\"\"\"\n        return dt.datetime.now() < self.retry_at\n\n    def try_again_later(self, seconds):\n        \"\"\"Put this cluster in retry-wait (or consider it dead)\"\"\"\n        if not self.failed:\n            self.fails += 1\n            self.retry_at = (dt.datetime.now() + timedelta(seconds=seconds))\n\n\ndef wait_for_any_cluster(contexts):\n    \"\"\"\n    Wait until any of the clusters are out of retry-wait\n\n    :param contexts: List[ClusterRetryContext]\n    :raises: AllClustersFailedException if no more retry attempts allowed\n    \"\"\"\n    try:\n        earliest_retry_at = min(ctx.retry_at for ctx in contexts.values()\n                                if not ctx.failed)\n    except ValueError:  # can't take min() of empty sequence\n        raise AllClustersFailedException(\n            \"Could not find appropriate cluster for worker build.\"\n        )\n\n    time_until_next = earliest_retry_at - dt.datetime.now()\n    time.sleep(max(timedelta(seconds=0), time_until_next).seconds)\n\n\nclass WorkerBuildInfo(object):\n\n    def __init__(self, build, cluster_info, logger):\n        self.build = build\n        self.cluster = cluster_info.cluster\n        self.osbs = cluster_info.osbs\n        self.platform = cluster_info.platform\n        self.log = logging.LoggerAdapter(logger, {'arch': self.platform})\n\n        self.monitor_exception = None\n\n    @property\n    def name(self):\n        return self.build.get_build_name() if self.build else 'N/A'\n\n    def wait_to_finish(self):\n        self.build = self.osbs.wait_for_build_to_finish(self.name)\n        return self.build\n\n    def watch_logs(self):\n        for line in self.osbs.get_build_logs(self.name, follow=True):\n            self.log.info(line)\n\n    def get_annotations(self):\n        build_annotations = self.build.get_annotations() or {}\n        annotations = {\n            'build': {\n                'cluster-url': self.osbs.os_conf.get_openshift_base_uri(),\n                'namespace': self.osbs.os_conf.get_namespace(),\n                'build-name': self.name,\n            },\n            'digests': json.loads(\n                build_annotations.get('digests', '[]')),\n            'plugins-metadata': json.loads(\n                build_annotations.get('plugins-metadata', '{}')),\n        }\n\n        if 'metadata_fragment' in build_annotations and \\\n           'metadata_fragment_key' in build_annotations:\n            annotations['metadata_fragment'] = build_annotations['metadata_fragment']\n            annotations['metadata_fragment_key'] = build_annotations['metadata_fragment_key']\n\n        return annotations\n\n    def get_fail_reason(self):\n        fail_reason = {}\n        if self.monitor_exception:\n            fail_reason['general'] = repr(self.monitor_exception)\n        elif not self.build:\n            fail_reason['general'] = 'build not started'\n\n        if not self.build:\n            return fail_reason\n\n        build_annotations = self.build.get_annotations() or {}\n        metadata = json.loads(build_annotations.get('plugins-metadata', '{}'))\n        if self.monitor_exception:\n            fail_reason['general'] = repr(self.monitor_exception)\n\n        try:\n            fail_reason.update(metadata['errors'])\n        except KeyError:\n            try:\n                build_name = self.build.get_build_name()\n                pod = self.osbs.get_pod_for_build(build_name)\n                fail_reason['pod'] = pod.get_failure_reason()\n            except (OsbsException, AttributeError):\n                # Catch AttributeError here because osbs-client < 0.41\n                # doesn't have this method\n                pass\n\n        return fail_reason\n\n    def cancel_build(self):\n        if self.build and not self.build.is_finished():\n            self.osbs.cancel_build(self.name)\n\n\nclass OrchestrateBuildPlugin(BuildStepPlugin):\n    \"\"\"\n    Start and monitor worker builds for each platform\n\n    This plugin will find the best suited worker cluster to\n    be used for each platform. It does so by calculating the\n    current load of active builds on each cluster and choosing\n    the one with smallest load.\n\n    The list of available worker clusters is retrieved by fetching\n    the result provided by reactor_config plugin.\n\n    If any of the worker builds fail, this plugin will return a\n    failed BuildResult. Although, it does wait for all worker builds\n    to complete in any case.\n\n    If all worker builds succeed, then this plugin returns a\n    successful BuildResult, but with a remote image result. The\n    image is built in the worker builds which is likely a different\n    host than the one running this build. This means that the local\n    docker daemon has no knowledge of the built image.\n\n    If build_image is defined it is passed to the worker build,\n    but there is still possibility to have build_imagestream inside\n    osbs.conf in the secret, and that would take precendence over\n    build_image from kwargs\n    \"\"\"\n\n    UNREACHABLE_CLUSTER_LOAD = object()\n\n    key = PLUGIN_BUILD_ORCHESTRATE_KEY\n\n    def __init__(self, tasker, workflow, build_kwargs, platforms=None,\n                 osbs_client_config=None, worker_build_image=None,\n                 config_kwargs=None,\n                 find_cluster_retry_delay=FIND_CLUSTER_RETRY_DELAY,\n                 failure_retry_delay=FAILURE_RETRY_DELAY,\n                 max_cluster_fails=MAX_CLUSTER_FAILS,\n                 url=None, verify_ssl=True, use_auth=True,\n                 goarch=None):\n        \"\"\"\n        constructor\n\n        :param tasker: DockerTasker instance\n        :param workflow: DockerBuildWorkflow instance\n        :param build_kwargs: dict, keyword arguments for starting worker builds\n        :param platforms: list<str>, platforms to build\n                          (used via utils.get_orchestrator_platforms())\n        :param osbs_client_config: str, path to directory containing osbs.conf\n        :param worker_build_image: str, the builder image to use for worker builds\n                                  (not used, image is inherited from the orchestrator)\n        :param config_kwargs: dict, keyword arguments to override worker configuration\n        :param find_cluster_retry_delay: the delay in seconds to try again reaching a cluster\n        :param failure_retry_delay: the delay in seconds to try again starting a build\n        :param max_cluster_fails: the maximum number of times a cluster can fail before being\n                                  ignored\n        :param goarch: dict, keys are platform, values are go language platform names\n        \"\"\"\n        super(OrchestrateBuildPlugin, self).__init__(tasker, workflow)\n        self.platforms = get_platforms(self.workflow)\n\n        self.build_kwargs = build_kwargs\n        self.osbs_client_config_fallback = osbs_client_config\n        self.config_kwargs = config_kwargs or {}\n\n        self.adjust_build_kwargs()\n        self.validate_arrangement_version()\n        self.adjust_config_kwargs()\n        self.reactor_config = get_config(self.workflow)\n\n        self.find_cluster_retry_delay = find_cluster_retry_delay\n        self.failure_retry_delay = failure_retry_delay\n        self.max_cluster_fails = max_cluster_fails\n        self.koji_upload_dir = self.get_koji_upload_dir()\n        self.fs_task_id = self.get_fs_task_id()\n        self.release = self.get_release()\n\n        self.plat_des_fallback = []\n        for plat, architecture in (goarch or {}).items():\n            plat_dic = {'platform': plat,\n                        'architecture': architecture}\n            self.plat_des_fallback.append(plat_dic)\n\n        self.openshift_fallback = {\n            'url': url,\n            'insecure': not verify_ssl,\n            'auth': {'enable': use_auth}\n     ",
+      "total_lines": 924,
+      "ref": "afee7c0f865923d3948033533d832a063955772f"
+    },
+    "satd_window": {
+      "found": true,
+      "satd_line": 434,
+      "start_line": 414,
+      "end_line": 454,
+      "matched_line": "            # TODO: raise as ValueError in release 1.6.38+",
+      "excerpt": "414:         self.build_kwargs['arrangement_version'] =\\\n415:             get_arrangement_version(self.workflow, self.build_kwargs['arrangement_version'])\n416: \n417:     def validate_arrangement_version(self):\n418:         \"\"\"Validate if the arrangement_version is supported\n419: \n420:         This is for autorebuilds to fail early otherwise they may failed\n421:         on workers because of osbs-client validation checks.\n422: \n423:         Method should be called after self.adjust_build_kwargs\n424: \n425:         Shows a warning when version is deprecated\n426: \n427:         :raises ValueError: when version is not supported\n428:         \"\"\"\n429:         arrangement_version = self.build_kwargs['arrangement_version']\n430:         if arrangement_version is None:\n431:             return\n432: \n433:         if arrangement_version <= 5:\n434:             # TODO: raise as ValueError in release 1.6.38+\n435:             warnings.warn(\"arrangement_version <= 5 is deprecated and will be removed\"\n436:                           \" in release 1.6.38\", DeprecationWarning)\n437: \n438:     def get_current_builds(self, osbs):\n439:         field_selector = ','.join(['status!={status}'.format(status=status.capitalize())\n440:                                    for status in BUILD_FINISHED_STATES])\n441:         with osbs.retries_disabled():\n442:             return len(osbs.list_builds(field_selector=field_selector))\n443: \n444:     def _get_openshift_session(self, kwargs):\n445:         conf = Configuration(**kwargs)\n446:         return OSBS(conf, conf)\n447: \n448:     def get_cluster_info(self, cluster, platform):\n449:         kwargs = deepcopy(self.config_kwargs)\n450:         kwargs['conf_section'] = cluster.name\n451:         kwargs['conf_file'] = get_clusters_client_config_path(self.workflow,\n452:                                                               self.osbs_client_config_fallback)\n453: \n454:         if platform in self.build_image_digests:"
+    },
+    "enclosing_symbol": {
+      "found": true,
+      "symbol_type": "FunctionDef",
+      "symbol_name": "validate_arrangement_version",
+      "start_line": 417,
+      "end_line": 436,
+      "source": "    def validate_arrangement_version(self):\n        \"\"\"Validate if the arrangement_version is supported\n\n        This is for autorebuilds to fail early otherwise they may failed\n        on workers because of osbs-client validation checks.\n\n        Method should be called after self.adjust_build_kwargs\n\n        Shows a warning when version is deprecated\n\n        :raises ValueError: when version is not supported\n        \"\"\"\n        arrangement_version = self.build_kwargs['arrangement_version']\n        if arrangement_version is None:\n            return\n\n        if arrangement_version <= 5:\n            # TODO: raise as ValueError in release 1.6.38+\n            warnings.warn(\"arrangement_version <= 5 is deprecated and will be removed\"\n                          \" in release 1.6.38\", DeprecationWarning)"
+    },
+    "current_file_focus": {
+      "match_reason": "symbol_match",
+      "start_line": 417,
+      "end_line": 436,
+      "excerpt": "    def validate_arrangement_version(self):\n        \"\"\"Validate if the arrangement_version is supported\n\n        This is for autorebuilds to fail early otherwise they may failed\n        on workers because of osbs-client validation checks.\n\n        Method should be called after self.adjust_build_kwargs\n\n        Shows a warning when version is deprecated\n\n        :raises ValueError: when version is not supported\n        \"\"\"\n        arrangement_version = self.build_kwargs['arrangement_version']\n        if arrangement_version is None:\n            return\n\n        if arrangement_version <= 5:\n            # TODO: raise as ValueError in release 1.6.38+\n            warnings.warn(\"arrangement_version <= 5 is deprecated and will be removed\"\n                          \" in release 1.6.38\", DeprecationWarning)",
+      "symbol_name": "validate_arrangement_version",
+      "symbol_type": "FunctionDef",
+      "ok": true,
+      "path": "atomic_reactor/plugins/build_orchestrate_build.py",
+      "sha": "5fb114670a913ffea038bf754057842bca054ff5",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/atomic-reactor/afee7c0f865923d3948033533d832a063955772f/atomic_reactor/plugins/build_orchestrate_build.py"
+    },
+    "imports": {
+      "imports": [
+        "__future__:unicode_literals",
+        "__future__:division",
+        "collections:namedtuple",
+        "copy:deepcopy",
+        "multiprocessing.pool:ThreadPool",
+        "warnings",
+        "json",
+        "os",
+        "operator:attrgetter",
+        "random",
+        "string:ascii_letters",
+        "time",
+        "logging",
+        "datetime:timedelta",
+        "datetime",
+        "copy",
+        "platform",
+        "atomic_reactor.build:BuildResult",
+        "atomic_reactor.plugin:BuildStepPlugin",
+        "atomic_reactor.plugins.pre_reactor_config:get_config",
+        "atomic_reactor.plugins.pre_reactor_config:get_arrangement_version",
+        "atomic_reactor.plugins.pre_reactor_config:get_koji",
+        "atomic_reactor.plugins.pre_reactor_config:get_odcs",
+        "atomic_reactor.plugins.pre_reactor_config:get_pulp",
+        "atomic_reactor.plugins.pre_reactor_config:get_prefer_schema1_digest",
+        "atomic_reactor.plugins.pre_reactor_config:get_smtp",
+        "atomic_reactor.plugins.pre_reactor_config:get_source_registry",
+        "atomic_reactor.plugins.pre_reactor_config:get_sources_command",
+        "atomic_reactor.plugins.pre_reactor_config:get_artifacts_allowed_domains",
+        "atomic_reactor.plugins.pre_reactor_config:get_yum_proxy"
+      ]
+    },
+    "issue_refs": [],
+    "module_docs": {
+      "ok": true,
+      "path": "README.md",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/atomic-reactor/afee7c0f865923d3948033533d832a063955772f/README.md",
+      "content_excerpt": "Atomic Reactor\n==============\n\n[![Build Status](https://travis-ci.org/projectatomic/atomic-reactor.svg?branch=master)](https://travis-ci.org/projectatomic/atomic-reactor)\n[![Code Health](https://landscape.io/github/projectatomic/atomic-reactor/master/landscape.svg?style=flat)](https://landscape.io/github/projectatomic/atomic-reactor/master)\n[![Coverage Status](https://coveralls.io/repos/projectatomic/atomic-reactor/badge.svg?branch=master)](https://coveralls.io/r/projectatomic/atomic-reactor?branch=master)\n[![Code Quality: Python](https://img.shields.io/lgtm/grade/python/g/projectatomic/atomic-reactor.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/projectatomic/atomic-reactor/context:python)\n[![Total Alerts](https://img.shields.io/lgtm/alerts/g/projectatomic/atomic-reactor.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/projectatomic/atomic-reactor/alerts)\n\nPython library with command line interface for building docker images.\n\n## Features\n\n * push image to registry when it's built\n * build inside a docker container (so your builds are separated between each other)\n * git as a source to your Dockerfile (you may specify commit/branch and path to Dockerfile within the git repo)\n * collect build logs\n * integration with\n   [koji](https://github.com/projectatomic/atomic-reactor/blob/master/docs/koji.md) build system\n * integration with [fedora packaging system](http://fedoraproject.org/wiki/Package_maintenance_guide)\n * inject arbitrary yum repo inside Dockerfile (change source of your packages)\n * retag base image so it matches `FROM` instruction in Dockerfi"
+    }
+  },
+  "repair_context": {
+    "repair_evidence_mode": "strong",
+    "related_tests": {
+      "ok": true,
+      "query": "validate_arrangement_version",
+      "count": 4,
+      "items": [
+        {
+          "name": "test_add_dockerfile.py",
+          "path": "tests/plugins/test_add_dockerfile.py",
+          "sha": "ee15cb535d85300671221b12151cde0947fa230f",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/blob/afee7c0f865923d3948033533d832a063955772f/tests/plugins/test_add_dockerfile.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 44,
+          "end_line": 68,
+          "excerpt": "44:     workflow.builder.df_path = df.dockerfile_path\n45:     workflow.builder.df_dir = str(tmpdir)\n46: \n47:     runner = PreBuildPluginsRunner(\n48:         docker_tasker,\n49:         workflow,\n50:         [{\n51:             'name': AddDockerfilePlugin.key,\n52:             'args': {'nvr': 'rhel-server-docker-7.1-20'}\n53:         }]\n54:     )\n55:     runner.run()\n56:     assert AddDockerfilePlugin.key is not None\n57: \n58:     expected_output = \"\"\"\n59: FROM fedora\n60: RUN yum install -y python-django\n61: ADD Dockerfile-rhel-server-docker-7.1-20 /root/buildinfo/Dockerfile-rhel-server-docker-7.1-20\n62: CMD blabla\"\"\"\n63:     assert df.content == expected_output\n64: \n65: \n66: def test_adddockerfile_todest(tmpdir, docker_tasker):  # noqa\n67:     df_content = \"\"\"\n68: FROM fedora",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_add_filesystem.py",
+          "path": "tests/plugins/test_add_filesystem.py",
+          "sha": "0fb95f880f2408ce6a87c84af26c0294af104266",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/blob/afee7c0f865923d3948033533d832a063955772f/tests/plugins/test_add_filesystem.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 89,
+          "end_line": 113,
+          "excerpt": "89:                       koji_krb_principal=None, koji_krb_keytab=None,\n90:                       scratch=False, image_task_fail=False,\n91:                       throws_build_cancelled=False,\n92:                       error_on_build_cancelled=False,\n93:                       download_filesystem=True,\n94:                       get_task_result_mock=None,\n95:                       arches=None):\n96: \n97:     session = flexmock()\n98: \n99:     def _mockBuildImageOz(*args, **kwargs):\n100:         if scratch:\n101:             assert kwargs['opts']['scratch'] is True\n102:         else:\n103:             assert 'scratch' not in kwargs['opts']\n104: \n105:         if arches:\n106:             assert set(args[2]) == set(arches)\n107: \n108:         if not download_filesystem:\n109:             return None\n110: \n111:         return FILESYSTEM_TASK_ID\n112: \n113:     flexmock(util).should_receive('is_scratch_build').and_return(scratch)",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_add_help.py",
+          "path": "tests/plugins/test_add_help.py",
+          "sha": "8fe9f51a31b3e01b2d238e786e10f732919afabb",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/blob/afee7c0f865923d3948033533d832a063955772f/tests/plugins/test_add_help.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 70,
+          "end_line": 94,
+          "excerpt": "70:     workflow.builder = X\n71:     workflow.builder.df_path = df.dockerfile_path\n72:     workflow.builder.df_dir = str(tmpdir)\n73: \n74:     help_markdown_path = os.path.join(workflow.builder.df_dir, filename)\n75:     generate_a_file(help_markdown_path, \"foo\")\n76:     help_man_path = os.path.join(workflow.builder.df_dir, AddHelpPlugin.man_filename)\n77:     generate_a_file(help_man_path, \"bar\")\n78: \n79:     cmd = ['go-md2man', '-in={}'.format(help_markdown_path), '-out={}'.format(help_man_path)]\n80: \n81:     def check_popen(*args, **kwargs):\n82:         assert args[0] == cmd\n83:         return MockedPopen()\n84: \n85:     (flexmock(subprocess)\n86:      .should_receive(\"Popen\")\n87:      .once()\n88:      .replace_with(check_popen))\n89: \n90:     runner = PreBuildPluginsRunner(\n91:         docker_tasker,\n92:         workflow,\n93:         [{\n94:             'name': AddHelpPlugin.key,",
+          "symbol_name": null,
+          "symbol_type": null
+        },
+        {
+          "name": "test_add_labels.py",
+          "path": "tests/plugins/test_add_labels.py",
+          "sha": "2a774a47d3aa79b72f898fc2851d816cf3a8b500",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/blob/afee7c0f865923d3948033533d832a063955772f/tests/plugins/test_add_labels.py",
+          "score": null,
+          "snippet_ok": true,
+          "match_reason": "assert_window",
+          "start_line": 214,
+          "end_line": 238,
+          "excerpt": "214:                 'labels': labels_conf,\n215:                 'dont_overwrite': dont_overwrite,\n216:                 'auto_labels': [],\n217:                 'aliases': aliases,\n218:                 'equal_labels': eq_conf,\n219:             }\n220:         }]\n221:     )\n222: \n223:     if isinstance(expected_output, RuntimeError):\n224:         with pytest.raises(PluginFailedException):\n225:             runner.run()\n226:         assert \"plugin 'add_labels_in_dockerfile' raised an exception: RuntimeError\" \\\n227:             in caplog.text()\n228: \n229:     else:\n230:         runner.run()\n231:         assert AddLabelsPlugin.key is not None\n232:         assert df.content in expected_output\n233: \n234: \n235: @pytest.mark.parametrize('use_reactor', [True, False])  # noqa\n236: @pytest.mark.parametrize('release', [None, 'test'])\n237: def test_add_labels_arrangement6(tmpdir, docker_tasker, release, use_reactor):\n238:     # explicitly test arrangement 6's handling of reactor config",
+          "symbol_name": null,
+          "symbol_type": null
+        }
+      ]
+    },
+    "call_sites": {
+      "ok": true,
+      "query": "validate_arrangement_version",
+      "count": 0,
+      "items": []
+    },
+    "repo_tree": {
+      "ok": true,
+      "prefix": "atomic_reactor/plugins",
+      "count": 40,
+      "entries": [
+        {
+          "name": "plugins",
+          "path": "atomic_reactor/plugins",
+          "type": "dir"
+        },
+        {
+          "name": "__init__.py",
+          "path": "atomic_reactor/plugins/__init__.py",
+          "type": "file"
+        },
+        {
+          "name": "build_docker_api.py",
+          "path": "atomic_reactor/plugins/build_docker_api.py",
+          "type": "file"
+        },
+        {
+          "name": "build_imagebuilder.py",
+          "path": "atomic_reactor/plugins/build_imagebuilder.py",
+          "type": "file"
+        },
+        {
+          "name": "build_orchestrate_build.py",
+          "path": "atomic_reactor/plugins/build_orchestrate_build.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_delete_from_registry.py",
+          "path": "atomic_reactor/plugins/exit_delete_from_registry.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_koji_import.py",
+          "path": "atomic_reactor/plugins/exit_koji_import.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_koji_promote.py",
+          "path": "atomic_reactor/plugins/exit_koji_promote.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_koji_tag_build.py",
+          "path": "atomic_reactor/plugins/exit_koji_tag_build.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_pulp_publish.py",
+          "path": "atomic_reactor/plugins/exit_pulp_publish.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_remove_built_image.py",
+          "path": "atomic_reactor/plugins/exit_remove_built_image.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_remove_worker_metadata.py",
+          "path": "atomic_reactor/plugins/exit_remove_worker_metadata.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_sendmail.py",
+          "path": "atomic_reactor/plugins/exit_sendmail.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_store_logs_to_file.py",
+          "path": "atomic_reactor/plugins/exit_store_logs_to_file.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_store_metadata_in_osv3.py",
+          "path": "atomic_reactor/plugins/exit_store_metadata_in_osv3.py",
+          "type": "file"
+        },
+        {
+          "name": "exit_verify_media_types.py",
+          "path": "atomic_reactor/plugins/exit_verify_media_types.py",
+          "type": "file"
+        },
+        {
+          "name": "input_env.py",
+          "path": "atomic_reactor/plugins/input_env.py",
+          "type": "file"
+        },
+        {
+          "name": "input_osv3.py",
+          "path": "atomic_reactor/plugins/input_osv3.py",
+          "type": "file"
+        },
+        {
+          "name": "input_path.py",
+          "path": "atomic_reactor/plugins/input_path.py",
+          "type": "file"
+        },
+        {
+          "name": "post_compare_components.py",
+          "path": "atomic_reactor/plugins/post_compare_components.py",
+          "type": "file"
+        },
+        {
+          "name": "post_compress.py",
+          "path": "atomic_reactor/plugins/post_compress.py",
+          "type": "file"
+        },
+        {
+          "name": "post_fetch_worker_metadata.py",
+          "path": "atomic_reactor/plugins/post_fetch_worker_metadata.py",
+          "type": "file"
+        },
+        {
+          "name": "post_group_manifests.py",
+          "path": "atomic_reactor/plugins/post_group_manifests.py",
+          "type": "file"
+        },
+        {
+          "name": "post_import_image.py",
+          "path": "atomic_reactor/plugins/post_import_image.py",
+          "type": "file"
+        },
+        {
+          "name": "post_koji_upload.py",
+          "path": "atomic_reactor/plugins/post_koji_upload.py",
+          "type": "file"
+        },
+        {
+          "name": "post_pulp_pull.py",
+          "path": "atomic_reactor/plugins/post_pulp_pull.py",
+          "type": "file"
+        },
+        {
+          "name": "post_pulp_sync.py",
+          "path": "atomic_reactor/plugins/post_pulp_sync.py",
+          "type": "file"
+        },
+        {
+          "name": "post_pulp_tag.py",
+          "path": "atomic_reactor/plugins/post_pulp_tag.py",
+          "type": "file"
+        },
+        {
+          "name": "post_push_to_pulp.py",
+          "path": "atomic_reactor/plugins/post_push_to_pulp.py",
+          "type": "file"
+        },
+        {
+          "name": "post_rpmqa.py",
+          "path": "atomic_reactor/plugins/post_rpmqa.py",
+          "type": "file"
+        },
+        {
+          "name": "post_tag_and_push.py",
+          "path": "atomic_reactor/plugins/post_tag_and_push.py",
+          "type": "file"
+        },
+        {
+          "name": "post_tag_by_labels.py",
+          "path": "atomic_reactor/plugins/post_tag_by_labels.py",
+          "type": "file"
+        },
+        {
+          "name": "post_tag_from_config.py",
+          "path": "atomic_reactor/plugins/post_tag_from_config.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_add_dockerfile.py",
+          "path": "atomic_reactor/plugins/pre_add_dockerfile.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_add_filesystem.py",
+          "path": "atomic_reactor/plugins/pre_add_filesystem.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_add_help.py",
+          "path": "atomic_reactor/plugins/pre_add_help.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_add_labels_in_df.py",
+          "path": "atomic_reactor/plugins/pre_add_labels_in_df.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_add_yum_repo.py",
+          "path": "atomic_reactor/plugins/pre_add_yum_repo.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_add_yum_repo_by_url.py",
+          "path": "atomic_reactor/plugins/pre_add_yum_repo_by_url.py",
+          "type": "file"
+        },
+        {
+          "name": "pre_bump_release.py",
+          "path": "atomic_reactor/plugins/pre_bump_release.py",
+          "type": "file"
+        }
+      ],
+      "ref": "afee7c0f865923d3948033533d832a063955772f"
+    },
+    "neighbor_files": {
+      "count": 5,
+      "items": [
+        {
+          "name": "__init__.py",
+          "path": "atomic_reactor/plugins/__init__.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 7,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2015 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\""
+        },
+        {
+          "name": "build_docker_api.py",
+          "path": "atomic_reactor/plugins/build_docker_api.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2017 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, unicode_literals\n9: \n10: import docker\n11: from atomic_reactor.plugin import BuildStepPlugin\n12: from atomic_reactor.util import wait_for_command\n13: from atomic_reactor.build import BuildResult"
+        },
+        {
+          "name": "build_imagebuilder.py",
+          "path": "atomic_reactor/plugins/build_imagebuilder.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2018 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: from __future__ import print_function, unicode_literals\n9: \n10: import subprocess\n11: from six import PY2\n12: import os\n13: "
+        },
+        {
+          "name": "exit_delete_from_registry.py",
+          "path": "atomic_reactor/plugins/exit_delete_from_registry.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2016 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: \n9: from __future__ import unicode_literals\n10: \n11: from copy import deepcopy\n12: import requests\n13: "
+        },
+        {
+          "name": "exit_koji_import.py",
+          "path": "atomic_reactor/plugins/exit_koji_import.py",
+          "match_reason": "file_start",
+          "start_line": 1,
+          "end_line": 13,
+          "excerpt": "1: \"\"\"\n2: Copyright (c) 2017 Red Hat, Inc\n3: All rights reserved.\n4: \n5: This software may be modified and distributed under the terms\n6: of the BSD license. See the LICENSE file for details.\n7: \"\"\"\n8: \n9: from __future__ import unicode_literals\n10: \n11: import json\n12: import os\n13: import time"
+        }
+      ]
+    },
+    "commits_for_path": {
+      "ok": true,
+      "path": "atomic_reactor/plugins/build_orchestrate_build.py",
+      "count": 5,
+      "commits": [
+        {
+          "sha": "110c30e16c4a37dfb755e4a9a9257d61359ca7e1",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/commit/110c30e16c4a37dfb755e4a9a9257d61359ca7e1",
+          "message": "Remove the orchestrate_build plugin\n\nCLOUDBLD-8266\n\nIt is not used anymore in OSBS 2.\n\nSigned-off-by: Adam Cmiel <acmiel@redhat.com>",
+          "author": "Adam Cmiel",
+          "date": "2022-04-13T10:14:19Z"
+        },
+        {
+          "sha": "e9cdc0238ef5a414a8949bd46daeac65dc0d0d84",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/commit/e9cdc0238ef5a414a8949bd46daeac65dc0d0d84",
+          "message": "remove `plugin_workspace`\n\nWe don't need this anymore, only parts of the\ncode that use it need to be refactored.\n\n* CLOUDBLD-9470\n\nSigned-off-by: Harsh Modi <hmodi@redhat.com>",
+          "author": "Harsh Modi",
+          "date": "2022-04-06T20:18:27Z"
+        },
+        {
+          "sha": "aff5dc938126095a5c0702c2b90a19296a84f8bf",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/commit/aff5dc938126095a5c0702c2b90a19296a84f8bf",
+          "message": "remove unused build_json_dir\n\n* CLOUDBLD-9045\n\nSigned-off-by: Robert Cerven <rcerven@redhat.com>",
+          "author": "Robert Cerven",
+          "date": "2022-03-23T20:13:29Z"
+        },
+        {
+          "sha": "e1e396faa7cf7b9526564cf14cf54f331c935063",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/commit/e1e396faa7cf7b9526564cf14cf54f331c935063",
+          "message": "Remove BuildResult from core modules\n\n* CLOUDBLD-8975\n\n* BuildResult class is removed from inner.py and every occurrence that\n  is affected by this change is also updated.\n* buildstep plugin does not return a build result object to indicate the\n  final execution state. Instead, if something is wrong",
+          "author": "Chenxiong Qi",
+          "date": "2022-03-11T05:59:00Z"
+        },
+        {
+          "sha": "1e97635a326cccde2a9791d114629fff6bb1ed73",
+          "html_url": "https://github.com/containerbuildsystem/atomic-reactor/commit/1e97635a326cccde2a9791d114629fff6bb1ed73",
+          "message": "get_platforms: decouple from workflow\n\nCLOUDBLD-8657\n\nThe method will be useful for the build task, which will not initialize\na full workflow instance. Decouple the function from workflow and pass\nonly the workflow data object.\n\nAnnotate the return type and, to make sure it is correct, also annotate",
+          "author": "Adam Cmiel",
+          "date": "2022-03-04T09:07:06Z"
+        }
+      ]
+    },
+    "similar_history": {
+      "ok": true,
+      "query": "validate_arrangement_version TODO raise ValueError release",
+      "count": 0,
+      "items": []
+    },
+    "history_snippets": {
+      "count": 0,
+      "items": []
+    },
+    "issue_comments": [],
+    "related_pr_files": [],
+    "last_commit_for_line": {
+      "ok": true,
+      "path": "atomic_reactor/plugins/build_orchestrate_build.py",
+      "satd_line": 434,
+      "last_commit": {
+        "sha": "110c30e16c4a37dfb755e4a9a9257d61359ca7e1",
+        "html_url": "https://github.com/containerbuildsystem/atomic-reactor/commit/110c30e16c4a37dfb755e4a9a9257d61359ca7e1",
+        "message": "Remove the orchestrate_build plugin\n\nCLOUDBLD-8266\n\nIt is not used anymore in OSBS 2.\n\nSigned-off-by: Adam Cmiel <acmiel@redhat.com>",
+        "author": "Adam Cmiel",
+        "date": "2022-04-13T10:14:19Z"
+      },
+      "note": "line-level blame is approximated with the latest path commit",
+      "error": null
+    }
+  },
+  "review_context": {
+    "validation_signals_summary": {
+      "analysis_validation_signals": [],
+      "related_tests_count": 4,
+      "call_sites_count": 0,
+      "commits_count": 5,
+      "history_snippets_count": 0,
+      "github_evidence_strength": "medium",
+      "snapshot_alignment_status": "aligned",
+      "repair_evidence_mode": "strong"
+    },
+    "risk_indicators": [],
+    "change_scope_evidence": {
+      "analysis_scope_radius": "function",
+      "repair_changed_scope": "function",
+      "symbol_name": "validate_arrangement_version",
+      "symbol_type": "FunctionDef",
+      "historical_snapshot_mismatch": false
+    },
+    "em_risk_guardrails": {
+      "disallow_signature_changes_without_strong_evidence": true,
+      "disallow_new_helpers_without_strong_evidence": true,
+      "disallow_control_flow_rewrites_without_strong_evidence": true,
+      "repair_evidence_mode": "strong",
+      "snapshot_alignment_status": "aligned"
+    }
+  }
+}

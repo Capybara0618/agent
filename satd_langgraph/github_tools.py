@@ -31,25 +31,26 @@ class GitHubToolbox:
         self.github_token = None if token == "PASTE_YOUR_GITHUB_TOKEN_HERE" else token
         self.user_agent = "satd-langgraph-agent"
 
-    def fetch_repo_readme(self, owner: str, repo: str) -> dict[str, Any]:
-        return self._fetch_repo_readme(owner, repo)
+    def fetch_repo_readme(self, owner: str, repo: str, ref: str | None = None) -> dict[str, Any]:
+        return self._fetch_repo_readme(owner, repo, ref)
 
-    def fetch_readme_or_module_docs(self, owner: str, repo: str, path_prefix: str) -> dict[str, Any]:
-        return self._fetch_readme_or_module_docs(owner, repo, path_prefix)
+    def fetch_readme_or_module_docs(self, owner: str, repo: str, path_prefix: str, ref: str | None = None) -> dict[str, Any]:
+        return self._fetch_readme_or_module_docs(owner, repo, path_prefix, ref)
 
-    def fetch_repo_file(self, owner: str, repo: str, path: str) -> dict[str, Any]:
-        return self._fetch_repo_file(owner, repo, path)
+    def fetch_repo_file(self, owner: str, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
+        return self._fetch_repo_file(owner, repo, path, ref)
 
     def fetch_repo_file_full_or_window(
         self,
         owner: str,
         repo: str,
         path: str,
+        ref: str | None = None,
         start_line: int | None = None,
         end_line: int | None = None,
         max_chars: int = FILE_LIMIT,
     ) -> dict[str, Any]:
-        file_payload = self._fetch_repo_file(owner, repo, path)
+        file_payload = self._fetch_repo_file(owner, repo, path, ref)
         if not file_payload.get("ok"):
             return file_payload
 
@@ -160,11 +161,26 @@ class GitHubToolbox:
     def search_code(self, owner: str, repo: str, query: str, per_page: int = SEARCH_LIMIT) -> dict[str, Any]:
         return self._search_code(owner, repo, query, per_page)
 
-    def find_related_tests(self, owner: str, repo: str, symbol_name_or_path: str, per_page: int = SEARCH_LIMIT) -> dict[str, Any]:
-        return self._find_related_tests(owner, repo, symbol_name_or_path, per_page)
+    def find_related_tests(
+        self,
+        owner: str,
+        repo: str,
+        symbol_name_or_path: str,
+        per_page: int = SEARCH_LIMIT,
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        return self._find_related_tests(owner, repo, symbol_name_or_path, per_page, ref)
 
-    def find_call_sites(self, owner: str, repo: str, symbol_name: str, per_page: int = SEARCH_LIMIT) -> dict[str, Any]:
-        return self._find_call_sites(owner, repo, symbol_name, per_page)
+    def find_call_sites(
+        self,
+        owner: str,
+        repo: str,
+        symbol_name: str,
+        per_page: int = SEARCH_LIMIT,
+        ref: str | None = None,
+        current_path: str = "",
+    ) -> dict[str, Any]:
+        return self._find_call_sites(owner, repo, symbol_name, per_page, ref, current_path)
 
     def fetch_commits_for_path(self, owner: str, repo: str, path: str, limit: int = COMMIT_LIMIT) -> dict[str, Any]:
         return self._fetch_commits_for_path(owner, repo, path, limit)
@@ -181,8 +197,8 @@ class GitHubToolbox:
     def fetch_issue_comments(self, owner: str, repo: str, number: int) -> dict[str, Any]:
         return self._fetch_issue_comments(owner, repo, number)
 
-    def fetch_repo_tree(self, owner: str, repo: str, prefix: str = "") -> dict[str, Any]:
-        return self._fetch_repo_tree(owner, repo, prefix)
+    def fetch_repo_tree(self, owner: str, repo: str, prefix: str = "", ref: str | None = None) -> dict[str, Any]:
+        return self._fetch_repo_tree(owner, repo, prefix, ref)
 
     def fetch_blame_or_last_commit_for_line(self, owner: str, repo: str, path: str, satd_line: int | None) -> dict[str, Any]:
         commits = self._fetch_commits_for_path(owner, repo, path, 1)
@@ -200,17 +216,18 @@ class GitHubToolbox:
         owner: str,
         repo: str,
         path: str,
+        ref: str | None = None,
         anchor_text: str = "",
         symbol_name: str = "",
         prefer_assert: bool = False,
         window: int = SNIPPET_WINDOW,
         max_chars: int = SNIPPET_CHAR_LIMIT,
     ) -> dict[str, Any]:
-        return self._fetch_code_snippet(owner, repo, path, anchor_text, symbol_name, prefer_assert, window, max_chars)
+        return self._fetch_code_snippet(owner, repo, path, ref, anchor_text, symbol_name, prefer_assert, window, max_chars)
 
     @functools.lru_cache(maxsize=256)
-    def _fetch_repo_readme(self, owner: str, repo: str) -> dict[str, Any]:
-        endpoint = f"https://api.github.com/repos/{owner}/{repo}/readme"
+    def _fetch_repo_readme(self, owner: str, repo: str, ref: str | None) -> dict[str, Any]:
+        endpoint = self._with_ref(f"https://api.github.com/repos/{owner}/{repo}/readme", ref)
         try:
             payload = self._github_json(endpoint)
             decoded = self._decode_content(payload)
@@ -224,7 +241,7 @@ class GitHubToolbox:
             return {"ok": False, "error": str(exc)}
 
     @functools.lru_cache(maxsize=256)
-    def _fetch_readme_or_module_docs(self, owner: str, repo: str, path_prefix: str) -> dict[str, Any]:
+    def _fetch_readme_or_module_docs(self, owner: str, repo: str, path_prefix: str, ref: str | None) -> dict[str, Any]:
         candidates = []
         cleaned_prefix = (path_prefix or "").strip("/")
         if cleaned_prefix:
@@ -234,7 +251,7 @@ class GitHubToolbox:
                 f"{cleaned_prefix}/docs/README.md",
             ])
         for candidate in candidates:
-            payload = self._fetch_repo_file(owner, repo, candidate)
+            payload = self._fetch_repo_file(owner, repo, candidate, ref)
             if payload.get("ok"):
                 return {
                     "ok": True,
@@ -242,12 +259,12 @@ class GitHubToolbox:
                     "download_url": payload.get("download_url"),
                     "content_excerpt": (payload.get("full_content") or "")[:README_LIMIT],
                 }
-        return self._fetch_repo_readme(owner, repo)
+        return self._fetch_repo_readme(owner, repo, ref)
 
     @functools.lru_cache(maxsize=1024)
-    def _fetch_repo_file(self, owner: str, repo: str, path: str) -> dict[str, Any]:
+    def _fetch_repo_file(self, owner: str, repo: str, path: str, ref: str | None) -> dict[str, Any]:
         encoded_path = "/".join(urllib.parse.quote(part) for part in path.split("/"))
-        endpoint = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}"
+        endpoint = self._with_ref(f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_path}", ref)
         try:
             payload = self._github_json(endpoint)
             decoded = self._decode_content(payload)
@@ -258,9 +275,16 @@ class GitHubToolbox:
                 "download_url": payload.get("download_url"),
                 "content_excerpt": decoded[:FILE_LIMIT],
                 "full_content": decoded,
+                "ref": ref,
             }
         except Exception as exc:
-            return {"ok": False, "error": str(exc), "path": path}
+            error_text = str(exc)
+            if ref:
+                if self._ref_exists(owner, repo, ref):
+                    error_text = f"historical_file_missing: {error_text}"
+                else:
+                    error_text = f"historical_ref_missing: {error_text}"
+            return {"ok": False, "error": error_text, "path": path, "ref": ref}
 
     @functools.lru_cache(maxsize=512)
     def _search_code(self, owner: str, repo: str, query: str, per_page: int) -> dict[str, Any]:
@@ -285,12 +309,30 @@ class GitHubToolbox:
             return {"ok": False, "query": query, "error": str(exc), "items": []}
 
     @functools.lru_cache(maxsize=256)
-    def _find_related_tests(self, owner: str, repo: str, symbol_name_or_path: str, per_page: int) -> dict[str, Any]:
+    def _find_related_tests(
+        self,
+        owner: str,
+        repo: str,
+        symbol_name_or_path: str,
+        per_page: int,
+        ref: str | None,
+    ) -> dict[str, Any]:
         token = (symbol_name_or_path or "").strip()
         if not token:
             return {"ok": True, "query": "", "count": 0, "items": []}
         basename = os.path.basename(token).replace(".py", "")
         symbol_name = basename if basename and basename != token else ""
+        if ref:
+            items = self._scan_historical_tree_for_matches(
+                owner,
+                repo,
+                ref,
+                query_token=basename or token,
+                symbol_name=symbol_name,
+                per_page=per_page,
+                candidate_kind="test",
+            )
+            return {"ok": True, "query": basename or token, "count": len(items), "items": items}
         raw = self._search_code(owner, repo, f'{basename} test', per_page)
         items = self._expand_search_items(
             owner,
@@ -303,10 +345,30 @@ class GitHubToolbox:
         return {"ok": raw.get("ok", False), "query": raw.get("query"), "count": len(items), "items": items}
 
     @functools.lru_cache(maxsize=256)
-    def _find_call_sites(self, owner: str, repo: str, symbol_name: str, per_page: int) -> dict[str, Any]:
+    def _find_call_sites(
+        self,
+        owner: str,
+        repo: str,
+        symbol_name: str,
+        per_page: int,
+        ref: str | None,
+        current_path: str,
+    ) -> dict[str, Any]:
         token = (symbol_name or "").strip()
         if not token:
             return {"ok": True, "query": "", "count": 0, "items": []}
+        if ref:
+            items = self._scan_historical_tree_for_matches(
+                owner,
+                repo,
+                ref,
+                query_token=token,
+                symbol_name=token,
+                per_page=per_page,
+                candidate_kind="callsite",
+                current_path=current_path,
+            )
+            return {"ok": True, "query": token, "count": len(items), "items": items}
         raw = self._search_code(owner, repo, f'"{token}("', per_page)
         items = self._expand_search_items(owner, repo, raw.get("items", []), anchor_text=f"{token}(", symbol_name=token)
         return {"ok": raw.get("ok", False), "query": raw.get("query"), "count": len(items), "items": items}
@@ -414,8 +476,21 @@ class GitHubToolbox:
             return {"ok": False, "number": number, "error": str(exc), "comments": []}
 
     @functools.lru_cache(maxsize=256)
-    def _fetch_repo_tree(self, owner: str, repo: str, prefix: str) -> dict[str, Any]:
+    def _fetch_repo_tree(self, owner: str, repo: str, prefix: str, ref: str | None) -> dict[str, Any]:
         cleaned_prefix = prefix.strip("/")
+        if ref:
+            payload = self._fetch_repo_tree_for_ref(owner, repo, cleaned_prefix, ref)
+            if not payload.get("ok"):
+                return payload
+            entries = list(payload.get("entries", []))[:TREE_LIMIT]
+            return {
+                "ok": True,
+                "prefix": cleaned_prefix,
+                "count": len(entries),
+                "entries": entries,
+                "ref": ref,
+            }
+
         encoded_prefix = "/".join(urllib.parse.quote(part) for part in cleaned_prefix.split("/")) if cleaned_prefix else ""
         endpoint = f"https://api.github.com/repos/{owner}/{repo}/contents/{encoded_prefix}" if encoded_prefix else f"https://api.github.com/repos/{owner}/{repo}/contents"
         try:
@@ -441,13 +516,14 @@ class GitHubToolbox:
         owner: str,
         repo: str,
         path: str,
+        ref: str | None,
         anchor_text: str,
         symbol_name: str,
         prefer_assert: bool,
         window: int,
         max_chars: int,
     ) -> dict[str, Any]:
-        payload = self._fetch_repo_file(owner, repo, path)
+        payload = self._fetch_repo_file(owner, repo, path, ref)
         if not payload.get("ok"):
             return {"ok": False, "path": path, "error": payload.get("error")}
 
@@ -475,6 +551,13 @@ class GitHubToolbox:
         with urllib.request.urlopen(request, timeout=20) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             return json.loads(response.read().decode(charset, errors="replace"))
+
+    def _with_ref(self, url: str, ref: str | None) -> str:
+        token = (ref or "").strip()
+        if not token:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}ref={urllib.parse.quote(token)}"
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -505,6 +588,7 @@ class GitHubToolbox:
         anchor_text: str,
         symbol_name: str = "",
         prefer_assert: bool = False,
+        ref: str | None = None,
     ) -> list[dict[str, Any]]:
         enriched = []
         seen_paths: set[str] = set()
@@ -517,6 +601,7 @@ class GitHubToolbox:
                 owner,
                 repo,
                 path,
+                ref,
                 anchor_text=anchor_text,
                 symbol_name=symbol_name,
                 prefer_assert=prefer_assert,
@@ -538,6 +623,157 @@ class GitHubToolbox:
             if len(enriched) >= EXPANDED_ITEM_LIMIT:
                 break
         return enriched
+
+    @functools.lru_cache(maxsize=128)
+    def _fetch_repo_tree_for_ref(self, owner: str, repo: str, prefix: str, ref: str) -> dict[str, Any]:
+        endpoint = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{urllib.parse.quote(ref)}?recursive=1"
+        try:
+            payload = self._github_json(endpoint)
+            tree = payload.get("tree", []) if isinstance(payload, dict) else []
+            normalized_prefix = prefix.strip("/")
+            entries = []
+            for item in tree:
+                path = (item.get("path") or "").strip("/")
+                if not path:
+                    continue
+                if normalized_prefix and not (path == normalized_prefix or path.startswith(normalized_prefix + "/")):
+                    continue
+                item_type = item.get("type")
+                entries.append(
+                    {
+                        "name": os.path.basename(path),
+                        "path": path,
+                        "type": "file" if item_type == "blob" else "dir" if item_type == "tree" else item_type,
+                    }
+                )
+            return {"ok": True, "prefix": normalized_prefix, "count": len(entries), "entries": entries, "ref": ref}
+        except Exception as exc:
+            error_text = f"historical_ref_missing: {exc}" if not self._ref_exists(owner, repo, ref) else str(exc)
+            return {"ok": False, "prefix": prefix, "error": error_text, "entries": [], "ref": ref}
+
+    @functools.lru_cache(maxsize=512)
+    def _ref_exists(self, owner: str, repo: str, ref: str) -> bool:
+        endpoint = f"https://api.github.com/repos/{owner}/{repo}/commits/{urllib.parse.quote(ref)}"
+        try:
+            self._github_json(endpoint)
+            return True
+        except Exception:
+            return False
+
+    def _scan_historical_tree_for_matches(
+        self,
+        owner: str,
+        repo: str,
+        ref: str,
+        query_token: str,
+        symbol_name: str,
+        per_page: int,
+        candidate_kind: str,
+        current_path: str = "",
+    ) -> list[dict[str, Any]]:
+        tree_payload = self._fetch_repo_tree_for_ref(owner, repo, "", ref)
+        if not tree_payload.get("ok"):
+            return []
+
+        scored_paths = []
+        for item in tree_payload.get("entries", []):
+            path = item.get("path") or ""
+            if item.get("type") != "file" or not self._looks_like_source_file(path):
+                continue
+            score = self._historical_candidate_score(path, query_token, symbol_name, candidate_kind, current_path)
+            if score <= 0:
+                continue
+            scored_paths.append((score, path))
+
+        scored_paths.sort(key=lambda pair: (-pair[0], pair[1]))
+        candidate_budget = max(per_page * 3, EXPANDED_ITEM_LIMIT)
+        anchor_text = f"{symbol_name}(" if candidate_kind == "callsite" and symbol_name else query_token
+        prefer_assert = candidate_kind == "test"
+
+        enriched = []
+        for _, path in scored_paths[:candidate_budget]:
+            snippet = self._fetch_code_snippet(
+                owner,
+                repo,
+                path,
+                ref,
+                anchor_text=anchor_text,
+                symbol_name=symbol_name if candidate_kind == "callsite" else "",
+                prefer_assert=prefer_assert,
+                window=SNIPPET_WINDOW,
+                max_chars=SNIPPET_CHAR_LIMIT,
+            )
+            excerpt = snippet.get("excerpt") or ""
+            if candidate_kind == "callsite" and symbol_name and symbol_name not in excerpt:
+                continue
+            if candidate_kind == "test" and not (snippet.get("match_reason") != "file_start" or query_token.lower() in path.lower()):
+                continue
+            enriched.append(
+                {
+                    "name": os.path.basename(path),
+                    "path": path,
+                    "sha": snippet.get("sha"),
+                    "html_url": f"https://github.com/{owner}/{repo}/blob/{ref}/{path}",
+                    "score": None,
+                    "snippet_ok": snippet.get("ok", False),
+                    "match_reason": snippet.get("match_reason"),
+                    "start_line": snippet.get("start_line"),
+                    "end_line": snippet.get("end_line"),
+                    "excerpt": excerpt,
+                    "symbol_name": snippet.get("symbol_name"),
+                    "symbol_type": snippet.get("symbol_type"),
+                }
+            )
+            if len(enriched) >= min(per_page, EXPANDED_ITEM_LIMIT):
+                break
+        return enriched
+
+    def _historical_candidate_score(
+        self,
+        path: str,
+        query_token: str,
+        symbol_name: str,
+        candidate_kind: str,
+        current_path: str,
+    ) -> int:
+        lowered_path = (path or "").lower()
+        token = (query_token or "").lower()
+        symbol = (symbol_name or "").lower()
+        current = (current_path or "").replace("\\", "/").lower()
+        basename = os.path.basename(lowered_path)
+        score = 0
+
+        if candidate_kind == "test":
+            if not self._is_test_path(path):
+                return 0
+            score += 3
+            if token and token in lowered_path:
+                score += 4
+            if symbol and symbol in lowered_path:
+                score += 2
+            if basename.startswith("test_") or basename.endswith("_test.py"):
+                score += 1
+            return score
+
+        if current and lowered_path == current:
+            return 0
+        if self._is_test_path(path):
+            score -= 1
+        if symbol and symbol in basename:
+            score += 5
+        elif symbol and symbol in lowered_path:
+            score += 3
+        if token and token in lowered_path:
+            score += 2
+        if current:
+            current_prefix = os.path.dirname(current)
+            if current_prefix and lowered_path.startswith(current_prefix):
+                score += 2
+        return score
+
+    def _looks_like_source_file(self, path: str) -> bool:
+        lowered = (path or "").lower()
+        return lowered.endswith((".py", ".pyi")) or self._is_test_path(lowered)
 
     def _extract_best_snippet(
         self,

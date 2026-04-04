@@ -182,7 +182,10 @@ class LangGraphSATDWorkflow:
         return any(keyword in reject_signal for keyword in retry_keywords)
 
     def run_record(self, record: SATDRecord):
-        self._log(f"[task {record.task_id}] start project={record.project} file={record.file_path}")
+        self._log(
+            f"[task {record.task_id}] start project={record.project} file={record.file_path} "
+            f"commit={(record.commit or '')[:12]}"
+        )
         initial_state = record_to_graph_input(record, self.max_rounds)
         initial_state["github_context"] = self._load_or_build_base_context(initial_state)
         final_state = self.graph.invoke(initial_state)
@@ -280,7 +283,7 @@ class LangGraphSATDWorkflow:
 
     def _write_trajectory_overview_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
+            "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
@@ -306,6 +309,8 @@ class LangGraphSATDWorkflow:
             "task_id": trace.task_id,
             "project": trace.project,
             "file_path": trace.file_path,
+            "commit": trace.commit,
+            "context_commit": metadata.get("context_commit"),
             "status": trace.status,
             "workflow_output": "YES" if trace.status == "accepted" else "NO",
             "drop_stage": self._drop_stage(trace),
@@ -397,7 +402,7 @@ class LangGraphSATDWorkflow:
 
     def _write_results_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
+            "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
@@ -437,7 +442,7 @@ class LangGraphSATDWorkflow:
 
     def _write_github_context_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "repo_owner", "repo_name", "file_path", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
+            "task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
             "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "base_context_json", "repair_context_json", "review_context_json",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -450,6 +455,8 @@ class LangGraphSATDWorkflow:
                     "repo_owner": context.get("repo_owner"),
                     "repo_name": context.get("repo_name"),
                     "file_path": context.get("file_path"),
+                    "commit": trace.commit,
+                    "context_commit": metadata.get("context_commit"),
                     "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                     "github_evidence_strength": metadata.get("github_evidence_strength"),
                     "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
@@ -473,7 +480,7 @@ class LangGraphSATDWorkflow:
 
     def _write_context_cache_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
+            "task_id", "commit", "context_commit", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
             "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -483,6 +490,8 @@ class LangGraphSATDWorkflow:
                 _, metadata = self._trace_context_metadata(trace)
                 writer.writerow({
                     "task_id": trace.task_id,
+                    "commit": trace.commit,
+                    "context_commit": metadata.get("context_commit"),
                     "cache_file": str(self._context_cache_file(trace.task_id)),
                     "base_cached": metadata.get("base_cached"),
                     "base_cache_source": metadata.get("base_cache_source"),
@@ -530,7 +539,7 @@ class LangGraphSATDWorkflow:
 
     def _append_trajectory_overview_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
+            "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
@@ -545,7 +554,7 @@ class LangGraphSATDWorkflow:
 
     def _append_results_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
+            "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
@@ -580,7 +589,7 @@ class LangGraphSATDWorkflow:
 
     def _append_github_context_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "repo_owner", "repo_name", "file_path", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
+            "task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
             "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "base_context_json", "repair_context_json", "review_context_json",
         ]
         rows = []
@@ -591,6 +600,8 @@ class LangGraphSATDWorkflow:
                 "repo_owner": context.get("repo_owner"),
                 "repo_name": context.get("repo_name"),
                 "file_path": context.get("file_path"),
+                "commit": trace.commit,
+                "context_commit": metadata.get("context_commit"),
                 "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                 "github_evidence_strength": metadata.get("github_evidence_strength"),
                 "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
@@ -615,7 +626,7 @@ class LangGraphSATDWorkflow:
 
     def _append_context_cache_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
+            "task_id", "commit", "context_commit", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
             "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
         ]
         rows = []
@@ -623,6 +634,8 @@ class LangGraphSATDWorkflow:
             _, metadata = self._trace_context_metadata(trace)
             rows.append({
                 "task_id": trace.task_id,
+                "commit": trace.commit,
+                "context_commit": metadata.get("context_commit"),
                 "cache_file": str(self._context_cache_file(trace.task_id)),
                 "base_cached": metadata.get("base_cached"),
                 "base_cache_source": metadata.get("base_cache_source"),

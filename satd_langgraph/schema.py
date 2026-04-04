@@ -18,6 +18,7 @@ class SATDRecord:
     user: str
     project: str
     file_path: str
+    commit: str
     em_label: str
 
 
@@ -80,6 +81,7 @@ class WorkflowTrace:
     task_id: str
     project: str
     file_path: str
+    commit: str
     satd_comment: str
     original_code: str
     processed_manual_code: str
@@ -107,6 +109,7 @@ class GraphState(TypedDict):
     user: str
     project: str
     file_path: str
+    commit: str
     status: str
     round_id: int
     max_rounds: int
@@ -159,6 +162,7 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         user=record.user,
         project=record.project,
         file_path=record.file_path,
+        commit=record.commit,
         status="pending",
         round_id=0,
         max_rounds=max_rounds,
@@ -236,6 +240,7 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         task_id=state["task_id"],
         project=state["project"],
         file_path=state["file_path"],
+        commit=state["commit"],
         satd_comment=state["satd_comment"],
         original_code=state["original_code"],
         processed_manual_code=processed_manual_code,

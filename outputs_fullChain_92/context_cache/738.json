@@ -1,0 +1,185 @@
+{
+  "task_id": "738",
+  "repo_owner": "agronholm",
+  "repo_name": "apscheduler",
+  "file_path": "src/apscheduler/datastores/sync/sqlalchemy.py",
+  "commit": "19d75e196aea88032e68535352bbdd9f528a214f",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T04:47:29+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "19d75e196aea88032e68535352bbdd9f528a214f",
+    "symbol_name": "remove_schedules",
+    "satd_line": 198,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 1,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T04:47:29+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/apscheduler/datastores/sync/sqlalchemy.py",
+    "original_signature": "async def remove_schedules(self, ids: Iterable[str]) -> None:",
+    "target_file": {
+      "ok": true,
+      "path": "src/apscheduler/datastores/sync/sqlalchemy.py",
+      "sha": "dbc286e78b52c23665c9835720114063f9a16a11",
+      "download_url": "https://raw.githubusercontent.com/agronholm/apscheduler/19d75e196aea88032e68535352bbdd9f528a214f/src/apscheduler/datastores/sync/sqlalchemy.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport logging\nfrom datetime import datetime, timedelta, timezone\nfrom typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, Union\nfrom uuid import UUID\n\nfrom sqlalchemy import (\n    Column, Integer, LargeBinary, MetaData, Table, Unicode, and_, bindparam, or_, select)\nfrom sqlalchemy.engine import URL, Connectable\nfrom sqlalchemy.exc import CompileError, IntegrityError\nfrom sqlalchemy.future import create_engine\nfrom sqlalchemy.sql.ddl import DropTable\n\nfrom ...abc import DataStore, Job, Schedule, Serializer\nfrom ...events import (\n    Event, EventHub, JobAdded, JobDeserializationFailed, ScheduleAdded,\n    ScheduleDeserializationFailed, ScheduleRemoved, ScheduleUpdated, SubscriptionToken)\nfrom ...exceptions import ConflictingIdError, SerializationError\nfrom ...policies import ConflictPolicy\nfrom ...serializers.pickle import PickleSerializer\nfrom ...structures import JobResult\nfrom ...util import reentrant\n\nlogger = logging.getLogger(__name__)\n\n\n@reentrant\nclass SQLAlchemyDataStore(DataStore):\n    def __init__(self, bind: Connectable, *, schema: Optional[str] = None,\n                 serializer: Optional[Serializer] = None,\n                 lock_expiration_delay: float = 30, max_poll_time: Optional[float] = 1,\n                 max_idle_time: float = 60, start_from_scratch: bool = False):\n        self.bind = bind\n        self.schema = schema\n        self.serializer = serializer or PickleSerializer()\n        self.lock_expiration_delay = lock_expiration_delay\n        self.max_poll_time = max_poll_time\n        self.max_idle_time = max_idle_time\n        self.start_from_scratch = start_from_scratch\n        self._logger = logging.getLogger(__name__)\n        self._events = EventHub()\n\n        # Generate the table definitions\n        self._metadata = self.get_table_definitions()\n        self.t_metadata = self._metadata.tables['metadata']\n        self.t_schedules = self._metadata.tables['schedules']\n        self.t_jobs = self._metadata.tables['jobs']\n        self.t_job_results = self._metadata.tables['job_results']\n\n        # Find out if the dialect supports RETURNING\n        statement = self.t_jobs.update().returning(self.t_schedules.c.id)\n        try:\n            statement.compile(bind=self.bind)\n        except CompileError:\n            self._supports_update_returning = False\n        else:\n            self._supports_update_returning = True\n\n    @classmethod\n    def from_url(cls, url: Union[str, URL], **options) -> 'SQLAlchemyDataStore':\n        engine = create_engine(url)\n        return cls(engine, **options)\n\n    def __enter__(self):\n        with self.bind.begin() as conn:\n            if self.start_from_scratch:\n                for table in self._metadata.sorted_tables:\n                    conn.execute(DropTable(table, if_exists=True))\n\n            self._metadata.create_all(conn)\n            query = select(self.t_metadata.c.schema_version)\n            result = conn.execute(query)\n            version = result.scalar()\n            if version is None:\n                conn.execute(self.t_metadata.insert(values={'schema_version': 1}))\n            elif version > 1:\n                raise RuntimeError(f'Unexpected schema version ({version}); '\n                                   f'only version 1 is supported by this version of APScheduler')\n\n        self._events.__enter__()\n        return self\n\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        self._events.__exit__(exc_type, exc_val, exc_tb)\n\n    def get_table_definitions(self) -> MetaData:\n        if self.bind.dialect.name in ('mysql', 'mariadb'):\n            from sqlalchemy.dialects.mysql import TIMESTAMP\n            timestamp_type = TIMESTAMP(fsp=6)\n        else:\n            from sqlalchemy.types import TIMESTAMP\n            timestamp_type = TIMESTAMP(timezone=True)\n\n        metadata = MetaData()\n        Table(\n            'metadata',\n            metadata,\n            Column('schema_version', Integer, nullable=False)\n        )\n        Table(\n            'tasks',\n            metadata,\n            Column('id', Unicode(500), primary_key=True),\n            Column('serialized_data', LargeBinary, nullable=False)\n        )\n        Table(\n            'schedules',\n            metadata,\n            Column('id', Unicode(500), primary_key=True),\n            Column('task_id', Unicode(500), nullable=False, index=True),\n            Column('serialized_data', LargeBinary, nullable=False),\n            Column('next_fire_time', timestamp_type, index=True),\n            Column('acquired_by', Unicode(500)),\n            Column('acquired_until', timestamp_type)\n        )\n        Table(\n            'jobs',\n            metadata,\n            Column('id', Unicode(32), primary_key=True),\n            Column('task_id', Unicode(500), nullable=False, index=True),\n            Column('serialized_data', LargeBinary, nullable=False),\n            Column('created_at', timestamp_type, nullable=False),\n            Column('acquired_by', Unicode(500)),\n            Column('acquired_until', timestamp_type)\n        )\n        Table(\n            'job_results',\n            metadata,\n            Column('job_id', Unicode(32), primary_key=True),\n            Column('finished_at', timestamp_type, index=True),\n            Column('serialized_data', LargeBinary, nullable=False)\n        )\n        return metadata\n\n    def _deserialize_jobs(self, serialized_jobs: Iterable[Tuple[UUID, bytes]]) -> List[Job]:\n        jobs: List[Job] = []\n        for job_id, serialized_data in serialized_jobs:\n            try:\n                jobs.append(self.serializer.deserialize(serialized_data))\n            except SerializationError as exc:\n                self._events.publish(JobDeserializationFailed(job_id=job_id, exception=exc))\n\n        return jobs\n\n    def _deserialize_schedules(\n            self, serialized_schedules: Iterable[Tuple[str, bytes]]) -> List[Schedule]:\n        jobs: List[Schedule] = []\n        for schedule_id, serialized_data in serialized_schedules:\n            try:\n                jobs.append(self.serializer.deserialize(serialized_data))\n            except SerializationError as exc:\n                self._events.publish(\n                    ScheduleDeserializationFailed(schedule_id=schedule_id, exception=exc))\n\n        return jobs\n\n    def subscribe(self, callback: Callable[[Event], Any],\n                  event_types: Optional[Iterable[Type[Event]]] = None) -> SubscriptionToken:\n        return self._events.subscribe(callback, event_types)\n\n    def unsubscribe(self, token: SubscriptionToken) -> None:\n        self._events.unsubscribe(token)\n\n    def add_schedule(self, schedule: Schedule, conflict_policy: ConflictPolicy) -> None:\n        serialized_data = self.serializer.serialize(schedule)\n        statement = self.t_schedules.insert().\\\n            values(id=schedule.id, task_id=schedule.task_id, serialized_data=serialized_data,\n                   next_fire_time=schedule.next_fire_time)\n        try:\n            with self.bind.begin() as conn:\n                conn.execute(statement)\n                event = ScheduleAdded(schedule_id=schedule.id,\n                                      next_fire_time=schedule.next_fire_time)\n                self._events.publish(event)\n        except IntegrityError:\n            if conflict_policy is ConflictPolicy.exception:\n                raise ConflictingIdError(schedule.id) from None\n            elif conflict_policy is ConflictPolicy.replace:\n                statement = self.t_schedules.update().\\\n                    where(self.t_schedules.c.id == schedule.id).\\\n                    values(serialized_data=serialized_data,\n                           next_fire_time=schedule.next_fire_time)\n                with self.bind.begin() as conn:\n                    conn.execute(statement)\n\n                event = ScheduleUpdated(schedule_id=schedule.id,\n                                        next_fire_time=schedule.next_fire_time)\n                self._events.publish(event)\n\n    def remove_schedules(self, ids: Iterable[str]) -> None:\n        with self.bind.begin() as conn:\n            statement = self.t_schedules.delete().where(self.t_schedules.c.id.in_(ids))\n            if self._supports_update_returning:\n                statement = statement.returning(self.t_schedules.c.id)\n                removed_ids = [row[0] for row in conn.execute(statement)]\n            else:\n                # TODO: actually check which rows were deleted?\n                conn.execute(statement)\n                removed_ids = ids\n\n        for schedule_id in removed_ids:\n            self._events.publish(ScheduleRemoved(schedule_id=schedule_id))\n\n    def get_schedules(self, ids: Optional[Set[str]] = None) -> List[Schedule]:\n        query = select([self.t_schedules.c.id, self.t_schedules.c.serialized_data]).\\\n            order_by(self.t_schedules.c.id)\n        if ids:\n            query = query.where(self.t_schedules.c.id.in_(ids))\n\n        with self.bind.begin() as conn:\n            result = conn.execute(query)\n            return self._deserialize_schedules(result)\n\n    def acquire_schedules(self, scheduler_id: str, limit: int) -> List[Schedule]:\n        with self.bind.begin() as conn:\n            now = datetime.now(timezone.utc)\n            acquired_until = now + timedelta(seconds=self.lock_expiration_delay)\n            schedules_cte = select(self.t_schedules.c.id).\\\n                where(and_(self.t_schedules.c.next_fire_time.isnot(None),\n                           self.t_schedules.c.next_fire_time <= now,\n                           or_(self.t_schedules.c.acquired_until.is_(None),\n                               self.t_schedules.c.acquired_until < now))).\\\n                order_by(self.t_schedules.c.next_fire_time).\\\n                limit(limit).cte()\n            subselect = select([schedules_cte.c.id])\n            statement = self.t_schedules.update().\\\n                where(self.t_schedules.c.id.in_(subselect)).\\\n                values(acquired_by=scheduler_id, acquired_until=acquired_until)\n            if self._supports_update_returning:\n                statement = statement.returning(self.t_schedules.c.id,\n                                                self.t_schedules.c.serialized_data)\n            else:\n                conn.execute(statement)\n                statement = select([self.t_schedules.c.id, self.t_schedules.c.serialized_data]).\\\n                    where(and_(self.t_schedules.c.acquired_by == scheduler_id))\n\n            result = conn.execute(statement)\n            schedules = self._deserialize_schedules(result)\n\n        return schedules\n\n    def release_schedules(self, scheduler_id: str, schedules: List[Schedule]) -> None:\n        with self.bind.begin() as conn:\n            update_events: List[ScheduleUpdated] = []\n            finished_schedule_ids: List[str] = []\n            update_args: List[Dict[str, Any]] = []\n            for schedule in schedules:\n                if schedule.next_fire_time is not None:\n                    try:\n                        serialized_data = self.serializer.serialize(schedule)\n                    except SerializationError:\n                        self._logger.exception('Error serializing schedule %r – '\n                                               'removing from data store', schedule.id)\n                        finished_schedule_ids.append(schedule.id)\n                        continue\n\n                    update_args.append({\n                        'p_id': schedule.id,\n                        'p_serialized_data': serialized_data,\n                        'p_next_fire_time': schedule.next_fire_time\n                    })\n                else:\n                    finished_schedule_ids.append(schedule.id)\n\n            # Update schedules that have a next fire time\n            if update_args:\n                p_id = bindparam('p_id')\n                p_serialized = bindparam('p_serialized_data')\n                p_next_fire_time = bindparam('p_next_fire_time')\n                statement = se",
+      "total_lines": 376,
+      "ref": "19d75e196aea88032e68535352bbdd9f528a214f"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "remove_schedules",
+      "class_name": "SQLAlchemyDataStore",
+      "start_line": 191,
+      "end_line": 203,
+      "satd_line": 198,
+      "matched_by": "signature_or_comment",
+      "source": "    def remove_schedules(self, ids: Iterable[str]) -> None:\n        with self.bind.begin() as conn:\n            statement = self.t_schedules.delete().where(self.t_schedules.c.id.in_(ids))\n            if self._supports_update_returning:\n                statement = statement.returning(self.t_schedules.c.id)\n                removed_ids = [row[0] for row in conn.execute(statement)]\n            else:\n                # TODO: actually check which rows were deleted?\n                conn.execute(statement)\n                removed_ids = ids\n\n        for schedule_id in removed_ids:\n            self._events.publish(ScheduleRemoved(schedule_id=schedule_id))",
+      "calls": [
+        "ScheduleRemoved"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "_events",
+        "_supports_update_returning",
+        "bind",
+        "t_schedules"
+      ],
+      "global_uses": [
+        "Iterable",
+        "ScheduleRemoved",
+        "removed_ids",
+        "row"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "release_schedules",
+          "class_name": "SQLAlchemyDataStore",
+          "start_line": 243,
+          "end_line": 300,
+          "relevance": [
+            "keyword_source_overlap=5",
+            "same_class"
+          ],
+          "source": "    def release_schedules(self, scheduler_id: str, schedules: List[Schedule]) -> None:\n        with self.bind.begin() as conn:\n            update_events: List[ScheduleUpdated] = []\n            finished_schedule_ids: List[str] = []\n            update_args: List[Dict[str, Any]] = []\n            for schedule in schedules:\n                if schedule.next_fire_time is not None:\n                    try:\n                        serialized_data = self.serializer.serialize(schedule)\n                    except SerializationError:\n                        self._logger.exception('Error serializing schedule %r – '\n                                               'removing from data store', schedule.id)\n                        finished_schedule_ids.append(schedule.id)\n                        continue\n\n                    update_args.append({\n                        'p_id': schedule.id,\n                        'p_serialized_data': serialized_data,\n                        'p_next_fire_time': schedule.next_fire_time\n                    })\n                else:\n                    finished_schedule_ids.append(schedule.id)\n\n            # Update schedules that have a next fire time\n            if update_args:\n                p_id = bindparam('p_id')\n                p_serialized = bindparam('p_serialized_data')\n                p_next_fire_time = bindparam('p_next_fire_time')\n                statement = self.t_schedules.update().\\\n                    where(and_(self.t_schedules.c.id == p_id,\n                               self.t_schedules.c.acquired_by == scheduler_id)).\\\n                    values(serialized_data=p_serialized, next_fire_time=p_next_fire_time,\n                           acquired_by=None, acquired_until=None)\n                next_fire_times = {arg['p_id']: arg['p_next_fire_time'] for arg in update_args}\n                if self._supports_update_returning:\n                    statement = statement.returning(self.t_schedules.c.id)\n                    updated_ids = [row[0] for row in conn.execute(statement, update_args)]\n                else:\n                    # TODO: actually check which rows were updated?\n                    conn.execute(statement, update_args)\n                    updated_ids = list(next_fire_times)\n\n                for schedule_id in updated_ids:\n                    event = ScheduleUpdated(schedule_id=schedule_id,\n                                            next_fire_time=next_fire_times[schedule_id])\n                    update_events.append(event)\n\n            # Remove schedules that have no next fire time or failed to serialize\n            if finished_schedule_ids:\n                statement = self.t_schedules.delete().\\\n                    where(self.t_schedules.c.id.in_(finished_schedule_ids))\n                conn.execute(statement)\n\n        for event in update_events:\n            self._events.publish(event)\n\n        for schedule_id in finished_schedule_ids:\n            self._events.publish(ScheduleRemoved(schedule_id=schedule_id))"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "SQLAlchemyDataStore",
+      "related_methods_count": 2,
+      "related_attributes_count": 3,
+      "related_methods": [
+        {
+          "symbol_name": "release_schedules",
+          "start_line": 243,
+          "end_line": 300,
+          "relevance": [
+            "shared_attrs=4",
+            "keyword_source_overlap=5"
+          ],
+          "source": "    def release_schedules(self, scheduler_id: str, schedules: List[Schedule]) -> None:\n        with self.bind.begin() as conn:\n            update_events: List[ScheduleUpdated] = []\n            finished_schedule_ids: List[str] = []\n            update_args: List[Dict[str, Any]] = []\n            for schedule in schedules:\n                if schedule.next_fire_time is not None:\n                    try:\n                        serialized_data = self.serializer.serialize(schedule)\n                    except SerializationError:\n                        self._logger.exception('Error serializing schedule %r – '\n                                               'removing from data store', schedule.id)\n                        finished_schedule_ids.append(schedule.id)\n                        continue\n\n                    update_args.append({\n                        'p_id': schedule.id,\n                        'p_serialized_data': serialized_data,\n                        'p_next_fire_time': schedule.next_fire_time\n                    })\n                else:\n                    finished_schedule_ids.append(schedule.id)\n\n            # Update schedules that have a next fire time\n            if update_args:\n                p_id = bindparam('p_id')\n                p_serialized = bindparam('p_serialized_data')\n                p_next_fire_time = bindparam('p_next_fire_time')\n                statement = self.t_schedules.update().\\\n                    where(and_(self.t_schedules.c.id == p_id,\n                               self.t_schedules.c.acquired_by == scheduler_id)).\\\n                    values(serialized_data=p_serialized, next_fire_time=p_next_fire_time,\n                           acquired_by=None, acquired_until=None)\n                next_fire_times = {arg['p_id']: arg['p_next_fire_time'] for arg in update_args}\n                if self._supports_update_returning:\n                    statement = statement.returning(self.t_schedules.c.id)\n                    updated_ids = [row[0] for row in conn.execute(statement, update_args)]\n                else:\n                    # TODO: actually check which rows were updated?\n                    conn.execute(statement, update_args)\n                    updated_ids = list(next_fire_times)\n\n                for schedule_id in updated_ids:\n                    event = ScheduleUpdated(schedule_id=schedule_id,\n                                            next_fire_time=next_fire_times[schedule_id])\n                    update_events.append(event)\n\n            # Remove schedules that have no next fire time or failed to serialize\n            if finished_schedule_ids:\n                statement = self.t_schedules.delete().\\\n                    where(self.t_schedules.c.id.in_(finished_schedule_ids))\n                conn.execute(statement)\n\n        for event in update_events:\n            self._events.publish(event)\n\n        for schedule_id in finished_schedule_ids:\n            self._events.publish(ScheduleRemoved(schedule_id=schedule_id))"
+        },
+        {
+          "symbol_name": "__init__",
+          "start_line": 30,
+          "end_line": 58,
+          "relevance": [
+            "shared_attrs=4"
+          ],
+          "source": "    def __init__(self, bind: Connectable, *, schema: Optional[str] = None,\n                 serializer: Optional[Serializer] = None,\n                 lock_expiration_delay: float = 30, max_poll_time: Optional[float] = 1,\n                 max_idle_time: float = 60, start_from_scratch: bool = False):\n        self.bind = bind\n        self.schema = schema\n        self.serializer = serializer or PickleSerializer()\n        self.lock_expiration_delay = lock_expiration_delay\n        self.max_poll_time = max_poll_time\n        self.max_idle_time = max_idle_time\n        self.start_from_scratch = start_from_scratch\n        self._logger = logging.getLogger(__name__)\n        self._events = EventHub()\n\n        # Generate the table definitions\n        self._metadata = self.get_table_definitions()\n        self.t_metadata = self._metadata.tables['metadata']\n        self.t_schedules = self._metadata.tables['schedules']\n        self.t_jobs = self._metadata.tables['jobs']\n        self.t_job_results = self._metadata.tables['job_results']\n\n        # Find out if the dialect supports RETURNING\n        statement = self.t_jobs.update().returning(self.t_schedules.c.id)\n        try:\n            statement.compile(bind=self.bind)\n        except CompileError:\n            self._supports_update_returning = False\n        else:\n            self._supports_update_returning = True"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "bind",
+          "start_line": 33,
+          "end_line": 35,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "                 max_idle_time: float = 60, start_from_scratch: bool = False):\n        self.bind = bind\n        self.schema = schema"
+        },
+        {
+          "attribute": "_events",
+          "start_line": 41,
+          "end_line": 43,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        self._logger = logging.getLogger(__name__)\n        self._events = EventHub()\n"
+        },
+        {
+          "attribute": "t_schedules",
+          "start_line": 46,
+          "end_line": 48,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        self.t_metadata = self._metadata.tables['metadata']\n        self.t_schedules = self._metadata.tables['schedules']\n        self.t_jobs = self._metadata.tables['jobs']"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "release_schedules",
+          "class_name": "SQLAlchemyDataStore",
+          "start_line": 243,
+          "end_line": 300,
+          "source": "    def release_schedules(self, scheduler_id: str, schedules: List[Schedule]) -> None:\n        with self.bind.begin() as conn:\n            update_events: List[ScheduleUpdated] = []\n            finished_schedule_ids: List[str] = []\n            update_args: List[Dict[str, Any]] = []\n            for schedule in schedules:\n                if schedule.next_fire_time is not None:\n                    try:\n                        serialized_data = self.serializer.serialize(schedule)\n                    except SerializationError:\n                        self._logger.exception('Error serializing schedule %r – '\n                                               'removing from data store', schedule.id)\n                        finished_schedule_ids.append(schedule.id)\n                        continue\n\n                    update_args.append({\n                        'p_id': schedule.id,\n                        'p_serialized_data': serialized_data,\n                        'p_next_fire_time': schedule.next_fire_time\n                    })\n                else:\n                    finished_schedule_ids.append(schedule.id)\n\n            # Update schedules that have a next fire time\n            if update_args:\n                p_id = bindparam('p_id')\n                p_serialized = bindparam('p_serialized_data')\n                p_next_fire_time = bindparam('p_next_fire_time')\n                statement = self.t_schedules.update().\\\n                    where(and_(self.t_schedules.c.id == p_id,\n                               self.t_schedules.c.acquired_by == scheduler_id)).\\\n                    values(serialized_data=p_serialized, next_fire_time=p_next_fire_time,\n                           acquired_by=None, acquired_until=None)\n                next_fire_times = {arg['p_id']: arg['p_next_fire_time'] for arg in update_args}\n                if self._supports_update_returning:\n                    statement = statement.returning(self.t_schedules.c.id)\n                    updated_ids = [row[0] for row in conn.execute(statement, update_args)]\n                else:\n                    # TODO: actually check which rows were updated?\n                    conn.execute(statement, update_args)\n                    updated_ids = list(next_fire_times)\n\n                for schedule_id in updated_ids:\n                    event = ScheduleUpdated(schedule_id=schedule_id,\n                                            next_fire_time=next_fire_times[schedule_id])\n                    update_events.append(event)\n\n            # Remove schedules that have no next fire time or failed to serialize\n            if finished_schedule_ids:\n                statement = self.t_schedules.delete().\\\n                    where(self.t_schedules.c.id.in_(finished_schedule_ids))\n                conn.execute(statement)\n\n        for event in update_events:\n            self._events.publish(event)\n\n        for schedule_id in finished_schedule_ids:\n            self._events.publish(ScheduleRemoved(schedule_id=schedule_id))"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

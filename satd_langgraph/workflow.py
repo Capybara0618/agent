@@ -23,15 +23,21 @@ class LangGraphSATDWorkflow:
         model: str = "gpt-4o-mini",
         verbose: bool = False,
         write_batch_size: int = 10,
+        use_analyzer: bool = False,
+        use_reviewer: bool = False,
+        repair_prompt_mode: str = "lightweight",
     ) -> None:
         self.max_rounds = max_rounds
         self.model = model
         self.verbose = verbose
         self.write_batch_size = write_batch_size
+        self.use_analyzer = use_analyzer
+        self.use_reviewer = use_reviewer
+        self.repair_prompt_mode = repair_prompt_mode
         client = OpenAICompatClient(model=model)
         self.context_client = client
         self.analyzer = OpenAIAnalyzer(client)
-        self.fixer = OpenAIFixer(client)
+        self.fixer = OpenAIFixer(client, prompt_mode=repair_prompt_mode)
         self.reviewer = OpenAIReviewer(client)
         self.graph = self._build_graph()
         self._current_output_dir: Path | None = None
@@ -53,15 +59,19 @@ class LangGraphSATDWorkflow:
 
     def _analyze_node(self, state: GraphState) -> dict:
         self._log(f"[task {state['task_id']}] analyze start")
-        context_bundle = state.get("github_context") or self._load_or_build_base_context(state)
-        try:
-            analysis = self.analyzer.run({**state, "github_context": context_bundle})
-        except Exception as exc:
-            if self.context_client._is_content_filter_error(exc):
-                self._log(f"[task {state['task_id']}] analyze content-filtered; using fallback drop")
-                analysis = self._fallback_analysis(context_bundle)
-            else:
-                raise
+        context_bundle = state.get("github_context") or self._load_or_build_shared_context(state)
+        if self.use_analyzer:
+            try:
+                analysis = self.analyzer.run({**state, "github_context": context_bundle})
+            except Exception as exc:
+                if self.context_client._is_content_filter_error(exc):
+                    self._log(f"[task {state['task_id']}] analyze content-filtered; using fallback drop")
+                    analysis = self._fallback_analysis(context_bundle, reason="analyzer_content_filter")
+                else:
+                    self._log(f"[task {state['task_id']}] analyze exception type={type(exc).__name__}; using fallback drop")
+                    analysis = self._fallback_analysis(context_bundle, reason=f"analyzer_exception:{type(exc).__name__}")
+        else:
+            analysis = self._bypass_analysis(state, context_bundle)
         self._log(
             f"[task {state['task_id']}] analyze done decision={analysis.decision} "
             f"repairable={analysis.repairable} score={analysis.repairability_score:.2f} "
@@ -72,19 +82,21 @@ class LangGraphSATDWorkflow:
     def _repair_node(self, state: GraphState) -> dict:
         next_round = state["round_id"] + 1
         self._log(f"[task {state['task_id']}] repair start round={next_round}")
-        context_bundle = self._ensure_repair_context_cache(state)
+        context_bundle = self._load_or_build_shared_context(state)
         try:
             repair = self.fixer.run({**state, "github_context": context_bundle})
         except Exception as exc:
             if self.context_client._is_content_filter_error(exc):
                 self._log(f"[task {state['task_id']}] repair content-filtered; using fallback no-op repair")
-                repair = self._fallback_repair(state, next_round)
+                repair = self._fallback_repair(state, next_round, reason="fixer_content_filter")
             else:
-                raise
+                self._log(f"[task {state['task_id']}] repair exception type={type(exc).__name__}; using fallback no-op repair")
+                repair = self._fallback_repair(state, next_round, reason=f"fixer_exception:{type(exc).__name__}")
         self._log(f"[task {state['task_id']}] repair done round={repair.round_id} scope={repair.changed_scope} conf={repair.confidence:.2f}")
         return {
             "github_context": context_bundle,
             "repair_context_used": bool((context_bundle.get("metadata") or {}).get("repair_cached")),
+            "repair_feedback": state.get("repair_feedback"),
             "status": "repairing",
             "round_id": repair.round_id,
             "latest_repair": repair,
@@ -96,17 +108,23 @@ class LangGraphSATDWorkflow:
         assert state["analysis"] is not None
         assert state["latest_repair"] is not None
         context_bundle = self._ensure_review_context_cache(state)
-        try:
-            review = self.reviewer.run({**state, "github_context": context_bundle})
-        except Exception as exc:
-            if self.context_client._is_content_filter_error(exc):
-                self._log(f"[task {state['task_id']}] review content-filtered; using fallback reject")
-                review = self._fallback_review(state)
-            else:
-                raise
+        if self.use_reviewer:
+            try:
+                review = self.reviewer.run({**state, "github_context": context_bundle})
+            except Exception as exc:
+                if self.context_client._is_content_filter_error(exc):
+                    self._log(f"[task {state['task_id']}] review content-filtered; using fallback reject")
+                    review = self._fallback_review(state, reason="review_content_filter")
+                else:
+                    self._log(f"[task {state['task_id']}] review exception type={type(exc).__name__}; using fallback reject")
+                    review = self._fallback_review(state, reason=f"review_exception:{type(exc).__name__}")
+        else:
+            review = self._bypass_review(state)
         self._log(f"[task {state['task_id']}] review done round={review.round_id} approved={review.approved} score={review.review_score:.2f}")
+        repair_feedback = None if review.approved else self._build_repair_feedback(review)
         return {
             "github_context": context_bundle,
+            "repair_feedback": repair_feedback,
             "review_strict_gate_result": "approved" if review.approved else "rejected",
             "status": "accepted" if review.approved else "review_failed",
             "latest_review": review,
@@ -118,6 +136,7 @@ class LangGraphSATDWorkflow:
         self._log(f"[task {state['task_id']}] accepted after rounds={state['round_id']}")
         return {
             "status": "accepted",
+            "repair_feedback": None,
             "review_strict_gate_result": state.get("review_strict_gate_result") or "approved",
             "final_repaired_code": state["latest_repair"].repaired_code if state["latest_repair"] else None,
         }
@@ -125,9 +144,13 @@ class LangGraphSATDWorkflow:
     def _drop_node(self, state: GraphState) -> dict:
         if state["analysis"] and not state["analysis"].repairable:
             self._log(f"[task {state['task_id']}] dropped by analyzer reason={state['analysis'].drop_reason}")
-            return {"status": "dropped_by_analyzer"}
+            return {"status": "dropped_by_analyzer", "repair_feedback": None}
         self._log(f"[task {state['task_id']}] dropped after review rounds={state['round_id']}")
-        return {"status": "dropped_after_review", "review_strict_gate_result": state.get("review_strict_gate_result") or "rejected"}
+        return {
+            "status": "dropped_after_review",
+            "repair_feedback": state.get("repair_feedback"),
+            "review_strict_gate_result": state.get("review_strict_gate_result") or "rejected",
+        }
 
     def _route_after_analysis(self, state: GraphState) -> str:
         analysis = state["analysis"]
@@ -149,37 +172,38 @@ class LangGraphSATDWorkflow:
         latest_review = state.get("latest_review")
         if latest_review is None or latest_review.approved:
             return False
-        if state["round_id"] >= state["max_rounds"]:
+        if state["round_id"] >= min(state["max_rounds"], 2):
             return False
-        reject_type = (latest_review.reject_type or "").strip().lower()
-        advice = (latest_review.revision_advice or "").strip().lower()
-        if reject_type in {"missing_evidence", "context_gap", "targeted_context_needed"} or "retrieve:" in advice:
-            return True
+        feedback = state.get("repair_feedback") or {}
+        return bool(feedback.get("can_retry"))
 
-        analysis = state.get("analysis")
-        if analysis is None:
-            return False
+    def _build_repair_feedback(self, review: ReviewResult) -> dict | None:
+        issues = []
+        seen = set()
+        for issue in review.issues:
+            cleaned = str(issue).strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            issues.append(cleaned)
+            if len(issues) >= 3:
+                break
 
-        local_retry_candidate = (
-            analysis.scope_radius in {"line", "function", "class", "file"}
-            and analysis.risk_level in {"low", "medium"}
-            and analysis.analyze_score >= 0.60
-            and latest_review.review_score >= 0.50
-        )
-        if not local_retry_candidate:
-            return False
-
-        retry_keywords = (
-            "api shape",
-            "api change",
-            "overwritten",
-            "no_change",
-            "borderline_review_confidence",
-            "comment_only_change",
-            "comment_change",
-        )
-        reject_signal = f"{reject_type} {advice}"
-        return any(keyword in reject_signal for keyword in retry_keywords)
+        reject_type = str(review.reject_type or "").strip()
+        revision_advice = str(review.revision_advice or "").strip()
+        rationale = str(review.rationale or "").strip()
+        combined = " ".join(part.lower() for part in [reject_type, revision_advice, rationale, *issues] if part)
+        feedback = {
+            "reject_type": reject_type or None,
+            "revision_advice": revision_advice or None,
+            "key_issues": issues,
+            "has_api_shape_drift": any(token in combined for token in ("api shape", "api change", "signature")),
+            "has_noop_change": any(token in combined for token in ("no-op", "no change", "comment-only", "comment only")),
+            "has_over_edit": any(token in combined for token in ("overwritten", "over-edit", "too broad", "broader", "minimality")),
+            "has_comment_only_problem": any(token in combined for token in ("comment-only", "comment only")),
+        }
+        feedback["can_retry"] = bool(feedback["reject_type"] or feedback["revision_advice"] or feedback["key_issues"])
+        return feedback if feedback["can_retry"] else None
 
     def run_record(self, record: SATDRecord):
         self._log(
@@ -187,7 +211,7 @@ class LangGraphSATDWorkflow:
             f"commit={(record.commit or '')[:12]}"
         )
         initial_state = record_to_graph_input(record, self.max_rounds)
-        initial_state["github_context"] = self._load_or_build_base_context(initial_state)
+        initial_state["github_context"] = self._load_or_build_shared_context(initial_state)
         final_state = self.graph.invoke(initial_state)
         self._log(f"[task {record.task_id}] end status={final_state['status']}")
         return trace_from_state(final_state, record.em_label)
@@ -227,6 +251,9 @@ class LangGraphSATDWorkflow:
                 summary["max_rounds"] = self.max_rounds
                 summary["written_tasks"] = len(completed_ids) + len(new_traces)
                 summary["write_batch_size"] = self.write_batch_size
+                summary["use_analyzer"] = self.use_analyzer
+                summary["use_reviewer"] = self.use_reviewer
+                summary["repair_prompt_mode"] = self.repair_prompt_mode
                 if resume and completed_ids:
                     self._append_outputs(output_dir, pending_flush_traces)
                     self._write_summary_csv(output_dir / "summary.csv", summary)
@@ -243,6 +270,9 @@ class LangGraphSATDWorkflow:
             summary["max_rounds"] = self.max_rounds
             summary["written_tasks"] = len(completed_ids)
             summary["write_batch_size"] = self.write_batch_size
+            summary["use_analyzer"] = self.use_analyzer
+            summary["use_reviewer"] = self.use_reviewer
+            summary["repair_prompt_mode"] = self.repair_prompt_mode
             self._write_summary_csv(output_dir / "summary.csv", summary)
 
         assert summary is not None
@@ -726,6 +756,12 @@ class LangGraphSATDWorkflow:
         self._persist_context_cache(state["task_id"], built)
         return built
 
+    def _load_or_build_shared_context(self, state: GraphState) -> dict:
+        bundle = self._ensure_repair_context_cache(state)
+        bundle.setdefault("metadata", {})["shared_context_mode"] = True
+        self._persist_context_cache(state["task_id"], bundle)
+        return bundle
+
     def _ensure_repair_context_cache(self, state: GraphState) -> dict:
         bundle = state.get("github_context") or self._load_or_build_base_context(state)
         before = bool((bundle.get("metadata") or {}).get("repair_cached"))
@@ -736,10 +772,10 @@ class LangGraphSATDWorkflow:
         return enriched
 
     def _ensure_review_context_cache(self, state: GraphState) -> dict:
-        bundle = state.get("github_context") or self._ensure_repair_context_cache(state)
-        enriched = self.context_client.ensure_review_context(state, bundle, state["analysis"], state["latest_repair"])
-        self._persist_context_cache(state["task_id"], enriched)
-        return enriched
+        bundle = state.get("github_context") or self._load_or_build_shared_context(state)
+        bundle.setdefault("metadata", {})["review_cache_source"] = "shared_context"
+        self._persist_context_cache(state["task_id"], bundle)
+        return bundle
 
     def _context_cache_dir(self) -> Path:
         if self._current_output_dir is None:
@@ -764,7 +800,7 @@ class LangGraphSATDWorkflow:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _fallback_analysis(self, context_bundle: dict) -> AnalysisResult:
+    def _fallback_analysis(self, context_bundle: dict, reason: str = "analyzer_fallback") -> AnalysisResult:
         metadata = context_bundle.get("metadata", {}) if isinstance(context_bundle, dict) else {}
         return AnalysisResult(
             decision="drop",
@@ -772,14 +808,14 @@ class LangGraphSATDWorkflow:
             repairability_score=0.0,
             confidence=0.0,
             satd_type="content_filtered",
-            reason="Analyzer prompt was blocked by provider content filtering.",
-            evidence_summary="Analyzer prompt was blocked by provider content filtering.",
+            reason=reason,
+            evidence_summary=f"Analyzer fallback triggered: {reason}",
             risk_level="medium",
             context_score=0.0,
             clarity_score=0.0,
             scope_radius="file",
-            validation_signals=["content_filter_fallback"],
-            context_gaps=["provider_content_filter"],
+            validation_signals=[reason],
+            context_gaps=[reason],
             followup_context_requests=[],
             repair_strategy="Do not attempt automatic repair.",
             drop_reason="insufficient_context",
@@ -787,25 +823,90 @@ class LangGraphSATDWorkflow:
             github_evidence_strength=str(metadata.get("github_evidence_strength") or "low"),
         )
 
-    def _fallback_repair(self, state: GraphState, round_id: int) -> RepairAttempt:
+    def _bypass_analysis(self, state: GraphState, context_bundle: dict) -> AnalysisResult:
+        metadata = context_bundle.get("metadata", {}) if isinstance(context_bundle, dict) else {}
+        comment = (state.get("satd_comment") or "").strip().lower()
+        satd_type = "todo"
+        repair_strategy = "Apply the smallest plausible local fix that satisfies the SATD comment."
+        if "uncomment" in comment or "re-enable" in comment:
+            satd_type = "commented_code"
+            repair_strategy = "Restore the nearby intended executable line(s) with the smallest possible edit."
+        elif "temporary" in comment or "disabled" in comment:
+            satd_type = "temporary"
+            repair_strategy = "Remove the temporary workaround or restore the intended nearby logic with a minimal change."
+        elif "default value" in comment or "set default" in comment:
+            satd_type = "default_value"
+            repair_strategy = "Change the default value in place without altering surrounding structure."
+        elif "support" in comment or "switch to" in comment or "replace by" in comment or "deprecated" in comment:
+            satd_type = "api_migration"
+            repair_strategy = "Perform the narrowest symbol or field replacement that matches the SATD comment."
+        elif "warn" in comment:
+            satd_type = "warning"
+            repair_strategy = "Add the smallest local warning or guard branch required by the SATD comment."
+
+        scope_radius = "function" if "def " in (state.get("original_code") or "") or "class " in (state.get("original_code") or "") else "file"
+        return AnalysisResult(
+            decision="repairable",
+            repairable=True,
+            repairability_score=0.75,
+            intent_clarity=0.70,
+            change_locality=0.75,
+            semantic_risk=0.35,
+            context_sufficiency=0.65,
+            verifiability=0.60,
+            analyze_score=0.72,
+            confidence=0.60,
+            satd_type=satd_type,
+            reason="Analyzer disabled; using fixer-only heuristic analysis.",
+            evidence_summary="Analyzer disabled; SATD passed directly to fixer with shared GitHub context.",
+            risk_level="medium",
+            context_score=0.65,
+            clarity_score=0.70,
+            scope_radius=scope_radius,
+            validation_signals=["analyzer_bypassed"],
+            context_gaps=[],
+            followup_context_requests=[],
+            repair_strategy=repair_strategy,
+            drop_reason=None,
+            historical_snapshot_mismatch=bool(metadata.get("historical_snapshot_mismatch")),
+            github_evidence_strength=str(metadata.get("github_evidence_strength") or "low"),
+        )
+
+    def _fallback_repair(self, state: GraphState, round_id: int, reason: str = "fixer_fallback") -> RepairAttempt:
         return RepairAttempt(
             round_id=round_id,
-            repair_plan="Fallback no-op repair because the fixer prompt was blocked by provider content filtering.",
+            repair_plan=f"Fallback no-op repair because the fixer request failed ({reason}).",
             repaired_code=state["original_code"],
             changed_scope="none",
             confidence=0.0,
-            notes="fixer_content_filter_fallback",
+            notes=reason,
         )
 
-    def _fallback_review(self, state: GraphState) -> ReviewResult:
+    def _fallback_review(self, state: GraphState, reason: str = "review_fallback") -> ReviewResult:
         return ReviewResult(
             round_id=state["round_id"],
             approved=False,
             review_score=0.0,
-            issues=["Reviewer prompt was blocked by provider content filtering."],
-            revision_advice="Stop automatic approval for this SATD because reviewer prompting was content-filtered.",
-            reject_type="content_filter",
-            rationale="Reviewer prompt was blocked by provider content filtering.",
+            issues=[f"Reviewer fallback triggered: {reason}"],
+            revision_advice=f"Stop automatic approval for this SATD because reviewer request failed ({reason}).",
+            reject_type="content_filter" if "content_filter" in reason else "review_error",
+            rationale=f"Reviewer fallback triggered: {reason}",
+        )
+
+    def _bypass_review(self, state: GraphState) -> ReviewResult:
+        return ReviewResult(
+            round_id=state["round_id"],
+            approved=True,
+            review_score=1.0,
+            problem_alignment=1.0,
+            minimality=1.0,
+            semantic_preservation=1.0,
+            internal_consistency=1.0,
+            issues=[],
+            revision_advice="Reviewer disabled; accepting fixer output directly.",
+            reject_type=None,
+            rationale="Reviewer disabled in fixer-only experiment.",
+            softened_gate_used=False,
         )
 
     def _log(self, message: str) -> None:

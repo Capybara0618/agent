@@ -1,0 +1,151 @@
+{
+  "task_id": "83",
+  "repo_owner": "release-engineering",
+  "repo_name": "iib",
+  "file_path": "iib/workers/tasks/utils.py",
+  "commit": "392921ffeb4a7ff996dab49e1ce8474d3b746024",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T01:49:27+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "392921ffeb4a7ff996dab49e1ce8474d3b746024",
+    "symbol_name": "request_logger",
+    "satd_line": 700,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T01:49:27+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "iib/workers/tasks/utils.py",
+    "original_signature": "def request_logger(func):",
+    "target_file": {
+      "ok": true,
+      "path": "iib/workers/tasks/utils.py",
+      "sha": "89558c0d14c1012c1dd02a80fa89dffdbac4b4cf",
+      "download_url": "https://raw.githubusercontent.com/release-engineering/iib/392921ffeb4a7ff996dab49e1ce8474d3b746024/iib/workers/tasks/utils.py",
+      "content_excerpt": "# SPDX-License-Identifier: GPL-3.0-or-later\nimport base64\nfrom contextlib import contextmanager\nimport functools\nimport hashlib\nimport inspect\nimport json\nimport logging\nimport os\nimport re\nimport sqlite3\nimport subprocess\nfrom typing import Any, Dict, Iterable\n\nfrom retry import retry\n\nfrom iib.workers.dogpile_cache import (\n    create_dogpile_region,\n    dogpile_cache,\n    skopeo_inspect_should_use_cache,\n)\nfrom operator_manifest.operator import ImageName\n\nfrom iib.exceptions import IIBError, ExternalServiceError\nfrom iib.workers.config import get_worker_config\nfrom iib.workers.s3_utils import upload_file_to_s3_bucket\nfrom iib.workers.api_utils import set_request_state\nfrom iib.workers.tasks.opm_operations import opm_registry_serve, opm_serve_from_index\n\nlog = logging.getLogger(__name__)\ndogpile_cache_region = create_dogpile_region()\n\n\ndef _add_property_to_index(db_path, property):\n    \"\"\"\n    Add a property to the index.\n\n    :param str db_path: path to the index database\n    :param dict property: a dict representing a property to be added to the index.db\n    \"\"\"\n    insert = (\n        'INSERT INTO properties '\n        '(type, value, operatorbundle_name, operatorbundle_version, operatorbundle_path) '\n        'VALUES (?, ?, ?, ?, ?);'\n    )\n    con = sqlite3.connect(db_path)\n    # Insert property\n    con.execute(\n        insert,\n        (\n            property['type'],\n            property['value'],\n            property['operatorbundle_name'],\n            property['operatorbundle_version'],\n            property['operatorbundle_path'],\n        ),\n    )\n    con.commit()\n    con.close()\n\n\ndef add_max_ocp_version_property(resolved_bundles, temp_dir):\n    \"\"\"\n    Add the max ocp version property to bundles.\n\n    We need to ensure that any bundle which has deprecated/removed API(s) in 1.22/ocp 4.9\n    will have this property to prevent users from upgrading clusters to 4.9 before upgrading\n    the operator installed to a version that is compatible with 4.9\n\n    :param list resolved_bundles: list of resolved bundles to which the max ocp version property\n        will be added if missing\n    :param str temp_dir: directory location of the index image\n    \"\"\"\n    # Get the CSV name and version (not just the bundle path)\n    temp_index_db_path = get_worker_config()['temp_index_db_path']\n    db_path = os.path.join(temp_dir, temp_index_db_path)\n    port, rpc_proc = opm_registry_serve(db_path=db_path)\n\n    raw_bundles = run_cmd(\n        ['grpcurl', '-plaintext', f'localhost:{port}', 'api.Registry/ListBundles'],\n        exc_msg='Failed to get bundle data from index image',\n    )\n    rpc_proc.kill()\n\n    # This branch is hit when `bundles` attribute is empty and the index image is empty.\n    # Ideally the code should not reach here if the bundles attribute is empty but adding\n    # this here as a failsafe if it's called from some other place. Also, if the bundles\n    # attribute is not empty, the index image cannot be empty here because we add the\n    # bundle to the index before adding the maxOpenShiftVersion property\n    if not raw_bundles:\n        log.info('No bundles found in the index image')\n        return\n\n    # Filter index image bundles to get pull spec for bundles in the request\n    updated_bundles = list(\n        filter(lambda b: b['bundlePath'] in resolved_bundles, get_bundle_json(raw_bundles))\n    )\n\n    for bundle in updated_bundles:\n        if _requires_max_ocp_version(bundle['bundlePath']):\n            log.info('adding property for %s', bundle['bundlePath'])\n            max_openshift_version_property = {\n                'type': 'olm.maxOpenShiftVersion',\n                'value': '4.8',\n                'operatorbundle_name': bundle['csvName'],\n                'operatorbundle_version': bundle['version'],\n                'operatorbundle_path': bundle['bundlePath'],\n            }\n            _add_property_to_index(db_path, max_openshift_version_property)\n            log.info('property added for %s', bundle['bundlePath'])\n\n\ndef get_binary_image_from_config(ocp_version, distribution_scope, binary_image_config={}):\n    \"\"\"\n    Determine the binary image to be used to build the index image.\n\n    :param str ocp_version: the ocp_version label value of the index image.\n    :param str distribution_scope: the distribution_scope label value of the index image.\n    :param dict binary_image_config: the dict of config required to identify the appropriate\n        ``binary_image`` to use.\n    :return: pull specification of the binary_image to be used for this build.\n    :rtype: str\n    :raises IIBError: when the config value for the ocp_version and distribution_scope is missing.\n    \"\"\"\n    binary_image = binary_image_config.get(distribution_scope, {}).get(ocp_version, None)\n    if not binary_image:\n        raise IIBError(\n            'IIB does not have a configured binary_image for'\n            f' distribution_scope : {distribution_scope} and ocp_version: {ocp_version}.'\n            ' Please specify a binary_image value in the request.'\n        )\n\n    return binary_image\n\n\ndef get_bundle_json(bundles):\n    \"\"\"\n    Get bundle json from grpcurl response.\n\n    :param list bundles: response from grpcurl call to retrieve list of bundles in\n        an index\n    \"\"\"\n    return [json.loads(bundle) for bundle in re.split(r'(?<=})\\n(?={)', bundles)]\n\n\ndef _requires_max_ocp_version(bundle):\n    \"\"\"\n    Check if the bundle requires the olm.maxOpenShiftVersion property.\n\n    This property is required for bundles using deprecated APIs that don't already\n    have the olm.maxOpenShiftVersion property set.\n\n    :param str bundle: a string representing the bundle pull specification\n    :returns bool:\n    \"\"\"\n    cmd = [\n        'operator-sdk',\n        'bundle',\n        'validate',\n        bundle,\n        '--select-optional',\n        'name=community',\n        '--output=json-alpha1',\n        '--image-builder',\n        'none',\n    ]\n    result = run_cmd(cmd, strict=False)\n    if result:\n        output = json.loads(result)\n        # check if the bundle validation failed\n        if not output['passed']:\n            # check if the failure is due to the presence of deprecated APIs\n            # and absence of the 'olm.maxOpenShiftVersion' property\n            # Note: there is no other error in the sdk that mentions this field\n            for msg in output['outputs']:\n                if 'olm.maxOpenShiftVersion' in msg['message']:\n                    return True\n    return False\n\n\nclass RequestConfig:\n    \"\"\"Request config abstract class.\n\n    :param str _binary_image:  the pull specification of the container image\n                          where the opm binary gets copied from.\n    :param str distribution_scope: the scope for distribution\n        of the index image, defaults to ``None``.\n    :param str source_from_index: the pull specification of the container image\n        containing the index that will be used\n        as a base of the merged index image.\n    :param str target_index: the pull specification of the container image\n        containing the index whose new data will be added\n        to the merged index image.\n    :param dict binary_image_config: the dict of config required to\n        identify the appropriate ``binary_image`` to use.\n    \"\"\"\n\n    _attrs = [\"_binary_image\", \"distribution_scope\", \"binary_image_config\"]\n    __slots__ = _attrs\n\n    def __init__(self, **kwargs):\n        \"\"\"\n        Request config __init__.\n\n        Do not use this directly, use subclasses instead.\n        :Keyword Arguments:\n            See `_attrs` to check accepted keyword arguments.\n        \"\"\"\n        for key in self.__slots__:\n            setattr(self, key, None)\n        for key, val in kwargs.items():\n            setattr(self, key, kwargs[key])\n\n    def __eq__(self, other):\n        if type(self) == type(other) and [getattr(self, x) for x in self.__slots__] == [\n            getattr(self, x) for x in self.__slots__\n        ]:\n            return True\n        return False\n\n    def binary_image(self, index_info, distribution_scope):\n        \"\"\"Get binary image based on self configuration, index image info and distribution scope.\"\"\"\n        if not self._binary_image:\n            binary_image_ocp_version = index_info['ocp_version']\n            return get_binary_image_from_config(\n                binary_image_ocp_version, distribution_scope, self.binary_image_config\n            )\n        return self._binary_image\n\n\nclass RequestConfigAddRm(RequestConfig):\n    \"\"\"Request config for add and remove operations.\n\n    :param str overwrite_from_index_token: the token used for overwriting the input\n        ``from_index`` image. This is required for\n        non-privileged users to use ``overwrite_from_index``.\n        The format of the token must be\n        in the format \"user:password\".\n    :param str from_index: the pull specification of the container image\n        containing the index that the index image build\n        will be based from.\n    :param list add_arches: the list of arches to build in addition to the\n        arches ``from_index`` is currently built for;\n        if ``from_index`` is ``None``, then this is used as the list of arches\n        to build the index image for\n    :param list bundles: the list of bundles to create the\n        bundle mapping on the request\n    \"\"\"\n\n    _attrs = RequestConfig._attrs + [\n        \"overwrite_from_index_token\",\n        \"from_index\",\n        \"add_arches\",\n        \"bundles\",\n        \"operators\",\n    ]\n    __slots__ = _attrs\n\n\nclass RequestConfigMerge(RequestConfig):\n    \"\"\"Request config for merge operation.\n\n    :param str overwrite_target_index_token:  auth token used to pus index image\n        when overwrite is set.\n    :param str source_from_index: the pull specification of the container image\n        containing the index that will be used\n        as a base of the merged index image.\n    :param str target_index: the pull specification of the container image\n        containing the index whose new data will be added\n        to the merged index image.\n    \"\"\"\n\n    _attrs = RequestConfig._attrs + [\n        \"source_from_index\",\n        \"target_index\",\n        \"overwrite_target_index_token\",\n    ]\n\n    __slots__ = _attrs\n\n\nclass RequestConfigCreateIndexImage(RequestConfig):\n    \"\"\"Request config for add and remove operations.\n\n    :param str overwrite_from_index_token: the token used for overwriting the input\n        ``from_index`` image. This is required for\n        non-privileged users to use ``overwrite_from_index``.\n        The format of the token must be\n        in the format \"user:password\".\n    :param str from_index: the pull specification of the container image\n        containing the index that the index image build\n        will be based from.\n    :param dict labels: the dictionary of labels to build in addition to the\n        labels ``from_index`` is currently built for;\n    \"\"\"\n\n    _attrs = RequestConfig._attrs + [\"from_index\", \"labels\"]\n    __slots__ = _attrs\n\n\ndef deprecate_bundles(\n    bundles,\n    base_dir,\n    binary_image,\n    from_index,\n    overwrite_target_index_token=None,\n    container_tool=None,\n):\n    \"\"\"\n    Deprecate the specified bundles from the index image.\n\n    Only Dockerfile is created, no build is performed.\n\n    :param list bundles: pull specifications of bundles to deprecate.\n    :param str base_dir: base directory where operation files will be located.\n    :param str binary_image: binary image to be used by the new index image.\n    :param str from_index: index image, from which the bundles will be deprecated.\n    :param str overwrite_target_index_token: the token used for overwriting the input\n        ``from_index`` image. This is required to use ``overwrite_target_index``.\n        The format of the token must be in the format \"user:password\".\n    :param str container_tool: the container tool to be used to operate on the index image\n    \"\"\"\n    cmd = [\n        'opm',\n        'index',\n        'deprecatetruncate',\n        '--generate',\n        '--binary-im",
+      "total_lines": 1027,
+      "ref": "392921ffeb4a7ff996dab49e1ce8474d3b746024"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "request_logger",
+      "class_name": null,
+      "start_line": 668,
+      "end_line": 713,
+      "satd_line": 700,
+      "matched_by": "signature_or_comment",
+      "source": "def request_logger(func):\n    \"\"\"\n    Log messages relevant to the current request to a dedicated file.\n\n    If ``iib_request_logs_dir`` is set, a temporary log handler is added before the decorated\n    function is invoked. It's then removed once the decorated function completes execution.\n\n    If ``iib_request_logs_dir`` is not set, the temporary log handler will not be added.\n\n    :param function func: the function to be decorated. The function must take the ``request_id``\n        parameter.\n    :return: the decorated function\n    :rtype: function\n    \"\"\"\n    worker_config = get_worker_config()\n    log_dir = worker_config.iib_request_logs_dir\n    log_level = worker_config.iib_request_logs_level\n    log_format = worker_config.iib_request_logs_format\n\n    @functools.wraps(func)\n    def wrapper(*args, **kwargs):\n        request_log_handler = None\n        if log_dir:\n            log_formatter = logging.Formatter(log_format)\n            request_id = _get_function_arg_value('request_id', func, args, kwargs)\n            if not request_id:\n                raise IIBError(f'Unable to get \"request_id\" from {func.__name__}')\n\n            log_file_path = os.path.join(log_dir, f'{request_id}.log')\n            request_log_handler = logging.FileHandler(log_file_path)\n            request_log_handler.setLevel(log_level)\n            request_log_handler.setFormatter(log_formatter)\n            # FIXME: Bandit complaining on too permissive logs - CLOUDDST-11307\n            os.chmod(log_file_path, 0o775)  # nosec\n            logger = logging.getLogger()\n            logger.addHandler(request_log_handler)\n        try:\n            return func(*args, **kwargs)\n        finally:\n            if request_log_handler:\n                logger.removeHandler(request_log_handler)\n                request_log_handler.flush()\n                if worker_config['iib_aws_s3_bucket_name']:\n                    upload_file_to_s3_bucket(log_file_path, 'request_logs', f'{request_id}.log')\n\n    return wrapper",
+      "calls": [
+        "IIBError",
+        "_get_function_arg_value",
+        "func",
+        "get_worker_config",
+        "upload_file_to_s3_bucket"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "IIBError",
+        "_get_function_arg_value",
+        "args",
+        "functools",
+        "get_worker_config",
+        "kwargs",
+        "logging",
+        "os",
+        "upload_file_to_s3_bucket",
+        "wrapper"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "_get_function_arg_value",
+          "class_name": null,
+          "start_line": 716,
+          "end_line": 727,
+          "relevance": [
+            "direct_call"
+          ],
+          "source": "def _get_function_arg_value(arg_name, func, args, kwargs):\n    \"\"\"Return the value of the given argument name.\"\"\"\n    original_func = func\n    while getattr(original_func, '__wrapped__', None):\n        original_func = original_func.__wrapped__\n    argspec = inspect.getfullargspec(original_func).args\n\n    arg_index = argspec.index(arg_name)\n    arg_value = kwargs.get(arg_name, None)\n    if arg_value is None and len(args) > arg_index:\n        arg_value = args[arg_index]\n    return arg_value"
+        },
+        {
+          "symbol_name": "wrapper",
+          "class_name": null,
+          "start_line": 688,
+          "end_line": 711,
+          "relevance": [
+            "keyword_source_overlap=6"
+          ],
+          "source": "    def wrapper(*args, **kwargs):\n        request_log_handler = None\n        if log_dir:\n            log_formatter = logging.Formatter(log_format)\n            request_id = _get_function_arg_value('request_id', func, args, kwargs)\n            if not request_id:\n                raise IIBError(f'Unable to get \"request_id\" from {func.__name__}')\n\n            log_file_path = os.path.join(log_dir, f'{request_id}.log')\n            request_log_handler = logging.FileHandler(log_file_path)\n            request_log_handler.setLevel(log_level)\n            request_log_handler.setFormatter(log_formatter)\n            # FIXME: Bandit complaining on too permissive logs - CLOUDDST-11307\n            os.chmod(log_file_path, 0o775)  # nosec\n            logger = logging.getLogger()\n            logger.addHandler(request_log_handler)\n        try:\n            return func(*args, **kwargs)\n        finally:\n            if request_log_handler:\n                logger.removeHandler(request_log_handler)\n                request_log_handler.flush()\n                if worker_config['iib_aws_s3_bucket_name']:\n                    upload_file_to_s3_bucket(log_file_path, 'request_logs', f'{request_id}.log')"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "wrapper",
+          "class_name": null,
+          "start_line": 688,
+          "end_line": 711,
+          "source": "    def wrapper(*args, **kwargs):\n        request_log_handler = None\n        if log_dir:\n            log_formatter = logging.Formatter(log_format)\n            request_id = _get_function_arg_value('request_id', func, args, kwargs)\n            if not request_id:\n                raise IIBError(f'Unable to get \"request_id\" from {func.__name__}')\n\n            log_file_path = os.path.join(log_dir, f'{request_id}.log')\n            request_log_handler = logging.FileHandler(log_file_path)\n            request_log_handler.setLevel(log_level)\n            request_log_handler.setFormatter(log_formatter)\n            # FIXME: Bandit complaining on too permissive logs - CLOUDDST-11307\n            os.chmod(log_file_path, 0o775)  # nosec\n            logger = logging.getLogger()\n            logger.addHandler(request_log_handler)\n        try:\n            return func(*args, **kwargs)\n        finally:\n            if request_log_handler:\n                logger.removeHandler(request_log_handler)\n                request_log_handler.flush()\n                if worker_config['iib_aws_s3_bucket_name']:\n                    upload_file_to_s3_bucket(log_file_path, 'request_logs', f'{request_id}.log')"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

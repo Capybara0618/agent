@@ -1,0 +1,95 @@
+{
+  "task_id": "829",
+  "repo_owner": "galaxyproject",
+  "repo_name": "galaxy",
+  "file_path": "lib/galaxy/jobs/__init__.py",
+  "commit": "24b9c8c8a7715bd7a157543c10bac044df566143",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T05:08:31+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "24b9c8c8a7715bd7a157543c10bac044df566143",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T05:08:31+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "lib/galaxy/jobs/__init__.py",
+    "original_signature": "def _change_ownership(self, username, gid):",
+    "target_file": {
+      "ok": true,
+      "path": "lib/galaxy/jobs/__init__.py",
+      "sha": "0cefb14a1478d0ff1aa2f81cb7a0c4d14d403d97",
+      "download_url": "https://raw.githubusercontent.com/galaxyproject/galaxy/24b9c8c8a7715bd7a157543c10bac044df566143/lib/galaxy/jobs/__init__.py",
+      "content_excerpt": "import logging, threading, sys, os, time, traceback, shutil\n\nimport galaxy\nfrom galaxy import util, model\nfrom galaxy.model.orm import lazyload\nfrom galaxy.datatypes.tabular import *\nfrom galaxy.datatypes.interval import *\n# tabular/interval imports appear to be unused.  Clean up?\nfrom galaxy.datatypes import metadata\nfrom galaxy.util.json import from_json_string\nfrom galaxy.util.expressions import ExpressionContext\nfrom galaxy.jobs.actions.post import ActionBox\nimport subprocess, pwd\nfrom sqlalchemy.sql.expression import and_, or_\n\nimport pkg_resources\npkg_resources.require( \"PasteDeploy\" )\n\nfrom Queue import Queue, Empty\n\nlog = logging.getLogger( __name__ )\n\n# States for running a job. These are NOT the same as data states\nJOB_WAIT, JOB_ERROR, JOB_INPUT_ERROR, JOB_INPUT_DELETED, JOB_READY, JOB_DELETED, JOB_ADMIN_DELETED = 'wait', 'error', 'input_error', 'input_deleted', 'ready', 'deleted', 'admin_deleted'\n\n# This file, if created in the job's working directory, will be used for\n# setting advanced metadata properties on the job and its associated outputs.\n# This interface is currently experimental, is only used by the upload tool,\n# and should eventually become API'd\nTOOL_PROVIDED_JOB_METADATA_FILE = 'galaxy.json'\n\nclass JobManager( object ):\n    \"\"\"\n    Highest level interface to job management.\n\n    TODO: Currently the app accesses \"job_queue\" and \"job_stop_queue\" directly.\n          This should be decoupled.\n    \"\"\"\n    def __init__( self, app ):\n        self.app = app\n        if self.app.config.get_bool( \"enable_job_running\", True ):\n            # The dispatcher launches the underlying job runners\n            self.dispatcher = DefaultJobDispatcher( app )\n            # Queues for starting and stopping jobs\n            self.job_queue = JobQueue( app, self.dispatcher )\n            self.job_stop_queue = JobStopQueue( app, self.dispatcher )\n            if self.app.config.enable_beta_job_managers:\n                from galaxy.jobs.deferred import DeferredJobQueue\n                self.deferred_job_queue = DeferredJobQueue( app )\n        else:\n            self.job_queue = self.job_stop_queue = NoopQueue()\n    def shutdown( self ):\n        self.job_queue.shutdown()\n        self.job_stop_queue.shutdown()\n\nclass Sleeper( object ):\n    \"\"\"\n    Provides a 'sleep' method that sleeps for a number of seconds *unless*\n    the notify method is called (from a different thread).\n    \"\"\"\n    def __init__( self ):\n        self.condition = threading.Condition()\n    def sleep( self, seconds ):\n        self.condition.acquire()\n        self.condition.wait( seconds )\n        self.condition.release()\n    def wake( self ):\n        self.condition.acquire()\n        self.condition.notify()\n        self.condition.release()\n\nclass JobQueue( object ):\n    \"\"\"\n    Job manager, waits for jobs to be runnable and then dispatches to\n    a JobRunner.\n    \"\"\"\n    STOP_SIGNAL = object()\n    def __init__( self, app, dispatcher ):\n        \"\"\"Start the job manager\"\"\"\n        self.app = app\n        self.sa_session = app.model.context\n        self.job_lock = False\n        # Should we read jobs form the database, or use an in memory queue\n        self.track_jobs_in_database = app.config.get_bool( 'track_jobs_in_database', False )\n        # Keep track of the pid that started the job manager, only it\n        # has valid threads\n        self.parent_pid = os.getpid()\n        # Contains new jobs. Note this is not used if track_jobs_in_database is True\n        self.queue = Queue()\n        # Contains jobs that are waiting (only use from monitor thread)\n        ## This and jobs_to_check[] are closest to a \"Job Queue\"\n        self.waiting_jobs = []\n        # Helper for interruptable sleep\n        self.sleeper = Sleeper()\n        self.running = True\n        self.dispatcher = dispatcher\n        self.monitor_thread = threading.Thread( target=self.__monitor )\n        self.monitor_thread.start()\n        log.info( \"job manager started\" )\n        if app.config.get_bool( 'enable_job_recovery', True ):\n            self.__check_jobs_at_startup()\n\n    def __check_jobs_at_startup( self ):\n        \"\"\"\n        Checks all jobs that are in the 'new', 'queued' or 'running' state in\n        the database and requeues or cleans up as necessary.  Only run as the\n        job manager starts.\n        \"\"\"\n        model = self.app.model # DBTODO Why?\n        for job in self.sa_session.query( model.Job ).filter( model.Job.state == model.Job.states.NEW ):\n            if job.tool_id not in self.app.toolbox.tools_by_id:\n                log.warning( \"Tool '%s' removed from tool config, unable to recover job: %s\" % ( job.tool_id, job.id ) )\n                JobWrapper( job, self ).fail( 'This tool was disabled before the job completed.  Please contact your Galaxy administrator, or' )\n            else:\n                log.debug( \"no runner: %s is still in new state, adding to the jobs queue\" %job.id )\n                self.queue.put( ( job.id, job.tool_id ) )\n        for job in self.sa_session.query( model.Job ).options( lazyload( \"external_output_metadata\" ), lazyload( \"parameters\" ) ).filter( ( model.Job.state == model.Job.states.RUNNING ) | ( model.Job.state == model.Job.states.QUEUED ) ):\n            if job.tool_id not in self.app.toolbox.tools_by_id:\n                log.warning( \"Tool '%s' removed from tool config, unable to recover job: %s\" % ( job.tool_id, job.id ) )\n                JobWrapper( job, self ).fail( 'This tool was disabled before the job completed.  Please contact your Galaxy administrator, or' )\n            elif job.job_runner_name is None:\n                log.debug( \"no runner: %s is still in queued state, adding to the jobs queue\" %job.id )\n                if self.track_jobs_in_database:\n                    job.state = model.Job.states.NEW\n                else:\n                    self.queue.put( ( job.id, job.tool_id ) )\n            else:\n                job_wrapper = JobWrapper( job, self )\n                self.dispatcher.recover( job, job_wrapper )\n        if self.sa_session.dirty:\n            self.sa_session.flush()\n\n    def __monitor( self ):\n        \"\"\"\n        Continually iterate the waiting jobs, checking is each is ready to\n        run and dispatching if so.\n        \"\"\"\n        # HACK: Delay until after forking, we need a way to do post fork notification!!!\n        time.sleep( 10 )\n        while self.running:\n            try:\n                self.__monitor_step()\n            except:\n                log.exception( \"Exception in monitor_step\" )\n            # Sleep\n            self.sleeper.sleep( 1 )\n\n    def __monitor_step( self ):\n        \"\"\"\n        Called repeatedly by `monitor` to process waiting jobs. Gets any new\n        jobs (either from the database or from its own queue), then iterates\n        over all new and waiting jobs to check the state of the jobs each\n        depends on. If the job has dependencies that have not finished, it\n        it goes to the waiting queue. If the job has dependencies with errors,\n        it is marked as having errors and removed from the queue. Otherwise,\n        the job is dispatched.\n        \"\"\"\n        # Pull all new jobs from the queue at once\n        jobs_to_check = []\n        if self.track_jobs_in_database:\n            # Clear the session so we get fresh states for job and all datasets\n            self.sa_session.expunge_all()\n            # Fetch all new jobs\n            jobs_to_check = self.sa_session.query( model.Job ) \\\n                                .options( lazyload( \"external_output_metadata\" ), lazyload( \"parameters\" ) ) \\\n                                .filter( model.Job.state == model.Job.states.NEW ).all()\n        else:\n            # Get job objects and append to watch queue for any which were\n            # previously waiting\n            for job_id in self.waiting_jobs:\n                jobs_to_check.append( self.sa_session.query( model.Job ).get( job_id ) )\n            try:\n                while 1:\n                    message = self.queue.get_nowait()\n                    if message is self.STOP_SIGNAL:\n                        return\n                    # Unpack the message\n                    job_id, tool_id = message\n                    # Get the job object and append to watch queue\n                    jobs_to_check.append( self.sa_session.query( model.Job ).get( job_id ) )\n            except Empty:\n                pass\n        # Iterate over new and waiting jobs and look for any that are\n        # ready to run\n        new_waiting_jobs = []\n        for job in jobs_to_check:\n            try:\n                # Check the job's dependencies, requeue if they're not done\n                job_state = self.__check_if_ready_to_run( job )\n                if job_state == JOB_WAIT:\n                    if not self.track_jobs_in_database:\n                        new_waiting_jobs.append( job.id )\n                elif job_state == JOB_INPUT_ERROR:\n                    log.info( \"job %d unable to run: one or more inputs in error state\" % job.id )\n                elif job_state == JOB_INPUT_DELETED:\n                    log.info( \"job %d unable to run: one or more inputs deleted\" % job.id )\n                elif job_state == JOB_READY:\n                    if self.job_lock:\n                        log.info( \"Job dispatch attempted for %s, but prevented by administrative lock.\" % job.id )\n                        if not self.track_jobs_in_database:\n                            new_waiting_jobs.append( job.id )\n                    else:\n                        self.dispatcher.put( JobWrapper( job, self ) )\n                        log.info( \"job %d dispatched\" % job.id )\n                elif job_state == JOB_DELETED:\n                    log.info( \"job %d deleted by user while still queued\" % job.id )\n                elif job_state == JOB_ADMIN_DELETED:\n                    log.info( \"job %d deleted by admin while still queued\" % job.id )\n                else:\n                    log.error( \"unknown job state '%s' for job %d\" % ( job_state, job.id ) )\n                    if not self.track_jobs_in_database:\n                        new_waiting_jobs.append( job.id )\n            except Exception, e:\n                log.exception( \"failure running job %d\" % job.id )\n        # Update the waiting list\n        self.waiting_jobs = new_waiting_jobs\n        # Done with the session\n        self.sa_session.remove()\n\n    def __check_if_ready_to_run( self, job ):\n        \"\"\"\n        Check if a job is ready to run by verifying that each of its input\n        datasets is ready (specifically in the OK state). If any input dataset\n        has an error, fail the job and return JOB_INPUT_ERROR. If any input\n        dataset is deleted, fail the job and return JOB_INPUT_DELETED.  If all\n        input datasets are in OK state, return JOB_READY indicating that the\n        job can be dispatched. Otherwise, return JOB_WAIT indicating that input\n        datasets are still being prepared.\n        \"\"\"\n        if job.state == model.Job.states.DELETED:\n            return JOB_DELETED\n        elif job.state == model.Job.states.ERROR:\n            return JOB_ADMIN_DELETED\n        elif self.app.config.enable_quotas:\n            quota = self.app.quota_agent.get_quota( job.user )\n            if quota is not None:\n                try:\n                    usage = self.app.quota_agent.get_usage( user=job.user, history=job.history )\n                    if usage > quota:\n                        return JOB_WAIT\n                except AssertionError, e:\n                    pass # No history, should not happen with an anon user\n        for dataset_assoc in job.input_datasets + job.input_library_datasets:\n            idata = dataset_assoc.dataset\n            if not idata:\n                continue\n            # don't run jobs for which the input dataset was deleted\n            if idata.deleted:\n                JobWrapper( job, self ).fail( \"input data %d (file: %s) was deleted before the job started\" % ( idata.hid, idata.file_name ) )\n             ",
+      "total_lines": 1318,
+      "ref": "24b9c8c8a7715bd7a157543c10bac044df566143"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

@@ -1,0 +1,196 @@
+{
+  "task_id": "927",
+  "repo_owner": "quarkchain",
+  "repo_name": "pyquarkchain",
+  "file_path": "quarkchain/cluster/slave.py",
+  "commit": "867343efce2fda7c4a5656bda5db909f462775e7",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T05:47:41+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "867343efce2fda7c4a5656bda5db909f462775e7",
+    "symbol_name": "broadcastNewTip",
+    "satd_line": 93,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 5,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T05:47:50+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "quarkchain/cluster/slave.py",
+    "original_signature": "def broadcastNewTip(self):",
+    "target_file": {
+      "ok": true,
+      "path": "quarkchain/cluster/slave.py",
+      "sha": "63e7e348f1f9e525179063e170d00a5598e82b15",
+      "download_url": "https://raw.githubusercontent.com/QuarkChain/pyquarkchain/867343efce2fda7c4a5656bda5db909f462775e7/quarkchain/cluster/slave.py",
+      "content_excerpt": "import argparse\nimport asyncio\nimport errno\nimport ipaddress\n\nfrom quarkchain.core import Branch, ShardMask\nfrom quarkchain.config import DEFAULT_ENV\nfrom quarkchain.cluster.core import CrossShardTransactionList\nfrom quarkchain.cluster.protocol import (\n    ClusterConnection, VirtualConnection, ClusterMetadata, ForwardingVirtualConnection\n)\nfrom quarkchain.cluster.rpc import ConnectToSlavesResponse, ClusterOp, CLUSTER_OP_SERIALIZER_MAP, Ping, Pong\nfrom quarkchain.cluster.rpc import AddMinorBlockHeaderRequest\nfrom quarkchain.cluster.rpc import (\n    AddRootBlockResponse, EcoInfo, GetEcoInfoListResponse, GetNextBlockToMineResponse,\n    AddMinorBlockResponse, HeadersInfo, GetUnconfirmedHeadersResponse,\n    GetAccountDataResponse, AddTransactionResponse,\n    CreateClusterPeerConnectionResponse\n)\nfrom quarkchain.cluster.rpc import AddXshardTxListRequest, AddXshardTxListResponse\nfrom quarkchain.cluster.shard_state import ShardState\nfrom quarkchain.cluster.p2p_commands import (\n    CommandOp, OP_SERIALIZER_MAP, NewMinorBlockHeaderListCommand, GetMinorBlockListRequest, GetMinorBlockListResponse\n)\nfrom quarkchain.protocol import Connection, AbstractConnection\nfrom quarkchain.db import PersistentDb, ShardedDb\nfrom quarkchain.utils import check, set_logging_level, Logger\n\n\nclass ShardConnection(VirtualConnection):\n    ''' A virtual connection between local shard and remote shard\n    '''\n\n    def __init__(self, masterConn, clusterPeerId, shardState):\n        super().__init__(masterConn, OP_SERIALIZER_MAP, OP_NONRPC_MAP, OP_RPC_MAP)\n        self.clusterPeerId = clusterPeerId\n        self.shardState = shardState\n        self.masterConn = masterConn\n        self.slaveServer = masterConn.slaveServer\n\n    def closeWithError(self, error):\n        Logger.error(\"Closing shard connection with error {}\".format(error))\n        return super().closeWithError(error)\n\n    async def handleGetMinorBlockListRequest(self, request):\n        mBlockList = []\n        for mBlockHash in request.minorBlockHashList:\n            mBlock = self.shardState.getBlockByHash(mBlockHash)\n            if mBlock is None:\n                continue\n            # TODO: Check list size to make sure the resp is smaller than limit\n            mBlockList.append(mBlock)\n\n        return GetMinorBlockListResponse(mBlockList)\n\n    async def handleNewMinorBlockHeaderListCommand(self, op, cmd, rpcId):\n        # TODO:  Make sure the minor block height and root is not decreasing\n        if len(cmd.minorBlockHeaderList) == 0:\n            self.closeWithError(\"minor block header list must be not empty\")\n            return\n        for mHeader in cmd.minorBlockHeaderList:\n            if mHeader.branch != self.shardState.branch:\n                self.closeWithError(\"incorrect branch\")\n                return\n\n        # Download all that are not in db (and prev in db)\n        # TODO: Check timestamp and download only append after tip?\n        mDownloadList = []\n        for mHeader in cmd.minorBlockHeaderList:\n            mHash = mHeader.getHash()\n            if not self.shardState.containBlockByHash(mHeader.hashPrevMinorBlock):\n                # TODO: Download previous block\n                continue\n            mDownloadList.append(mHash)\n\n        if len(mDownloadList) == 0:\n            return\n\n        try:\n            op, resp, rpcId = await self.writeRpcRequest(\n                CommandOp.GET_MINOR_BLOCK_LIST_REQUEST, GetMinorBlockListRequest(mDownloadList))\n        except Exception as e:\n            Logger.logException()\n            self.closeWithError(e)\n            return\n\n        for mBlock in resp.minorBlockList:\n            success = await self.slaveServer.addBlock(mBlock)\n            if not success:\n                self.closeWithError(e)\n\n    def broadcastNewTip(self):\n        # TODO: Compare local best observed and broadcast if the tip is latest\n        self.writeCommand(\n            op=CommandOp.NEW_MINOR_BLOCK_HEADER_LIST,\n            cmd=NewMinorBlockHeaderListCommand(self.shardState.rootTip, [self.shardState.headerTip]))\n\n    def getMetadataToWrite(self, metadata):\n        ''' Override VirtualConnection.getMetadataToWrite()\n        '''\n        return ClusterMetadata(self.shardState.branch, self.clusterPeerId)\n\n\n# P2P command definitions\nOP_NONRPC_MAP = {\n    CommandOp.NEW_MINOR_BLOCK_HEADER_LIST: ShardConnection.handleNewMinorBlockHeaderListCommand,\n}\n\n\nOP_RPC_MAP = {\n    CommandOp.GET_MINOR_BLOCK_LIST_REQUEST:\n        (CommandOp.GET_MINOR_BLOCK_LIST_RESPONSE, ShardConnection.handleGetMinorBlockListRequest),\n\n}\n\n\nclass MasterConnection(ClusterConnection):\n\n    def __init__(self, env, reader, writer, slaveServer):\n        super().__init__(env, reader, writer, CLUSTER_OP_SERIALIZER_MAP, MASTER_OP_NONRPC_MAP, MASTER_OP_RPC_MAP)\n        self.loop = asyncio.get_event_loop()\n        self.env = env\n        self.slaveServer = slaveServer\n        self.shardStateMap = slaveServer.shardStateMap\n\n        asyncio.ensure_future(self.activeAndLoopForever())\n\n        # clusterPeerId -> {branchValue -> ShardConn}\n        self.vConnMap = dict()\n\n    def getConnectionToForward(self, metadata):\n        ''' Override ProxyConnection.getConnectionToForward()\n        '''\n        if metadata.clusterPeerId == 0:\n            # Data from master\n            return None\n\n        if metadata.branch.value not in self.shardStateMap:\n            self.closeWithError(\"incorrect forwarding branch\")\n            return\n\n        connMap = self.vConnMap.get(metadata.clusterPeerId)\n        if connMap is None:\n            self.closeWithError(\"cannot find cluster peer id in vConnMap\")\n            return\n\n        return connMap[metadata.branch.value].getForwardingConnection()\n\n    def validateConnection(self, connection):\n        return isinstance(connection, ForwardingVirtualConnection)\n\n    def __getShardSize(self):\n        return self.env.config.SHARD_SIZE\n\n    def close(self):\n        for clusterPeerId, connMap in self.vConnMap.items():\n            for branchValue, conn in connMap.items():\n                conn.getForwardingConnection().close()\n\n        Logger.info(\"Lost connection with master\")\n        return super().close()\n\n    def closeWithError(self, error):\n        Logger.info(\"Closing connection with master: {}\".format(error))\n        return super().closeWithError(error)\n\n    def closeConnection(self, conn):\n        ''' TODO: Notify master that the connection is closed by local.\n        The master should close the peer connection, and notify the other slaves that a close happens\n        More hint could be provided so that the master may blacklist the peer if it is mis-behaving\n        '''\n        pass\n\n    # Cluster RPC handlers\n\n    async def handlePing(self, ping):\n        return Pong(self.slaveServer.id, self.slaveServer.shardMaskList)\n\n    async def handleConnectToSlavesRequest(self, connectToSlavesRequest):\n        ''' Master sends in the slave list. Let's connect to them.\n        Skip self and slaves already connected.\n        '''\n        resultList = []\n        for slaveInfo in connectToSlavesRequest.slaveInfoList:\n            if slaveInfo.id == self.slaveServer.id or slaveInfo.id in self.slaveServer.slaveIds:\n                resultList.append(bytes())\n                continue\n\n            ip = str(ipaddress.ip_address(slaveInfo.ip))\n            port = slaveInfo.port\n            try:\n                reader, writer = await asyncio.open_connection(ip, port, loop=self.loop)\n            except Exception as e:\n                errMsg = \"Failed to connect {}:{} with exception {}\".format(ip, port, e)\n                Logger.info(errMsg)\n                resultList.append(bytes(errMsg, \"ascii\"))\n                continue\n\n            slave = SlaveConnection(self.env, reader, writer, self.slaveServer, slaveInfo.id, slaveInfo.shardMaskList)\n            await slave.waitUntilActive()\n            # Tell the remote slave who I am\n            id, shardMaskList = await slave.sendPing()\n            # Verify that remote slave indeed has the id and shard mask list advertised by the master\n            if id != slave.id:\n                resultList.append(bytes(\"id does not match. expect {} got {}\".format(slave.id, id), \"ascii\"))\n                continue\n            if shardMaskList != slave.shardMaskList:\n                resultList.append(bytes(\"shard mask list does not match. expect {} got {}\".format(\n                    slave.shardMaskList, shardMaskList), \"ascii\"))\n                continue\n\n            self.slaveServer.addSlaveConnection(slave)\n            resultList.append(bytes())\n        return ConnectToSlavesResponse(resultList)\n\n    # Blockchain RPC handlers\n\n    async def handleAddRootBlockRequest(self, req):\n        # TODO: handle expectSwitch\n        errorCode = 0\n        switched = False\n        for branchValue, shardState in self.shardStateMap.items():\n            try:\n                switched = shardState.addRootBlock(req.rootBlock)\n            except ValueError:\n                # TODO: May be enum or Unix errno?\n                errorCode = errno.EBADMSG\n                break\n\n        return AddRootBlockResponse(errorCode, switched)\n\n    async def handleGetEcoInfoListRequest(self, req):\n        ecoInfoList = []\n        for branchValue, shardState in self.shardStateMap.items():\n            ecoInfoList.append(EcoInfo(\n                branch=Branch(branchValue),\n                height=shardState.headerTip.height + 1,\n                coinbaseAmount=shardState.getNextBlockCoinbaseAmount(),\n                difficulty=shardState.getNextBlockDifficulty(),\n                unconfirmedHeadersCoinbaseAmount=shardState.getUnconfirmedHeadersCoinbaseAmount(),\n            ))\n        return GetEcoInfoListResponse(\n            errorCode=0,\n            ecoInfoList=ecoInfoList,\n        )\n\n    async def handleGetNextBlockToMineRequest(self, req):\n        branchValue = req.branch.value\n        if branchValue not in self.shardStateMap:\n            return GetNextBlockToMineResponse(errorCode=errno.EBADMSG)\n\n        block = self.shardStateMap[branchValue].createBlockToMine(address=req.address)\n        response = GetNextBlockToMineResponse(\n            errorCode=0,\n            block=block,\n        )\n        return response\n\n    async def handleAddMinorBlockRequest(self, req):\n        success = await self.slaveServer.addBlock(req.minorBlock)\n        return AddMinorBlockResponse(\n            errorCode=0 if success else errno.EFAULT,\n        )\n\n    async def handleGetUnconfirmedHeaderListRequest(self, req):\n        headersInfoList = []\n        for branchValue, shardState in self.shardStateMap.items():\n            headersInfoList.append(HeadersInfo(\n                branch=Branch(branchValue),\n                headerList=shardState.getUnconfirmedHeaderList(),\n            ))\n        return GetUnconfirmedHeadersResponse(\n            errorCode=0,\n            headersInfoList=headersInfoList,\n        )\n\n    async def handleAccountDataRequest(self, req):\n        count = self.slaveServer.getTransactionCount(req.address)\n        balance = self.slaveServer.getBalance(req.address)\n        errorCode = 0\n        if count is None or balance is None:\n            errorCode = errno.EBADMSG\n            count = -1\n            balance = -1\n        return GetAccountDataResponse(\n            errorCode=errorCode,\n            transactionCount=count,\n            balance=balance,\n        )\n\n    async def handleAddTransaction(self, req):\n        success = self.slaveServer.addTx(req.tx)\n        return AddTransactionResponse(\n            errorCode=0 if success else 1,\n        )\n\n    async def handleDestroyClusterPeerConnectionCommand(self, op, cmd, rpcId):\n        if cmd.clusterPeerId not in self.vConnMap:\n            Logger.error(\"cannot find cluster peer connection to destroy {}\".formate(cmd.clusterPeerId))\n            return\n        for branchValue, vConn in self.vConnMap[cmd.clusterPeerId].items():\n            vConn.getForwardingConnection().close()\n        del self.vConnMap[cmd.clusterPeerId]\n\n    async def handleCreateClus",
+      "total_lines": 663,
+      "ref": "867343efce2fda7c4a5656bda5db909f462775e7"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "broadcastNewTip",
+      "class_name": "ShardConnection",
+      "start_line": 92,
+      "end_line": 96,
+      "satd_line": 93,
+      "matched_by": "normalized_source",
+      "source": "    def broadcastNewTip(self):\n        # TODO: Compare local best observed and broadcast if the tip is latest\n        self.writeCommand(\n            op=CommandOp.NEW_MINOR_BLOCK_HEADER_LIST,\n            cmd=NewMinorBlockHeaderListCommand(self.shardState.rootTip, [self.shardState.headerTip]))",
+      "calls": [
+        "NewMinorBlockHeaderListCommand"
+      ],
+      "self_calls": [
+        "writeCommand"
+      ],
+      "self_attrs": [
+        "shardState",
+        "writeCommand"
+      ],
+      "global_uses": [
+        "CommandOp",
+        "NewMinorBlockHeaderListCommand"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "broadcastXshardTxList",
+          "class_name": "SlaveServer",
+          "start_line": 537,
+          "end_line": 564,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=2"
+          ],
+          "source": "    async def broadcastXshardTxList(self, block, xshardTxList):\n        ''' Broadcast x-shard transactions to their recipient shards '''\n\n        xshardMap = dict()\n        # TODO: Only broadcast to neighbors\n        for shardId in range(self.__getShardSize()):\n            xshardMap[shardId + self.__getShardSize()] = []\n\n        for xshardTx in xshardTxList:\n            shardId = xshardTx.address.getShardId(self.__getShardSize())\n            branchValue = Branch.create(self.__getShardSize(), shardId).value\n            xshardMap[branchValue].append(xshardTx)\n\n        blockHash = block.header.getHash()\n        rpcFutures = []\n        for branchValue, txList in xshardMap.items():\n            crossShardTxList = CrossShardTransactionList(txList)\n            if branchValue in self.shardStateMap:\n                self.shardStateMap[branchValue].addCrossShardTxListByMinorBlockHash(blockHash, crossShardTxList)\n\n            branch = Branch(branchValue)\n            request = AddXshardTxListRequest(branch, blockHash, crossShardTxList)\n\n            for slaveConn in self.shardToSlaves[branch.getShardId()]:\n                future = slaveConn.writeRpcRequest(ClusterOp.ADD_XSHARD_TX_LIST_REQUEST, request)\n                rpcFutures.append(future)\n        responses = await asyncio.gather(*rpcFutures)\n        check(all([response.errorCode == 0 for _, response, _ in responses]))"
+        },
+        {
+          "symbol_name": "startAndLoop",
+          "class_name": "SlaveServer",
+          "start_line": 510,
+          "end_line": 516,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=1"
+          ],
+          "source": "    def startAndLoop(self):\n        self.start()\n        try:\n            self.loop.run_forever()\n        except KeyboardInterrupt:\n            pass\n        self.shutdown()"
+        },
+        {
+          "symbol_name": "handleNewMinorBlockHeaderListCommand",
+          "class_name": "ShardConnection",
+          "start_line": 56,
+          "end_line": 90,
+          "relevance": [
+            "keyword_source_overlap=3",
+            "same_class"
+          ],
+          "source": "    async def handleNewMinorBlockHeaderListCommand(self, op, cmd, rpcId):\n        # TODO:  Make sure the minor block height and root is not decreasing\n        if len(cmd.minorBlockHeaderList) == 0:\n            self.closeWithError(\"minor block header list must be not empty\")\n            return\n        for mHeader in cmd.minorBlockHeaderList:\n            if mHeader.branch != self.shardState.branch:\n                self.closeWithError(\"incorrect branch\")\n                return\n\n        # Download all that are not in db (and prev in db)\n        # TODO: Check timestamp and download only append after tip?\n        mDownloadList = []\n        for mHeader in cmd.minorBlockHeaderList:\n            mHash = mHeader.getHash()\n            if not self.shardState.containBlockByHash(mHeader.hashPrevMinorBlock):\n                # TODO: Download previous block\n                continue\n            mDownloadList.append(mHash)\n\n        if len(mDownloadList) == 0:\n            return\n\n        try:\n            op, resp, rpcId = await self.writeRpcRequest(\n                CommandOp.GET_MINOR_BLOCK_LIST_REQUEST, GetMinorBlockListRequest(mDownloadList))\n        except Exception as e:\n            Logger.logException()\n            self.closeWithError(e)\n            return\n\n        for mBlock in resp.minorBlockList:\n            success = await self.slaveServer.addBlock(mBlock)\n            if not success:\n                self.closeWithError(e)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "ShardConnection",
+      "related_methods_count": 2,
+      "related_attributes_count": 1,
+      "related_methods": [
+        {
+          "symbol_name": "handleNewMinorBlockHeaderListCommand",
+          "start_line": 56,
+          "end_line": 90,
+          "relevance": [
+            "shared_attrs=1",
+            "keyword_source_overlap=3"
+          ],
+          "source": "    async def handleNewMinorBlockHeaderListCommand(self, op, cmd, rpcId):\n        # TODO:  Make sure the minor block height and root is not decreasing\n        if len(cmd.minorBlockHeaderList) == 0:\n            self.closeWithError(\"minor block header list must be not empty\")\n            return\n        for mHeader in cmd.minorBlockHeaderList:\n            if mHeader.branch != self.shardState.branch:\n                self.closeWithError(\"incorrect branch\")\n                return\n\n        # Download all that are not in db (and prev in db)\n        # TODO: Check timestamp and download only append after tip?\n        mDownloadList = []\n        for mHeader in cmd.minorBlockHeaderList:\n            mHash = mHeader.getHash()\n            if not self.shardState.containBlockByHash(mHeader.hashPrevMinorBlock):\n                # TODO: Download previous block\n                continue\n            mDownloadList.append(mHash)\n\n        if len(mDownloadList) == 0:\n            return\n\n        try:\n            op, resp, rpcId = await self.writeRpcRequest(\n                CommandOp.GET_MINOR_BLOCK_LIST_REQUEST, GetMinorBlockListRequest(mDownloadList))\n        except Exception as e:\n            Logger.logException()\n            self.closeWithError(e)\n            return\n\n        for mBlock in resp.minorBlockList:\n            success = await self.slaveServer.addBlock(mBlock)\n            if not success:\n                self.closeWithError(e)"
+        },
+        {
+          "symbol_name": "handleGetMinorBlockListRequest",
+          "start_line": 45,
+          "end_line": 54,
+          "relevance": [
+            "shared_attrs=1",
+            "keyword_source_overlap=2"
+          ],
+          "source": "    async def handleGetMinorBlockListRequest(self, request):\n        mBlockList = []\n        for mBlockHash in request.minorBlockHashList:\n            mBlock = self.shardState.getBlockByHash(mBlockHash)\n            if mBlock is None:\n                continue\n            # TODO: Check list size to make sure the resp is smaller than limit\n            mBlockList.append(mBlock)\n\n        return GetMinorBlockListResponse(mBlockList)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "shardState",
+          "start_line": 36,
+          "end_line": 38,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        self.clusterPeerId = clusterPeerId\n        self.shardState = shardState\n        self.masterConn = masterConn"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "CommandOp",
+          "kind": "import_from",
+          "start_line": 22,
+          "end_line": 24,
+          "source": "from quarkchain.cluster.p2p_commands import (\n    CommandOp, OP_SERIALIZER_MAP, NewMinorBlockHeaderListCommand, GetMinorBlockListRequest, GetMinorBlockListResponse\n)"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "handleGetMinorBlockListRequest",
+          "class_name": "ShardConnection",
+          "start_line": 45,
+          "end_line": 54,
+          "source": "    async def handleGetMinorBlockListRequest(self, request):\n        mBlockList = []\n        for mBlockHash in request.minorBlockHashList:\n            mBlock = self.shardState.getBlockByHash(mBlockHash)\n            if mBlock is None:\n                continue\n            # TODO: Check list size to make sure the resp is smaller than limit\n            mBlockList.append(mBlock)\n\n        return GetMinorBlockListResponse(mBlockList)"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

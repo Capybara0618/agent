@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import json
 import os
 import re
@@ -50,7 +51,9 @@ class OpenAICompatClient:
         )
         if base_url == "https://your-openai-compatible-host/v1":
             base_url = None
-        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=120)
+        self.request_timeout = float(os.environ.get("OPENAI_TIMEOUT_SECONDS") or 60)
+        self.max_attempts = max(1, int(os.environ.get("OPENAI_MAX_ATTEMPTS") or 1))
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.request_timeout)
         self.requested_model = model
         self.model = self._normalize_model_name(model)
         self.toolbox = GitHubToolbox()
@@ -60,13 +63,17 @@ class OpenAICompatClient:
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.0,
+        request_label: str = "",
     ) -> dict[str, Any]:
         last_error: Exception | None = None
         sanitized = False
         active_system_prompt = system_prompt
         active_user_prompt = user_prompt
         active_model = self.model
-        for attempt in range(3):
+        label = request_label or "llm_request"
+        for attempt in range(self.max_attempts):
+            attempt_started = time.time()
+            print(f"[llm] start label={label} attempt={attempt + 1}/{self.max_attempts} model={active_model} timeout={self.request_timeout:.0f}s")
             try:
                 response = self.client.chat.completions.create(
                     model=active_model,
@@ -78,25 +85,40 @@ class OpenAICompatClient:
                     response_format={"type": "json_object"},
                 )
                 content = response.choices[0].message.content or "{}"
+                elapsed = time.time() - attempt_started
+                print(f"[llm] success label={label} attempt={attempt + 1}/{self.max_attempts} elapsed={elapsed:.2f}s")
                 return json.loads(content)
             except Exception as exc:
                 last_error = exc
+                elapsed = time.time() - attempt_started
+                print(
+                    f"[llm] error label={label} attempt={attempt + 1}/{self.max_attempts} "
+                    f"elapsed={elapsed:.2f}s type={type(exc).__name__} message={self._short_error(exc)}"
+                )
                 fallback_model = self._fallback_model_for_error(exc, active_model)
                 if fallback_model and fallback_model != active_model:
+                    print(f"[llm] fallback_model label={label} from={active_model} to={fallback_model}")
                     active_model = fallback_model
                     self.model = fallback_model
                     continue
                 if self._is_content_filter_error(exc) and not sanitized:
+                    print(f"[llm] sanitize_prompts label={label}")
                     active_system_prompt, active_user_prompt = self._sanitize_prompts(system_prompt, user_prompt)
                     sanitized = True
                     continue
-                if attempt < 2:
+                if attempt < self.max_attempts - 1:
                     time.sleep(2 * (attempt + 1))
                     continue
                 raise
         if last_error:
             raise last_error
         raise RuntimeError("OpenAI-compatible request failed unexpectedly.")
+
+    def _short_error(self, exc: Exception) -> str:
+        message = " ".join(str(exc).split())
+        if len(message) > 220:
+            return message[:217] + "..."
+        return message
 
     def _normalize_model_name(self, model: str) -> str:
         cleaned = (model or "gpt-4o-mini").strip()
@@ -120,6 +142,11 @@ class OpenAICompatClient:
         compact_user = user_prompt
         compact_user = re.sub(
             r"(Base \+ repair \+ review context:\n)[\s\S]*",
+            r"\1[context compacted for safety; rely on metadata and direct task evidence]",
+            compact_user,
+        )
+        compact_user = re.sub(
+            r"(Unified GitHub context:\n)[\s\S]*",
             r"\1[context compacted for safety; rely on metadata and direct task evidence]",
             compact_user,
         )
@@ -171,37 +198,15 @@ class OpenAICompatClient:
         repo = state["project"]
         path = state["file_path"]
         ref = (state.get("commit") or "").strip() or None
-        issue_numbers = self._extract_issue_numbers(state["satd_comment"])[:2]
-        focus_symbol = self._fallback_symbol_name(state)
         file_payload = self.toolbox.fetch_repo_file(owner, repo, path, ref=ref)
         file_content = file_payload.get("full_content", "") if file_payload.get("ok") else ""
-        satd_window = self.toolbox.extract_satd_window(file_content, state["satd_comment"])
-        enclosing_symbol = self.toolbox.extract_enclosing_symbol(file_content, state["satd_comment"])
-        imports = self.toolbox.extract_imports(file_content)
-        module_prefix = self._module_prefix(path)
-        current_file_focus = self.toolbox.fetch_code_snippet(
-            owner,
-            repo,
-            path,
-            ref=ref,
-            anchor_text=state["satd_comment"],
-            symbol_name=enclosing_symbol.get("symbol_name") or focus_symbol,
-        )
+        target_function = self._resolve_target_function(file_content, state)
 
         bundle["base_context"] = {
             "file_path": path,
-            "original_code": state["original_code"],
             "original_signature": self._extract_original_signature(state["original_code"]),
-            "satd_comment": state["satd_comment"],
             "target_file": self._summarize_file_payload(file_payload),
-            "satd_window": satd_window,
-            "enclosing_symbol": enclosing_symbol,
-            "current_file_focus": current_file_focus,
-            "imports": imports,
-            "issue_refs": [self.toolbox.fetch_issue_or_pr(owner, repo, number) for number in issue_numbers],
-            "module_docs": self.toolbox.fetch_readme_or_module_docs(owner, repo, module_prefix, ref=ref)
-            if module_prefix
-            else {"ok": False, "error": "no_module_prefix"},
+            "target_function": target_function,
         }
         metadata.update(
             {
@@ -209,8 +214,8 @@ class OpenAICompatClient:
                 "base_context_fetched_at": self._timestamp(),
                 "base_cache_source": metadata.get("base_cache_source") or "github_fetch",
                 "context_commit": state.get("commit") or "",
-                "symbol_name": enclosing_symbol.get("symbol_name") if isinstance(enclosing_symbol, dict) else None,
-                "satd_line": satd_window.get("satd_line") if isinstance(satd_window, dict) else None,
+                "symbol_name": target_function.get("symbol_name"),
+                "satd_line": target_function.get("satd_line"),
             }
         )
         return self._augment_bundle_metadata(bundle)
@@ -227,40 +232,19 @@ class OpenAICompatClient:
         repo = state["project"]
         path = state["file_path"]
         ref = (state.get("commit") or "").strip() or None
-        symbol_name = metadata.get("symbol_name") or self._fallback_symbol_name(state)
-        satd_line = metadata.get("satd_line")
-        module_prefix = self._module_prefix(path)
-        issue_refs = (bundle.get("base_context", {}) or {}).get("issue_refs", [])
-        issue_numbers = [item.get("number") for item in issue_refs if isinstance(item, dict) and item.get("ok")]
-        history_query = self._build_history_query(state["satd_comment"], symbol_name)
-        similar_history = (
-            self.toolbox.search_closed_prs_or_issues(owner, repo, history_query)
-            if history_query
-            else {"ok": True, "query": "", "count": 0, "items": []}
-        )
-        repo_tree = self.toolbox.fetch_repo_tree(owner, repo, module_prefix, ref=ref)
-        related_tests = self.toolbox.find_related_tests(owner, repo, symbol_name or path, ref=ref)
-        call_sites = self.toolbox.find_call_sites(owner, repo, symbol_name, ref=ref, current_path=path)
-        related_pr_files = [
-            self.toolbox.fetch_pr_files(owner, repo, item.get("number"))
-            for item in similar_history.get("items", [])
-            if item.get("is_pull_request")
-        ][:2]
-        history_snippets = self._history_snippets(owner, repo, path, symbol_name, related_pr_files, ref)
-        neighbor_files = self._neighbor_files(owner, repo, repo_tree, path, symbol_name, ref)
+        file_payload = self.toolbox.fetch_repo_file(owner, repo, path, ref=ref)
+        file_content = file_payload.get("full_content", "") if file_payload.get("ok") else ""
+        target_function = ((bundle.get("base_context") or {}).get("target_function") or {}) if isinstance(bundle.get("base_context"), dict) else {}
+        symbol_name = str(target_function.get("symbol_name") or metadata.get("symbol_name") or self._fallback_symbol_name(state))
 
         bundle["repair_context"] = {
-            "repair_evidence_mode": metadata.get("repair_evidence_mode"),
-            "related_tests": related_tests,
-            "call_sites": call_sites,
-            "repo_tree": repo_tree,
-            "neighbor_files": neighbor_files,
-            "commits_for_path": self.toolbox.fetch_commits_for_path(owner, repo, path, limit=5),
-            "similar_history": similar_history,
-            "history_snippets": history_snippets,
-            "issue_comments": [self.toolbox.fetch_issue_comments(owner, repo, number) for number in issue_numbers[:2]],
-            "related_pr_files": related_pr_files,
-            "last_commit_for_line": self.toolbox.fetch_blame_or_last_commit_for_line(owner, repo, path, satd_line),
+            "context_strategy": "function_external_evidence",
+            "same_file_helpers": self._extract_same_file_helpers(file_content, target_function, state["satd_comment"]),
+            "same_class_evidence": self._extract_same_class_evidence(file_content, target_function, state["satd_comment"]),
+            "module_symbols": self._extract_module_symbols(file_content, target_function, state["satd_comment"]),
+            "same_file_pattern": self._extract_same_file_pattern(file_content, target_function, state["satd_comment"]),
+            "targeted_test_snippet": self._extract_targeted_test_snippet(owner, repo, ref, state, symbol_name),
+            "targeted_callsite_snippet": self._extract_targeted_callsite_snippet(owner, repo, path, ref, state, symbol_name),
         }
         metadata.update(
             {
@@ -367,74 +351,54 @@ class OpenAICompatClient:
         review = bundle.get("review_context") or {}
         compact = {
             "metadata": {
+                "context_strategy": metadata.get("context_strategy"),
                 "historical_snapshot_mismatch": metadata.get("historical_snapshot_mismatch"),
                 "snapshot_alignment_status": metadata.get("snapshot_alignment_status"),
                 "repair_evidence_mode": metadata.get("repair_evidence_mode"),
                 "github_evidence_strength": metadata.get("github_evidence_strength"),
                 "target_file_ok": metadata.get("target_file_ok"),
-                "satd_window_found": metadata.get("satd_window_found"),
-                "enclosing_symbol_found": metadata.get("enclosing_symbol_found"),
-                "related_tests_count": metadata.get("related_tests_count"),
-                "call_sites_count": metadata.get("call_sites_count"),
-                "commits_count": metadata.get("commits_count"),
-                "similar_history_count": metadata.get("similar_history_count"),
+                "target_function_found": metadata.get("target_function_found"),
+                "same_file_helpers_count": metadata.get("same_file_helpers_count"),
+                "same_class_methods_count": metadata.get("same_class_methods_count"),
+                "same_class_attributes_count": metadata.get("same_class_attributes_count"),
+                "module_symbols_count": metadata.get("module_symbols_count"),
+                "same_file_pattern_count": metadata.get("same_file_pattern_count"),
+                "decisive_external_evidence_count": metadata.get("decisive_external_evidence_count"),
+                "targeted_test_snippet_count": metadata.get("targeted_test_snippet_count"),
+                "targeted_callsite_snippet_count": metadata.get("targeted_callsite_snippet_count"),
                 "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
                 "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
-                "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
                 "symbol_name": metadata.get("symbol_name"),
                 "satd_line": metadata.get("satd_line"),
             },
             "base_context": {
                 "file_path": base.get("file_path"),
-                "satd_comment": base.get("satd_comment"),
                 "original_signature": base.get("original_signature"),
-                "target_file": {
-                    "ok": (base.get("target_file") or {}).get("ok"),
-                    "path": (base.get("target_file") or {}).get("path"),
-                    "content_excerpt": (base.get("target_file") or {}).get("content_excerpt"),
-                    "total_lines": (base.get("target_file") or {}).get("total_lines"),
+                "target_function": {
+                    "found": (base.get("target_function") or {}).get("found"),
+                    "symbol_name": (base.get("target_function") or {}).get("symbol_name"),
+                    "class_name": (base.get("target_function") or {}).get("class_name"),
+                    "start_line": (base.get("target_function") or {}).get("start_line"),
+                    "end_line": (base.get("target_function") or {}).get("end_line"),
+                    "matched_by": (base.get("target_function") or {}).get("matched_by"),
                 },
-                "satd_window": base.get("satd_window"),
-                "enclosing_symbol": base.get("enclosing_symbol"),
-                "current_file_focus": base.get("current_file_focus"),
-                "imports": ((base.get("imports") or {}).get("imports", []) if isinstance(base.get("imports"), dict) else (base.get("imports") or []))[:20],
-                "issue_refs": ((base.get("issue_refs") or []) if isinstance(base.get("issue_refs"), list) else [])[:2],
-                "module_docs": base.get("module_docs"),
             },
         }
         if stage in {"repair", "review"}:
             compact["repair_context"] = {
-                "repair_evidence_mode": repair.get("repair_evidence_mode") or metadata.get("repair_evidence_mode"),
-                "related_tests": {
-                    "count": (repair.get("related_tests") or {}).get("count", 0),
-                    "items": (repair.get("related_tests") or {}).get("items", [])[:4],
-                },
-                "call_sites": {
-                    "count": (repair.get("call_sites") or {}).get("count", 0),
-                    "items": (repair.get("call_sites") or {}).get("items", [])[:4],
-                },
-                "neighbor_files": {
-                    "count": (repair.get("neighbor_files") or {}).get("count", 0),
-                    "items": ((repair.get("neighbor_files") or {}).get("items", []) if isinstance(repair.get("neighbor_files"), dict) else [])[:3],
-                },
-                "commits_for_path": {
-                    "count": (repair.get("commits_for_path") or {}).get("count", 0),
-                    "commits": (repair.get("commits_for_path") or {}).get("commits", [])[:2],
-                },
-                "similar_history": {
-                    "count": (repair.get("similar_history") or {}).get("count", 0),
-                    "items": (repair.get("similar_history") or {}).get("items", [])[:2],
-                },
-                "history_snippets": {
-                    "count": (repair.get("history_snippets") or {}).get("count", 0),
-                    "items": (repair.get("history_snippets") or {}).get("items", [])[:3],
-                },
-                "related_pr_files": (repair.get("related_pr_files") or [])[:2],
-                "last_commit_for_line": repair.get("last_commit_for_line"),
+                "same_file_helpers": repair.get("same_file_helpers"),
+                "same_class_evidence": repair.get("same_class_evidence"),
+                "module_symbols": repair.get("module_symbols"),
+                "same_file_pattern": repair.get("same_file_pattern"),
+                "targeted_test_snippet": repair.get("targeted_test_snippet"),
+                "targeted_callsite_snippet": repair.get("targeted_callsite_snippet"),
             }
         if stage == "review":
             compact["review_context"] = review
         return json.dumps(compact, ensure_ascii=False)
+
+    def compact_shared_context(self, bundle: dict[str, Any] | None) -> str:
+        return self.compact_context_for_stage(bundle, "repair")
 
     def _ensure_bundle(self, bundle: dict[str, Any] | None, state: GraphState) -> dict[str, Any]:
         current = dict(bundle or {})
@@ -577,6 +541,157 @@ class OpenAICompatClient:
                 return stripped
         return ""
 
+    def _comment_keywords(self, satd_comment: str) -> set[str]:
+        stopwords = {
+            "todo",
+            "fixme",
+            "xxx",
+            "temporary",
+            "temporarily",
+            "this",
+            "that",
+            "these",
+            "those",
+            "when",
+            "with",
+            "from",
+            "into",
+            "only",
+            "then",
+            "than",
+            "they",
+            "them",
+            "their",
+            "there",
+            "here",
+            "should",
+            "would",
+            "could",
+            "must",
+            "need",
+            "needs",
+            "line",
+            "code",
+            "function",
+            "test",
+            "tests",
+            "comment",
+            "below",
+            "above",
+            "entire",
+            "environment",
+            "remove",
+            "support",
+            "default",
+        }
+        raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]+", satd_comment or "")
+        keywords: set[str] = set()
+        for token in raw_tokens:
+            lowered = token.lower()
+            if lowered in stopwords or len(lowered) < 3:
+                continue
+            keywords.add(lowered)
+            if lowered.endswith("s") and len(lowered) > 4:
+                keywords.add(lowered[:-1])
+        return keywords
+
+    def _name_tokens(self, name: str) -> set[str]:
+        if not name:
+            return set()
+        pieces = re.split(r"[_\W]+", name)
+        exploded: list[str] = []
+        for piece in pieces:
+            if not piece:
+                continue
+            exploded.extend(re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|$)|\d+", piece))
+        return {part.lower() for part in exploded if len(part) >= 2}
+
+    def _keyword_overlap(self, text: str, keywords: set[str]) -> int:
+        lowered = (text or "").lower()
+        return sum(1 for keyword in keywords if keyword in lowered)
+
+    def _distinct_match_tokens(self, text: str) -> set[str]:
+        generic = {"test", "tests", "case", "cases", "bug", "func", "function", "method", "class", "file", "py"}
+        return {token for token in self._name_tokens(text) if token not in generic}
+
+    def _score_helper_candidate(
+        self,
+        item: dict[str, Any],
+        current_name: str,
+        direct_calls: set[str],
+        self_calls: set[str],
+        comment_keywords: set[str],
+        class_name: str | None,
+    ) -> tuple[int, list[str]]:
+        score = 0
+        reasons: list[str] = []
+        symbol_name = item["symbol_name"]
+        name_tokens = self._name_tokens(symbol_name)
+        overlap = len(name_tokens.intersection(comment_keywords))
+        if symbol_name in direct_calls or symbol_name in self_calls:
+            score += 10
+            reasons.append("direct_call")
+        if overlap:
+            score += 4 * overlap
+            reasons.append(f"keyword_name_overlap={overlap}")
+        source_hits = self._keyword_overlap(item["source"], comment_keywords)
+        if source_hits:
+            score += source_hits
+            reasons.append(f"keyword_source_overlap={source_hits}")
+        if class_name and item.get("class_name") == class_name:
+            score += 1
+            reasons.append("same_class")
+        if symbol_name == current_name:
+            score = -1
+        return score, reasons
+
+    def _strong_targeted_item(
+        self,
+        item: dict[str, Any] | None,
+        symbol_name: str,
+        satd_comment: str,
+        current_path: str,
+        expected_kind: str,
+    ) -> bool:
+        if not item or not item.get("snippet_ok"):
+            return False
+        match_reason = str(item.get("match_reason") or "")
+        if match_reason in {"file_start", "assert_window"} and expected_kind != "test":
+            return False
+
+        keywords = self._comment_keywords(satd_comment)
+        symbol_tokens = self._distinct_match_tokens(symbol_name)
+        path_tokens = self._distinct_match_tokens(os.path.basename(item.get("path") or ""))
+        current_tokens = self._distinct_match_tokens(os.path.basename(current_path or ""))
+        excerpt = str(item.get("excerpt") or "")
+        excerpt_lower = excerpt.lower()
+
+        score = 0
+        if match_reason in {"symbol_match", "anchor_text"}:
+            score += 3
+        if symbol_name and symbol_name in excerpt:
+            score += 4
+        if symbol_tokens.intersection(path_tokens):
+            score += 3
+        if current_tokens.intersection(path_tokens):
+            score += 2
+        keyword_hits = sum(1 for keyword in keywords if keyword in excerpt_lower)
+        score += min(3, keyword_hits)
+        if expected_kind == "test" and self.toolbox._is_test_path(item.get("path", "")):
+            score += 1
+            if match_reason == "assert_window" and not (
+                symbol_tokens.intersection(path_tokens) or current_tokens.intersection(path_tokens)
+            ):
+                return False
+        return score >= 4
+
+    def _first_signature_line(self, code: str) -> str:
+        for line in (code or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("def ") or stripped.startswith("async def ") or stripped.startswith("class "):
+                return stripped
+        return ""
+
     def _timestamp(self) -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -586,31 +701,31 @@ class OpenAICompatClient:
         repair_context = bundle.get("repair_context", {}) or {}
 
         target_file = base_context.get("target_file", {}) if isinstance(base_context, dict) else {}
-        satd_window = base_context.get("satd_window", {}) if isinstance(base_context, dict) else {}
-        enclosing_symbol = base_context.get("enclosing_symbol", {}) if isinstance(base_context, dict) else {}
-        related_tests = repair_context.get("related_tests", {}) if isinstance(repair_context, dict) else {}
-        call_sites = repair_context.get("call_sites", {}) if isinstance(repair_context, dict) else {}
-        commits_for_path = repair_context.get("commits_for_path", {}) if isinstance(repair_context, dict) else {}
-        similar_history = repair_context.get("similar_history", {}) if isinstance(repair_context, dict) else {}
-        history_snippets = repair_context.get("history_snippets", {}) if isinstance(repair_context, dict) else {}
+        target_function = base_context.get("target_function", {}) if isinstance(base_context, dict) else {}
+        same_file_helpers = repair_context.get("same_file_helpers", {}) if isinstance(repair_context, dict) else {}
+        same_class_evidence = repair_context.get("same_class_evidence", {}) if isinstance(repair_context, dict) else {}
+        module_symbols = repair_context.get("module_symbols", {}) if isinstance(repair_context, dict) else {}
+        same_file_pattern = repair_context.get("same_file_pattern", {}) if isinstance(repair_context, dict) else {}
+        targeted_test_snippet = repair_context.get("targeted_test_snippet", {}) if isinstance(repair_context, dict) else {}
+        targeted_callsite_snippet = repair_context.get("targeted_callsite_snippet", {}) if isinstance(repair_context, dict) else {}
         context_commit = str(metadata.get("context_commit") or bundle.get("commit") or "")
 
         target_file_ok = bool(target_file.get("ok"))
-        satd_window_found = bool(satd_window.get("found"))
-        enclosing_symbol_found = bool(enclosing_symbol.get("found"))
-        related_tests_count = int(related_tests.get("count") or 0)
-        call_sites_count = int(call_sites.get("count") or 0)
-        commits_count = int(commits_for_path.get("count") or 0)
-        similar_history_count = int(similar_history.get("count") or 0)
-        retrieved_test_snippets_count = sum(1 for item in related_tests.get("items", []) if item.get("excerpt"))
-        retrieved_callsite_snippets_count = sum(1 for item in call_sites.get("items", []) if item.get("excerpt"))
-        retrieved_history_snippets_count = sum(1 for item in history_snippets.get("items", []) if item.get("excerpt"))
+        target_function_found = bool(target_function.get("found"))
+        same_file_helpers_count = int(same_file_helpers.get("count") or 0)
+        same_class_methods_count = int(same_class_evidence.get("related_methods_count") or 0)
+        same_class_attributes_count = int(same_class_evidence.get("related_attributes_count") or 0)
+        module_symbols_count = int(module_symbols.get("count") or 0)
+        same_file_pattern_count = int(same_file_pattern.get("count") or 0)
+        targeted_test_snippet_count = 1 if targeted_test_snippet.get("used") and targeted_test_snippet.get("item") else 0
+        targeted_callsite_snippet_count = 1 if targeted_callsite_snippet.get("used") and targeted_callsite_snippet.get("item") else 0
+        retrieved_test_snippets_count = targeted_test_snippet_count
+        retrieved_callsite_snippets_count = targeted_callsite_snippet_count
+        retrieved_history_snippets_count = 0
 
         target_file_error = str(target_file.get("error") or "")
-        if target_file_ok and satd_window_found and enclosing_symbol_found:
+        if target_file_ok and target_function_found:
             snapshot_alignment_status = "aligned"
-        elif target_file_ok and (satd_window_found or enclosing_symbol_found):
-            snapshot_alignment_status = "partial"
         elif context_commit and self._is_missing_ref_error(target_file_error):
             snapshot_alignment_status = "historical_ref_missing"
         elif context_commit and not target_file_ok:
@@ -619,33 +734,43 @@ class OpenAICompatClient:
             snapshot_alignment_status = "true_mismatch"
 
         historical_snapshot_mismatch = snapshot_alignment_status != "aligned"
-        evidence_snippet_count = (
-            retrieved_test_snippets_count
-            + retrieved_callsite_snippets_count
-            + retrieved_history_snippets_count
+        external_evidence_count = (
+            same_file_helpers_count
+            + same_class_methods_count
+            + same_class_attributes_count
+            + module_symbols_count
+            + same_file_pattern_count
+            + targeted_test_snippet_count
+            + targeted_callsite_snippet_count
+        )
+        decisive_evidence_count = (
+            same_file_helpers_count
+            + same_class_methods_count
+            + targeted_test_snippet_count
+            + targeted_callsite_snippet_count
         )
         repair_evidence_mode = "strong" if (
-            snapshot_alignment_status == "aligned"
-            or (snapshot_alignment_status == "partial" and (enclosing_symbol_found or evidence_snippet_count > 0))
+            target_function_found and decisive_evidence_count > 0
         ) else "weak"
 
         positive_signals = sum(
             1
             for flag in (
                 target_file_ok,
-                satd_window_found,
-                enclosing_symbol_found,
-                related_tests_count > 0,
-                call_sites_count > 0,
-                commits_count > 0,
-                similar_history_count > 0,
-                evidence_snippet_count > 0,
+                target_function_found,
+                same_file_helpers_count > 0,
+                same_class_methods_count > 0,
+                same_class_attributes_count > 0,
+                module_symbols_count > 0 and decisive_evidence_count > 0,
+                same_file_pattern_count > 0,
+                targeted_test_snippet_count > 0,
+                targeted_callsite_snippet_count > 0,
             )
             if flag
         )
-        if positive_signals >= 5 and repair_evidence_mode == "strong":
+        if positive_signals >= 4 and repair_evidence_mode == "strong":
             github_evidence_strength = "high"
-        elif positive_signals >= 2 or target_file_ok:
+        elif positive_signals >= 2 or (target_file_ok and decisive_evidence_count > 0):
             github_evidence_strength = "medium"
         else:
             github_evidence_strength = "low"
@@ -654,12 +779,22 @@ class OpenAICompatClient:
             {
                 "target_file_ok": target_file_ok,
                 "context_commit": context_commit,
-                "satd_window_found": satd_window_found,
-                "enclosing_symbol_found": enclosing_symbol_found,
-                "related_tests_count": related_tests_count,
-                "call_sites_count": call_sites_count,
-                "commits_count": commits_count,
-                "similar_history_count": similar_history_count,
+                "context_strategy": "function_external_evidence",
+                "target_function_found": target_function_found,
+                "same_file_helpers_count": same_file_helpers_count,
+                "same_class_methods_count": same_class_methods_count,
+                "same_class_attributes_count": same_class_attributes_count,
+                "module_symbols_count": module_symbols_count,
+                "same_file_pattern_count": same_file_pattern_count,
+                "decisive_external_evidence_count": decisive_evidence_count,
+                "targeted_test_snippet_count": targeted_test_snippet_count,
+                "targeted_callsite_snippet_count": targeted_callsite_snippet_count,
+                "satd_window_found": False,
+                "enclosing_symbol_found": target_function_found,
+                "related_tests_count": targeted_test_snippet_count,
+                "call_sites_count": targeted_callsite_snippet_count,
+                "commits_count": 0,
+                "similar_history_count": 0,
                 "retrieved_test_snippets_count": retrieved_test_snippets_count,
                 "retrieved_callsite_snippets_count": retrieved_callsite_snippets_count,
                 "retrieved_history_snippets_count": retrieved_history_snippets_count,
@@ -674,6 +809,424 @@ class OpenAICompatClient:
         )
         bundle["metadata"] = metadata
         return bundle
+
+    def _resolve_target_function(self, file_content: str, state: GraphState) -> dict[str, Any]:
+        contexts = self._collect_function_contexts(file_content)
+        if not contexts:
+            return {"found": False, "error": "function_not_found"}
+
+        signature_name = self._fallback_symbol_name(state)
+        satd_window = self.toolbox.extract_satd_window(file_content, state["satd_comment"], window=0)
+        satd_line = satd_window.get("satd_line") if satd_window.get("found") else None
+        original_norm = preprocess_python_code(state["original_code"])
+        best = None
+        best_score = -1
+
+        for item in contexts:
+            score = 0
+            if signature_name and item["symbol_name"] == signature_name:
+                score += 5
+            if satd_line and item["start_line"] <= satd_line <= item["end_line"]:
+                score += 7
+            candidate_norm = preprocess_python_code(item["source"])
+            if original_norm and candidate_norm == original_norm:
+                score += 20
+            elif original_norm and self._first_signature_line(item["source"]) == self._first_signature_line(state["original_code"]):
+                score += 4
+            if score > best_score:
+                best = item
+                best_score = score
+
+        if not best or best_score <= 0:
+            return {"found": False, "error": "function_not_found", "satd_line": satd_line}
+
+        matched_by = "normalized_source" if preprocess_python_code(best["source"]) == original_norm else "signature_or_comment"
+        return {
+            "found": True,
+            "symbol_name": best["symbol_name"],
+            "class_name": best["class_name"],
+            "start_line": best["start_line"],
+            "end_line": best["end_line"],
+            "satd_line": satd_line,
+            "matched_by": matched_by,
+            "source": best["source"],
+            "calls": sorted(best["calls"]),
+            "self_calls": sorted(best["self_calls"]),
+            "self_attrs": sorted(best["self_attrs"]),
+            "global_uses": sorted(best["global_uses"]),
+        }
+
+    def _collect_function_contexts(self, file_content: str) -> list[dict[str, Any]]:
+        clean_content = self.toolbox._sanitize_source_text(file_content)
+        if not clean_content.strip():
+            return []
+        try:
+            tree = ast.parse(clean_content)
+        except (SyntaxError, ValueError):
+            return []
+
+        lines = clean_content.splitlines()
+        parent_map: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parent_map[child] = parent
+
+        builtin_names = set(dir(builtins))
+        contexts: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", None)
+            if start is None or end is None:
+                continue
+            parent = parent_map.get(node)
+            class_name = parent.name if isinstance(parent, ast.ClassDef) else None
+            usage = self._collect_function_usage(node, builtin_names)
+            contexts.append(
+                {
+                    "node": node,
+                    "class_name": class_name,
+                    "symbol_name": node.name,
+                    "start_line": start,
+                    "end_line": end,
+                    "source": "\n".join(lines[start - 1 : end]),
+                    "calls": usage["calls"],
+                    "self_calls": usage["self_calls"],
+                    "self_attrs": usage["self_attrs"],
+                    "global_uses": usage["global_uses"],
+                }
+            )
+        return contexts
+
+    def _collect_function_usage(self, node: ast.AST, builtin_names: set[str]) -> dict[str, set[str]]:
+        arg_names = set()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs):
+                arg_names.add(arg.arg)
+            if node.args.vararg:
+                arg_names.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                arg_names.add(node.args.kwarg.arg)
+
+        local_names = set(arg_names)
+        calls: set[str] = set()
+        self_calls: set[str] = set()
+        self_attrs: set[str] = set()
+        global_uses: set[str] = set()
+
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                func = child.func
+                if isinstance(func, ast.Name):
+                    calls.add(func.id)
+                elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self":
+                    self_calls.add(func.attr)
+                    self_attrs.add(func.attr)
+            elif isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id == "self":
+                self_attrs.add(child.attr)
+            elif isinstance(child, ast.Name):
+                if isinstance(child.ctx, ast.Store):
+                    local_names.add(child.id)
+                elif isinstance(child.ctx, ast.Load) and child.id not in local_names and child.id not in builtin_names and child.id != "self":
+                    global_uses.add(child.id)
+
+        return {
+            "calls": calls,
+            "self_calls": self_calls,
+            "self_attrs": self_attrs,
+            "global_uses": global_uses,
+        }
+
+    def _extract_same_file_helpers(self, file_content: str, target_function: dict[str, Any], satd_comment: str) -> dict[str, Any]:
+        if not target_function.get("found"):
+            return {"count": 0, "items": []}
+        contexts = self._collect_function_contexts(file_content)
+        direct_calls = set(target_function.get("calls") or [])
+        self_calls = set(target_function.get("self_calls") or [])
+        current_name = target_function.get("symbol_name")
+        comment_keywords = self._comment_keywords(satd_comment)
+        class_name = target_function.get("class_name")
+        scored: list[tuple[int, int, dict[str, Any]]] = []
+        for item in contexts:
+            score, reasons = self._score_helper_candidate(
+                item,
+                current_name=current_name,
+                direct_calls=direct_calls,
+                self_calls=self_calls,
+                comment_keywords=comment_keywords,
+                class_name=class_name,
+            )
+            if score < 4:
+                continue
+            scored.append((score, item["start_line"], {
+                "symbol_name": item["symbol_name"],
+                "class_name": item["class_name"],
+                "start_line": item["start_line"],
+                "end_line": item["end_line"],
+                "relevance": reasons,
+                "source": item["source"],
+            }))
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        items = [payload for _, _, payload in scored[:3]]
+        return {"count": len(items), "items": items}
+
+    def _extract_same_class_evidence(self, file_content: str, target_function: dict[str, Any], satd_comment: str) -> dict[str, Any]:
+        if not target_function.get("found") or not target_function.get("class_name"):
+            return {"class_name": None, "related_methods_count": 0, "related_attributes_count": 0, "related_methods": [], "related_attributes": []}
+
+        contexts = self._collect_function_contexts(file_content)
+        class_name = target_function.get("class_name")
+        current_name = target_function.get("symbol_name")
+        self_calls = set(target_function.get("self_calls") or [])
+        self_attrs = set(target_function.get("self_attrs") or [])
+        comment_keywords = self._comment_keywords(satd_comment)
+
+        scored_methods: list[tuple[int, int, dict[str, Any]]] = []
+        for item in contexts:
+            if item["class_name"] != class_name or item["symbol_name"] == current_name:
+                continue
+            score = 0
+            reasons: list[str] = []
+            if item["symbol_name"] in self_calls:
+                score += 8
+                reasons.append("direct_self_call")
+            shared_attrs = len(self_attrs.intersection(set(item.get("self_attrs") or [])))
+            if shared_attrs:
+                score += 2 * shared_attrs
+                reasons.append(f"shared_attrs={shared_attrs}")
+            keyword_hits = self._keyword_overlap(item["source"], comment_keywords)
+            if keyword_hits:
+                score += keyword_hits
+                reasons.append(f"keyword_source_overlap={keyword_hits}")
+            name_overlap = len(self._name_tokens(item["symbol_name"]).intersection(comment_keywords))
+            if name_overlap:
+                score += 3 * name_overlap
+                reasons.append(f"keyword_name_overlap={name_overlap}")
+            if score < 4:
+                continue
+            scored_methods.append((score, item["start_line"], {
+                "symbol_name": item["symbol_name"],
+                "start_line": item["start_line"],
+                "end_line": item["end_line"],
+                "relevance": reasons,
+                "source": item["source"],
+            }))
+
+        related_methods = [payload for _, _, payload in sorted(scored_methods, key=lambda pair: (-pair[0], pair[1]))[:2]]
+        related_attributes = self._extract_class_attribute_evidence(file_content, class_name, self_attrs, satd_comment)
+        return {
+            "class_name": class_name,
+            "related_methods_count": len(related_methods),
+            "related_attributes_count": len(related_attributes),
+            "related_methods": related_methods,
+            "related_attributes": related_attributes,
+        }
+
+    def _extract_class_attribute_evidence(self, file_content: str, class_name: str, attr_names: set[str], satd_comment: str) -> list[dict[str, Any]]:
+        if not attr_names:
+            return []
+        clean_content = self.toolbox._sanitize_source_text(file_content)
+        try:
+            tree = ast.parse(clean_content)
+        except (SyntaxError, ValueError):
+            return []
+        lines = clean_content.splitlines()
+        comment_keywords = self._comment_keywords(satd_comment)
+        results: list[tuple[int, int, dict[str, Any]]] = []
+        seen_attrs: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name != class_name:
+                continue
+            for child in ast.walk(node):
+                targets = list(child.targets) if isinstance(child, ast.Assign) else [child.target] if isinstance(child, ast.AnnAssign) else []
+                for target in targets:
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                        and target.attr in attr_names
+                        and target.attr not in seen_attrs
+                    ):
+                        continue
+                    start = max(1, getattr(child, "lineno", 1) - 1)
+                    end = min(len(lines), getattr(child, "end_lineno", getattr(child, "lineno", 1)) + 1)
+                    snippet = "\n".join(lines[start - 1 : end])
+                    score = 3
+                    reasons = ["direct_attribute_use"]
+                    keyword_hits = self._keyword_overlap(snippet, comment_keywords)
+                    if keyword_hits:
+                        score += keyword_hits
+                        reasons.append(f"keyword_source_overlap={keyword_hits}")
+                    if score < 3:
+                        continue
+                    results.append((score, start, {
+                        "attribute": target.attr,
+                        "start_line": start,
+                        "end_line": end,
+                        "relevance": reasons,
+                        "snippet": snippet,
+                    }))
+                    seen_attrs.add(target.attr)
+        return [payload for _, _, payload in sorted(results, key=lambda pair: (-pair[0], pair[1]))[:3]]
+
+    def _extract_module_symbols(self, file_content: str, target_function: dict[str, Any], satd_comment: str) -> dict[str, Any]:
+        if not target_function.get("found"):
+            return {"count": 0, "items": []}
+        clean_content = self.toolbox._sanitize_source_text(file_content)
+        try:
+            tree = ast.parse(clean_content)
+        except (SyntaxError, ValueError):
+            return {"count": 0, "items": []}
+
+        lines = clean_content.splitlines()
+        used_names = set(target_function.get("global_uses") or [])
+        comment_keywords = self._comment_keywords(satd_comment)
+        if not used_names:
+            return {"count": 0, "items": []}
+
+        items = []
+        seen_names: set[str] = set()
+        for node in getattr(tree, "body", []):
+            symbol_name = None
+            symbol_kind = None
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", start)
+            source = ""
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    candidate = alias.asname or alias.name.split(".")[0]
+                    if candidate in used_names and candidate not in seen_names:
+                        if not self._name_tokens(candidate).intersection(comment_keywords):
+                            continue
+                        symbol_name = candidate
+                        symbol_kind = "import"
+                        break
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    candidate = alias.asname or alias.name
+                    if candidate in used_names and candidate not in seen_names:
+                        source = "\n".join(lines[(start or 1) - 1 : (end or start or 1)])
+                        if not (
+                            self._name_tokens(candidate).intersection(comment_keywords)
+                            or self._keyword_overlap(source, comment_keywords)
+                        ):
+                            continue
+                        symbol_name = candidate
+                        symbol_kind = "import_from"
+                        break
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in used_names and target.id not in seen_names:
+                        symbol_name = target.id
+                        symbol_kind = "assign"
+                        break
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in used_names and node.target.id not in seen_names:
+                symbol_name = node.target.id
+                symbol_kind = "annassign"
+            elif isinstance(node, ast.ClassDef) and node.name in used_names and node.name not in seen_names:
+                symbol_name = node.name
+                symbol_kind = "class"
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in used_names and node.name not in seen_names:
+                symbol_name = node.name
+                symbol_kind = "function"
+
+            if not symbol_name or start is None:
+                continue
+            source = source or "\n".join(lines[start - 1 : end])
+            if symbol_kind in {"assign", "annassign", "class", "function"}:
+                if not (
+                    self._name_tokens(symbol_name).intersection(comment_keywords)
+                    or self._keyword_overlap(source, comment_keywords)
+                ):
+                    continue
+            seen_names.add(symbol_name)
+            end = end or start
+            items.append(
+                {
+                    "symbol_name": symbol_name,
+                    "kind": symbol_kind,
+                    "start_line": start,
+                    "end_line": end,
+                    "source": source,
+                }
+            )
+        items = items[:3]
+        return {"count": len(items), "items": items}
+
+    def _extract_same_file_pattern(self, file_content: str, target_function: dict[str, Any], satd_comment: str) -> dict[str, Any]:
+        if not target_function.get("found"):
+            return {"count": 0, "items": []}
+        contexts = self._collect_function_contexts(file_content)
+        current_name = target_function.get("symbol_name")
+        current_class = target_function.get("class_name")
+        current_calls = set(target_function.get("calls") or [])
+        current_self_calls = set(target_function.get("self_calls") or [])
+        current_self_attrs = set(target_function.get("self_attrs") or [])
+        comment_tokens = [token.lower() for token in re.findall(r"[A-Za-z_]{4,}", satd_comment or "")[:6]]
+
+        scored = []
+        for item in contexts:
+            if item["symbol_name"] == current_name:
+                continue
+            score = 0
+            score += 2 * len(current_calls.intersection(item["calls"]))
+            score += 2 * len(current_self_calls.intersection(item["self_calls"]))
+            score += 2 * len(current_self_attrs.intersection(item["self_attrs"]))
+            if current_class and item["class_name"] == current_class:
+                score += 1
+            source_lower = item["source"].lower()
+            score += sum(1 for token in comment_tokens if token in source_lower)
+            if score >= 4:
+                scored.append((score, item))
+
+        scored.sort(key=lambda pair: (-pair[0], pair[1]["start_line"]))
+        items = []
+        for _, item in scored[:1]:
+            items.append(
+                {
+                    "symbol_name": item["symbol_name"],
+                    "class_name": item["class_name"],
+                    "start_line": item["start_line"],
+                    "end_line": item["end_line"],
+                    "source": item["source"],
+                }
+            )
+        return {"count": len(items), "items": items}
+
+    def _extract_targeted_test_snippet(self, owner: str, repo: str, ref: str | None, state: GraphState, symbol_name: str) -> dict[str, Any]:
+        if not self._should_use_test_context(state["satd_comment"]):
+            return {"used": False, "reason": "rule_not_triggered", "item": None}
+        payload = self.toolbox.find_related_tests(owner, repo, symbol_name or state["file_path"], per_page=1, ref=ref)
+        item = ((payload.get("items") or [None])[0] if isinstance(payload, dict) else None)
+        if not self._strong_targeted_item(item, symbol_name, state["satd_comment"], state["file_path"], expected_kind="test"):
+            return {"used": False, "reason": "weak_match_filtered", "item": None}
+        return {"used": True, "reason": "keyword_triggered", "item": item}
+
+    def _extract_targeted_callsite_snippet(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        ref: str | None,
+        state: GraphState,
+        symbol_name: str,
+    ) -> dict[str, Any]:
+        if not self._should_use_callsite_context(state["satd_comment"]):
+            return {"used": False, "reason": "rule_not_triggered", "item": None}
+        payload = self.toolbox.find_call_sites(owner, repo, symbol_name, per_page=1, ref=ref, current_path=path)
+        item = ((payload.get("items") or [None])[0] if isinstance(payload, dict) else None)
+        if not self._strong_targeted_item(item, symbol_name, state["satd_comment"], state["file_path"], expected_kind="callsite"):
+            return {"used": False, "reason": "weak_match_filtered", "item": None}
+        return {"used": True, "reason": "keyword_triggered", "item": item}
+
+    def _should_use_test_context(self, satd_comment: str) -> bool:
+        comment = (satd_comment or "").lower()
+        return any(token in comment for token in ("test", "assert", "re-enable", "reenable", "skip", "-o"))
+
+    def _should_use_callsite_context(self, satd_comment: str) -> bool:
+        comment = (satd_comment or "").lower()
+        return any(token in comment for token in ("replace by", "switch to", "support", "deprecated", "legacy", "full_path", "rename", "use "))
 
     def _is_missing_ref_error(self, error_text: str) -> bool:
         lowered = (error_text or "").lower()
@@ -693,7 +1246,7 @@ class OpenAIAnalyzer:
 
     def run(self, state: GraphState) -> AnalysisResult:
         context_bundle = state.get("github_context") or self.client.build_base_context(state)
-        github_context = self.client.format_context(context_bundle, layers=("base_context",))
+        github_context = self.client.compact_shared_context(context_bundle)
         system_prompt = (
             "You are the analyzer agent in a SATD repair workflow. "
             "Your job is to decide whether a SATD item is a good candidate for automatic repair, not whether it is theoretically fixable in some ideal setting. "
@@ -720,9 +1273,9 @@ class OpenAIAnalyzer:
             f"File path: {state['file_path']}\n"
             f"SATD comment: {state['satd_comment']}\n"
             f"Current code snippet:\n{state['original_code']}\n\n"
-            f"Base GitHub context:\n{github_context}\n"
+            f"Unified GitHub context:\n{github_context}\n"
         )
-        payload = self.client.generate_json(system_prompt, user_prompt)
+        payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"analyze:task_{state['task_id']}")
         return self._coerce_analysis(payload, state, context_bundle)
 
     def _coerce_analysis(
@@ -1046,75 +1599,35 @@ class OpenAIAnalyzer:
 
 
 class OpenAIFixer:
-    def __init__(self, client: OpenAICompatClient) -> None:
+    def __init__(self, client: OpenAICompatClient, prompt_mode: str = "lightweight") -> None:
         self.client = client
+        self.prompt_mode = prompt_mode
 
     def run(self, state: GraphState) -> RepairAttempt:
-        analysis = state["analysis"]
-        latest_review = state["latest_review"]
-        assert analysis is not None
-
         metadata = ((state.get("github_context") or {}).get("metadata") or {}) if isinstance(state.get("github_context"), dict) else {}
         round_id = state["round_id"] + 1
-        github_context = self.client.compact_context_for_stage(state.get("github_context"), "repair")
+        github_context = self.client.compact_shared_context(state.get("github_context"))
         repair_evidence_mode = str(metadata.get("repair_evidence_mode") or "weak")
         snapshot_alignment_status = str(metadata.get("snapshot_alignment_status") or "mismatch")
-        system_prompt = (
-            "You are the fixer agent in a SATD repair workflow. "
-            "Produce repaired code, not a patch description. "
-            "Optimize for the most conservative plausible human repair and preserve the original code skeleton whenever possible. "
-            "Prefer comment-driven, minimal textual repairs over broader rewrites. "
-            "Unless the evidence clearly requires it, do not add parameters, helper functions, return statements, exception paths, renames, or control-flow rewrites. "
-            "If a previous review warns about API shape drift, overwritten repair, or no-op output, fix that issue first with a smaller in-place edit. "
-            "A pure comment removal is acceptable only when the SATD itself explicitly says the obsolete comment or TODO should be removed. "
-            "Use the repair context to localize the smallest valid repair. Return JSON only."
-        )
         contextual_repair_hint = self._contextual_repair_hint(state["original_code"], state["satd_comment"])
-        user_prompt = (
-            "Return a JSON object with keys: "
-            "repair_plan (string), repaired_code (string), changed_scope (string), "
-            "confidence (float 0-1), notes (string).\n"
-            "repaired_code must be the complete repaired version of the provided original code block.\n"
-            "If evidence is weak or snapshot alignment is poor, prefer tiny local edits inside the existing structure.\n"
-            "Do not invent APIs, helper methods, parameters, or control-flow changes without direct evidence from the provided context.\n"
-            "If the previous review asked for a smaller change, follow that advice before trying anything broader.\n"
-            "When a SATD comment sits directly above an existing workaround, guard, or commented-out behavior, prefer deleting that obsolete workaround and restoring the nearby intended lines before inventing new logic.\n"
-            "Keep the original signature unchanged unless the SATD explicitly asks for a signature-local annotation fix or the retrieved evidence clearly supports a signature edit.\n\n"
-            f"Round: {round_id}\n"
-            f"Repository owner: {state['user']}\n"
-            f"Repository name: {state['project']}\n"
-            f"File path: {state['file_path']}\n"
-            f"SATD comment: {state['satd_comment']}\n"
-            f"Analyzer decision: {analysis.decision}\n"
-            f"Analyzer type: {analysis.satd_type}\n"
-            f"Analyzer risk: {analysis.risk_level}\n"
-            f"Analyzer confidence: {analysis.confidence}\n"
-            f"Analyzer repairability score: {analysis.repairability_score}\n"
-            f"Analyzer scope radius: {analysis.scope_radius}\n"
-            f"Analyzer validation signals: {analysis.validation_signals}\n"
-            f"Analyzer context gaps: {analysis.context_gaps}\n"
-            f"Analyzer historical snapshot mismatch: {analysis.historical_snapshot_mismatch}\n"
-            f"Analyzer github evidence strength: {analysis.github_evidence_strength}\n"
-            f"Snapshot alignment status: {snapshot_alignment_status}\n"
-            f"Repair evidence mode: {repair_evidence_mode}\n"
-            f"Analyzer evidence summary: {analysis.evidence_summary}\n"
-            f"Analyzer strategy: {analysis.repair_strategy}\n"
-            f"Type-specific repair guidance: {self._repair_style_guidance(analysis.satd_type)}\n"
-            f"Contextual repair hint: {contextual_repair_hint}\n"
-            f"Previous review advice: {latest_review.revision_advice if latest_review else 'None'}\n"
-            f"Original code block:\n{state['original_code']}\n\n"
-            f"Base + repair context:\n{github_context}\n"
+        system_prompt, user_prompt = self._build_repair_prompts(
+            state=state,
+            round_id=round_id,
+            github_context=github_context,
+            repair_evidence_mode=repair_evidence_mode,
+            snapshot_alignment_status=snapshot_alignment_status,
+            contextual_repair_hint=contextual_repair_hint,
         )
-        payload = self.client.generate_json(system_prompt, user_prompt)
-        repair_plan = str(payload.get("repair_plan") or analysis.repair_strategy or "Apply the smallest plausible local fix.")
+        payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"repair:task_{state['task_id']}:round_{round_id}")
+        repair_plan = str(payload.get("repair_plan") or "Resolve the SATD with the smallest plausible local edit.")
         repaired_code = str(payload.get("repaired_code") or state["original_code"])
-        changed_scope = str(payload.get("changed_scope") or analysis.scope_radius or "function")
+        changed_scope = str(payload.get("changed_scope") or "function")
         if changed_scope not in {"line", "function", "class", "file", "multi_file"}:
-            changed_scope = analysis.scope_radius or "function"
+            changed_scope = "function"
         try:
-            confidence = max(0.0, min(1.0, float(payload.get("confidence", analysis.confidence or 0.45))))
+            confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.45))))
         except (TypeError, ValueError):
-            confidence = max(0.0, min(1.0, float(analysis.confidence or 0.45)))
+            confidence = 0.45
         notes = str(payload.get("notes") or "model response normalized with fixer fallback")
 
         em_risk_notes = self._em_risk_notes(state["original_code"], repaired_code)
@@ -1130,6 +1643,101 @@ class OpenAIFixer:
             confidence=confidence,
             notes=notes,
         )
+
+    def _build_repair_prompts(
+        self,
+        *,
+        state: GraphState,
+        round_id: int,
+        github_context: str,
+        repair_evidence_mode: str,
+        snapshot_alignment_status: str,
+        contextual_repair_hint: str,
+    ) -> tuple[str, str]:
+        repair_feedback = state.get("repair_feedback") or {}
+        reviewer_feedback_block = self._format_reviewer_feedback_block(repair_feedback)
+        if self.prompt_mode == "analysis_heavy":
+            system_prompt = (
+                "You are the fixer agent in a SATD repair workflow. "
+                "Produce repaired code, not a patch description. "
+                "Optimize for the most conservative plausible human repair and preserve the original code skeleton whenever possible. "
+                "Prefer comment-driven, minimal textual repairs over broader rewrites. "
+                "Unless the evidence clearly requires it, do not add parameters, helper functions, return statements, exception paths, renames, or control-flow rewrites. "
+                "Treat external repository context as optional evidence, not a mandate. If it is weak, generic, or indirect, ignore it and stay with the smallest comment-driven local edit. "
+                "If a previous review warns about API shape drift, overwritten repair, or no-op output, fix that issue first with a smaller in-place edit. "
+                "A pure comment removal is acceptable only when the SATD itself explicitly says the obsolete comment or TODO should be removed. "
+                "Use the repair context to localize the smallest valid repair. Return JSON only."
+            )
+            user_prompt = (
+                "Return a JSON object with keys: "
+                "repair_plan (string), repaired_code (string), changed_scope (string), "
+                "confidence (float 0-1), notes (string).\n"
+                "repaired_code must be the complete repaired version of the provided original code block.\n"
+                "If evidence is weak or snapshot alignment is poor, prefer tiny local edits inside the existing structure.\n"
+                "If external context does not contain a decisive helper, method, callsite, or test constraint, ignore generic imports, broad patterns, and indirect snippets.\n"
+                "Do not invent APIs, helper methods, parameters, or control-flow changes without direct evidence from the provided context.\n"
+                "If the previous review asked for a smaller change, follow that advice before trying anything broader.\n"
+                "When a SATD comment sits directly above an existing workaround, guard, or commented-out behavior, prefer deleting that obsolete workaround and restoring the nearby intended lines before inventing new logic.\n"
+                "Keep the original signature unchanged unless the SATD explicitly asks for a signature-local annotation fix or the retrieved evidence clearly supports a signature edit.\n\n"
+                f"Round: {round_id}\n"
+                f"Repository owner: {state['user']}\n"
+                f"Repository name: {state['project']}\n"
+                f"File path: {state['file_path']}\n"
+                f"SATD comment: {state['satd_comment']}\n"
+                f"Snapshot alignment status: {snapshot_alignment_status}\n"
+                f"Repair evidence mode: {repair_evidence_mode}\n"
+                f"Contextual repair hint: {contextual_repair_hint}\n"
+                f"Original code block:\n{state['original_code']}\n\n"
+                f"Unified GitHub context:\n{github_context}\n"
+                f"{reviewer_feedback_block}"
+            )
+            return system_prompt, user_prompt
+
+        system_prompt = (
+            "Return valid JSON only with keys: "
+            "repair_plan (string), repaired_code (string), changed_scope (string), "
+            "confidence (float 0-1), notes (string). "
+            "repaired_code must be the full updated version of the provided code."
+        )
+        user_prompt = (
+            "How to update the following code to resolve the SATD?\n\n"
+            f"### Code:\n{state['original_code']}\n\n"
+            f"### SATD comment:\n{state['satd_comment']}\n"
+            f"### Optional external evidence:\n{github_context}\n\n"
+            f"{reviewer_feedback_block}"
+            "### Consider the following questions in your answer:\n"
+            "Shortly explain how to resolve the SATD.\n"
+            "Provide the updated code."
+        )
+        return system_prompt, user_prompt
+
+    def _format_reviewer_feedback_block(self, repair_feedback: dict[str, Any]) -> str:
+        if not repair_feedback:
+            return ""
+        lines = ["### Reviewer feedback from previous attempt:"]
+        reject_type = repair_feedback.get("reject_type")
+        revision_advice = repair_feedback.get("revision_advice")
+        key_issues = repair_feedback.get("key_issues") or []
+        if reject_type:
+            lines.append(f"Reject type: {reject_type}")
+        if revision_advice:
+            lines.append(f"Revision advice: {revision_advice}")
+        if key_issues:
+            lines.append("Key issues:")
+            for issue in key_issues[:3]:
+                lines.append(f"- {issue}")
+        flags = []
+        if repair_feedback.get("has_api_shape_drift"):
+            flags.append("api_shape_drift")
+        if repair_feedback.get("has_noop_change"):
+            flags.append("noop_change")
+        if repair_feedback.get("has_over_edit"):
+            flags.append("over_edit")
+        if repair_feedback.get("has_comment_only_problem"):
+            flags.append("comment_only_problem")
+        if flags:
+            lines.append(f"Reviewer flags: {', '.join(flags)}")
+        return "\n".join(lines) + "\n\n"
 
     def _repair_style_guidance(self, satd_type: str) -> str:
         satd = (satd_type or "").strip().lower()
@@ -1189,7 +1797,7 @@ class OpenAIReviewer:
         metadata = ((state.get("github_context") or {}).get("metadata") or {}) if isinstance(state.get("github_context"), dict) else {}
         repair_evidence_mode = str(metadata.get("repair_evidence_mode") or "weak")
         snapshot_alignment_status = str(metadata.get("snapshot_alignment_status") or "mismatch")
-        github_context = self.client.compact_context_for_stage(state.get("github_context"), "review")
+        github_context = self.client.compact_shared_context(state.get("github_context"))
         system_prompt = (
             "You are the reviewer agent in a SATD repair workflow. "
             "You are a strict EM-oriented final gate. "
@@ -1234,9 +1842,9 @@ class OpenAIReviewer:
             f"Repaired code block:\n{repair.repaired_code}\n\n"
             f"Repair plan: {repair.repair_plan}\n"
             f"Repair confidence: {repair.confidence}\n\n"
-            f"Base + repair + review context:\n{github_context}\n"
+            f"Unified GitHub context:\n{github_context}\n"
         )
-        payload = self.client.generate_json(system_prompt, user_prompt)
+        payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"review:task_{state['task_id']}:round_{repair.round_id}")
 
         problem_alignment = self._clamp_float(payload.get("problem_alignment"), 0.0)
         minimality = self._clamp_float(payload.get("minimality"), 0.0)

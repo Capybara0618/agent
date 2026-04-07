@@ -41,6 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume from an existing output directory by skipping task_ids already present in results.csv.",
     )
+    parser.add_argument(
+        "--enable-analyzer",
+        action="store_true",
+        help="Enable analyzer gating before repair. Default is off for fixer-only experiments.",
+    )
+    parser.add_argument(
+        "--enable-review",
+        action="store_true",
+        help="Enable reviewer gating after repair. Default is off for fixer-only experiments.",
+    )
+    parser.add_argument(
+        "--repair-prompt-mode",
+        choices=["lightweight", "analysis_heavy"],
+        default="lightweight",
+        help="Repair prompt style. Default keeps a baseline-style lightweight fixer prompt.",
+    )
     return parser
 
 
@@ -51,6 +67,9 @@ def main() -> None:
         model=args.model,
         verbose=args.verbose,
         write_batch_size=args.write_batch_size,
+        use_analyzer=args.enable_analyzer,
+        use_reviewer=args.enable_review,
+        repair_prompt_mode=args.repair_prompt_mode,
     )
     summary = workflow.run_csv(args.input, args.output_dir, limit=args.limit, resume=args.resume)
 
@@ -67,6 +86,9 @@ def main() -> None:
     print(f"Recall: {summary['recall']}")
     print(f"Written tasks: {summary['written_tasks']}")
     print(f"Write batch size: {summary['write_batch_size']}")
+    print(f"Analyzer enabled: {args.enable_analyzer}")
+    print(f"Review enabled: {args.enable_review}")
+    print(f"Repair prompt mode: {args.repair_prompt_mode}")
     print(f"Resume mode: {args.resume}")
     print(f"Main trajectory file: {args.output_dir / 'trajectory_overview.csv'}")
     print(f"Context cache index: {args.output_dir / 'context_cache.csv'}")

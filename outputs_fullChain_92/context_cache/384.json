@@ -1,0 +1,165 @@
+{
+  "task_id": "384",
+  "repo_owner": "getsentry",
+  "repo_name": "sentry",
+  "file_path": "src/sentry/statistical_detectors/detector.py",
+  "commit": "ab45cd53dad6508ee851e84e57f5fb06539ec2af",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T03:11:03+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ab45cd53dad6508ee851e84e57f5fb06539ec2af",
+    "symbol_name": "redirect_escalations",
+    "satd_line": 396,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 1,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T03:11:03+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/sentry/statistical_detectors/detector.py",
+    "original_signature": "def redirect_escalations(",
+    "target_file": {
+      "ok": true,
+      "path": "src/sentry/statistical_detectors/detector.py",
+      "sha": "464e9cf22b1480396fd29b09f088873528e520eb",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/ab45cd53dad6508ee851e84e57f5fb06539ec2af/src/sentry/statistical_detectors/detector.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport heapq\nfrom abc import ABC, abstractmethod\nfrom collections import defaultdict\nfrom dataclasses import dataclass\nfrom datetime import datetime, timezone\nfrom typing import DefaultDict, Generator, Iterable, List, Optional, Set, Tuple\n\nimport sentry_sdk\n\nfrom sentry import options\nfrom sentry.api.serializers.snuba import SnubaTSResultSerializer\nfrom sentry.issues.producer import PayloadType, produce_occurrence_to_kafka\nfrom sentry.issues.status_change_message import StatusChangeMessage\nfrom sentry.models.group import GroupStatus\nfrom sentry.models.project import Project\nfrom sentry.models.statistical_detectors import (\n    RegressionGroup,\n    RegressionType,\n    get_regression_groups,\n)\nfrom sentry.search.events.fields import get_function_alias\nfrom sentry.seer.utils import BreakpointData, detect_breakpoints\nfrom sentry.statistical_detectors.algorithm import DetectorAlgorithm\nfrom sentry.statistical_detectors.base import (\n    DetectorConfig,\n    DetectorPayload,\n    DetectorState,\n    TrendType,\n)\nfrom sentry.statistical_detectors.issue_platform_adapter import fingerprint_regression\nfrom sentry.statistical_detectors.store import DetectorStore\nfrom sentry.utils import metrics\nfrom sentry.utils.iterators import chunked\nfrom sentry.utils.snuba import SnubaTSResult\n\n\n@dataclass(frozen=True)\nclass TrendBundle:\n    type: TrendType\n    score: float\n    payload: DetectorPayload\n    state: Optional[DetectorState] = None\n    regression_group: Optional[RegressionGroup] = None\n\n\n@dataclass(frozen=True)\nclass RegressionDetector(ABC):\n    source: str\n    kind: str\n    regression_type: RegressionType\n    config: DetectorConfig\n    state_cls: type[DetectorState]\n    detector_cls: type[DetectorAlgorithm]\n    min_change: int\n    resolution_rel_threshold: float\n    escalation_rel_threshold: float\n\n    @classmethod\n    @abstractmethod\n    def make_detector_store(cls) -> DetectorStore:\n        ...\n\n    @classmethod\n    def all_payloads(\n        cls,\n        projects: List[Project],\n        start: datetime,\n    ) -> Generator[DetectorPayload, None, None]:\n        projects_per_query = options.get(\"statistical_detectors.query.batch_size\")\n        assert projects_per_query > 0\n\n        for projects in chunked(projects, projects_per_query):\n            try:\n                yield from cls.query_payloads(projects, start)\n            except Exception as e:\n                sentry_sdk.capture_exception(e)\n\n    @classmethod\n    @abstractmethod\n    def query_payloads(\n        cls,\n        projects: List[Project],\n        start: datetime,\n    ) -> Iterable[DetectorPayload]:\n        ...\n\n    @classmethod\n    def detect_trends(\n        cls, projects: List[Project], start: datetime\n    ) -> Generator[TrendBundle, None, None]:\n        unique_project_ids: Set[int] = set()\n\n        total_count = 0\n        regressed_count = 0\n        improved_count = 0\n\n        store = cls.make_detector_store()\n\n        for payloads in chunked(cls.all_payloads(projects, start), 100):\n            total_count += len(payloads)\n\n            raw_states = store.bulk_read_states(payloads)\n\n            states = []\n\n            for raw_state, payload in zip(raw_states, payloads):\n                try:\n                    state = cls.state_cls.from_redis_dict(raw_state)\n                except Exception as e:\n                    state = cls.state_cls.empty()\n\n                    if raw_state:\n                        # empty raw state implies that there was no\n                        # previous state so no need to capture an exception\n                        sentry_sdk.capture_exception(e)\n\n                algorithm = cls.detector_cls(cls.source, cls.kind, state, cls.config)\n                trend_type, score = algorithm.update(payload)\n\n                # the trend type can be None if no update happened,\n                # pass None to indicate we do not need up update the state\n                states.append(\n                    None if trend_type == TrendType.Skipped else algorithm.state.to_redis_dict()\n                )\n\n                if trend_type == TrendType.Regressed:\n                    regressed_count += 1\n                elif trend_type == TrendType.Improved:\n                    improved_count += 1\n\n                unique_project_ids.add(payload.project_id)\n\n                yield TrendBundle(\n                    type=trend_type,\n                    score=score,\n                    payload=payload,\n                    state=algorithm.state,\n                )\n\n            store.bulk_write_states(payloads, states)\n\n        metrics.incr(\n            \"statistical_detectors.projects.active\",\n            amount=len(unique_project_ids),\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )\n\n        metrics.incr(\n            \"statistical_detectors.objects.total\",\n            amount=total_count,\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )\n\n        metrics.incr(\n            \"statistical_detectors.objects.regressed\",\n            amount=regressed_count,\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )\n\n        metrics.incr(\n            \"statistical_detectors.objects.improved\",\n            amount=improved_count,\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )\n\n    @classmethod\n    def all_timeseries(\n        cls, objects: List[Tuple[Project, int | str]], start: datetime, function: str, chunk_size=25\n    ) -> Generator[Tuple[int, int | str, SnubaTSResult], None, None]:\n        # Snuba allows 10,000 data points per request. 14 days * 1hr * 24hr =\n        # 336 data points per transaction name, so we can safely get 25 transaction\n        # timeseries.\n        for chunk in chunked(objects, chunk_size):\n            try:\n                yield from cls.query_timeseries(chunk, start, function)\n            except Exception as e:\n                sentry_sdk.capture_exception(e)\n\n    @classmethod\n    @abstractmethod\n    def query_timeseries(\n        cls,\n        objects: List[Tuple[Project, int | str]],\n        start: datetime,\n        function: str,\n    ) -> Iterable[Tuple[int, int | str, SnubaTSResult]]:\n        ...\n\n    @classmethod\n    def detect_regressions(\n        cls,\n        objects: List[Tuple[Project, int | str]],\n        start: datetime,\n        function: str,\n        timeseries_per_batch=10,\n    ) -> Generator[BreakpointData, None, None]:\n        serializer = SnubaTSResultSerializer(None, None, None)\n\n        for chunk in chunked(cls.all_timeseries(objects, start, function), timeseries_per_batch):\n            data = {}\n            for project_id, object_name, result in chunk:\n                serialized = serializer.serialize(result, get_function_alias(function))\n                data[f\"{project_id},{object_name}\"] = {\n                    \"data\": serialized[\"data\"],\n                    \"data_start\": serialized[\"start\"],\n                    \"data_end\": serialized[\"end\"],\n                    # only look at the last 3 days of the request data\n                    \"request_start\": serialized[\"end\"] - 3 * 24 * 60 * 60,\n                    \"request_end\": serialized[\"end\"],\n                }\n\n            request = {\n                \"data\": data,\n                \"sort\": \"-trend_percentage()\",\n                \"min_change()\": cls.min_change,\n                # \"trend_percentage()\": 0.5,  # require a minimum 50% increase\n                # \"validate_tail_hours\": 6,\n                # Disable the fall back to use the midpoint as the breakpoint\n                # which was originally intended to detect a gradual regression\n                # for the trends use case. That does not apply here.\n                \"allow_midpoint\": \"0\",\n            }\n\n            try:\n                yield from detect_breakpoints(request)[\"data\"]\n            except Exception as e:\n                sentry_sdk.capture_exception(e)\n                metrics.incr(\n                    \"statistical_detectors.breakpoint.errors\",\n                    tags={\"source\": cls.source, \"kind\": cls.kind},\n                )\n\n    @classmethod\n    def limit_regressions_by_project(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        ratelimit: Optional[int] = None,\n    ) -> Generator[TrendBundle, None, None]:\n        if ratelimit is None:\n            ratelimit = options.get(\"statistical_detectors.ratelimit.ema\")\n\n        regressions_by_project: DefaultDict[int, List[Tuple[float, TrendBundle]]] = defaultdict(\n            list\n        )\n\n        for bundle in bundles:\n            if bundle.type != TrendType.Regressed:\n                continue\n            heapq.heappush(\n                regressions_by_project[bundle.payload.project_id], (bundle.score, bundle)\n            )\n\n            while (\n                ratelimit >= 0\n                and len(regressions_by_project[bundle.payload.project_id]) > ratelimit\n            ):\n                heapq.heappop(regressions_by_project[bundle.payload.project_id])\n\n        for regressions in regressions_by_project.values():\n            for _, bundle in regressions:\n                yield bundle\n\n    @classmethod\n    def make_status_change_message(\n        cls,\n        payload: DetectorPayload,\n        status: int,\n        substatus: Optional[int] = None,\n    ) -> StatusChangeMessage:\n        return StatusChangeMessage(\n            # To align with the issue, we need to use the full fingerprint here\n            fingerprint=[generate_fingerprint(cls.regression_type, payload.group)],\n            project_id=payload.project_id,\n            new_status=status,\n            new_substatus=substatus,\n        )\n\n    @classmethod\n    def get_regression_groups(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        batch_size=100,\n    ) -> Generator[TrendBundle, None, None]:\n        for trend_chunk in chunked(bundles, batch_size):\n            active_regression_groups = {\n                (group.project_id, group.fingerprint): group\n                for group in get_regression_groups(\n                    cls.regression_type,\n                    [\n                        (\n                            bundle.payload.project_id,\n                            generate_fingerprint(cls.regression_type, bundle.payload.group),\n                        )\n                        for bundle in trend_chunk\n                    ],\n                    active=True,\n                )\n            }\n\n            for bundle in trend_chunk:\n                group = active_regression_groups.get(\n                    (\n                        bundle.payload.project_id,\n                        generate_fingerprint(cls.regression_type, bundle.payload.group),\n                    )\n                )\n                yield TrendBundle(\n                    type=bundle.type,\n                    score=bundle.score,\n                    payload=bundle.payload,\n                    state=bundle.state,\n                    regression_group=group,\n                )\n\n    @classmethod\n    def redirect_resolutions(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        timestamp: datetime,\n        batch_size=100,\n    ) -> Generator[TrendBundle, None, None]:\n        groups_to_resolve = []\n\n        for bundle in bundles:\n            group = bundle.regression_group\n            try:\n                if (\n                    group is not None\n                    and bundle.state is not None\n                    and bundle.state.should_auto_resolve(\n                        group.baseline, cls.resolution_rel_threshold\n                    )\n                ):\n                    group.active = False\n                    group.date_resolved = timestamp\n                    groups_to_resolve.append(group)\n\n                    status_change = cls.make_status_change_message(\n                        bundle.payload, status=GroupStatus.RESOLVED\n                    )",
+      "total_lines": 487,
+      "ref": "ab45cd53dad6508ee851e84e57f5fb06539ec2af"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "redirect_escalations",
+      "class_name": "RegressionDetector",
+      "start_line": 367,
+      "end_line": 403,
+      "satd_line": 396,
+      "matched_by": "normalized_source",
+      "source": "    def redirect_escalations(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        timestamp: datetime,\n        batch_size=100,\n    ) -> Generator[TrendBundle, None, None]:\n        groups_to_escalate = []\n\n        for bundle in bundles:\n            group = bundle.regression_group\n            try:\n                if (\n                    group is not None\n                    and bundle.state is not None\n                    and bundle.state.should_escalate(\n                        group.baseline,\n                        group.regressed,\n                        cls.min_change,\n                        cls.escalation_rel_threshold,\n                    )\n                ):\n                    groups_to_escalate.append(group)\n\n                # For now, keep passing on the bundle.\n                # Eventually, should redirect these bundles to escalation\n                yield bundle\n            except Exception as e:\n                sentry_sdk.capture_exception(e)\n\n        # TODO: mark the groups as escalated\n\n        metrics.incr(\n            \"statistical_detectors.objects.escalated\",\n            amount=len(groups_to_escalate),\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )",
+      "calls": [
+        "len"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "Generator",
+        "TrendBundle",
+        "datetime",
+        "e",
+        "metrics",
+        "sentry_sdk"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "get_regression_groups",
+          "class_name": "RegressionDetector",
+          "start_line": 285,
+          "end_line": 319,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=2",
+            "same_class"
+          ],
+          "source": "    def get_regression_groups(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        batch_size=100,\n    ) -> Generator[TrendBundle, None, None]:\n        for trend_chunk in chunked(bundles, batch_size):\n            active_regression_groups = {\n                (group.project_id, group.fingerprint): group\n                for group in get_regression_groups(\n                    cls.regression_type,\n                    [\n                        (\n                            bundle.payload.project_id,\n                            generate_fingerprint(cls.regression_type, bundle.payload.group),\n                        )\n                        for bundle in trend_chunk\n                    ],\n                    active=True,\n                )\n            }\n\n            for bundle in trend_chunk:\n                group = active_regression_groups.get(\n                    (\n                        bundle.payload.project_id,\n                        generate_fingerprint(cls.regression_type, bundle.payload.group),\n                    )\n                )\n                yield TrendBundle(\n                    type=bundle.type,\n                    score=bundle.score,\n                    payload=bundle.payload,\n                    state=bundle.state,\n                    regression_group=group,\n                )"
+        },
+        {
+          "symbol_name": "get_regression_versions",
+          "class_name": "RegressionDetector",
+          "start_line": 406,
+          "end_line": 446,
+          "relevance": [
+            "keyword_source_overlap=3",
+            "same_class"
+          ],
+          "source": "    def get_regression_versions(\n        cls,\n        regressions: Generator[BreakpointData, None, None],\n        batch_size=100,\n    ) -> Generator[Tuple[int, BreakpointData], None, None]:\n        active_regressions = 0\n\n        for regression_chunk in chunked(regressions, batch_size):\n            existing_regression_groups = {\n                (group.project_id, group.fingerprint): group\n                for group in get_regression_groups(\n                    cls.regression_type,\n                    [\n                        (\n                            int(regression[\"project\"]),\n                            generate_fingerprint(cls.regression_type, regression[\"transaction\"]),\n                        )\n                        for regression in regression_chunk\n                    ],\n                )\n            }\n\n            for regression in regression_chunk:\n                project_id = int(regression[\"project\"])\n                fingerprint = generate_fingerprint(cls.regression_type, regression[\"transaction\"])\n                group = existing_regression_groups.get((project_id, fingerprint))\n\n                if group is None:\n                    yield 1, regression\n                elif not group.active:\n                    yield group.version + 1, regression\n                else:\n                    # There is an active regression group already, so skip it\n                    active_regressions += 1\n\n        metrics.incr(\n            \"statistical_detectors.breakpoint.skipped\",\n            amount=active_regressions,\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "RegressionDetector",
+      "related_methods_count": 1,
+      "related_attributes_count": 0,
+      "related_methods": [
+        {
+          "symbol_name": "get_regression_groups",
+          "start_line": 285,
+          "end_line": 319,
+          "relevance": [
+            "keyword_source_overlap=2",
+            "keyword_name_overlap=1"
+          ],
+          "source": "    def get_regression_groups(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        batch_size=100,\n    ) -> Generator[TrendBundle, None, None]:\n        for trend_chunk in chunked(bundles, batch_size):\n            active_regression_groups = {\n                (group.project_id, group.fingerprint): group\n                for group in get_regression_groups(\n                    cls.regression_type,\n                    [\n                        (\n                            bundle.payload.project_id,\n                            generate_fingerprint(cls.regression_type, bundle.payload.group),\n                        )\n                        for bundle in trend_chunk\n                    ],\n                    active=True,\n                )\n            }\n\n            for bundle in trend_chunk:\n                group = active_regression_groups.get(\n                    (\n                        bundle.payload.project_id,\n                        generate_fingerprint(cls.regression_type, bundle.payload.group),\n                    )\n                )\n                yield TrendBundle(\n                    type=bundle.type,\n                    score=bundle.score,\n                    payload=bundle.payload,\n                    state=bundle.state,\n                    regression_group=group,\n                )"
+        }
+      ],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "TrendBundle",
+          "kind": "class",
+          "start_line": 40,
+          "end_line": 45,
+          "source": "class TrendBundle:\n    type: TrendType\n    score: float\n    payload: DetectorPayload\n    state: Optional[DetectorState] = None\n    regression_group: Optional[RegressionGroup] = None"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "redirect_resolutions",
+          "class_name": "RegressionDetector",
+          "start_line": 322,
+          "end_line": 364,
+          "source": "    def redirect_resolutions(\n        cls,\n        bundles: Generator[TrendBundle, None, None],\n        timestamp: datetime,\n        batch_size=100,\n    ) -> Generator[TrendBundle, None, None]:\n        groups_to_resolve = []\n\n        for bundle in bundles:\n            group = bundle.regression_group\n            try:\n                if (\n                    group is not None\n                    and bundle.state is not None\n                    and bundle.state.should_auto_resolve(\n                        group.baseline, cls.resolution_rel_threshold\n                    )\n                ):\n                    group.active = False\n                    group.date_resolved = timestamp\n                    groups_to_resolve.append(group)\n\n                    status_change = cls.make_status_change_message(\n                        bundle.payload, status=GroupStatus.RESOLVED\n                    )\n                    produce_occurrence_to_kafka(\n                        payload_type=PayloadType.STATUS_CHANGE,\n                        status_change=status_change,\n                    )\n\n                else:\n                    yield bundle\n            except Exception as e:\n                sentry_sdk.capture_exception(e)\n\n        RegressionGroup.objects.bulk_update(groups_to_resolve, [\"active\", \"date_resolved\"])\n\n        metrics.incr(\n            \"statistical_detectors.objects.auto_resolved\",\n            amount=len(groups_to_resolve),\n            tags={\"source\": cls.source, \"kind\": cls.kind},\n            sample_rate=1.0,\n        )"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

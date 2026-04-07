@@ -1,0 +1,133 @@
+{
+  "task_id": "646",
+  "repo_owner": "odoo",
+  "repo_name": "odoo",
+  "file_path": "addons/sale_purchase/models/sale_order.py",
+  "commit": "9639283a81528f0a1b41e412dfc6d65a32c5fc5b",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T04:22:59+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "9639283a81528f0a1b41e412dfc6d65a32c5fc5b",
+    "symbol_name": "_purchase_service_create",
+    "satd_line": 260,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 1,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 1,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T04:22:59+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "addons/sale_purchase/models/sale_order.py",
+    "original_signature": "def _purchase_service_create(self, quantity=False):",
+    "target_file": {
+      "ok": true,
+      "path": "addons/sale_purchase/models/sale_order.py",
+      "sha": "74356834d64d3c5f1fbda8c602b4a67ed6d13968",
+      "download_url": "https://raw.githubusercontent.com/odoo/odoo/9639283a81528f0a1b41e412dfc6d65a32c5fc5b/addons/sale_purchase/models/sale_order.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# Part of Odoo. See LICENSE file for full copyright and licensing details.\n\nfrom dateutil.relativedelta import relativedelta\n\nfrom odoo import api, fields, models, _\nfrom odoo.exceptions import UserError\nfrom odoo.tools import float_compare\n\n\nclass SaleOrder(models.Model):\n    _inherit = 'sale.order'\n\n    purchase_order_count = fields.Integer(\"Number of Purchase Order\", compute='_compute_purchase_order_count', groups='purchase.group_purchase_user')\n\n    @api.depends('order_line.purchase_line_ids')\n    def _compute_purchase_order_count(self):\n        purchase_line_data = self.env['purchase.order.line'].read_group(\n            [('sale_order_id', 'in', self.ids)],\n            ['sale_order_id', 'purchase_order_count:count_distinct(order_id)'], ['sale_order_id']\n        )\n        purchase_count_map = {item['sale_order_id'][0]: item['purchase_order_count'] for item in purchase_line_data}\n        for order in self:\n            order.purchase_order_count = purchase_count_map.get(order.id, 0)\n\n    def _action_confirm(self):\n        result = super(SaleOrder, self)._action_confirm()\n        for order in self:\n            order.order_line.sudo()._purchase_service_generation()\n        return result\n\n    def action_cancel(self):\n        result = super(SaleOrder, self).action_cancel()\n        # When a sale person cancel a SO, he might not have the rights to write\n        # on PO. But we need the system to create an activity on the PO (so 'write'\n        # access), hence the `sudo`.\n        self.sudo()._activity_cancel_on_purchase()\n        return result\n\n    def action_view_purchase(self):\n        action = self.env.ref('purchase.purchase_rfq').read()[0]\n        action['domain'] = [('id', 'in', self.mapped('order_line.purchase_line_ids.order_id').ids)]\n        return action\n\n    def _activity_cancel_on_purchase(self):\n        \"\"\" If some SO are cancelled, we need to put an activity on their generated purchase. If sale lines of\n            different sale orders impact different purchase, we only want one activity to be attached.\n        \"\"\"\n        purchase_to_notify_map = {}  # map PO -> recordset of SOL as {purchase.order: set(sale.orde.liner)}\n\n        purchase_order_lines = self.env['purchase.order.line'].search([('sale_line_id', 'in', self.mapped('order_line').ids), ('state', '!=', 'cancel')])\n        for purchase_line in purchase_order_lines:\n            purchase_to_notify_map.setdefault(purchase_line.order_id, self.env['sale.order.line'])\n            purchase_to_notify_map[purchase_line.order_id] |= purchase_line.sale_line_id\n\n        for purchase_order, sale_order_lines in purchase_to_notify_map.items():\n            purchase_order.activity_schedule_with_view('mail.mail_activity_data_warning',\n                user_id=purchase_order.user_id.id or self.env.uid,\n                views_or_xmlid='sale_purchase.exception_purchase_on_sale_cancellation',\n                render_context={\n                    'sale_orders': sale_order_lines.mapped('order_id'),\n                    'sale_order_lines': sale_order_lines,\n            })\n\n\nclass SaleOrderLine(models.Model):\n    _inherit = 'sale.order.line'\n\n    purchase_line_ids = fields.One2many('purchase.order.line', 'sale_line_id', string=\"Generated Purchase Lines\", readonly=True, help=\"Purchase line generated by this Sales item on order confirmation, or when the quantity was increased.\")\n    purchase_line_count = fields.Integer(\"Number of generated purchase items\", compute='_compute_purchase_count')\n\n    @api.depends('purchase_line_ids')\n    def _compute_purchase_count(self):\n        database_data = self.env['purchase.order.line'].sudo().read_group([('sale_line_id', 'in', self.ids)], ['sale_line_id'], ['sale_line_id'])\n        mapped_data = dict([(db['sale_line_id'][0], db['sale_line_id_count']) for db in database_data])\n        for line in self:\n            line.purchase_line_count = mapped_data.get(line.id, 0)\n\n    @api.onchange('product_uom_qty')\n    def _onchange_service_product_uom_qty(self):\n        if self.state == 'sale' and self.product_id.type == 'service' and self.product_id.service_to_purchase:\n            if self.product_uom_qty < self._origin.product_uom_qty:\n                if self.product_uom_qty < self.qty_delivered:\n                    return {}\n                warning_mess = {\n                    'title': _('Ordered quantity decreased!'),\n                    'message': _('You are decreasing the ordered quantity! Do not forget to manually update the purchase order if needed.'),\n                }\n                return {'warning': warning_mess}\n        return {}\n\n    # --------------------------\n    # CRUD\n    # --------------------------\n\n    @api.model\n    def create(self, values):\n        line = super(SaleOrderLine, self).create(values)\n        # Do not generate purchase when expense SO line since the product is already delivered\n        if line.state == 'sale' and not line.is_expense:\n            line.sudo()._purchase_service_generation()\n        return line\n\n    def write(self, values):\n        increased_lines = None\n        decreased_lines = None\n        increased_values = {}\n        decreased_values = {}\n        if 'product_uom_qty' in values:\n            precision = self.env['decimal.precision'].precision_get('Product Unit of Measure')\n            increased_lines = self.sudo().filtered(lambda r: r.product_id.service_to_purchase and r.purchase_line_count and float_compare(r.product_uom_qty, values['product_uom_qty'], precision_digits=precision) == -1)\n            decreased_lines = self.sudo().filtered(lambda r: r.product_id.service_to_purchase and r.purchase_line_count and float_compare(r.product_uom_qty, values['product_uom_qty'], precision_digits=precision) == 1)\n            increased_values = {line.id: line.product_uom_qty for line in increased_lines}\n            decreased_values = {line.id: line.product_uom_qty for line in decreased_lines}\n\n        result = super(SaleOrderLine, self).write(values)\n\n        if increased_lines:\n            increased_lines._purchase_increase_ordered_qty(values['product_uom_qty'], increased_values)\n        if decreased_lines:\n            decreased_lines._purchase_decrease_ordered_qty(values['product_uom_qty'], decreased_values)\n        return result\n\n    # --------------------------\n    # Business Methods\n    # --------------------------\n\n    def _purchase_decrease_ordered_qty(self, new_qty, origin_values):\n        \"\"\" Decrease the quantity from SO line will add a next acitivities on the related purchase order\n            :param new_qty: new quantity (lower than the current one on SO line), expressed\n                in UoM of SO line.\n            :param origin_values: map from sale line id to old value for the ordered quantity (dict)\n        \"\"\"\n        purchase_to_notify_map = {}  # map PO -> set(SOL)\n        last_purchase_lines = self.env['purchase.order.line'].search([('sale_line_id', 'in', self.ids)])\n        for purchase_line in last_purchase_lines:\n            purchase_to_notify_map.setdefault(purchase_line.order_id, self.env['sale.order.line'])\n            purchase_to_notify_map[purchase_line.order_id] |= purchase_line.sale_line_id\n\n        # create next activity\n        for purchase_order, sale_lines in purchase_to_notify_map.items():\n            render_context = {\n                'sale_lines': sale_lines,\n                'sale_orders': sale_lines.mapped('order_id'),\n                'origin_values': origin_values,\n            }\n            purchase_order.activity_schedule_with_view('mail.mail_activity_data_warning',\n                user_id=purchase_order.user_id.id or self.env.uid,\n                views_or_xmlid='sale_purchase.exception_purchase_on_sale_quantity_decreased',\n                render_context=render_context)\n\n    def _purchase_increase_ordered_qty(self, new_qty, origin_values):\n        \"\"\" Increase the quantity on the related purchase lines\n            :param new_qty: new quantity (higher than the current one on SO line), expressed\n                in UoM of SO line.\n            :param origin_values: map from sale line id to old value for the ordered quantity (dict)\n        \"\"\"\n        for line in self:\n            last_purchase_line = self.env['purchase.order.line'].search([('sale_line_id', '=', line.id)], order='create_date DESC', limit=1)\n            if last_purchase_line.state in ['draft', 'sent', 'to approve']:  # update qty for draft PO lines\n                quantity = line.product_uom._compute_quantity(new_qty, last_purchase_line.product_uom)\n                last_purchase_line.write({'product_qty': quantity})\n            elif last_purchase_line.state in ['purchase', 'done', 'cancel']:  # create new PO, by forcing the quantity as the difference from SO line\n                quantity = line.product_uom._compute_quantity(new_qty - origin_values.get(line.id, 0.0), last_purchase_line.product_uom)\n                line._purchase_service_create(quantity=quantity)\n\n    def _purchase_get_date_order(self, supplierinfo):\n        \"\"\" return the ordered date for the purchase order, computed as : SO commitment date - supplier delay \"\"\"\n        commitment_date = fields.Datetime.from_string(self.order_id.commitment_date or fields.Datetime.now())\n        return commitment_date - relativedelta(days=int(supplierinfo.delay))\n\n    def _purchase_service_prepare_order_values(self, supplierinfo):\n        \"\"\" Returns the values to create the purchase order from the current SO line.\n            :param supplierinfo: record of product.supplierinfo\n            :rtype: dict\n        \"\"\"\n        self.ensure_one()\n        partner_supplier = supplierinfo.name\n        fiscal_position_id = self.env['account.fiscal.position'].sudo().get_fiscal_position(partner_supplier.id)\n        date_order = self._purchase_get_date_order(supplierinfo)\n        return {\n            'partner_id': partner_supplier.id,\n            'partner_ref': partner_supplier.ref,\n            'company_id': self.company_id.id,\n            'currency_id': partner_supplier.property_purchase_currency_id.id or self.env.company.currency_id.id,\n            'dest_address_id': self.order_id.partner_shipping_id.id,\n            'origin': self.order_id.name,\n            'payment_term_id': partner_supplier.property_supplier_payment_term_id.id,\n            'date_order': date_order,\n            'fiscal_position_id': fiscal_position_id,\n        }\n\n    def _purchase_service_prepare_line_values(self, purchase_order, quantity=False):\n        \"\"\" Returns the values to create the purchase order line from the current SO line.\n            :param purchase_order: record of purchase.order\n            :rtype: dict\n            :param quantity: the quantity to force on the PO line, expressed in SO line UoM\n        \"\"\"\n        self.ensure_one()\n        # compute quantity from SO line UoM\n        product_quantity = self.product_uom_qty\n        if quantity:\n            product_quantity = quantity\n\n        purchase_qty_uom = self.product_uom._compute_quantity(product_quantity, self.product_id.uom_po_id)\n\n        # determine vendor (real supplier, sharing the same partner as the one from the PO, but with more accurate informations like validity, quantity, ...)\n        # Note: one partner can have multiple supplier info for the same product\n        supplierinfo = self.product_id._select_seller(\n            partner_id=purchase_order.partner_id,\n            quantity=purchase_qty_uom,\n            date=purchase_order.date_order and purchase_order.date_order.date(), # and purchase_order.date_order[:10],\n            uom_id=self.product_id.uom_po_id\n        )\n        fpos = purchase_order.fiscal_position_id\n        taxes = fpos.map_tax(self.product_id.supplier_taxes_id) if fpos else self.product_id.supplier_taxes_id\n        if taxes:\n            taxes = taxes.filtered(lambda t: t.company_id.id == self.company_id.id)\n\n        # compute unit price\n        price_unit = 0.0\n        if supplierinfo:\n            price_unit = self.env['account.tax'].sudo()._",
+      "total_lines": 309,
+      "ref": "9639283a81528f0a1b41e412dfc6d65a32c5fc5b"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_purchase_service_create",
+      "class_name": "SaleOrderLine",
+      "start_line": 248,
+      "end_line": 297,
+      "satd_line": 260,
+      "matched_by": "signature_or_comment",
+      "source": "    def _purchase_service_create(self, quantity=False):\n        \"\"\" On Sales Order confirmation, some lines (services ones) can create a purchase order line and maybe a purchase order.\n            If a line should create a RFQ, it will check for existing PO. If no one is find, the SO line will create one, then adds\n            a new PO line. The created purchase order line will be linked to the SO line.\n            :param quantity: the quantity to force on the PO line, expressed in SO line UoM\n        \"\"\"\n        PurchaseOrder = self.env['purchase.order']\n        supplier_po_map = {}\n        sale_line_purchase_map = {}\n        for line in self:\n            line = line.with_context(force_company=line.company_id.id)\n            # determine vendor of the order (take the first matching company and product)\n            # VFE fixme why isn't the _select_seller function used ???\n            suppliers = line.product_id.seller_ids.filtered(lambda vendor: (not vendor.company_id or vendor.company_id == line.company_id) and (not vendor.product_id or vendor.product_id == line.product_id))\n            if not suppliers:\n                raise UserError(_(\"There is no vendor associated to the product %s. Please define a vendor for this product.\") % (line.product_id.display_name,))\n            supplierinfo = suppliers[0]\n            partner_supplier = supplierinfo.name  # yes, this field is not explicit .... it is a res.partner !\n\n            # determine (or create) PO\n            purchase_order = supplier_po_map.get(partner_supplier.id)\n            if not purchase_order:\n                purchase_order = PurchaseOrder.search([\n                    ('partner_id', '=', partner_supplier.id),\n                    ('state', '=', 'draft'),\n                    ('company_id', '=', line.company_id.id),\n                ], limit=1)\n            if not purchase_order:\n                values = line._purchase_service_prepare_order_values(supplierinfo)\n                purchase_order = PurchaseOrder.create(values)\n            else:  # update origin of existing PO\n                so_name = line.order_id.name\n                origins = []\n                if purchase_order.origin:\n                    origins = purchase_order.origin.split(', ') + origins\n                if so_name not in origins:\n                    origins += [so_name]\n                    purchase_order.write({\n                        'origin': ', '.join(origins)\n                    })\n            supplier_po_map[partner_supplier.id] = purchase_order\n\n            # add a PO line to the PO\n            values = line._purchase_service_prepare_line_values(purchase_order, quantity=quantity)\n            purchase_line = line.env['purchase.order.line'].create(values)\n\n            # link the generated purchase to the SO line\n            sale_line_purchase_map.setdefault(line, line.env['purchase.order.line'])\n            sale_line_purchase_map[line] |= purchase_line\n        return sale_line_purchase_map",
+      "calls": [
+        "UserError",
+        "_"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "env"
+      ],
+      "global_uses": [
+        "UserError",
+        "_",
+        "vendor"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": "SaleOrderLine",
+      "related_methods_count": 1,
+      "related_attributes_count": 0,
+      "related_methods": [
+        {
+          "symbol_name": "_purchase_service_prepare_line_values",
+          "start_line": 193,
+          "end_line": 246,
+          "relevance": [
+            "shared_attrs=1",
+            "keyword_source_overlap=2"
+          ],
+          "source": "    def _purchase_service_prepare_line_values(self, purchase_order, quantity=False):\n        \"\"\" Returns the values to create the purchase order line from the current SO line.\n            :param purchase_order: record of purchase.order\n            :rtype: dict\n            :param quantity: the quantity to force on the PO line, expressed in SO line UoM\n        \"\"\"\n        self.ensure_one()\n        # compute quantity from SO line UoM\n        product_quantity = self.product_uom_qty\n        if quantity:\n            product_quantity = quantity\n\n        purchase_qty_uom = self.product_uom._compute_quantity(product_quantity, self.product_id.uom_po_id)\n\n        # determine vendor (real supplier, sharing the same partner as the one from the PO, but with more accurate informations like validity, quantity, ...)\n        # Note: one partner can have multiple supplier info for the same product\n        supplierinfo = self.product_id._select_seller(\n            partner_id=purchase_order.partner_id,\n            quantity=purchase_qty_uom,\n            date=purchase_order.date_order and purchase_order.date_order.date(), # and purchase_order.date_order[:10],\n            uom_id=self.product_id.uom_po_id\n        )\n        fpos = purchase_order.fiscal_position_id\n        taxes = fpos.map_tax(self.product_id.supplier_taxes_id) if fpos else self.product_id.supplier_taxes_id\n        if taxes:\n            taxes = taxes.filtered(lambda t: t.company_id.id == self.company_id.id)\n\n        # compute unit price\n        price_unit = 0.0\n        if supplierinfo:\n            price_unit = self.env['account.tax'].sudo()._fix_tax_included_price_company(supplierinfo.price, self.product_id.supplier_taxes_id, taxes, self.company_id)\n            if purchase_order.currency_id and supplierinfo.currency_id != purchase_order.currency_id:\n                price_unit = supplierinfo.currency_id.compute(price_unit, purchase_order.currency_id)\n\n        # purchase line description in supplier lang\n        product_in_supplier_lang = self.product_id.with_context(\n            lang=supplierinfo.name.lang,\n            partner_id=supplierinfo.name.id,\n        )\n        name = '[%s] %s' % (self.product_id.default_code, product_in_supplier_lang.display_name)\n        if product_in_supplier_lang.description_purchase:\n            name += '\\n' + product_in_supplier_lang.description_purchase\n\n        return {\n            'name': '[%s] %s' % (self.product_id.default_code, self.name) if self.product_id.default_code else self.name,\n            'product_qty': purchase_qty_uom,\n            'product_id': self.product_id.id,\n            'product_uom': self.product_id.uom_po_id.id,\n            'price_unit': price_unit,\n            'date_planned': fields.Date.from_string(purchase_order.date_order) + relativedelta(days=int(supplierinfo.delay)),\n            'taxes_id': [(6, 0, taxes.ids)],\n            'order_id': purchase_order.id,\n            'sale_line_id': self.id,\n        }"
+        }
+      ],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_purchase_service_prepare_line_values",
+          "class_name": "SaleOrderLine",
+          "start_line": 193,
+          "end_line": 246,
+          "source": "    def _purchase_service_prepare_line_values(self, purchase_order, quantity=False):\n        \"\"\" Returns the values to create the purchase order line from the current SO line.\n            :param purchase_order: record of purchase.order\n            :rtype: dict\n            :param quantity: the quantity to force on the PO line, expressed in SO line UoM\n        \"\"\"\n        self.ensure_one()\n        # compute quantity from SO line UoM\n        product_quantity = self.product_uom_qty\n        if quantity:\n            product_quantity = quantity\n\n        purchase_qty_uom = self.product_uom._compute_quantity(product_quantity, self.product_id.uom_po_id)\n\n        # determine vendor (real supplier, sharing the same partner as the one from the PO, but with more accurate informations like validity, quantity, ...)\n        # Note: one partner can have multiple supplier info for the same product\n        supplierinfo = self.product_id._select_seller(\n            partner_id=purchase_order.partner_id,\n            quantity=purchase_qty_uom,\n            date=purchase_order.date_order and purchase_order.date_order.date(), # and purchase_order.date_order[:10],\n            uom_id=self.product_id.uom_po_id\n        )\n        fpos = purchase_order.fiscal_position_id\n        taxes = fpos.map_tax(self.product_id.supplier_taxes_id) if fpos else self.product_id.supplier_taxes_id\n        if taxes:\n            taxes = taxes.filtered(lambda t: t.company_id.id == self.company_id.id)\n\n        # compute unit price\n        price_unit = 0.0\n        if supplierinfo:\n            price_unit = self.env['account.tax'].sudo()._fix_tax_included_price_company(supplierinfo.price, self.product_id.supplier_taxes_id, taxes, self.company_id)\n            if purchase_order.currency_id and supplierinfo.currency_id != purchase_order.currency_id:\n                price_unit = supplierinfo.currency_id.compute(price_unit, purchase_order.currency_id)\n\n        # purchase line description in supplier lang\n        product_in_supplier_lang = self.product_id.with_context(\n            lang=supplierinfo.name.lang,\n            partner_id=supplierinfo.name.id,\n        )\n        name = '[%s] %s' % (self.product_id.default_code, product_in_supplier_lang.display_name)\n        if product_in_supplier_lang.description_purchase:\n            name += '\\n' + product_in_supplier_lang.description_purchase\n\n        return {\n            'name': '[%s] %s' % (self.product_id.default_code, self.name) if self.product_id.default_code else self.name,\n            'product_qty': purchase_qty_uom,\n            'product_id': self.product_id.id,\n            'product_uom': self.product_id.uom_po_id.id,\n            'price_unit': price_unit,\n            'date_planned': fields.Date.from_string(purchase_order.date_order) + relativedelta(days=int(supplierinfo.delay)),\n            'taxes_id': [(6, 0, taxes.ids)],\n            'order_id': purchase_order.id,\n            'sale_line_id': self.id,\n        }"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

@@ -1,0 +1,95 @@
+{
+  "task_id": "209",
+  "repo_owner": "lmfdb",
+  "repo_name": "lmfdb",
+  "file_path": "lmfdb/db_backend.py",
+  "commit": "c0c000f70d913bcd5cf024aabbeaf41d7e0aac26",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T02:26:59+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "c0c000f70d913bcd5cf024aabbeaf41d7e0aac26",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T02:26:59+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "lmfdb/db_backend.py",
+    "original_signature": "def refresh_stats(self, total=True, suffix=''):",
+    "target_file": {
+      "ok": true,
+      "path": "lmfdb/db_backend.py",
+      "sha": "b69fda63e4570f3a72f002e625210475f0fc4095",
+      "download_url": "https://raw.githubusercontent.com/LMFDB/lmfdb/c0c000f70d913bcd5cf024aabbeaf41d7e0aac26/lmfdb/db_backend.py",
+      "content_excerpt": "\"\"\"\nThis module provides an interface to Postgres supporting\nthe kinds of queries needed by the LMFDB.\n\nEXAMPLES::\n\n    sage: from lmfdb.db_backend import db\n    sage: db\n    Interface to Postgres database\n    sage: len(db.tablenames)\n    53\n    sage: db.tablenames[0]\n    'artin_field_data'\n    sage: db.artin_field_data\n    Interface to Postgres table artin_field_data\n\nYou can search using the methods ``search``, ``lucky`` and ``lookup``::\n\n    sage: G = db.gps_small.lookup('8.2')\n    sage: G['Exponent']\n    4\n\n- ``extra_table`` -- a string or None.  If provided, gives the name of a table that is linked to the search table by an ``id`` column and provides more data that cannot be searched on.  The reason to separate the data into two tables is to reduce the size of the search table.  For large tables this speeds up some queries.\n- ``count_table`` -- a string or None.  If provided, gives the name of a table that caches counts for searches on the search table.  These counts are relevant when many results are returned, allowing the search pages to report the number of records even when it would take Postgres a long time to compute this count.\n\n\"\"\"\n\n\nimport logging, tempfile, re, os, time, random, traceback, datetime, getpass\nfrom collections import defaultdict, Counter\nfrom psycopg2 import connect, DatabaseError, InterfaceError\nfrom psycopg2.sql import SQL, Identifier, Placeholder, Literal, Composable\nfrom psycopg2.extras import execute_values\nfrom lmfdb.db_encoding import setup_connection, Array, Json, copy_dumps\nfrom sage.misc.mrange import cartesian_product_iterator\nfrom sage.functions.other import binomial\nfrom lmfdb.utils import make_logger, format_percentage\nfrom lmfdb.typed_data.artin_types import Dokchitser_ArtinRepresentation, Dokchitser_NumberFieldGaloisGroup\n\nSLOW_QUERY_LOGFILE = \"slow_queries.log\"\nSLOW_CUTOFF = 0.1\n\n# This list is used when creating new tables\ntypes_whitelist = set([\n    \"int2\", \"smallint\", \"smallserial\", \"serial2\",\n    \"int4\", \"int\", \"integer\", \"serial\", \"serial4\",\n    \"int8\", \"bigint\", \"bigserial\", \"serial8\",\n    \"numeric\", \"decimal\",\n    \"float4\", \"real\",\n    \"float8\", \"double precision\",\n    \"boolean\", \"bool\",\n    \"text\", \"char\", \"character\", \"character varying\", \"varchar\",\n    \"json\", \"jsonb\", \"xml\",\n    \"date\", \"interval\", \"time\", \"time without time zone\", \"time with time zone\", \"timetz\",\n    \"timestamp\", \"timestamp without time zone\", \"timestamp with time zone\", \"timestamptz\",\n    \"bytea\", \"bit\", \"bit varying\", \"varbit\",\n    \"point\", \"line\", \"lseg\", \"path\", \"box\", \"polygon\", \"circle\",\n    \"tsquery\", \"tsvector\",\n    \"txid_snapshot\", \"uuid\",\n    \"cidr\", \"inet\", \"macaddr\",\n    \"money\", \"pg_lsn\",\n])\nparam_types_whitelist = [\n    r\"^(bit( varying)?|varbit)\\s*\\([1-9][0-9]*\\)$\",\n    r'(text|(char(acter)?|character varying|varchar(\\s*\\(1-9][0-9]*\\))?))(\\s+collate \"(c|posix|[a-z][a-z]_[a-z][a-z](\\.[a-z0-9-]+)?)\")?',\n    r\"^interval(\\s+year|month|day|hour|minute|second|year to month|day to hour|day to minute|day to second|hour to minute|hour to second|minute to second)?(\\s*\\([0-6]\\))?$\",\n    r\"^timestamp\\s*\\([0-6]\\)(\\s+with(out)? time zone)?$\",\n    r\"^time\\s*\\(([0-9]|10)\\)(\\s+with(out)? time zone)?$\",\n    r\"^(numeric|decimal)\\s*\\([1-9][0-9]*(,\\s*(0|[1-9][0-9]*))?\\)$\",\n]\nparam_types_whitelist = [re.compile(s) for s in param_types_whitelist]\n# the non-default operator classes, used in creating indexes\n_operator_classes = {'brin':   ['inet_minmax_ops'],\n                     'btree':  ['bpchar_pattern_ops', 'cidr_ops', 'record_image_ops',\n                                'text_pattern_ops', 'varchar_ops', 'varchar_pattern_ops'],\n                     'gin':    ['jsonb_path_ops'],\n                     'gist':   ['inet_ops'],\n                     'hash':   ['bpchar_pattern_ops', 'cidr_ops', 'text_pattern_ops',\n                                'varchar_ops', 'varchar_pattern_ops'],\n                     'spgist': ['kd_point_ops']}\n# Valid storage parameters by type, used in creating indexes\n_valid_storage_params = {'brin':   ['pages_per_range', 'autosummarize'],\n                         'btree':  ['fillfactor'],\n                         'gin':    ['fastupdate', 'gin_pending_list_limit'],\n                         'gist':   ['fillfactor', 'buffering'],\n                         'hash':   ['fillfactor'],\n                         'spgist': ['fillfactor']}\n\nclass QueryLogFilter(object):\n    \"\"\"\n    A filter used when logging slow queries.\n    \"\"\"\n    def filter(self, record):\n        if record.pathname.startswith('db_backend.py'):\n            return 1\n        else:\n            return 0\n\nclass EmptyContext(object):\n    \"\"\"\n    Used to simplify code in cases where we may or may not want to open an extras file.\n    \"\"\"\n    name = None\n    def __enter__(self):\n        pass\n    def __exit__(self, exc_type, exc_value, traceback):\n        pass\n\nclass DelayCommit(object):\n    \"\"\"\n    Used to set default behavior for whether to commit changes to the database connection.\n\n    Entering this context in a with statement will cause `_execute` calls to not commit by\n    default.  When the final DelayCommit is exited, the connection will commit.\n    \"\"\"\n    def __init__(self, obj, final_commit=True, silence=None):\n        self.obj = obj._db\n        self.final_commit = final_commit\n        self._orig_silenced = obj._db._silenced\n        if silence is not None:\n            obj._silenced = silence\n    def __enter__(self):\n        self.obj._nocommit_stack += 1\n    def __exit__(self, exc_type, exc_value, traceback):\n        self.obj._nocommit_stack -= 1\n        self.obj._silenced = self._orig_silenced\n        if exc_type is None and self.obj._nocommit_stack == 0 and self.final_commit:\n            self.obj.conn.commit()\n\nclass PostgresBase(object):\n    \"\"\"\n    A base class for various objects that interact with Postgres.\n\n    Any class inheriting from this one must provide a connection\n    to the postgres database, as well as a name used when creating a logger.\n    \"\"\"\n    def __init__(self, loggername, db):\n        # Have to record this object in the db so that we can reset the connection if necessary.\n        # This function also sets self.conn\n        db.register_object(self)\n        self._db = db\n        handler = logging.FileHandler(SLOW_QUERY_LOGFILE)\n        formatter = logging.Formatter(\"%(asctime)s - %(message)s\")\n        filt = QueryLogFilter()\n        handler.setFormatter(formatter)\n        handler.addFilter(filt)\n        self.logger = make_logger(loggername, hl = False, extraHandlers = [handler])\n\n    def _execute(self, query, values=None, silent=None, values_list=False, template=None, commit=None, slow_note=None, reissued=False):\n        \"\"\"\n        Execute an SQL command, properly catching errors and returning the resulting cursor.\n\n        INPUT:\n\n        - ``query`` -- an SQL Composable object, the SQL command to execute.\n        - ``values`` -- values to substitute for %s in the query.  Quoting from the documentation\n            for psycopg2 (http://initd.org/psycopg/docs/usage.html#passing-parameters-to-sql-queries):\n\n            Never, never, NEVER use Python string concatenation (+) or string parameters\n            interpolation (%) to pass variables to a SQL query string. Not even at gunpoint.\n\n        - ``silent`` -- boolean (default None).  If True, don't log a warning for a slow query.\n            If None, allow DelayCommit contexts to control silencing.\n        - ``values_list`` -- boolean (default False).  If True, use the ``execute_values`` method,\n            designed for inserting multiple values.\n        - ``template`` -- string, for use with ``values_list`` to insert constant values:\n            for example ``\"(%s, %s, 42)\"``. See the documentation of ``execute_values``\n            for more details.\n        - ``commit`` -- boolean (default None).  Whether to commit changes on success.  The default\n            is to commit unless we are currently in a DelayCommit context.\n        - ``slow_note`` -- a tuple for generating more useful data for slow query logging.\n        - ``reissued`` -- used internally to prevent infinite recursion when attempting to\n            reset the connection.\n\n        .. NOTE:\n\n            If the Postgres connection has been closed, the execute statement will fail.\n            We try to recover gracefully by attempting to open a new connection\n            and issuing the command again.  However, this approach is not prudent if this\n            execute statement is one of a chain of statements, which we detect by checking\n            whether ``commit == False``.  In this case, we will reset the connection but reraise\n            the interface error.\n\n            The upshot is that you should use ``commit=False`` even for the last of a chain of\n            execute statements, then explicitly call ``self.conn.commit()`` afterward.\n\n        OUTPUT:\n\n        - a cursor object from which the resulting records can be obtained via iteration.\n\n        This function will also log slow queries.\n        \"\"\"\n        if not isinstance(query, Composable):\n            raise TypeError(\"You must use the psycopg2.sql module to execute queries\")\n\n        try:\n            cur = self.conn.cursor()\n\n            t = time.time()\n            if values_list:\n                if template is not None:\n                    template = template.as_string(self.conn)\n                execute_values(cur, query.as_string(self.conn), values, template)\n            else:\n                #print query.as_string(self.conn)\n                cur.execute(query, values)\n            if silent is False or (silent is None and not self._db._silenced):\n                t = time.time() - t\n                if t > SLOW_CUTOFF:\n                    query = query.as_string(self.conn)\n                    if values:\n                        query = query % (tuple(values))\n                    self.logger.info(query + \" ran in %ss\" % (t,))\n                    if slow_note is not None:\n                        self.logger.info(\"Replicate with db.{0}.{1}({2})\".format(slow_note[0], slow_note[1], \", \".join(str(c) for c in slow_note[2:])))\n        except (DatabaseError, InterfaceError):\n            if self.conn.closed != 0:\n                # If reissued, we need to raise since we're recursing.\n                if reissued:\n                    raise\n                # Attempt to reset the connection\n                self._db.reset_connection()\n                if commit or (commit is None and self._db._nocommit_stack == 0):\n                    return self._execute(query, values=values, silent=silent, values_list=values_list, template=template, slow_note=slow_note, reissued=True)\n                else:\n                    raise\n            else:\n                self.conn.rollback()\n                raise\n        else:\n            if commit or (commit is None and self._db._nocommit_stack == 0):\n                self.conn.commit()\n        return cur\n\n    def _table_exists(self, tablename):\n        cur = self._execute(SQL(\"SELECT to_regclass(%s)\"), [tablename], silent=True)\n        return cur.fetchone()[0] is not None\n\n    def _constraint_exists(self, tablename, constraintname):\n        print tablename, constraintname\n        cur = self._execute(SQL(\"SELECT 1 from information_schema.table_constraints where table_name=%s and constraint_name=%s\"), [tablename, constraintname],  silent=True)\n        return cur.fetchone() is not None\n\n    @staticmethod\n    def _sort_str(sort_list):\n        \"\"\"\n        Constructs a psycopg2.sql.Composable object describing a sort order for Postgres from a list of columns.\n\n        INPUT:\n\n        - ``sort_list`` -- a list, either of strings (which are interpreted as column names in the ascending direction) or of pairs (column name, 1 or -1).\n\n        OUTPUT:\n\n        - a Composable to be used by psycopg2 in the ORDER BY clause.\n        \"\"\"\n        L = []\n        for col in sort_list:\n            if isinstance(col, basestring):\n                L.append(Identifier(col))\n            elif co",
+      "total_lines": 3745,
+      "ref": "c0c000f70d913bcd5cf024aabbeaf41d7e0aac26"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

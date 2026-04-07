@@ -89,6 +89,7 @@ class WorkflowTrace:
     rounds_used: int
     github_context: dict[str, Any] | None
     repair_context_used: bool
+    repair_feedback: dict[str, Any] | None
     review_strict_gate_result: str | None
     analysis: dict[str, Any] | None
     repairs: list[dict[str, Any]] = field(default_factory=list)
@@ -115,6 +116,7 @@ class GraphState(TypedDict):
     max_rounds: int
     github_context: dict[str, Any] | None
     repair_context_used: bool
+    repair_feedback: dict[str, Any] | None
     review_strict_gate_result: str | None
     analysis: AnalysisResult | None
     repairs: list[RepairAttempt]
@@ -168,6 +170,7 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         max_rounds=max_rounds,
         github_context=None,
         repair_context_used=False,
+        repair_feedback=None,
         review_strict_gate_result=None,
         analysis=None,
         repairs=[],
@@ -248,6 +251,7 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         rounds_used=state["round_id"],
         github_context=state["github_context"],
         repair_context_used=state["repair_context_used"],
+        repair_feedback=state["repair_feedback"],
         review_strict_gate_result=state["review_strict_gate_result"],
         analysis=asdict(state["analysis"]) if state["analysis"] else None,
         repairs=[asdict(item) for item in state["repairs"]],

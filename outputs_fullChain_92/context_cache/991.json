@@ -1,0 +1,147 @@
+{
+  "task_id": "991",
+  "repo_owner": "stoq",
+  "repo_name": "stoq",
+  "file_path": "stoqlib/database/orm.py",
+  "commit": "dd282947423a1f47ea7a015b70005b361054cd8d",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T06:06:45+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "dd282947423a1f47ea7a015b70005b361054cd8d",
+    "symbol_name": "select",
+    "satd_line": 1012,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T06:06:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "stoqlib/database/orm.py",
+    "original_signature": "def select(cls, clause=None, having=None, connection=None, orderBy=None,",
+    "target_file": {
+      "ok": true,
+      "path": "stoqlib/database/orm.py",
+      "sha": "c92dbadaad7934f391dfe383b03b4d0aa65b31d8",
+      "download_url": "https://raw.githubusercontent.com/stoq/stoq/dd282947423a1f47ea7a015b70005b361054cd8d/stoqlib/database/orm.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# vi:si:et:sw=4:sts=4:ts=4\n\n##\n## Copyright (c) 2006, 2007 Canonical\n## Copyright (C) 2008-2012 Async Open Source <http://www.async.com.br>\n## All rights reserved\n##\n## This program is free software; you can redistribute it and/or modify\n## it under the terms of the GNU General Public License as published by\n## the Free Software Foundation; either version 2 of the License, or\n## (at your option) any later version.\n##\n## This program is distributed in the hope that it will be useful,\n## but WITHOUT ANY WARRANTY; without even the implied warranty of\n## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n## GNU General Public License for more details.\n##\n## You should have received a copy of the GNU General Public License\n## along with this program; if not, write to the Free Software\n## Foundation, Inc., or visit: http://www.gnu.org/.\n##\n## Author(s): Stoq Team <stoq-devel@async.com.br>\n##            Gustavo Niemeyer <gustavo@niemeyer.net>\n##\n\n# This file is full of hacks to mimic the SQLObject API\n# The migration plan is to:\n# - Mimic the SQLObject api & behavior exactly (IN PROGRESS)\n# - Run both of them for a couple of weeks to find all bugs (SKIP)\n# - Remove the SQLObject support (DONE)\n# - Clean up the API\n\n\"\"\"Simple ORM abstraction layer\"\"\"\n\nimport re\nimport datetime\nimport decimal\nimport warnings\nfrom weakref import WeakValueDictionary\n\nfrom kiwi.db.stormintegration import StormQueryExecuter\nfrom kiwi.currency import currency\nfrom psycopg2 import IntegrityError\nfrom storm import expr, Undef\nfrom storm.base import Storm\nfrom storm.database import create_database\nfrom storm.exceptions import StormError, NotOneError\nfrom storm.expr import (\n    SQL, SQLRaw, Desc, And, Or, Not, In, Like, AutoTables, LeftJoin,\n    Alias, Update, Join, NamedFunc, Select, compile as expr_compile,\n    is_safe_token)\nfrom storm.info import get_cls_info, get_obj_info, ClassAlias\nfrom storm.properties import (\n    RawStr, Int, Bool, Float, DateTime, Date, TimeDelta, Unicode,\n    Decimal, PropertyColumn)\nfrom storm.properties import SimpleProperty, PropertyPublisherMeta\nfrom storm.references import Reference, ReferenceSet\nfrom storm.store import AutoReload, Store\nfrom storm.tracer import debug\nfrom storm.tz import tzutc\nfrom storm.variables import (Variable, BoolVariable, DateVariable,\n                             DateTimeVariable, RawStrVariable, DecimalVariable,\n                             IntVariable)\n\nfrom stoqlib.lib.defaults import DECIMAL_PRECISION, QUANTITY_PRECISION\n\n_IGNORED = object()\n\n\nclass SQLObjectNotFound(StormError):\n    pass\n\n\nclass SQLObjectStyle(object):\n\n    longID = False\n\n    def idForTable(self, table_name):\n        if self.longID:\n            return self.tableReference(table_name)\n        else:\n            return \"id\"\n\n    def pythonClassToAttr(self, class_name):\n        return self._lowerword(class_name)\n\n    def instanceAttrToIDAttr(self, attr_name):\n        return attr_name + \"ID\"\n\n    def pythonAttrToDBColumn(self, attr_name):\n        return self._mixed_to_under(attr_name)\n\n    def dbColumnToPythonAttr(self, column_name):\n        return self._under_to_mixed(column_name)\n\n    def pythonClassToDBTable(self, class_name):\n        return class_name[0].lower() + self._mixed_to_under(class_name[1:])\n\n    def dbTableToPythonClass(self, table_name):\n        return table_name[0].upper() + self._under_to_mixed(table_name[1:])\n\n    def pythonClassToDBTableReference(self, class_name):\n        return self.tableReference(self.pythonClassToDBTable(class_name))\n\n    def tableReference(self, table_name):\n        return table_name + \"_id\"\n\n    def _mixed_to_under(self, name, _re=re.compile(\"[A-Z]+\")):\n        if name.endswith(\"ID\"):\n            return self._mixed_to_under(name[:-2] + \"_id\")\n        name = _re.sub(self._mixed_to_under_sub, name)\n        if name.startswith(\"_\"):\n            return name[1:]\n        return name\n\n    def _mixed_to_under_sub(self, match):\n        m = match.group(0).lower()\n        if len(m) > 1:\n            return \"_%s_%s\" % (m[:-1], m[-1])\n        else:\n            return \"_%s\" % m\n\n    def _under_to_mixed(self, name, _re=re.compile(\"_.\")):\n        if name.endswith(\"_id\"):\n            return self._under_to_mixed(name[:-3] + \"ID\")\n        return _re.sub(self._under_to_mixed_sub, name)\n\n    def _under_to_mixed_sub(self, match):\n        return match.group(0)[1].upper()\n\n    @staticmethod\n    def _capword(s):\n        return s[0].upper() + s[1:]\n\n    @staticmethod\n    def _lowerword(s):\n        return s[0].lower() + s[1:]\n\n\n# Not a metaclass, more the 'sqlmeta' attribute\nclass _SQLMeta(object):\n    def __init__(self, cls):\n        self.soClass = cls\n        self.table = cls.__storm_table__\n\n    @property\n    def columnList(self):\n        cls = self.soClass\n        info = get_cls_info(cls)\n        return info.columns\n\n    def addColumn(self, column):\n        cls = self.soClass\n        kwargs = column.kwargs.copy()\n        name = kwargs['name']\n        propName = name + 'ID'\n        dbName = name + '_id'\n        if dbName.startswith('_'):\n            dbName = dbName[1:]\n\n        # This is completely wrong but enough for our usage\n        if column.kwargs.get('forceDBName'):\n            ref = Reference(getattr(cls, propName),\n                            '%s.id' % column.foreignKey)\n            setattr(cls, name, ref)\n            return\n\n        property_registry = cls._storm_property_registry\n        property_registry.add_property(cls, column, propName)\n\n    def delColumn(self, attr_name):\n        cls = self.soClass\n        info = get_cls_info(cls)\n        delattr(cls, attr_name)\n        columns = []\n        for col in info.columns:\n            if col.name != attr_name:\n                columns.append(col)\n        info.columns = tuple(columns)\n        del info.attributes[attr_name]\n\n\nclass SQLObjectMeta(PropertyPublisherMeta):\n\n    @staticmethod\n    def _get_attr(attr, bases, dict):\n        value = dict.get(attr)\n        if value is None:\n            for base in bases:\n                value = getattr(base, attr, None)\n                if value is not None:\n                    break\n        return value\n\n    def __new__(cls, name, bases, dict):\n        if Storm in bases or SQLObjectBase in bases:\n            # Do not parse abstract base classes.\n            return type.__new__(cls, name, bases, dict)\n\n        style = cls._get_attr(\"_style\", bases, dict)\n        if style is None:\n            dict[\"_style\"] = style = SQLObjectStyle()\n\n        table_name = cls._get_attr(\"_table\", bases, dict)\n        if table_name is None:\n            table_name = style.pythonClassToDBTable(name)\n\n        id_name = cls._get_attr(\"_idName\", bases, dict)\n        if id_name is None:\n            id_name = style.idForTable(table_name)\n\n        # Handle this later to call _parse_orderBy() on the created class.\n        default_order = cls._get_attr(\"_defaultOrder\", bases, dict)\n\n        dict[\"__storm_table__\"] = table_name\n\n        attr_to_prop = {}\n        for attr, prop in dict.items():\n            attr_to_prop[attr] = attr\n            if isinstance(prop, ForeignKey):\n                db_name = prop.kwargs.get(\"dbName\", None)\n                local_prop_name = style.instanceAttrToIDAttr(attr)\n                if db_name is None:\n                    if local_prop_name.endswith('ID'):\n                        db_name = attr + '_id'\n                    else:\n                        db_name = attr\n                dict[local_prop_name] = local_prop = Int(\n                    db_name, allow_none=not prop.kwargs.get(\"notNull\", False),\n                    validator=prop.kwargs.get(\"storm_validator\", None))\n                dict[attr] = Reference(local_prop,\n                                       \"%s.<primary key>\" % prop.foreignKey)\n                attr_to_prop[attr] = local_prop_name\n            elif isinstance(prop, PropertyAdapter):\n                db_name = prop.dbName or attr\n                method_name = prop.alternateMethodName\n                if method_name is None and prop.alternateID:\n                    method_name = \"by\" + db_name[0].upper() + db_name[1:]\n                if method_name is not None:\n                    def func(cls, key, attr=attr):\n                        store = cls._get_store()\n                        obj = store.find(cls, getattr(cls, attr) == key).one()\n                        if obj is None:\n                            raise SQLObjectNotFound\n                        return obj\n                    func.func_name = method_name\n                    dict[method_name] = classmethod(func)\n            elif isinstance(prop, SQLMultipleJoin):\n                # Generate addFoo/removeFoo names.\n                def define_add_remove(dict, prop):\n                    capitalised_name = (prop._otherClass[0].capitalize() +\n                                        prop._otherClass[1:])\n\n                    def add(self, obj):\n                        prop._get_bound_reference_set(self).add(obj)\n                    add.__name__ = \"add\" + capitalised_name\n                    dict.setdefault(add.__name__, add)\n\n                    def remove(self, obj):\n                        prop._get_bound_reference_set(self).remove(obj)\n                    remove.__name__ = \"remove\" + capitalised_name\n                    dict.setdefault(remove.__name__, remove)\n                define_add_remove(dict, prop)\n\n        id_type = dict.setdefault(\"_idType\", int)\n        id_cls = {int: Int, str: RawStr, unicode: AutoUnicode}[id_type]\n        dict[\"id\"] = id_cls(id_name, primary=True, default=AutoReload)\n        attr_to_prop[id_name] = \"id\"\n\n        # Notice that obj is the class since this is the metaclass.\n        obj = super(SQLObjectMeta, cls).__new__(cls, name, bases, dict)\n        obj.sqlmeta = _SQLMeta(obj)\n\n        property_registry = obj._storm_property_registry\n\n        property_registry.add_property(obj, getattr(obj, \"id\"),\n                                       \"<primary key>\")\n\n        # Let's explore this same mechanism to register table names,\n        # so that we can find them to handle prejoinClauseTables.\n        property_registry.add_property(obj, getattr(obj, \"id\"),\n                                       \"<table %s>\" % table_name)\n\n        for fake_name, real_name in attr_to_prop.items():\n            prop = getattr(obj, real_name)\n            if fake_name != real_name:\n                property_registry.add_property(obj, prop, fake_name)\n            attr_to_prop[fake_name] = prop\n\n        obj._attr_to_prop = attr_to_prop\n\n        if default_order is not None:\n            cls_info = get_cls_info(obj)\n            cls_info.default_order = obj._parse_orderBy(default_order)\n\n        return obj\n\n\nclass DotQ(object):\n    \"\"\"A descriptor that mimics the SQLObject 'Table.q' syntax\"\"\"\n\n    def __get__(self, obj, cls=None):\n        return BoundDotQ(cls)\n\n\nclass BoundDotQ(object):\n\n    def __init__(self, cls):\n        self._cls = cls\n\n    def __getattr__(self, attr):\n        if attr.startswith(\"__\"):\n            raise AttributeError(attr)\n        elif attr == \"id\":\n            cls_info = get_cls_info(self._cls)\n            return cls_info.primary_key[0]\n        else:\n            return getattr(self._cls, attr)\n\n\nclass DotQAlias(object):\n\n    def __get__(self, obj, cls=None):\n        return BoundDotQAlias(obj)\n\n\nclass BoundDotQAlias(object):\n\n    def __init__(self, alias):\n        self._alias = alias\n\n    def __getattr__(self, attr):\n        if attr.startswith(\"__\"):\n            raise AttributeError(attr)\n        elif attr == \"id\":\n            #self._alias.name + '.id'\n            return\n        else:\n            return getattr(self._alias.expr, attr)\n\n\nclass MyAlias(Alias):\n    q = DotQAlias()\n\n\ndef GetAlias(klass, name):\n    # If it is a viewable we should use our own Alias that handles it\n    # correctly. We cant use ClassAlias as that depends on __storm_id__ and\n    # __storm_table__\n    if issubclass(klass, Viewable):\n        return MyAlias(klass, name)\n    else:\n     ",
+      "total_lines": 1472,
+      "ref": "dd282947423a1f47ea7a015b70005b361054cd8d"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "select",
+      "class_name": "Viewable",
+      "start_line": 976,
+      "end_line": 1014,
+      "satd_line": 1012,
+      "matched_by": "signature_or_comment",
+      "source": "    def select(cls, clause=None, having=None, connection=None, orderBy=None):\n        attributes, columns = zip(*cls.columns.items())\n\n        if connection is None:\n            from stoqlib.database.runtime import get_connection\n            connection = get_connection()\n        store = connection.store\n        clauses = []\n        if clause:\n            clauses.append(clause)\n\n        if cls.clause:\n            clauses.append(cls.clause)\n\n        if clauses:\n            clauses = [AND(*clauses)]\n\n        def _load_view_objects(result, values):\n            instance = cls()\n            instance._connection = connection\n            for attribute, value in zip(attributes, values):\n                # Convert values according to the column specification\n                if hasattr(cls.columns[attribute], 'variable_factory'):\n                    var = cls.columns[attribute].variable_factory.func()\n                    if value is not None:\n                        value = var.parse_set(value, False)\n                setattr(instance, attribute, value)\n            return instance\n\n        results = store.using(*cls.tables).find(columns, *clauses)\n        if cls.group_by:\n            results = results.group_by(*cls.group_by)\n        if orderBy:\n            results = results.order_by(orderBy)\n\n        results._load_objects = _load_view_objects\n        # FIXME: Fix the callsites of orderBy\n        results.orderBy = results.order_by\n        return results",
+      "calls": [
+        "AND",
+        "cls",
+        "get_connection",
+        "hasattr",
+        "setattr",
+        "zip"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "AND",
+        "_load_view_objects",
+        "get_connection",
+        "values"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "get_connection",
+          "class_name": "Viewable",
+          "start_line": 966,
+          "end_line": 967,
+          "relevance": [
+            "direct_call",
+            "same_class"
+          ],
+          "source": "    def get_connection(self):\n        return self._connection"
+        },
+        {
+          "symbol_name": "get_connection",
+          "class_name": "SQLObjectBase",
+          "start_line": 432,
+          "end_line": 436,
+          "relevance": [
+            "direct_call"
+          ],
+          "source": "    def get_connection(self):\n        if not self._connection:\n            self._connection = STORE_TRANS_MAP[self._get_store()]\n\n        return self._connection"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "Viewable",
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_load_view_objects",
+          "class_name": null,
+          "start_line": 993,
+          "end_line": 1003,
+          "source": "        def _load_view_objects(result, values):\n            instance = cls()\n            instance._connection = connection\n            for attribute, value in zip(attributes, values):\n                # Convert values according to the column specification\n                if hasattr(cls.columns[attribute], 'variable_factory'):\n                    var = cls.columns[attribute].variable_factory.func()\n                    if value is not None:\n                        value = var.parse_set(value, False)\n                setattr(instance, attribute, value)\n            return instance"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

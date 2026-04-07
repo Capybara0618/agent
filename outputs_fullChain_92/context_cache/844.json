@@ -1,0 +1,133 @@
+{
+  "task_id": "844",
+  "repo_owner": "airshipit",
+  "repo_name": "drydock",
+  "file_path": "helm_drydock/drivers/oob/pyghmi_driver/__init__.py",
+  "commit": "ad05a0976b30af3801965a5627dcefaa62409f1b",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T05:23:09+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ad05a0976b30af3801965a5627dcefaa62409f1b",
+    "symbol_name": "execute_task",
+    "satd_line": 96,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T05:23:09+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "helm_drydock/drivers/oob/pyghmi_driver/__init__.py",
+    "original_signature": "def execute_task(self, task_id):",
+    "target_file": {
+      "ok": true,
+      "path": "helm_drydock/drivers/oob/pyghmi_driver/__init__.py",
+      "sha": "9a57efe9dbbe471ea108047f4a8b17491928f22a",
+      "download_url": "https://raw.githubusercontent.com/airshipit/drydock/ad05a0976b30af3801965a5627dcefaa62409f1b/helm_drydock/drivers/oob/pyghmi_driver/__init__.py",
+      "content_excerpt": "# Copyright 2017 AT&T Intellectual Property.  All other rights reserved.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\nimport time\n\nfrom pyghmi.ipmi.command import Command\n\nimport helm_drydock.error as errors\nimport helm_drydock.config as config\n\nimport helm_drydock.objects.fields as hd_fields\nimport helm_drydock.objects.task as task_model\n\nimport helm_drydock.drivers.oob as oob\nimport helm_drydock.drivers as drivers\n\n\nclass PyghmiDriver(oob.OobDriver):\n\n    def __init__(self, **kwargs):\n        super(PyghmiDriver, self).__init__(**kwargs)\n\n        self.driver_name = \"pyghmi_driver\"\n        self.driver_key = \"pyghmi_driver\"\n        self.driver_desc = \"Pyghmi OOB Driver\"\n\n        self.config = config.DrydockConfig.node_driver[self.driver_key]\n\n    def execute_task(self, task_id):\n        task = self.state_manager.get_task(task_id)\n\n        if task is None:\n            raise errors.DriverError(\"Invalid task %s\" % (task_id))\n\n        if task.action not in self.supported_actions:\n            raise errors.DriverError(\"Driver %s doesn't support task action %s\"\n                % (self.driver_desc, task.action))\n\n        design_id = getattr(task, 'design_id', None)\n\n        if design_id is None:\n            raise errors.DriverError(\"No design ID specified in task %s\" %\n                                     (task_id))\n\n\n        if task.site_name is None:\n            raise errors.DriverError(\"Not site specified for task %s.\" %\n                                    (task_id))\n\n        self.orchestrator.task_field_update(task.get_id(),\n                            status=hd_fields.TaskStatus.Running)\n\n        if task.action == hd_fields.OrchestratorAction.ValidateOobServices:\n            self.orchestrator.task_field_update(task.get_id(),\n                                status=hd_fields.TaskStatus.Complete,\n                                result=hd_fields.ActionResult.Success)\n            return\n            \n        site_design = self.orchestrator.get_effective_site(design_id, task.site_name)\n\n        target_nodes = []\n\n        if len(task.node_list) > 0:\n            target_nodes.extend([x\n                                 for x in site_design.baremetal_nodes\n                                 if x.get_name() in task.node_list])\n        else:\n            target_nodes.extend(site_design.baremetal_nodes)\n\n        incomplete_subtasks = []\n        # For each target node, create a subtask and kick off a runner\n        for n in target_nodes:\n            subtask = self.orchestrator.create_task(task_model.DriverTask,\n                        parent_task_id=task.get_id(), design_id=design_id,\n                        action=task.action,\n                        task_scope={'site': task.site_name,\n                                    'node_names': [n.get_name()]})\n            incomplete_subtasks.append(subtask.get_id())\n\n            runner = PyghmiTaskRunner(state_manager=self.state_manager,\n                        orchestrator=self.orchestrator,\n                        task_id=subtask.get_id(), node=n)\n            runner.start()\n\n        # Wait for subtasks to complete\n        # TODO need some kind of timeout\n        i = 0\n        while len(incomplete_subtasks) > 0:\n            for n in incomplete_subtasks:\n                t = self.state_manager.get_task(n)\n                if t.get_status() in [hd_fields.TaskStatus.Terminated,\n                                  hd_fields.TaskStatus.Complete,\n                                  hd_fields.TaskStatus.Errored]:\n                    incomplete_subtasks.remove(n)\n            time.sleep(2)\n            i = i+1\n            if i == 5:\n                break\n\n        task = self.state_manager.get_task(task.get_id())\n        subtasks = map(self.state_manager.get_task, task.get_subtasks())\n\n        success_subtasks = [x\n                            for x in subtasks\n                            if x.get_result() == hd_fields.ActionResult.Success]\n        nosuccess_subtasks = [x\n                              for x in subtasks\n                              if x.get_result() in [hd_fields.ActionResult.PartialSuccess,\n                                                    hd_fields.ActionResult.Failure]]\n\n        print(\"Task %s successful subtasks: %s\" %\n            (task.get_id(), len(success_subtasks)))\n        print(\"Task %s unsuccessful subtasks: %s\" %\n            (task.get_id(), len(nosuccess_subtasks)))\n        print(\"Task %s total subtasks: %s\" %\n            (task.get_id(), len(task.get_subtasks())))\n\n        task_result = None\n        if len(success_subtasks) > 0 and len(nosuccess_subtasks) > 0:\n            task_result = hd_fields.ActionResult.PartialSuccess\n        elif len(success_subtasks) == 0 and len(nosuccess_subtasks) > 0:\n            task_result = hd_fields.ActionResult.Failure\n        elif len(success_subtasks) > 0 and len(nosuccess_subtasks) == 0:\n            task_result = hd_fields.ActionResult.Success\n        else:\n            task_result = hd_fields.ActionResult.Incomplete\n\n        self.orchestrator.task_field_update(task.get_id(),\n                            result=task_result,\n                            status=hd_fields.TaskStatus.Complete)\n        return\n\nclass PyghmiTaskRunner(drivers.DriverTaskRunner):\n\n    def __init__(self, node=None, **kwargs):\n        super(PyghmiTaskRunner, self).__init__(**kwargs)\n\n        # We cheat here by providing the Node model instead\n        # of making the runner source it from statemgmt\n        if node is None:\n            raise errors.DriverError(\"Did not specify target node\")\n\n        self.node = node\n\n    def execute_task(self):\n        task_action = self.task.action\n\n        if len(self.task.node_list) != 1:\n            self.orchestrator.task_field_update(self.task.get_id(),\n                result=hd_fields.ActionResult.Incomplete,\n                status=hd_fields.TaskStatus.Errored)\n            raise errors.DriverError(\"Multiple names (%s) in task %s node_list\"\n                % (len(self.task.node_list), self.task.get_id()))\n\n        target_node_name = self.task.node_list[0]\n        \n        if self.node.get_name() != target_node_name:\n            self.orchestrator.task_field_update(self.task.get_id(),\n                result=hd_fields.ActionResult.Incomplete,\n                status=hd_fields.TaskStatus.Errored)\n            raise errors.DriverError(\"Runner node does not match \" \\\n                                     \"task node scope\")\n\n\n        ipmi_network = self.node.applied.get('oob_network')\n        ipmi_address = self.node.get_network_address(ipmi_network)\n\n        if ipmi_address is None:\n            self.orchestrator.task_field_update(self.task.get_id(),\n                result=hd_fields.ActionResult.Incomplete,\n                status=hd_fields.TaskStatus.Errored)\n            raise errors.DriverError(\"Node %s has no IPMI address\" %\n                (target_node_name))\n\n        self.orchestrator.task_field_update(self.task.get_id(),\n                status=hd_fields.TaskStatus.Running)\n        ipmi_account = self.node.applied.get('oob_account', '')\n        ipmi_credential = self.node.applied.get('oob_credential', '')\n\n        ipmi_session = Command(bmc=ipmi_address, userid=ipmi_account,\n                               password=ipmi_credential)\n\n        if task_action == hd_fields.OrchestratorAction.ConfigNodePxe:\n            self.orchestrator.task_field_update(self.task.get_id(),\n                result=hd_fields.ActionResult.Failure,\n                status=hd_fields.TaskStatus.Complete)\n            return\n        elif task_action == hd_fields.OrchestratorAction.SetNodeBoot:\n            ipmi_session.set_bootdev('pxe')\n\n            time.sleep(3)\n\n            bootdev = ipmi_session.get_bootdev()\n\n            if bootdev.get('bootdev', '') == 'network':\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Success,\n                    status=hd_fields.TaskStatus.Complete)\n            else:\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Failure,\n                    status=hd_fields.TaskStatus.Complete)\n            return\n        elif task_action == hd_fields.OrchestratorAction.PowerOffNode:\n            ipmi_session.set_power('off')\n\n            i = 18\n\n            while i > 0:\n                power_state = ipmi_session.get_power()\n                if power_state.get('powerstate', '') == 'off':\n                    break\n                time.sleep(10)\n                i = i - 1\n\n            if power_state.get('powerstate', '') == 'off':\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Success,\n                    status=hd_fields.TaskStatus.Complete)\n            else:\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Failure,\n                    status=hd_fields.TaskStatus.Complete)\n            return\n        elif task_action == hd_fields.OrchestratorAction.PowerOnNode:\n            ipmi_session.set_power('on')\n\n            i = 18\n\n            while i > 0:\n                power_state = ipmi_session.get_power()\n                if power_state.get('powerstate', '') == 'on':\n                    break\n                time.sleep(10)\n                i = i - 1\n\n            if power_state.get('powerstate', '') == 'on':\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Success,\n                    status=hd_fields.TaskStatus.Complete)\n            else:\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Failure,\n                    status=hd_fields.TaskStatus.Complete)\n            return\n        elif task_action == hd_fields.OrchestratorAction.PowerCycleNode:\n            ipmi_session.set_power('off')\n\n            # Wait for power state of off before booting back up\n            # We'll wait for up to 3 minutes to power off\n            i = 18\n\n            while i > 0:\n                power_state = ipmi_session.get_power()\n                if power_state.get('powerstate', '') == 'off':\n                    break\n                time.sleep(10)\n                i = i - 1\n\n            if power_state.get('powerstate', '') == 'on':\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Failure,\n                    status=hd_fields.TaskStatus.Complete)\n                return\n\n            ipmi_session.set_power('on')\n\n            i = 18\n\n            while i > 0:\n                power_state = ipmi_session.get_power()\n                if power_state.get('powerstate', '') == 'on':\n                    break\n                time.sleep(10)\n                i = i - 1\n\n            if power_state.get('powerstate', '') == 'on':\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Success,\n                    status=hd_fields.TaskStatus.Complete)\n            else:\n                self.orchestrator.task_field_update(self.task.get_id(),\n                    result=hd_fields.ActionResult.Failure,\n                    status=hd_fields.TaskStatus.Complete)\n            return\n        elif task_action == hd_fields.OrchestratorAction.InterrogateOob:\n            mci_id = ipmi_session.get_mci()\n\n            self.orchestrator.t",
+      "total_lines": 303,
+      "ref": "ad05a0976b30af3801965a5627dcefaa62409f1b"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "execute_task",
+      "class_name": "PyghmiDriver",
+      "start_line": 39,
+      "end_line": 141,
+      "satd_line": 96,
+      "matched_by": "signature_or_comment",
+      "source": "    def execute_task(self, task_id):\n        task = self.state_manager.get_task(task_id)\n\n        if task is None:\n            raise errors.DriverError(\"Invalid task %s\" % (task_id))\n\n        if task.action not in self.supported_actions:\n            raise errors.DriverError(\"Driver %s doesn't support task action %s\"\n                % (self.driver_desc, task.action))\n\n        design_id = getattr(task, 'design_id', None)\n\n        if design_id is None:\n            raise errors.DriverError(\"No design ID specified in task %s\" %\n                                     (task_id))\n\n\n        if task.site_name is None:\n            raise errors.DriverError(\"Not site specified for task %s.\" %\n                                    (task_id))\n\n        self.orchestrator.task_field_update(task.get_id(),\n                            status=hd_fields.TaskStatus.Running)\n\n        if task.action == hd_fields.OrchestratorAction.ValidateOobServices:\n            self.orchestrator.task_field_update(task.get_id(),\n                                status=hd_fields.TaskStatus.Complete,\n                                result=hd_fields.ActionResult.Success)\n            return\n            \n        site_design = self.orchestrator.get_effective_site(design_id, task.site_name)\n\n        target_nodes = []\n\n        if len(task.node_list) > 0:\n            target_nodes.extend([x\n                                 for x in site_design.baremetal_nodes\n                                 if x.get_name() in task.node_list])\n        else:\n            target_nodes.extend(site_design.baremetal_nodes)\n\n        incomplete_subtasks = []\n        # For each target node, create a subtask and kick off a runner\n        for n in target_nodes:\n            subtask = self.orchestrator.create_task(task_model.DriverTask,\n                        parent_task_id=task.get_id(), design_id=design_id,\n                        action=task.action,\n                        task_scope={'site': task.site_name,\n                                    'node_names': [n.get_name()]})\n            incomplete_subtasks.append(subtask.get_id())\n\n            runner = PyghmiTaskRunner(state_manager=self.state_manager,\n                        orchestrator=self.orchestrator,\n                        task_id=subtask.get_id(), node=n)\n            runner.start()\n\n        # Wait for subtasks to complete\n        # TODO need some kind of timeout\n        i = 0\n        while len(incomplete_subtasks) > 0:\n            for n in incomplete_subtasks:\n                t = self.state_manager.get_task(n)\n                if t.get_status() in [hd_fields.TaskStatus.Terminated,\n                                  hd_fields.TaskStatus.Complete,\n                                  hd_fields.TaskStatus.Errored]:\n                    incomplete_subtasks.remove(n)\n            time.sleep(2)\n            i = i+1\n            if i == 5:\n                break\n\n        task = self.state_manager.get_task(task.get_id())\n        subtasks = map(self.state_manager.get_task, task.get_subtasks())\n\n        success_subtasks = [x\n                            for x in subtasks\n                            if x.get_result() == hd_fields.ActionResult.Success]\n        nosuccess_subtasks = [x\n                              for x in subtasks\n                              if x.get_result() in [hd_fields.ActionResult.PartialSuccess,\n                                                    hd_fields.ActionResult.Failure]]\n\n        print(\"Task %s successful subtasks: %s\" %\n            (task.get_id(), len(success_subtasks)))\n        print(\"Task %s unsuccessful subtasks: %s\" %\n            (task.get_id(), len(nosuccess_subtasks)))\n        print(\"Task %s total subtasks: %s\" %\n            (task.get_id(), len(task.get_subtasks())))\n\n        task_result = None\n        if len(success_subtasks) > 0 and len(nosuccess_subtasks) > 0:\n            task_result = hd_fields.ActionResult.PartialSuccess\n        elif len(success_subtasks) == 0 and len(nosuccess_subtasks) > 0:\n            task_result = hd_fields.ActionResult.Failure\n        elif len(success_subtasks) > 0 and len(nosuccess_subtasks) == 0:\n            task_result = hd_fields.ActionResult.Success\n        else:\n            task_result = hd_fields.ActionResult.Incomplete\n\n        self.orchestrator.task_field_update(task.get_id(),\n                            result=task_result,\n                            status=hd_fields.TaskStatus.Complete)\n        return",
+      "calls": [
+        "PyghmiTaskRunner",
+        "getattr",
+        "len",
+        "map",
+        "print"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "driver_desc",
+        "orchestrator",
+        "state_manager",
+        "supported_actions"
+      ],
+      "global_uses": [
+        "PyghmiTaskRunner",
+        "errors",
+        "hd_fields",
+        "task_model",
+        "time",
+        "x"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": "PyghmiDriver",
+      "related_methods_count": 0,
+      "related_attributes_count": 1,
+      "related_methods": [],
+      "related_attributes": [
+        {
+          "attribute": "driver_desc",
+          "start_line": 34,
+          "end_line": 36,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        self.driver_key = \"pyghmi_driver\"\n        self.driver_desc = \"Pyghmi OOB Driver\"\n"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

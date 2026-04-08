@@ -1,0 +1,143 @@
+{
+  "task_id": "515",
+  "repo_owner": "containerbuildsystem",
+  "repo_name": "osbs-client",
+  "file_path": "osbs/api.py",
+  "commit": "db09bf4df2b471dc46f939ae7a76e6670996b17c",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T08:39:16+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "db09bf4df2b471dc46f939ae7a76e6670996b17c",
+    "symbol_name": "render_plugins_configuration",
+    "satd_line": 1338,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T08:39:20+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "osbs/api.py",
+    "original_signature": "def render_plugins_configuration(self, user_params_json):",
+    "target_file": {
+      "ok": true,
+      "path": "osbs/api.py",
+      "sha": "f9611edd97c4ee55c10d13e039f1da6c7064410e",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/osbs-client/db09bf4df2b471dc46f939ae7a76e6670996b17c/osbs/api.py",
+      "content_excerpt": "\"\"\"\nCopyright (c) 2015 Red Hat, Inc\nAll rights reserved.\n\nThis software may be modified and distributed under the terms\nof the BSD license. See the LICENSE file for details.\n\"\"\"\nfrom __future__ import print_function, unicode_literals, absolute_import\n\nfrom collections import namedtuple\nimport json\nimport logging\nimport os\nimport os.path\nimport stat\nimport sys\nimport warnings\nimport getpass\nfrom functools import wraps\nfrom contextlib import contextmanager\nfrom types import GeneratorType\n\nfrom osbs.build.build_requestv2 import BuildRequestV2\nfrom osbs.build.user_params import load_user_params_from_json\nfrom osbs.build.plugins_configuration import PluginsConfiguration\nfrom osbs.build.build_response import BuildResponse\nfrom osbs.build.pod_response import PodResponse\nfrom osbs.build.config_map_response import ConfigMapResponse\nfrom osbs.constants import (BUILD_RUNNING_STATES, WORKER_OUTER_TEMPLATE,\n                            WORKER_INNER_TEMPLATE, WORKER_CUSTOMIZE_CONF,\n                            ORCHESTRATOR_OUTER_TEMPLATE, ORCHESTRATOR_INNER_TEMPLATE,\n                            ORCHESTRATOR_CUSTOMIZE_CONF, BUILD_TYPE_WORKER,\n                            BUILD_TYPE_ORCHESTRATOR, BUILD_FINISHED_STATES,\n                            DEFAULT_ARRANGEMENT_VERSION, REACTOR_CONFIG_ARRANGEMENT_VERSION,\n                            ANNOTATION_SOURCE_REPO, ANNOTATION_INSECURE_REPO, FILTER_KEY,\n                            RELEASE_LABEL_FORMAT)\nfrom osbs.core import Openshift\nfrom osbs.exceptions import (OsbsException, OsbsValidationException, OsbsResponseException,\n                             OsbsOrchestratorNotEnabled)\n# import utils in this way, so that we can mock standalone functions with flexmock\nfrom osbs import utils\nfrom osbs.utils import (retry_on_conflict, graceful_chain_get, RegistryURI,\n                        strip_registry_and_tag_from_image)\n\nfrom six.moves import http_client, input\n\n\n# Decorator for API methods.\ndef osbsapi(func):\n    @wraps(func)\n    def catch_exceptions(*args, **kwargs):\n        # XXX: remove this in the future\n        if kwargs.pop(\"namespace\", None):\n            warnings.warn(\"OSBS.%s: the 'namespace' argument is no longer supported\" %\n                          func.__name__)\n        try:\n            return func(*args, **kwargs)\n        except OsbsException:\n            # Re-raise OsbsExceptions\n            raise\n        except Exception as ex:\n            # Propogate flexmock errors immediately (used in test cases)\n            if getattr(ex, '__module__', None) == 'flexmock':\n                raise\n\n            # Convert anything else to OsbsException\n\n            # Python 3 has implicit exception chaining and enhanced\n            # reporting, so you get the original traceback as well as\n            # the one originating here.\n            # For Python 2, let's do that explicitly.\n            raise OsbsException(cause=ex, traceback=sys.exc_info()[2])\n\n    return catch_exceptions\n\n\nlogger = logging.getLogger(__name__)\n\nLogEntry = namedtuple('LogEntry', ['platform', 'line'])\n\n\ndef validate_arrangement_version(arrangement_version):\n    \"\"\"Validate if the arrangement_version is supported\n\n    Shows a warning when version is deprecated\n\n    :param int|None arrangement_version: version to be validated\n    :raises ValueError: when version is not supported\n    \"\"\"\n    if arrangement_version is None:\n        return\n\n    if arrangement_version <= 5:\n        raise ValueError('arrangement_version <= 5 is no longer supported')\n\n\nclass OSBS(object):\n    \"\"\"\n    Note: all API methods return osbs.http.Response object. This is, due to historical\n    reasons, untrue for list_builds and get_user, which return list of BuildResponse objects\n    and dict respectively.\n    \"\"\"\n\n    _GIT_LABEL_KEYS = ('git-repo-name', 'git-branch', 'git-full-repo')\n    _OLD_LABEL_KEYS = ('git-repo-name', 'git-branch')\n\n    @osbsapi\n    def __init__(self, openshift_configuration, build_configuration):\n        \"\"\" \"\"\"\n        self.os_conf = openshift_configuration\n        self.build_conf = build_configuration\n        self.os = Openshift(openshift_api_url=self.os_conf.get_openshift_api_uri(),\n                            openshift_oauth_url=self.os_conf.get_openshift_oauth_api_uri(),\n                            k8s_api_url=self.os_conf.get_k8s_api_uri(),\n                            verbose=self.os_conf.get_verbosity(),\n                            username=self.os_conf.get_username(),\n                            password=self.os_conf.get_password(),\n                            use_kerberos=self.os_conf.get_use_kerberos(),\n                            client_cert=self.os_conf.get_client_cert(),\n                            client_key=self.os_conf.get_client_key(),\n                            kerberos_keytab=self.os_conf.get_kerberos_keytab(),\n                            kerberos_principal=self.os_conf.get_kerberos_principal(),\n                            kerberos_ccache=self.os_conf.get_kerberos_ccache(),\n                            use_auth=self.os_conf.get_use_auth(),\n                            verify_ssl=self.os_conf.get_verify_ssl(),\n                            token=self.os_conf.get_oauth2_token(),\n                            namespace=self.os_conf.get_namespace())\n        self._bm = None\n\n    @osbsapi\n    def list_builds(self, field_selector=None, koji_task_id=None, running=None,\n                    labels=None):\n        \"\"\"\n        List builds with matching fields\n\n        :param field_selector: str, field selector for Builds\n        :param koji_task_id: str, only list builds for Koji Task ID\n        :return: BuildResponse list\n        \"\"\"\n\n        if running:\n            running_fs = \",\".join([\"status!={status}\".format(status=status.capitalize())\n                                  for status in BUILD_FINISHED_STATES])\n            if not field_selector:\n                field_selector = running_fs\n            else:\n                field_selector = ','.join([field_selector, running_fs])\n        response = self.os.list_builds(field_selector=field_selector,\n                                       koji_task_id=koji_task_id, labels=labels)\n        serialized_response = response.json()\n        build_list = []\n        for build in serialized_response[\"items\"]:\n            build_list.append(BuildResponse(build, self))\n\n        return build_list\n\n    def watch_builds(self, field_selector=None):\n        kwargs = {}\n        if field_selector is not None:\n            kwargs['fieldSelector'] = field_selector\n\n        for changetype, obj in self.os.watch_resource(\"builds\", **kwargs):\n            yield changetype, obj\n\n    @osbsapi\n    def get_build(self, build_id):\n        response = self.os.get_build(build_id)\n        build_response = BuildResponse(response.json(), self)\n        return build_response\n\n    @osbsapi\n    def cancel_build(self, build_id):\n        response = self.os.cancel_build(build_id)\n        build_response = BuildResponse(response.json(), self)\n        return build_response\n\n    @osbsapi\n    def get_pod_for_build(self, build_id):\n        \"\"\"\n        :return: PodResponse object for pod relating to the build\n        \"\"\"\n        pods = self.os.list_pods(label='openshift.io/build.name=%s' % build_id)\n        serialized_response = pods.json()\n        pod_list = [PodResponse(pod) for pod in serialized_response[\"items\"]]\n        if not pod_list:\n            raise OsbsException(\"No pod for build\")\n        elif len(pod_list) != 1:\n            raise OsbsException(\"Only one pod expected but %d returned\" % len(pod_list))\n        return pod_list[0]\n\n    @osbsapi\n    def get_build_request(self, build_type=None, inner_template=None,\n                          outer_template=None, customize_conf=None,\n                          arrangement_version=DEFAULT_ARRANGEMENT_VERSION):\n        \"\"\"\n        return instance of BuildRequest or BuildRequestV2\n\n        :param build_type: str, unused\n        :param inner_template: str, name of inner template for BuildRequest\n        :param outer_template: str, name of outer template for BuildRequest\n        :param customize_conf: str, name of customization config for BuildRequest\n        :param arrangement_version: int, value of the arrangement version\n\n        :return: instance of BuildRequest or BuildRequestV2\n        \"\"\"\n        if build_type is not None:\n            warnings.warn(\"build types are deprecated, do not use the build_type argument\")\n\n        validate_arrangement_version(arrangement_version)\n\n        build_request = BuildRequestV2(build_json_store=self.os_conf.get_build_json_store(),\n                                       outer_template=outer_template,\n                                       customize_conf=customize_conf)\n\n        # Apply configured resource limits.\n        cpu_limit = self.build_conf.get_cpu_limit()\n        memory_limit = self.build_conf.get_memory_limit()\n        storage_limit = self.build_conf.get_storage_limit()\n        if (cpu_limit is not None or\n                memory_limit is not None or\n                storage_limit is not None):\n            build_request.set_resource_limits(cpu=cpu_limit,\n                                              memory=memory_limit,\n                                              storage=storage_limit)\n\n        return build_request\n\n    @osbsapi\n    def create_build_from_buildrequest(self, build_request):\n        \"\"\"\n        render provided build_request and submit build from it\n\n        :param build_request: instance of build.build_request.BuildRequest\n        :return: instance of build.build_response.BuildResponse\n        \"\"\"\n        build_request.set_openshift_required_version(self.os_conf.get_openshift_required_version())\n        build = build_request.render()\n        response = self.os.create_build(json.dumps(build))\n        build_response = BuildResponse(response.json(), self)\n        return build_response\n\n    def _get_running_builds_for_build_config(self, build_config_id):\n        all_builds_for_bc = self.os.list_builds(build_config_id=build_config_id).json()['items']\n        running = []\n        for b in all_builds_for_bc:\n            br = BuildResponse(b, self)\n            if br.is_pending() or br.is_running():\n                running.append(br)\n        return running\n\n    def _get_not_cancelled_builds_for_koji_task(self, koji_task_id):\n        all_builds_for_task = self.os.list_builds(koji_task_id=koji_task_id).json()['items']\n        not_cancelled = []\n\n        for b in all_builds_for_task:\n            br = BuildResponse(b, self)\n            build_labels = br.get_labels()\n            if not br.is_cancelled() and build_labels['is_autorebuild'] == \"false\":\n                not_cancelled.append(br)\n\n        return not_cancelled\n\n    def _verify_labels_match(self, new_build_config, existing_build_config):\n        new_labels = new_build_config['metadata']['labels']\n        existing_labels = existing_build_config['metadata']['labels']\n\n        for key in self._GIT_LABEL_KEYS:\n            new_label_value = new_labels.get(key)\n            existing_label_value = existing_labels.get(key)\n\n            if (existing_label_value and existing_label_value != new_label_value):\n                msg = (\n                    'Git labels collide with existing build config \"%s\". '\n                    'Existing labels: %r, '\n                    'New labels: %r ') % (\n                       existing_build_config['metadata']['name'],\n                       existing_labels,\n                       new_labels)\n                raise OsbsValidationException(msg)\n\n    def _get_existing_build_config(self, build_config):\n        \"\"\"\n        Uses the given build config to find an existing matching build config.\n        Build configs are a match if:\n        - metadata.labels.git-repo-name AND metadata.labels.git-branch AND\n          metadata.labels.git-full-repo are equal\n        OR\n        - metadata.labels.git-repo-name AND metadata.labels.git-branch are equal AND\n          metadata.spec.source.git.uri are equal\n        OR\n        - m",
+      "total_lines": 1339,
+      "ref": "db09bf4df2b471dc46f939ae7a76e6670996b17c"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "render_plugins_configuration",
+      "class_name": "OSBS",
+      "start_line": 1335,
+      "end_line": 1339,
+      "satd_line": 1338,
+      "matched_by": "normalized_source",
+      "source": "    def render_plugins_configuration(self, user_params_json):\n        user_params = load_user_params_from_json(user_params_json)\n\n        # TODO use different plugin configuration\n        return PluginsConfiguration(user_params).render()",
+      "calls": [
+        "PluginsConfiguration",
+        "load_user_params_from_json"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "PluginsConfiguration",
+        "load_user_params_from_json",
+        "osbsapi"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": "OSBS",
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "load_user_params_from_json",
+          "kind": "import_from",
+          "start_line": 24,
+          "end_line": 24,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from osbs.build.user_params import load_user_params_from_json"
+        },
+        {
+          "symbol_name": "PluginsConfiguration",
+          "kind": "import_from",
+          "start_line": 25,
+          "end_line": 25,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from osbs.build.plugins_configuration import PluginsConfiguration"
+        },
+        {
+          "symbol_name": "osbsapi",
+          "kind": "function",
+          "start_line": 49,
+          "end_line": 74,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "def osbsapi(func):\n    @wraps(func)\n    def catch_exceptions(*args, **kwargs):\n        # XXX: remove this in the future\n        if kwargs.pop(\"namespace\", None):\n            warnings.warn(\"OSBS.%s: the 'namespace' argument is no longer supported\" %\n                          func.__name__)\n        try:\n            return func(*args, **kwargs)\n        except OsbsException:\n            # Re-raise OsbsExceptions\n            raise\n        except Exception as ex:\n            # Propogate flexmock errors immediately (used in test cases)\n            if getattr(ex, '__module__', None) == 'flexmock':\n                raise\n\n            # Convert anything else to OsbsException\n\n            # Python 3 has implicit exception chaining and enhanced\n            # reporting, so you get the original traceback as well as\n            # the one originating here.\n            # For Python 2, let's do that explicitly.\n            raise OsbsException(cause=ex, traceback=sys.exc_info()[2])\n\n    return catch_exceptions"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

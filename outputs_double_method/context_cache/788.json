@@ -1,0 +1,201 @@
+{
+  "task_id": "788",
+  "repo_owner": "pricingassistant",
+  "repo_name": "mrq",
+  "file_path": "mrq/job.py",
+  "commit": "a599cc51eb38304c900f80b1584efa52621eb483",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T19:11:24+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "a599cc51eb38304c900f80b1584efa52621eb483",
+    "symbol_name": "requeue",
+    "satd_line": 133,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 2,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T19:11:24+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "mrq/job.py",
+    "original_signature": "def requeue(self, queue=None):",
+    "target_file": {
+      "ok": true,
+      "path": "mrq/job.py",
+      "sha": "6c7380a68df165eb3946e48cb4fb2db6b73e7cd9",
+      "download_url": "https://raw.githubusercontent.com/pricingassistant/mrq/a599cc51eb38304c900f80b1584efa52621eb483/mrq/job.py",
+      "content_excerpt": "import datetime\nfrom bson import ObjectId\nimport pymongo\nimport time\nfrom .exceptions import RetryInterrupt\nfrom .utils import load_class_by_path\nfrom .queue import Queue\nfrom .context import get_current_worker, log, connections, get_current_config\n\n\nclass Job(object):\n\n  # Seconds the job can last before timeouting\n  timeout = 300\n\n  # Seconds the results are kept in MongoDB\n  result_ttl = 7 * 24 * 3600\n\n  # Exceptions that don't mark the task as failed but as retry\n  retry_on_exceptions = (\n    pymongo.errors.AutoReconnect,\n    pymongo.errors.OperationFailure,\n    pymongo.errors.ConnectionFailure,\n    RetryInterrupt\n  )\n\n  def __init__(self, job_id, worker=None, queue=None, start=False, fetch=False):\n    self.worker = get_current_worker()\n    self.queue = queue\n    self.datestarted = datetime.datetime.utcnow()\n\n    self.collection = connections.mongodb_jobs.mrq_jobs\n    self.id = ObjectId(job_id)\n\n    self.data = None\n    self.task = None\n\n    if start:\n      self.fetch(start=True, full_data=False)\n    elif fetch:\n      self.fetch(start=False, full_data=False)\n\n  def fetch(self, start=False, full_data=True):\n    \"\"\" Get the current job data and possibly flag it as started. \"\"\"\n\n    if full_data:\n      fields = None\n    else:\n      fields = {\n        \"_id\": 0,\n        \"path\": 1,\n        \"params\": 1,\n        \"status\": 1\n      }\n\n    if start:\n      self.data = self.collection.find_and_modify({\n        \"_id\": self.id,\n        \"status\": {\"$nin\": [\"cancel\"]}\n      }, {\"$set\": {\n        \"status\": \"started\",\n        \"datestarted\": datetime.datetime.utcnow(),\n        \"worker\": self.worker.name\n      }}, fields=fields)\n    else:\n      self.data = self.collection.find_one({\n        \"_id\": self.id\n      }, fields=fields)\n\n    if self.data is None:\n      log.info(\"Job %s not found in MongoDB or status was cancelled!\" % self.id)\n    else:\n      task_def = get_current_config().get(\"tasks\", {}).get(self.data[\"path\"]) or {}\n      self.timeout = task_def.get(\"timeout\", self.timeout)\n      self.result_ttl = task_def.get(\"result_ttl\", self.result_ttl)\n\n    return self\n\n  def save_status(self, status, result=None, traceback=None, w=1):\n\n    updates = {\n      \"status\": status,\n      \"dateupdated\": datetime.datetime.utcnow()\n    }\n    if result is not None:\n      updates[\"result\"] = result\n    if traceback is not None:\n      updates[\"traceback\"] = traceback\n\n    # Make the job document expire\n    if status in (\"success\", \"cancel\"):\n      updates[\"dateexpires\"] = datetime.datetime.utcnow() + datetime.timedelta(seconds=self.result_ttl)\n\n    self.collection.update({\n      \"_id\": self.id\n    }, {\"$set\": updates}, w=w)\n\n  def save_retry(self, exc, traceback=None):\n\n    countdown = 24 * 3600\n\n    if isinstance(exc, RetryInterrupt) and exc.countdown:\n      countdown = exc.countdown\n\n    update = {\n      \"traceback\": traceback,\n      \"status\": \"retry\",\n      \"dateupdated\": datetime.datetime.utcnow(),\n      \"dateretry\": datetime.datetime.utcnow() + datetime.timedelta(seconds=countdown)\n    }\n\n    if isinstance(exc, RetryInterrupt) and exc.queue:\n      update[\"queue\"] = exc.queue\n\n    self.collection.update({\n      \"_id\": self.id\n    }, {\"$set\": update}, w=1)\n\n  def retry(self, queue=None, countdown=None, max_retries=None):\n\n    exc = RetryInterrupt()\n    exc.queue = queue\n    exc.countdown = countdown\n    raise exc\n\n  def cancel(self):\n    self.save_status(\"cancel\")\n\n  def requeue(self, queue=None):\n    self.save_status(\"queued\")\n\n    if not self.data or not self.data.get(\"queue\"):\n      self.fetch(full_data=True)  # TODO only fetch queue?\n\n    Queue(queue or self.data[\"queue\"]).enqueue_job_ids([str(self.id)])\n\n  def perform(self):\n    \"\"\" Loads and starts the main task for this job, the saves the result. \"\"\"\n\n    if self.data is None:\n      return\n\n    log.debug(\"Starting %s(%s)\" % (self.data[\"path\"], self.data[\"params\"]))\n    task_class = load_class_by_path(self.data[\"path\"])\n\n    self.task = task_class()\n\n    result = self.task.run(self.data[\"params\"])\n\n    self.save_status(\"success\", result)\n\n  def wait(self, poll_interval=1, timeout=None, full_data=False):\n    \"\"\" Wait for this job to finish. \"\"\"\n\n    collection = connections.mongodb_jobs.mrq_jobs\n\n    end_time = None\n    if timeout:\n      end_time = time.time() + timeout\n\n    while (end_time is None or time.time() < end_time):\n\n      job_data = collection.find_one({\n        \"_id\": ObjectId(self.id),\n        \"status\": {\"$nin\": [\"started\", \"queued\"]}\n      }, fields=({\n        \"_id\": 0,\n        \"result\": 1,\n        \"status\": 1\n      } if not full_data else None))\n\n      if job_data:\n        return job_data\n\n      time.sleep(poll_interval)\n\n    raise Exception(\"Waited for job result for %ss seconds, timeout.\" % timeout)\n",
+      "total_lines": 177,
+      "ref": "a599cc51eb38304c900f80b1584efa52621eb483"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "requeue",
+      "class_name": "Job",
+      "start_line": 129,
+      "end_line": 135,
+      "satd_line": 133,
+      "matched_by": "signature_or_comment",
+      "source": "  def requeue(self, queue=None):\n    self.save_status(\"queued\")\n\n    if not self.data or not self.data.get(\"queue\"):\n      self.fetch(full_data=True)  # TODO only fetch queue?\n\n    Queue(queue or self.data[\"queue\"]).enqueue_job_ids([str(self.id)])",
+      "calls": [
+        "Queue",
+        "str"
+      ],
+      "self_calls": [
+        "fetch",
+        "save_status"
+      ],
+      "self_attrs": [
+        "data",
+        "fetch",
+        "id",
+        "save_status"
+      ],
+      "global_uses": [
+        "Queue"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "fetch",
+          "class_name": "Job",
+          "start_line": 43,
+          "end_line": 77,
+          "relevance": [
+            "direct_call",
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=1",
+            "same_class"
+          ],
+          "source": "  def fetch(self, start=False, full_data=True):\n    \"\"\" Get the current job data and possibly flag it as started. \"\"\"\n\n    if full_data:\n      fields = None\n    else:\n      fields = {\n        \"_id\": 0,\n        \"path\": 1,\n        \"params\": 1,\n        \"status\": 1\n      }\n\n    if start:\n      self.data = self.collection.find_and_modify({\n        \"_id\": self.id,\n        \"status\": {\"$nin\": [\"cancel\"]}\n      }, {\"$set\": {\n        \"status\": \"started\",\n        \"datestarted\": datetime.datetime.utcnow(),\n        \"worker\": self.worker.name\n      }}, fields=fields)\n    else:\n      self.data = self.collection.find_one({\n        \"_id\": self.id\n      }, fields=fields)\n\n    if self.data is None:\n      log.info(\"Job %s not found in MongoDB or status was cancelled!\" % self.id)\n    else:\n      task_def = get_current_config().get(\"tasks\", {}).get(self.data[\"path\"]) or {}\n      self.timeout = task_def.get(\"timeout\", self.timeout)\n      self.result_ttl = task_def.get(\"result_ttl\", self.result_ttl)\n\n    return self"
+        },
+        {
+          "symbol_name": "save_status",
+          "class_name": "Job",
+          "start_line": 79,
+          "end_line": 96,
+          "relevance": [
+            "direct_call",
+            "same_class"
+          ],
+          "source": "  def save_status(self, status, result=None, traceback=None, w=1):\n\n    updates = {\n      \"status\": status,\n      \"dateupdated\": datetime.datetime.utcnow()\n    }\n    if result is not None:\n      updates[\"result\"] = result\n    if traceback is not None:\n      updates[\"traceback\"] = traceback\n\n    # Make the job document expire\n    if status in (\"success\", \"cancel\"):\n      updates[\"dateexpires\"] = datetime.datetime.utcnow() + datetime.timedelta(seconds=self.result_ttl)\n\n    self.collection.update({\n      \"_id\": self.id\n    }, {\"$set\": updates}, w=w)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "Job",
+      "related_methods_count": 2,
+      "related_attributes_count": 2,
+      "related_methods": [
+        {
+          "symbol_name": "fetch",
+          "start_line": 43,
+          "end_line": 77,
+          "relevance": [
+            "direct_self_call",
+            "shared_attrs=2",
+            "keyword_source_overlap=1",
+            "keyword_name_overlap=1"
+          ],
+          "source": "  def fetch(self, start=False, full_data=True):\n    \"\"\" Get the current job data and possibly flag it as started. \"\"\"\n\n    if full_data:\n      fields = None\n    else:\n      fields = {\n        \"_id\": 0,\n        \"path\": 1,\n        \"params\": 1,\n        \"status\": 1\n      }\n\n    if start:\n      self.data = self.collection.find_and_modify({\n        \"_id\": self.id,\n        \"status\": {\"$nin\": [\"cancel\"]}\n      }, {\"$set\": {\n        \"status\": \"started\",\n        \"datestarted\": datetime.datetime.utcnow(),\n        \"worker\": self.worker.name\n      }}, fields=fields)\n    else:\n      self.data = self.collection.find_one({\n        \"_id\": self.id\n      }, fields=fields)\n\n    if self.data is None:\n      log.info(\"Job %s not found in MongoDB or status was cancelled!\" % self.id)\n    else:\n      task_def = get_current_config().get(\"tasks\", {}).get(self.data[\"path\"]) or {}\n      self.timeout = task_def.get(\"timeout\", self.timeout)\n      self.result_ttl = task_def.get(\"result_ttl\", self.result_ttl)\n\n    return self"
+        },
+        {
+          "symbol_name": "save_status",
+          "start_line": 79,
+          "end_line": 96,
+          "relevance": [
+            "direct_self_call",
+            "shared_attrs=1"
+          ],
+          "source": "  def save_status(self, status, result=None, traceback=None, w=1):\n\n    updates = {\n      \"status\": status,\n      \"dateupdated\": datetime.datetime.utcnow()\n    }\n    if result is not None:\n      updates[\"result\"] = result\n    if traceback is not None:\n      updates[\"traceback\"] = traceback\n\n    # Make the job document expire\n    if status in (\"success\", \"cancel\"):\n      updates[\"dateexpires\"] = datetime.datetime.utcnow() + datetime.timedelta(seconds=self.result_ttl)\n\n    self.collection.update({\n      \"_id\": self.id\n    }, {\"$set\": updates}, w=w)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "id",
+          "start_line": 32,
+          "end_line": 34,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "    self.collection = connections.mongodb_jobs.mrq_jobs\n    self.id = ObjectId(job_id)\n"
+        },
+        {
+          "attribute": "data",
+          "start_line": 34,
+          "end_line": 36,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "\n    self.data = None\n    self.task = None"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "Queue",
+          "kind": "import_from",
+          "start_line": 7,
+          "end_line": 7,
+          "source": "from .queue import Queue"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "__init__",
+          "class_name": "Job",
+          "start_line": 27,
+          "end_line": 41,
+          "source": "  def __init__(self, job_id, worker=None, queue=None, start=False, fetch=False):\n    self.worker = get_current_worker()\n    self.queue = queue\n    self.datestarted = datetime.datetime.utcnow()\n\n    self.collection = connections.mongodb_jobs.mrq_jobs\n    self.id = ObjectId(job_id)\n\n    self.data = None\n    self.task = None\n\n    if start:\n      self.fetch(start=True, full_data=False)\n    elif fetch:\n      self.fetch(start=False, full_data=False)"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

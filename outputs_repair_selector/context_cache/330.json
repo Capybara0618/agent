@@ -1,0 +1,232 @@
+{
+  "task_id": "330",
+  "repo_owner": "google",
+  "repo_name": "pytype",
+  "file_path": "pytype/abstract.py",
+  "commit": "ba6a010e4ad62936a2426282dfabf9fd8e2fe974",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T04:11:46+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ba6a010e4ad62936a2426282dfabf9fd8e2fe974",
+    "symbol_name": "call",
+    "satd_line": 2135,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 5,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T04:11:47+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "pytype/abstract.py",
+    "original_signature": "def call(self, node, unused_func, posargs, namedargs,",
+    "target_file": {
+      "ok": true,
+      "path": "pytype/abstract.py",
+      "sha": "dac250027f04c7ecdff14ddac1417d535d80fb9d",
+      "download_url": "https://raw.githubusercontent.com/google/pytype/ba6a010e4ad62936a2426282dfabf9fd8e2fe974/pytype/abstract.py",
+      "content_excerpt": "\"\"\"The abstract values used by typegraphvm.\n\nAn abstract value in effect represents a type. Groups of types are\ncombined using typegraph and that is what we compute over.\n\"\"\"\n\n# Because of false positives:\n# pylint: disable=unpacking-non-sequence\n# pylint: disable=abstract-method\n\nimport collections\nimport hashlib\nimport itertools\nimport logging\n\n\nfrom pytype import exceptions\nfrom pytype import function\nfrom pytype import output\nfrom pytype import utils\nfrom pytype.pyc import loadmarshal\nfrom pytype.pytd import cfg as typegraph\nfrom pytype.pytd import pytd\nfrom pytype.pytd import utils as pytd_utils\nfrom pytype.pytd.parse import visitors\n\nlog = logging.getLogger(__name__)\nchain = itertools.chain  # pylint: disable=invalid-name\nWrapsDict = pytd_utils.WrapsDict  # pylint: disable=invalid-name\n\n\nclass ConversionError(ValueError):\n  pass\n\n\ndef variable_set_official_name(variable, name):\n  \"\"\"Set official_name on each value in the variable.\n\n  Called for each entry in the top-level locals().\n\n  Args:\n    variable: A typegraph.Variable to name.\n    name: The name to give.\n  \"\"\"\n  for v in variable.bindings:\n    v.data.official_name = name\n\n\ndef get_atomic_value(variable):\n  if len(variable.bindings) == 1:\n    return variable.bindings[0].data\n  else:\n    raise ConversionError(\n        \"Variable with too many options when trying to get atomic value. %s %s\"\n        % (variable, [a.data for a in variable.bindings]))\n\n\ndef get_atomic_python_constant(variable):\n  \"\"\"Get the concrete atomic Python value stored in this variable.\n\n  This is used for things that are stored in typegraph.Variable, but we\n  need the actual data in order to proceed. E.g. function / class defintions.\n\n  Args:\n    variable: A typegraph.Variable. It can only have one possible value.\n  Returns:\n    A Python constant. (Typically, a string, a tuple, or a code object.)\n  Raises:\n    ValueError: If the value in this Variable is purely abstract, i.e. doesn't\n      store a Python value, or if it has more than one possible value.\n    IndexError: If there is more than one possibility for this value.\n  \"\"\"\n  atomic = get_atomic_value(variable)\n  if isinstance(atomic, PythonConstant):\n    return atomic.pyval\n  raise ConversionError(\"Only some types are supported: %r\" % type(atomic))\n\n\ndef match_var_against_type(var, other_type, subst, node, view):\n  if hasattr(other_type, \"match_var_against\"):\n    return other_type.match_var_against(var, subst, node, view)\n  elif var.bindings:\n    return match_value_against_type(view[var], other_type, subst, node, view)\n  else:  # Empty set of values. The \"nothing\" type.\n    if isinstance(other_type, Union):\n      right_side_options = other_type.options\n    else:\n      right_side_options = [other_type]\n    for right in right_side_options:\n      if isinstance(right, Class):\n        # If this type is empty, the only thing we can match it against is\n        # object (for pytd convenience).\n        if right.name == \"object\":\n          return subst\n      elif isinstance(right, Nothing):\n        # Matching nothing against nothing is fine.\n        return subst\n      elif isinstance(right, TypeParameter):\n        # If we have a union like \"K or V\" and we match both against\n        # nothing, that will fill in both K and V.\n        if right.name not in subst:\n          subst[right.name] = var.program.NewVariable(\"empty\")\n        return subst\n    return None\n\n\n# TODO(kramm): This needs to match values, not variables. A variable can\n# consist of different types.\ndef match_value_against_type(value, other_type, subst, node, view):\n  \"\"\"One-way unify value into pytd type given a substitution.\n\n  Args:\n    value: A typegraph.Binding\n    other_type: An AtomicAbstractValue instance.\n    subst: The current substitution. This dictionary is not modified.\n    node: Current location (typegraph CFG node)\n    view: A mapping of Variable to Value.\n  Returns:\n    A new (or unmodified original) substitution dict if the matching succeded,\n    None otherwise.\n  \"\"\"\n  left = value.data\n  assert isinstance(left, AtomicAbstractValue), left\n  assert not isinstance(left, FormalType)\n\n  # TODO(kramm): Use view\n\n  if isinstance(other_type, Class):\n    # Accumulate substitutions in \"subst\", or break in case of error:\n    return left.match_against_type(other_type, subst, node, view)\n  elif isinstance(other_type, Union):\n    for t in other_type.options:\n      new_subst = match_value_against_type(value, t, subst, node, view)\n      if new_subst is not None:\n        # TODO(kramm): What if more than one type matches?\n        return new_subst\n    return None\n  elif isinstance(other_type, TypeParameter):\n    if other_type.name in subst:\n      # Merge the two variables.\n      subst = subst.copy()\n      new_var = subst[other_type.name].AssignToNewVariable(other_type.name,\n                                                           node)\n      new_var.AddBinding(left, [], node)\n      subst[other_type.name] = new_var\n    else:\n      subst = subst.copy()\n      subst[other_type.name] = new_var = value.AssignToNewVariable(\n          other_type.name, node)\n    type_key = left.get_type_key()\n    # Every value with this type key produces the same result when matched\n    # against other_type, so they can all be added to this substitution rather\n    # than matched separately.\n    for other_value in value.variable.bindings:\n      if (other_value is not value and\n          other_value.data.get_type_key() == type_key):\n        new_var.AddBinding(other_value.data, {other_value}, node)\n    return subst\n  elif (isinstance(other_type, (Unknown, Unsolvable)) or\n        isinstance(left, (Unknown, Unsolvable))):\n    # We can match anything against unknown types, and unknown types against\n    # anything.\n    # TODO(kramm): Do we want to record what we matched them against?\n    assert not isinstance(other_type, ParameterizedClass)\n    return subst\n  elif isinstance(other_type, Nothing):\n    return left.match_against_type(other_type, subst, node, view)\n  else:\n    log.error(\"Invalid type: %s\", type(other_type))\n    return None\n\n\nclass AtomicAbstractValue(object):\n  \"\"\"A single abstract value such as a type or function signature.\n\n  This is the base class of the things that appear in Variables. It represents\n  an atomic object that the abstract interpreter works over just as variables\n  represent sets of parallel options.\n\n  Conceptually abstract values represent sets of possible concrete values in\n  compact form. For instance, an abstract value with .__class__ = int represents\n  all ints.\n  \"\"\"\n\n  _value_id = 0  # for pretty-printing\n\n  def __init__(self, name, vm):\n    \"\"\"Basic initializer for all AtomicAbstractValues.\"\"\"\n    assert hasattr(vm, \"program\")\n    self.vm = vm\n    self.mro = []\n    AtomicAbstractValue._value_id += 1\n    self.id = AtomicAbstractValue._value_id\n    self.name = name\n    self.module = None\n    self.official_name = None\n\n  def get_fullhash(self):\n    \"\"\"Hash this value and all of its children.\"\"\"\n    m = hashlib.md5()\n    seen_ids = set()\n    stack = [self]\n    while stack:\n      data = stack.pop()\n      data_id = id(data)\n      if data_id in seen_ids:\n        continue\n      seen_ids.add(data_id)\n      m.update(str(data_id))\n      for mapping in data.get_children_maps():\n        m.update(str(mapping.changestamp))\n        stack.extend(mapping.data)\n    return m.digest()\n\n  def get_children_maps(self):\n    \"\"\"Get this value's dictionaries of children.\n\n    Returns:\n      A sequence of dictionaries from names to child values.\n    \"\"\"\n    return ()\n\n  def property_get(self, callself, callcls):  # pylint: disable=unused-argument\n    \"\"\"Bind this value to the given self and class.\n\n    This function is similar to __get__ except at the abstract level. This does\n    not trigger any code execution inside the VM. See __get__ for more details.\n\n    Args:\n      callself: The Variable that should be passed as self when the call is\n        made. None if this is class call.\n      callcls: The Variable that should be used as the class when the call is\n        made.\n\n    Returns:\n      Another abstract value that should be returned in place of this one. The\n      default implementation returns self, so this can always be called safely.\n    \"\"\"\n    return self\n\n  def get_attribute_flat(self, node, name):  # pylint: disable=unused-argument\n    \"\"\"Get a shallow attribute from this object.\n\n    Unlike get_attribute, this will not ascend into superclasses.\n\n    Args:\n      node: The current CFG node.\n      name: The name of the attribute to retrieve.\n    Returns:\n      A tuple (CFGNode, typegraph.Variable). If this attribute doesn't exist,\n      the Variable will be None.\n\n    \"\"\"\n    return node, None\n\n  def get_attribute(self, node, name, valself=None, valcls=None):  # pylint: disable=unused-argument\n    \"\"\"Get the named attribute from this object.\n\n    Args:\n      node: The current CFG node.\n      name: The name of the attribute to retrieve.\n      valself: A typegraph.Binding, This is the self reference to use when\n        getting the attribute.\n      valcls: A typegraph.Binding. This is the cls reference to use when getting\n        the attribute. If valself is given then valcls will be ignored. Note\n        that most implementations of this method ignore this value as only class\n        objects need it (PyTDClass and InterpreterClass)\n\n    Returns:\n      A tuple (CFGNode, typegraph.Variable). If this attribute doesn't exist,\n      the Variable will be None.\n    \"\"\"\n    return node, None\n\n  def set_attribute(self, node, name, value):\n    \"\"\"Set an attribute on this object.\n\n    The attribute might already have a Variable in it and in that case we cannot\n    overwrite it and instead need to add the elements of the new variable to the\n    old variable.\n\n    Args:\n      node: The current CFG node.\n      name: The name of the attribute to set.\n      value: The Variable to store in it.\n    Returns:\n      A (possibly changed) CFG node.\n    \"\"\"\n    raise NotImplementedError()\n\n  def call(self, node, f, posargs, namedargs, starargs=None, starstarargs=None):\n    \"\"\"Call this abstract value with the given arguments.\n\n    The posargs and namedargs arguments may be modified by this function.\n\n    Args:\n      node: The CFGNode calling this function\n      f: The typegraph.Binding containing this function.\n      posargs: Positional arguments for the call (list of Variables).\n      namedargs: Keyword arguments for the call (dict mapping str to Variable).\n      starargs: *args Variable, if passed. (None otherwise).\n      starstarargs: **kwargs Variable, if passed (None otherwise).\n    Returns:\n      A tuple (cfg.Node, typegraph.Variable). The CFGNode corresponds\n      to the function's \"return\" statement(s).\n    Raises:\n      FailedFunctionCall\n\n    Make the call as required by this specific kind of atomic value, and make\n    sure to annotate the results correctly with the origins (val and also other\n    values appearing in the arguments).\n    \"\"\"\n    raise NotImplementedError\n\n  def get_bound_arguments(self):\n    \"\"\"Get the arguments bound into this object.\n\n    The default implementation returns [] since an object does not have any\n    bound arguments unless specified.\n\n    Returns:\n      A list of positional arguments that will be prepended to every call to\n      this value.\n    \"\"\"\n    return []\n\n  def is_closure(self):\n    \"\"\"Return whether this is a closure. Overridden by subclasses.\n\n    This can only return True for InterpreterFunction and NativeFunction\n    (i.e., at the time of this writing, never for functions e.g. from PYTD,\n    which doesn't know about closures), and only if they bind variables from\n    their outer scope. Inner functions not binding anything are not considered a\n    closure.\n\n    Returns:\n      True if this is a closure.\n    \"\"\"\n    return False\n\n  def register_instance(self, instance):  # pylint: disable=unused-arg\n    \"\"\"Treating self as a class definition, register an instance of it.\n\n    This is used for keeping merging call records",
+      "total_lines": 2694,
+      "ref": "ba6a010e4ad62936a2426282dfabf9fd8e2fe974"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "call",
+      "class_name": "InterpreterFunction",
+      "start_line": 2146,
+      "end_line": 2185,
+      "satd_line": 2135,
+      "matched_by": "normalized_source",
+      "source": "  def call(self, node, unused_func, posargs, namedargs,\n           starargs=None, starstarargs=None, new_locals=None):\n    if self.vm.is_at_maximum_depth():\n      log.info(\"Maximum depth reached. Not analyzing %r\", self.name)\n      # TODO(kramm): Return an unsolvable here.\n      return node, self.vm.program.NewVariable(self.name + \":ret\", [], [], node)\n    self._check_call(node, posargs, namedargs, starargs, starstarargs)\n    callargs = self._map_args(node, posargs, namedargs, starargs, starstarargs)\n    # Might throw vm.RecursionException:\n    frame = self.vm.make_frame(node, self.code, callargs,\n                               self.f_globals, self.f_locals, self.closure,\n                               new_locals=new_locals)\n    if self.vm.options.skip_repeat_calls:\n      callkey = self._hash_all(\n          (callargs, None),\n          (frame.f_globals.members, set(self.code.co_names)),\n          (frame.f_locals.members, set(self.code.co_varnames)))\n    else:\n      # Make the callkey the number of times this function has been called so\n      # that no call has the same key as a previous one.\n      callkey = len(self._call_records)\n    if callkey in self._call_records:\n      _, old_ret, _ = self._call_records[callkey]\n      # Optimization: This function has already been called, with the same\n      # environment and arguments, so recycle the old return value and don't\n      # record this call. We pretend that this return value originated at the\n      # current node to make sure we don't miss any possible types.\n      ret = self.vm.program.NewVariable(old_ret.name, old_ret.data, [], node)\n      return node, ret\n    if self.code.co_flags & loadmarshal.CodeType.CO_GENERATOR:\n      generator = Generator(frame, self.vm)\n      # Run the generator right now, even though the program didn't call it,\n      # because we need to know the contained type for futher matching.\n      node2, _ = generator.run_until_yield(node)\n      node_after_call, ret = node2, generator.to_variable(node2, self.name)\n    else:\n      node_after_call, ret = self.vm.run_frame(frame, node)\n    self._call_records[callkey] = (callargs, ret, node_after_call)\n    self.last_frame = frame\n    return node_after_call, ret",
+      "calls": [
+        "Generator",
+        "len",
+        "set"
+      ],
+      "self_calls": [
+        "_check_call",
+        "_hash_all",
+        "_map_args"
+      ],
+      "self_attrs": [
+        "_call_records",
+        "_check_call",
+        "_hash_all",
+        "_map_args",
+        "closure",
+        "code",
+        "f_globals",
+        "f_locals",
+        "last_frame",
+        "name",
+        "vm"
+      ],
+      "global_uses": [
+        "Generator",
+        "loadmarshal",
+        "log",
+        "node_after_call"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "_map_args",
+          "class_name": "InterpreterFunction",
+          "start_line": 2026,
+          "end_line": 2102,
+          "relevance": [
+            "direct_call",
+            "keyword_source_overlap=2",
+            "same_class"
+          ],
+          "source": "  def _map_args(self, node, posargs, namedargs, starargs, starstarargs):\n    \"\"\"Map call args to function args.\n\n    This emulates how Python would map arguments of function calls. It takes\n    care of keyword parameters, default parameters, and *args and **kwargs.\n\n    Args:\n      node: The current CFG node.\n      posargs: The positional arguments. A tuple of typegraph.Variable.\n      namedargs: The keyword arguments. A dictionary, mapping strings to\n        typegraph.Variable.\n      starargs: The *args parameter, or None.\n      starstarargs: The **kwargs parameter, or None.\n\n    Returns:\n      A dictionary, mapping strings (parameter names) to typegraph.Variable.\n\n    Raises:\n      ByteCodeTypeError\n    \"\"\"\n    # Originate a new variable for each argument and call.\n    args = [u.AssignToNewVariable(u.name, node)\n            for u in posargs]\n    kws = {k: u.AssignToNewVariable(u.name, node)\n           for k, u in namedargs.items()}\n    if (self.vm.python_version[0] == 2 and\n        self.code.co_name in [\"<setcomp>\", \"<dictcomp>\", \"<genexpr>\"]):\n      # This code is from github.com/nedbat/byterun. Apparently, Py2 doesn't\n      # know how to inspect set comprehensions, dict comprehensions, or\n      # generator expressions properly. See http://bugs.python.org/issue19611.\n      # Byterun says: \"They are always functions of one argument, so just do the\n      # right thing.\"\n      assert len(args) == 1, \"Surprising comprehension!\"\n      return {\".0\": args[0]}\n    param_names = self.get_parameter_names()\n    num_defaults = len(self.defaults)\n    callargs = dict(zip(param_names[-num_defaults:], self.defaults))\n    positional = dict(zip(param_names, args))\n    for key in positional.keys():\n      if key in kws:\n        raise exceptions.ByteCodeTypeError(\n            \"function got multiple values for keyword argument %r\" % key)\n    callargs.update(positional)\n    callargs.update(kws)\n    for key in param_names:\n      if key not in callargs:\n        raise exceptions.ByteCodeTypeError(\n            \"No value for parameter %r\" % key)\n    arg_pos = self.code.co_argcount\n    if self.has_varargs():\n      vararg_name = self.code.co_varnames[arg_pos]\n      extraneous = args[self.code.co_argcount:]\n      if starargs:\n        if extraneous:\n          log.warning(\"Not adding extra params to *%s\", vararg_name)\n        callargs[vararg_name] = starargs.AssignToNewVariable(\n            \"*args\", node)\n      else:\n        callargs[vararg_name] = self.vm.build_tuple(node, extraneous)\n      arg_pos += 1\n    elif len(args) > self.code.co_argcount:\n      raise exceptions.ByteCodeTypeError(\n          \"Function takes %d positional arguments (%d given)\" % (\n              arg_pos, len(args)))\n    if self.has_kwargs():\n      kwvararg_name = self.code.co_varnames[arg_pos]\n      # Build a **kwargs dictionary out of the extraneous parameters\n      if starstarargs:\n        # TODO(kramm): modify type parameters to account for namedargs\n        callargs[kwvararg_name] = starstarargs.AssignToNewVariable(\n            \"**kwargs\", node)\n      else:\n        k = Dict(\"kwargs\", self.vm)\n        k.update(node, namedargs, omit=param_names)\n        callargs[kwvararg_name] = k.to_variable(node, kwvararg_name)\n      arg_pos += 1\n    return callargs"
+        },
+        {
+          "symbol_name": "_hash_all",
+          "class_name": "InterpreterFunction",
+          "start_line": 2128,
+          "end_line": 2131,
+          "relevance": [
+            "direct_call",
+            "keyword_source_overlap=1",
+            "same_class"
+          ],
+          "source": "  def _hash_all(*hash_args):\n    \"\"\"Convenience method for hashing a sequence of dicts.\"\"\"\n    return hashlib.md5(\"\".join(InterpreterFunction._hash(*args)\n                               for args in hash_args)).digest()"
+        },
+        {
+          "symbol_name": "_check_call",
+          "class_name": "InterpreterFunction",
+          "start_line": 2133,
+          "end_line": 2144,
+          "relevance": [
+            "direct_call",
+            "keyword_source_overlap=1",
+            "same_class"
+          ],
+          "source": "  def _check_call(self, node, posargs, namedargs, starargs, starstarargs):\n    if not self.signature.has_param_annotations:\n      return\n    args = list(self.signature.iter_args(\n        posargs, namedargs, starargs, starstarargs))\n    for i, (_, param_var, formal) in enumerate(args):\n      for combination in utils.deep_variable_product([param_var]):\n        view = {value.variable: value for value in combination}\n        if match_var_against_type(param_var, formal, {}, node, view) is None:\n          passed = [p.data[0] for _, p, _ in args]\n          passed[i] = view[param_var].data\n          raise WrongArgTypes(self.signature, passed)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "InterpreterFunction",
+      "related_methods_count": 2,
+      "related_attributes_count": 3,
+      "related_methods": [
+        {
+          "symbol_name": "__init__",
+          "start_line": 1973,
+          "end_line": 1989,
+          "relevance": [
+            "shared_attrs=8"
+          ],
+          "source": "  def __init__(self, name, code, f_locals, f_globals, defaults, closure,\n               annotations, vm):\n    super(InterpreterFunction, self).__init__(name, vm)\n    log.debug(\"Creating InterpreterFunction %r for %r\", name, code.co_name)\n    self.bound_class = BoundInterpreterFunction\n    self.doc = code.co_consts[0] if code.co_consts else None\n    self.name = name\n    self.code = code\n    self.f_globals = f_globals\n    self.f_locals = f_locals\n    self.defaults = tuple(defaults)\n    self.closure = closure\n    self.annotations = annotations\n    self.cls = self.vm.function_type\n    self._call_records = {}\n    self.signature = self._build_signature()\n    self.last_frame = None  # for BuildClass"
+        },
+        {
+          "symbol_name": "_map_args",
+          "start_line": 2026,
+          "end_line": 2102,
+          "relevance": [
+            "direct_self_call",
+            "shared_attrs=2",
+            "keyword_source_overlap=2"
+          ],
+          "source": "  def _map_args(self, node, posargs, namedargs, starargs, starstarargs):\n    \"\"\"Map call args to function args.\n\n    This emulates how Python would map arguments of function calls. It takes\n    care of keyword parameters, default parameters, and *args and **kwargs.\n\n    Args:\n      node: The current CFG node.\n      posargs: The positional arguments. A tuple of typegraph.Variable.\n      namedargs: The keyword arguments. A dictionary, mapping strings to\n        typegraph.Variable.\n      starargs: The *args parameter, or None.\n      starstarargs: The **kwargs parameter, or None.\n\n    Returns:\n      A dictionary, mapping strings (parameter names) to typegraph.Variable.\n\n    Raises:\n      ByteCodeTypeError\n    \"\"\"\n    # Originate a new variable for each argument and call.\n    args = [u.AssignToNewVariable(u.name, node)\n            for u in posargs]\n    kws = {k: u.AssignToNewVariable(u.name, node)\n           for k, u in namedargs.items()}\n    if (self.vm.python_version[0] == 2 and\n        self.code.co_name in [\"<setcomp>\", \"<dictcomp>\", \"<genexpr>\"]):\n      # This code is from github.com/nedbat/byterun. Apparently, Py2 doesn't\n      # know how to inspect set comprehensions, dict comprehensions, or\n      # generator expressions properly. See http://bugs.python.org/issue19611.\n      # Byterun says: \"They are always functions of one argument, so just do the\n      # right thing.\"\n      assert len(args) == 1, \"Surprising comprehension!\"\n      return {\".0\": args[0]}\n    param_names = self.get_parameter_names()\n    num_defaults = len(self.defaults)\n    callargs = dict(zip(param_names[-num_defaults:], self.defaults))\n    positional = dict(zip(param_names, args))\n    for key in positional.keys():\n      if key in kws:\n        raise exceptions.ByteCodeTypeError(\n            \"function got multiple values for keyword argument %r\" % key)\n    callargs.update(positional)\n    callargs.update(kws)\n    for key in param_names:\n      if key not in callargs:\n        raise exceptions.ByteCodeTypeError(\n            \"No value for parameter %r\" % key)\n    arg_pos = self.code.co_argcount\n    if self.has_varargs():\n      vararg_name = self.code.co_varnames[arg_pos]\n      extraneous = args[self.code.co_argcount:]\n      if starargs:\n        if extraneous:\n          log.warning(\"Not adding extra params to *%s\", vararg_name)\n        callargs[vararg_name] = starargs.AssignToNewVariable(\n            \"*args\", node)\n      else:\n        callargs[vararg_name] = self.vm.build_tuple(node, extraneous)\n      arg_pos += 1\n    elif len(args) > self.code.co_argcount:\n      raise exceptions.ByteCodeTypeError(\n          \"Function takes %d positional arguments (%d given)\" % (\n              arg_pos, len(args)))\n    if self.has_kwargs():\n      kwvararg_name = self.code.co_varnames[arg_pos]\n      # Build a **kwargs dictionary out of the extraneous parameters\n      if starstarargs:\n        # TODO(kramm): modify type parameters to account for namedargs\n        callargs[kwvararg_name] = starstarargs.AssignToNewVariable(\n            \"**kwargs\", node)\n      else:\n        k = Dict(\"kwargs\", self.vm)\n        k.update(node, namedargs, omit=param_names)\n        callargs[kwvararg_name] = k.to_variable(node, kwvararg_name)\n      arg_pos += 1\n    return callargs"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "name",
+          "start_line": 1978,
+          "end_line": 1980,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "    self.doc = code.co_consts[0] if code.co_consts else None\n    self.name = name\n    self.code = code"
+        },
+        {
+          "attribute": "code",
+          "start_line": 1979,
+          "end_line": 1981,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "    self.name = name\n    self.code = code\n    self.f_globals = f_globals"
+        },
+        {
+          "attribute": "f_globals",
+          "start_line": 1980,
+          "end_line": 1982,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "    self.code = code\n    self.f_globals = f_globals\n    self.f_locals = f_locals"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "Generator",
+          "kind": "class",
+          "start_line": 2335,
+          "end_line": 2376,
+          "source": "class Generator(Instance):\n  \"\"\"A representation of instances of generators.\n\n  (I.e., the return type of coroutines).\n  \"\"\"\n\n  TYPE_PARAM = \"T\"  # See class generator in pytd/builtins/__builtin__.pytd\n\n  def __init__(self, generator_frame, vm):\n    super(Generator, self).__init__(vm.generator_type, vm)\n    self.generator_frame = generator_frame\n    self.runs = 0\n\n  def get_attribute(self, node, name, valself=None, valcls=None):\n    if name == \"__iter__\":\n      f = NativeFunction(name, self.__iter__, self.vm)\n      return node, f.to_variable(node, name)\n    elif name in [\"next\", \"__next__\"]:\n      return node, self.to_variable(node, name)\n    elif name == \"throw\":\n      # We don't model exceptions in a way that would allow us to induce one\n      # inside a coroutine. So just return ourself, mapping the call of\n      # throw() to a next() (which won't be executed).\n      return node, self.to_variable(node, name)\n    else:\n      return node, None\n\n  def __iter__(self, node):  # pylint: disable=non-iterator-returned,unexpected-special-method-signature\n    return node, self.to_variable(node, \"__iter__\")\n\n  def run_until_yield(self, node):\n    if self.runs == 0:  # Optimization: We only run the coroutine once.\n      node, _ = self.vm.resume_frame(node, self.generator_frame)\n      contained_type = self.generator_frame.yield_variable\n      self.type_parameters[self.TYPE_PARAM] = contained_type\n      self.runs += 1\n    return node, self.type_parameters[self.TYPE_PARAM]\n\n  def call(self, node, unused_func, posargs, namedargs,\n           starargs=None, starstarargs=None):\n    \"\"\"Call this generator or (more common) its \"next\" attribute.\"\"\"\n    return self.run_until_yield(node)"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "__init__",
+          "class_name": "InterpreterFunction",
+          "start_line": 1973,
+          "end_line": 1989,
+          "source": "  def __init__(self, name, code, f_locals, f_globals, defaults, closure,\n               annotations, vm):\n    super(InterpreterFunction, self).__init__(name, vm)\n    log.debug(\"Creating InterpreterFunction %r for %r\", name, code.co_name)\n    self.bound_class = BoundInterpreterFunction\n    self.doc = code.co_consts[0] if code.co_consts else None\n    self.name = name\n    self.code = code\n    self.f_globals = f_globals\n    self.f_locals = f_locals\n    self.defaults = tuple(defaults)\n    self.closure = closure\n    self.annotations = annotations\n    self.cls = self.vm.function_type\n    self._call_records = {}\n    self.signature = self._build_signature()\n    self.last_frame = None  # for BuildClass"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

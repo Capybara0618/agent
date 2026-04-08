@@ -14,7 +14,7 @@ from openai import OpenAI
 from .github_tools import GitHubToolbox
 from .local_settings import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
 from .local_settings import OPENAI_BASE_URL as LOCAL_OPENAI_BASE_URL
-from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, preprocess_python_code
+from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, SelectorDecision, preprocess_python_code
 
 
 VALID_DECISIONS = {"repairable", "drop", "needs_more_context"}
@@ -385,13 +385,18 @@ class OpenAICompatClient:
             },
         }
         if stage in {"repair", "review"}:
+            evidence_cards = self._build_repair_evidence_cards(repair)
             compact["repair_context"] = {
-                "same_file_helpers": repair.get("same_file_helpers"),
-                "same_class_evidence": repair.get("same_class_evidence"),
-                "module_symbols": repair.get("module_symbols"),
-                "same_file_pattern": repair.get("same_file_pattern"),
-                "targeted_test_snippet": repair.get("targeted_test_snippet"),
-                "targeted_callsite_snippet": repair.get("targeted_callsite_snippet"),
+                "evidence_cards": evidence_cards,
+                "same_file_helpers": {"count": (repair.get("same_file_helpers") or {}).get("count", 0)},
+                "same_class_evidence": {
+                    "related_methods_count": (repair.get("same_class_evidence") or {}).get("related_methods_count", 0),
+                    "related_attributes_count": (repair.get("same_class_evidence") or {}).get("related_attributes_count", 0),
+                },
+                "module_symbols": {"count": (repair.get("module_symbols") or {}).get("count", 0)},
+                "same_file_pattern": {"count": (repair.get("same_file_pattern") or {}).get("count", 0)},
+                "targeted_test_snippet": {"used": bool((repair.get("targeted_test_snippet") or {}).get("used"))},
+                "targeted_callsite_snippet": {"used": bool((repair.get("targeted_callsite_snippet") or {}).get("used"))},
             }
         if stage == "review":
             compact["review_context"] = review
@@ -613,6 +618,92 @@ class OpenAICompatClient:
     def _distinct_match_tokens(self, text: str) -> set[str]:
         generic = {"test", "tests", "case", "cases", "bug", "func", "function", "method", "class", "file", "py"}
         return {token for token in self._name_tokens(text) if token not in generic}
+
+    def _clip_source(self, text: str, limit: int = 420) -> str:
+        clipped = (text or "").strip()
+        if len(clipped) <= limit:
+            return clipped
+        return clipped[: limit - 3].rstrip() + "..."
+
+    def _format_relevance_reason(self, reasons: list[str]) -> str:
+        if not reasons:
+            return "directly referenced by the target function"
+        reason = reasons[0].replace("_", " ")
+        reason = re.sub(r"=\d+", "", reason)
+        return reason
+
+    def _build_repair_evidence_cards(self, repair_context: dict[str, Any]) -> list[dict[str, Any]]:
+        cards: list[dict[str, Any]] = []
+
+        for item in (repair_context.get("same_file_helpers") or {}).get("items") or []:
+            cards.append(
+                {
+                    "kind": "same_file_helper",
+                    "symbol_name": item.get("symbol_name"),
+                    "location": f"{item.get('start_line')}:{item.get('end_line')}",
+                    "why": self._format_relevance_reason(item.get("relevance") or []),
+                    "snippet": self._clip_source(item.get("source") or ""),
+                }
+            )
+
+        same_class = repair_context.get("same_class_evidence") or {}
+        for item in same_class.get("related_methods") or []:
+            cards.append(
+                {
+                    "kind": "same_class_method",
+                    "symbol_name": item.get("symbol_name"),
+                    "location": f"{item.get('start_line')}:{item.get('end_line')}",
+                    "why": self._format_relevance_reason(item.get("relevance") or []),
+                    "snippet": self._clip_source(item.get("source") or ""),
+                }
+            )
+        for item in same_class.get("related_attributes") or []:
+            cards.append(
+                {
+                    "kind": "same_class_attribute",
+                    "symbol_name": item.get("attribute"),
+                    "location": f"{item.get('start_line')}:{item.get('end_line')}",
+                    "why": self._format_relevance_reason(item.get("relevance") or []),
+                    "snippet": self._clip_source(item.get("snippet") or ""),
+                }
+            )
+
+        for item in (repair_context.get("module_symbols") or {}).get("items") or []:
+            cards.append(
+                {
+                    "kind": f"module_{item.get('kind')}",
+                    "symbol_name": item.get("symbol_name"),
+                    "location": f"{item.get('start_line')}:{item.get('end_line')}",
+                    "why": self._format_relevance_reason(item.get("relevance") or []),
+                    "snippet": self._clip_source(item.get("source") or ""),
+                }
+            )
+
+        test_item = (repair_context.get("targeted_test_snippet") or {}).get("item")
+        if test_item:
+            cards.append(
+                {
+                    "kind": "targeted_test",
+                    "symbol_name": test_item.get("path"),
+                    "location": f"{test_item.get('start_line')}:{test_item.get('end_line')}",
+                    "why": "targeted test snippet selected by rule",
+                    "snippet": self._clip_source(test_item.get("excerpt") or ""),
+                }
+            )
+
+        callsite_item = (repair_context.get("targeted_callsite_snippet") or {}).get("item")
+        if callsite_item:
+            cards.append(
+                {
+                    "kind": "targeted_callsite",
+                    "symbol_name": callsite_item.get("path"),
+                    "location": f"{callsite_item.get('start_line')}:{callsite_item.get('end_line')}",
+                    "why": "targeted callsite snippet selected by rule",
+                    "snippet": self._clip_source(callsite_item.get("excerpt") or ""),
+                }
+            )
+
+        return cards[:6]
 
     def _score_helper_candidate(
         self,
@@ -944,23 +1035,20 @@ class OpenAICompatClient:
         contexts = self._collect_function_contexts(file_content)
         direct_calls = set(target_function.get("calls") or [])
         self_calls = set(target_function.get("self_calls") or [])
-        current_name = target_function.get("symbol_name")
-        comment_keywords = self._comment_keywords(satd_comment)
         class_name = target_function.get("class_name")
+        decisive = direct_calls | self_calls
         scored: list[tuple[int, int, dict[str, Any]]] = []
         for item in contexts:
-            score, reasons = self._score_helper_candidate(
-                item,
-                current_name=current_name,
-                direct_calls=direct_calls,
-                self_calls=self_calls,
-                comment_keywords=comment_keywords,
-                class_name=class_name,
-            )
-            if score < 4:
+            symbol_name = item["symbol_name"]
+            if symbol_name not in decisive:
                 continue
+            score = 12
+            reasons = ["direct_call_reference"]
+            if class_name and item.get("class_name") == class_name:
+                score += 2
+                reasons.append("same_class")
             scored.append((score, item["start_line"], {
-                "symbol_name": item["symbol_name"],
+                "symbol_name": symbol_name,
                 "class_name": item["class_name"],
                 "start_line": item["start_line"],
                 "end_line": item["end_line"],
@@ -980,7 +1068,6 @@ class OpenAICompatClient:
         current_name = target_function.get("symbol_name")
         self_calls = set(target_function.get("self_calls") or [])
         self_attrs = set(target_function.get("self_attrs") or [])
-        comment_keywords = self._comment_keywords(satd_comment)
 
         scored_methods: list[tuple[int, int, dict[str, Any]]] = []
         for item in contexts:
@@ -989,21 +1076,9 @@ class OpenAICompatClient:
             score = 0
             reasons: list[str] = []
             if item["symbol_name"] in self_calls:
-                score += 8
+                score += 10
                 reasons.append("direct_self_call")
-            shared_attrs = len(self_attrs.intersection(set(item.get("self_attrs") or [])))
-            if shared_attrs:
-                score += 2 * shared_attrs
-                reasons.append(f"shared_attrs={shared_attrs}")
-            keyword_hits = self._keyword_overlap(item["source"], comment_keywords)
-            if keyword_hits:
-                score += keyword_hits
-                reasons.append(f"keyword_source_overlap={keyword_hits}")
-            name_overlap = len(self._name_tokens(item["symbol_name"]).intersection(comment_keywords))
-            if name_overlap:
-                score += 3 * name_overlap
-                reasons.append(f"keyword_name_overlap={name_overlap}")
-            if score < 4:
+            if score < 10:
                 continue
             scored_methods.append((score, item["start_line"], {
                 "symbol_name": item["symbol_name"],
@@ -1032,7 +1107,6 @@ class OpenAICompatClient:
         except (SyntaxError, ValueError):
             return []
         lines = clean_content.splitlines()
-        comment_keywords = self._comment_keywords(satd_comment)
         results: list[tuple[int, int, dict[str, Any]]] = []
         seen_attrs: set[str] = set()
         for node in ast.walk(tree):
@@ -1052,14 +1126,8 @@ class OpenAICompatClient:
                     start = max(1, getattr(child, "lineno", 1) - 1)
                     end = min(len(lines), getattr(child, "end_lineno", getattr(child, "lineno", 1)) + 1)
                     snippet = "\n".join(lines[start - 1 : end])
-                    score = 3
-                    reasons = ["direct_attribute_use"]
-                    keyword_hits = self._keyword_overlap(snippet, comment_keywords)
-                    if keyword_hits:
-                        score += keyword_hits
-                        reasons.append(f"keyword_source_overlap={keyword_hits}")
-                    if score < 3:
-                        continue
+                    score = 8
+                    reasons = ["direct_attribute_assignment"]
                     results.append((score, start, {
                         "attribute": target.attr,
                         "start_line": start,
@@ -1081,7 +1149,6 @@ class OpenAICompatClient:
 
         lines = clean_content.splitlines()
         used_names = set(target_function.get("global_uses") or [])
-        comment_keywords = self._comment_keywords(satd_comment)
         if not used_names:
             return {"count": 0, "items": []}
 
@@ -1097,8 +1164,6 @@ class OpenAICompatClient:
                 for alias in node.names:
                     candidate = alias.asname or alias.name.split(".")[0]
                     if candidate in used_names and candidate not in seen_names:
-                        if not self._name_tokens(candidate).intersection(comment_keywords):
-                            continue
                         symbol_name = candidate
                         symbol_kind = "import"
                         break
@@ -1106,12 +1171,6 @@ class OpenAICompatClient:
                 for alias in node.names:
                     candidate = alias.asname or alias.name
                     if candidate in used_names and candidate not in seen_names:
-                        source = "\n".join(lines[(start or 1) - 1 : (end or start or 1)])
-                        if not (
-                            self._name_tokens(candidate).intersection(comment_keywords)
-                            or self._keyword_overlap(source, comment_keywords)
-                        ):
-                            continue
                         symbol_name = candidate
                         symbol_kind = "import_from"
                         break
@@ -1134,12 +1193,6 @@ class OpenAICompatClient:
             if not symbol_name or start is None:
                 continue
             source = source or "\n".join(lines[start - 1 : end])
-            if symbol_kind in {"assign", "annassign", "class", "function"}:
-                if not (
-                    self._name_tokens(symbol_name).intersection(comment_keywords)
-                    or self._keyword_overlap(source, comment_keywords)
-                ):
-                    continue
             seen_names.add(symbol_name)
             end = end or start
             items.append(
@@ -1148,6 +1201,7 @@ class OpenAICompatClient:
                     "kind": symbol_kind,
                     "start_line": start,
                     "end_line": end,
+                    "relevance": ["direct_global_use"],
                     "source": source,
                 }
             )
@@ -1155,44 +1209,7 @@ class OpenAICompatClient:
         return {"count": len(items), "items": items}
 
     def _extract_same_file_pattern(self, file_content: str, target_function: dict[str, Any], satd_comment: str) -> dict[str, Any]:
-        if not target_function.get("found"):
-            return {"count": 0, "items": []}
-        contexts = self._collect_function_contexts(file_content)
-        current_name = target_function.get("symbol_name")
-        current_class = target_function.get("class_name")
-        current_calls = set(target_function.get("calls") or [])
-        current_self_calls = set(target_function.get("self_calls") or [])
-        current_self_attrs = set(target_function.get("self_attrs") or [])
-        comment_tokens = [token.lower() for token in re.findall(r"[A-Za-z_]{4,}", satd_comment or "")[:6]]
-
-        scored = []
-        for item in contexts:
-            if item["symbol_name"] == current_name:
-                continue
-            score = 0
-            score += 2 * len(current_calls.intersection(item["calls"]))
-            score += 2 * len(current_self_calls.intersection(item["self_calls"]))
-            score += 2 * len(current_self_attrs.intersection(item["self_attrs"]))
-            if current_class and item["class_name"] == current_class:
-                score += 1
-            source_lower = item["source"].lower()
-            score += sum(1 for token in comment_tokens if token in source_lower)
-            if score >= 4:
-                scored.append((score, item))
-
-        scored.sort(key=lambda pair: (-pair[0], pair[1]["start_line"]))
-        items = []
-        for _, item in scored[:1]:
-            items.append(
-                {
-                    "symbol_name": item["symbol_name"],
-                    "class_name": item["class_name"],
-                    "start_line": item["start_line"],
-                    "end_line": item["end_line"],
-                    "source": item["source"],
-                }
-            )
-        return {"count": len(items), "items": items}
+        return {"count": 0, "items": []}
 
     def _extract_targeted_test_snippet(self, owner: str, repo: str, ref: str | None, state: GraphState, symbol_name: str) -> dict[str, Any]:
         if not self._should_use_test_context(state["satd_comment"]):
@@ -1523,7 +1540,7 @@ class OpenAIAnalyzer:
     def _is_annotation_like_task(self, state: GraphState, satd_type: str) -> bool:
         satd = (satd_type or "").strip().lower()
         comment = (state.get("satd_comment") or "").strip().lower()
-        return satd in {"type_annotation", "pyre-fixme", "pyre_fixme"} or (
+        return satd.startswith("type_annotation") or satd in {"pyre-fixme", "pyre_fixme"} or (
             ("annotat" in comment or "type hint" in comment or "pyre-fixme" in comment)
             and "return type" in comment
         )
@@ -1603,7 +1620,7 @@ class OpenAIFixer:
         self.client = client
         self.prompt_mode = prompt_mode
 
-    def run(self, state: GraphState) -> RepairAttempt:
+    def run(self, state: GraphState, candidate_mode: str = "single") -> RepairAttempt:
         metadata = ((state.get("github_context") or {}).get("metadata") or {}) if isinstance(state.get("github_context"), dict) else {}
         round_id = state["round_id"] + 1
         github_context = self.client.compact_shared_context(state.get("github_context"))
@@ -1618,7 +1635,11 @@ class OpenAIFixer:
             snapshot_alignment_status=snapshot_alignment_status,
             contextual_repair_hint=contextual_repair_hint,
         )
-        payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"repair:task_{state['task_id']}:round_{round_id}")
+        payload = self.client.generate_json(
+            system_prompt,
+            user_prompt,
+            request_label=f"repair:task_{state['task_id']}:round_{round_id}:candidate_{candidate_mode}",
+        )
         repair_plan = str(payload.get("repair_plan") or "Resolve the SATD with the smallest plausible local edit.")
         repaired_code = str(payload.get("repaired_code") or state["original_code"])
         changed_scope = str(payload.get("changed_scope") or "function")
@@ -1642,6 +1663,7 @@ class OpenAIFixer:
             changed_scope=changed_scope,
             confidence=confidence,
             notes=notes,
+            candidate_mode=candidate_mode,
         )
 
     def _build_repair_prompts(
@@ -1656,6 +1678,9 @@ class OpenAIFixer:
     ) -> tuple[str, str]:
         repair_feedback = state.get("repair_feedback") or {}
         reviewer_feedback_block = self._format_reviewer_feedback_block(repair_feedback)
+        satd_route_type = str(state.get("satd_route_type") or "generic")
+        candidate_mode = str(state.get("candidate_mode") or "single")
+        type_hint = self._type_hint_for_route(satd_route_type, state.get("satd_comment") or "") if candidate_mode.startswith("typed_") else ""
         if self.prompt_mode == "analysis_heavy":
             system_prompt = (
                 "You are the fixer agent in a SATD repair workflow. "
@@ -1686,9 +1711,11 @@ class OpenAIFixer:
                 f"SATD comment: {state['satd_comment']}\n"
                 f"Snapshot alignment status: {snapshot_alignment_status}\n"
                 f"Repair evidence mode: {repair_evidence_mode}\n"
+                f"SATD route type: {satd_route_type}\n"
                 f"Contextual repair hint: {contextual_repair_hint}\n"
                 f"Original code block:\n{state['original_code']}\n\n"
                 f"Unified GitHub context:\n{github_context}\n"
+                f"{type_hint}"
                 f"{reviewer_feedback_block}"
             )
             return system_prompt, user_prompt
@@ -1704,6 +1731,7 @@ class OpenAIFixer:
             f"### Code:\n{state['original_code']}\n\n"
             f"### SATD comment:\n{state['satd_comment']}\n"
             f"### Optional external evidence:\n{github_context}\n\n"
+            f"{type_hint}"
             f"{reviewer_feedback_block}"
             "### Consider the following questions in your answer:\n"
             "Shortly explain how to resolve the SATD.\n"
@@ -1760,6 +1788,36 @@ class OpenAIFixer:
         if "return type must be annotated" in comment:
             return "Prefer the smallest signature-local annotation fix and avoid changing parameter shape or surrounding logic."
         return "Prefer the smallest in-place repair that matches the SATD comment."
+
+    def _type_hint_for_route(self, satd_route_type: str, satd_comment: str = "") -> str:
+        route = (satd_route_type or "").strip().lower()
+        if route == "type_annotation":
+            comment = (satd_comment or "").strip().lower()
+            if "return type" in comment:
+                return (
+                    "### Type hint:\n"
+                    "Prefer a return-annotation-only fix. Keep parameters, control flow, and the function body unchanged unless the comment explicitly requires otherwise.\n\n"
+                )
+            if "parameter must be annotated" in comment or ("parameter" in comment and "annotat" in comment):
+                return (
+                    "### Type hint:\n"
+                    "Prefer annotating only the specific parameter(s) mentioned by the comment. Do not change the return annotation or executable logic unless required.\n\n"
+                )
+            if "pyre-fixme" in comment or "type" in comment or "annotat" in comment:
+                return (
+                    "### Type hint:\n"
+                    "Prefer the smallest local type-only fix, such as adding a missing annotation or a narrow type adjustment. Avoid changing executable logic.\n\n"
+                )
+            return "### Type hint:\nPrefer the smallest annotation-only fix and avoid changing surrounding logic.\n\n"
+        if route == "remove_temporary":
+            return "### Type hint:\nPrefer deleting the temporary workaround or obsolete branch instead of introducing new logic.\n\n"
+        if route == "replace_symbol":
+            return "### Type hint:\nPrefer the narrowest in-place symbol or field replacement.\n\n"
+        if route == "restore_uncomment":
+            return "### Type hint:\nPrefer restoring the nearby commented or disabled line(s) with the smallest possible edit.\n\n"
+        if route == "small_local_value_fix":
+            return "### Type hint:\nPrefer the smallest local value or literal change inside the existing structure.\n\n"
+        return ""
 
     def _em_risk_notes(self, original_code: str, repaired_code: str) -> list[str]:
         risks = []
@@ -2004,6 +2062,7 @@ class OpenAIReviewer:
             reject_type=reject_type,
             rationale=rationale,
             softened_gate_used=softened_gate_used,
+            candidate_mode=getattr(repair, "candidate_mode", "single"),
         )
 
     def _weighted_review_score(
@@ -2115,3 +2174,239 @@ class OpenAIReviewer:
             return max(0.0, min(1.0, float(value)))
         except (TypeError, ValueError):
             return default
+
+
+class OpenAISelector:
+    def __init__(self, client: OpenAICompatClient) -> None:
+        self.client = client
+
+    def run(self, state: GraphState) -> SelectorDecision:
+        candidates = state.get("repair_candidates") or []
+        round_id = (candidates[0].round_id if candidates else state["round_id"] + 1)
+        satd_route_type = str(state.get("satd_route_type") or "generic")
+        if not candidates:
+            return SelectorDecision(
+                round_id=round_id,
+                satd_route_type=satd_route_type,
+                selected_candidate_mode="",
+                selected_index=0,
+                confidence=0.0,
+                rationale="No repair candidates were available.",
+                candidate_scores=[],
+            )
+        if len(candidates) == 1:
+            only = candidates[0]
+            return SelectorDecision(
+                round_id=round_id,
+                satd_route_type=satd_route_type,
+                selected_candidate_mode=only.candidate_mode,
+                selected_index=0,
+                confidence=max(0.45, only.confidence),
+                rationale="Only one repair candidate was available.",
+                candidate_scores=[{"index": 0, "candidate_mode": only.candidate_mode, "score": only.confidence}],
+            )
+
+        system_prompt = (
+            "You are the selector agent in a SATD repair workflow. "
+            "Choose the single candidate that is most likely to match the intended minimal human repair. "
+            "Prefer candidates that stay closest to the SATD comment, preserve the original structure, and avoid unnecessary API or control-flow changes. "
+            "Return JSON only."
+        )
+        candidate_blocks = []
+        for index, candidate in enumerate(candidates):
+            candidate_blocks.append(
+                f"Candidate {index} ({candidate.candidate_mode})\n"
+                f"Plan: {candidate.repair_plan}\n"
+                f"Scope: {candidate.changed_scope}\n"
+                f"Confidence: {candidate.confidence}\n"
+                f"Code:\n{candidate.repaired_code}\n"
+            )
+        user_prompt = (
+            "Return a JSON object with keys: selected_index (integer), selected_candidate_mode (string), "
+            "confidence (float 0-1), rationale (string), candidate_scores (array of objects with keys: index, candidate_mode, score).\n\n"
+            f"SATD route type: {satd_route_type}\n"
+            f"File path: {state['file_path']}\n"
+            f"SATD comment: {state['satd_comment']}\n"
+            f"Original code:\n{state['original_code']}\n\n"
+            "Candidates:\n"
+            + "\n".join(candidate_blocks)
+        )
+        payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"select:task_{state['task_id']}:round_{round_id}")
+        try:
+            selected_index = int(payload.get("selected_index", 0))
+        except (TypeError, ValueError):
+            selected_index = 0
+        if selected_index < 0 or selected_index >= len(candidates):
+            selected_index = 0
+        selected_candidate_mode = str(payload.get("selected_candidate_mode") or candidates[selected_index].candidate_mode)
+        try:
+            confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        rationale = str(payload.get("rationale") or "Selected the candidate that best matches the SATD comment with the smallest credible edit.")
+        raw_scores = payload.get("candidate_scores")
+        candidate_scores: list[dict[str, Any]] = []
+        if isinstance(raw_scores, list):
+            for item in raw_scores:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    idx = int(item.get("index", -1))
+                except (TypeError, ValueError):
+                    idx = -1
+                if idx < 0 or idx >= len(candidates):
+                    continue
+                try:
+                    score = max(0.0, min(1.0, float(item.get("score", 0.0))))
+                except (TypeError, ValueError):
+                    score = 0.0
+                candidate_scores.append(
+                    {
+                        "index": idx,
+                        "candidate_mode": str(item.get("candidate_mode") or candidates[idx].candidate_mode),
+                        "score": score,
+                    }
+                )
+        if not candidate_scores:
+            candidate_scores = [
+                {"index": idx, "candidate_mode": candidate.candidate_mode, "score": candidate.confidence}
+                for idx, candidate in enumerate(candidates)
+            ]
+        selected_index, selected_candidate_mode, confidence, rationale, candidate_scores = self._apply_route_bias(
+            satd_route_type=satd_route_type,
+            candidates=candidates,
+            selected_index=selected_index,
+            selected_candidate_mode=selected_candidate_mode,
+            confidence=confidence,
+            rationale=rationale,
+            candidate_scores=candidate_scores,
+        )
+        return SelectorDecision(
+            round_id=round_id,
+            satd_route_type=satd_route_type,
+            selected_candidate_mode=selected_candidate_mode,
+            selected_index=selected_index,
+            confidence=confidence,
+            rationale=rationale,
+            candidate_scores=candidate_scores,
+        )
+
+    def _apply_route_bias(
+        self,
+        satd_route_type: str,
+        candidates: list[RepairAttempt],
+        selected_index: int,
+        selected_candidate_mode: str,
+        confidence: float,
+        rationale: str,
+        candidate_scores: list[dict[str, Any]],
+    ) -> tuple[int, str, float, str, list[dict[str, Any]]]:
+        if not candidates:
+            return selected_index, selected_candidate_mode, confidence, rationale, candidate_scores
+
+        score_by_index: dict[int, float] = {}
+        normalized_scores: list[dict[str, Any]] = []
+        for idx, candidate in enumerate(candidates):
+            raw_item = next((item for item in candidate_scores if int(item.get("index", -1)) == idx), None)
+            raw_score = raw_item.get("score") if raw_item else candidate.confidence
+            try:
+                score = max(0.0, min(1.0, float(raw_score)))
+            except (TypeError, ValueError):
+                score = max(0.0, min(1.0, float(candidate.confidence)))
+            score_by_index[idx] = score
+            normalized_scores.append(
+                {
+                    "index": idx,
+                    "candidate_mode": candidate.candidate_mode,
+                    "score": score,
+                }
+            )
+
+        top_score = max(score_by_index.values())
+        preference = self._route_preference_map(satd_route_type)
+        eligible = [
+            idx
+            for idx, score in score_by_index.items()
+            if top_score - score <= self._route_bias_margin(satd_route_type)
+        ]
+        if len(eligible) <= 1:
+            return selected_index, selected_candidate_mode, confidence, rationale, normalized_scores
+
+        def rank_key(idx: int) -> tuple[float, float, int]:
+            mode = candidates[idx].candidate_mode
+            return (
+                preference.get(mode, 0.0),
+                score_by_index[idx],
+                1 if mode.endswith("no_context") else 0,
+            )
+
+        biased_index = max(eligible, key=rank_key)
+        if biased_index == selected_index:
+            return selected_index, selected_candidate_mode, confidence, rationale, normalized_scores
+
+        biased_mode = candidates[biased_index].candidate_mode
+        biased_score = score_by_index[biased_index]
+        selected_score = score_by_index.get(selected_index, 0.0)
+        bias_note = (
+            f" Route bias applied for {satd_route_type}: preferred {biased_mode} over "
+            f"{selected_candidate_mode or candidates[selected_index].candidate_mode} among near-tied candidates."
+        )
+        updated_confidence = max(confidence, min(0.95, max(biased_score, selected_score)))
+        return biased_index, biased_mode, updated_confidence, rationale + bias_note, normalized_scores
+
+    def _route_preference_map(self, satd_route_type: str) -> dict[str, float]:
+        if satd_route_type == "remove_temporary":
+            return {
+                "typed_no_context": 1.00,
+                "baseline_no_context": 0.92,
+                "baseline_context": 0.35,
+                "typed_context": 0.25,
+            }
+        if satd_route_type == "generic":
+            return {
+                "baseline_no_context": 1.00,
+                "baseline_context": 0.72,
+                "typed_no_context": 0.58,
+                "typed_context": 0.40,
+            }
+        if satd_route_type == "type_annotation":
+            return {
+                "typed_no_context": 1.00,
+                "baseline_no_context": 0.92,
+                "typed_context": 0.70,
+                "baseline_context": 0.52,
+            }
+        if satd_route_type == "restore_uncomment":
+            return {
+                "typed_no_context": 1.00,
+                "baseline_no_context": 0.95,
+                "baseline_context": 0.45,
+                "typed_context": 0.35,
+            }
+        if satd_route_type == "replace_symbol":
+            return {
+                "baseline_context": 1.00,
+                "typed_context": 0.92,
+                "baseline_no_context": 0.82,
+                "typed_no_context": 0.55,
+            }
+        if satd_route_type == "small_local_value_fix":
+            return {
+                "baseline_context": 1.00,
+                "baseline_no_context": 0.90,
+                "typed_no_context": 0.55,
+                "typed_context": 0.45,
+            }
+        return {
+            "baseline_no_context": 1.00,
+            "baseline_context": 0.70,
+            "typed_no_context": 0.55,
+            "typed_context": 0.40,
+        }
+
+    def _route_bias_margin(self, satd_route_type: str) -> float:
+        if satd_route_type in {"generic", "remove_temporary"}:
+            return 0.14
+        if satd_route_type in {"type_annotation", "restore_uncomment"}:
+            return 0.12
+        return 0.10

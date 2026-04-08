@@ -1,0 +1,161 @@
+{
+  "task_id": "789",
+  "repo_owner": "dask",
+  "repo_name": "distributed",
+  "file_path": "distributed/pubsub.py",
+  "commit": "175fccd82bc1b3d37dfcf940e6b925081e3be0d0",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T19:11:41+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "175fccd82bc1b3d37dfcf940e6b925081e3be0d0",
+    "symbol_name": "__init__",
+    "satd_line": 159,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 2,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T19:11:41+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "distributed/pubsub.py",
+    "original_signature": "def __init__(self, client):",
+    "target_file": {
+      "ok": true,
+      "path": "distributed/pubsub.py",
+      "sha": "a5d05cdf610b84e4ffe44ec5136a15e03e29d13c",
+      "download_url": "https://raw.githubusercontent.com/dask/distributed/175fccd82bc1b3d37dfcf940e6b925081e3be0d0/distributed/pubsub.py",
+      "content_excerpt": "from collections import defaultdict, deque\nimport datetime\nimport weakref\n\nimport tornado.locks\nfrom tornado import gen\n\nfrom .compatibility import finalize, get_thread_identity\nfrom .core import CommClosedError\nfrom .utils import sync\nfrom .protocol.serialize import to_serialize\n\n\nclass PubSubSchedulerExtension(object):\n    \"\"\" Extend Dask's scheduler with routes to handle PubSub machinery \"\"\"\n    def __init__(self, scheduler):\n        self.scheduler = scheduler\n        self.publishers = defaultdict(set)\n        self.subscribers = defaultdict(set)\n        self.client_subscribers = defaultdict(set)\n\n        self.scheduler.handlers.update({\n            'pubsub_add_publisher': self.add_publisher,\n        })\n\n        self.scheduler.stream_handlers.update({\n            'pubsub-add-subscriber': self.add_subscriber,\n            'pubsub-remove-publisher': self.remove_publisher,\n            'pubsub-remove-subscriber': self.remove_subscriber,\n            'pubsub-msg': self.handle_message,\n        })\n\n        self.scheduler.extensions['pubsub'] = self\n\n    def add_publisher(self, comm=None, name=None, worker=None):\n        self.publishers[name].add(worker)\n        return {'subscribers': {addr: {} for addr in self.subscribers[name]},\n                'publish-scheduler': name in self.client_subscribers and\n                                     len(self.client_subscribers[name]) > 0}\n\n    def add_subscriber(self, comm=None, name=None, worker=None, client=None):\n        if worker:\n            self.subscribers[name].add(worker)\n            for pub in self.publishers[name]:\n                self.scheduler.worker_send(pub, {'op': 'pubsub-add-subscriber',\n                                                 'address': worker,\n                                                 'name': name})\n        elif client:\n            for pub in self.publishers[name]:\n                self.scheduler.worker_send(pub, {'op': 'pubsub-publish-scheduler',\n                                                 'name': name,\n                                                 'publish': True})\n            self.client_subscribers[name].add(client)\n\n    def remove_publisher(self, comm=None, name=None, worker=None):\n        self.publishers[name].remove(worker)\n\n        if not self.subscribers[name] and not self.publishers[name]:\n            del self.subscribers[name]\n            del self.publishers[name]\n\n    def remove_subscriber(self, comm=None, name=None, worker=None, client=None):\n        if worker:\n            self.subscribers[name].remove(worker)\n            for pub in self.publishers[name]:\n                self.scheduler.worker_send(pub, {'op': 'pubsub-remove-subscriber',\n                                                 'address': worker,\n                                                 'name': name})\n        elif client:\n            self.client_subscribers[name].remove(client)\n            if not self.client_subscribers[name]:\n                del self.client_subscribers[name]\n                for pub in self.publishers[name]:\n                    self.scheduler.worker_send(pub, {'op': 'pubsub-publish-scheduler',\n                                                     'name': name,\n                                                     'publish': False})\n\n        if not self.subscribers[name] and not self.publishers[name]:\n            del self.subscribers[name]\n            del self.publishers[name]\n\n    def handle_message(self, name=None, msg=None, worker=None, client=None):\n        for c in list(self.client_subscribers[name]):\n            try:\n                self.scheduler.client_comms[c].send({'op': 'pubsub-msg',\n                                                     'name': name,\n                                                     'msg': msg})\n            except (KeyError, CommClosedError):\n                self.remove_subscriber(name=name, client=c)\n\n        if client:\n            for sub in self.subscribers[name]:\n                self.scheduler.worker_send(sub, {'op': 'pubsub-msg',\n                                                 'name': name,\n                                                 'msg': msg})\n\n\nclass PubSubWorkerExtension(object):\n    \"\"\" Extend Dask's Worker with routes to handle PubSub machinery \"\"\"\n    def __init__(self, worker):\n        self.worker = worker\n        self.worker.stream_handlers.update({\n            'pubsub-add-subscriber': self.add_subscriber,\n            'pubsub-remove-subscriber': self.remove_subscriber,\n            'pubsub-msg': self.handle_message,\n            'pubsub-publish-scheduler': self.publish_scheduler,\n        })\n\n        self.subscribers = defaultdict(weakref.WeakSet)\n        self.publishers = defaultdict(weakref.WeakSet)\n        self.publish_to_scheduler = defaultdict(lambda: False)\n\n        self.worker.extensions['pubsub'] = self  # circular reference\n\n    def add_subscriber(self, name=None, address=None, **info):\n        for pub in self.publishers[name]:\n            pub.subscribers[address] = info\n\n    def remove_subscriber(self, name=None, address=None):\n        for pub in self.publishers[name]:\n            del pub.subscribers[address]\n\n    def publish_scheduler(self, name=None, publish=None):\n        self.publish_to_scheduler[name] = publish\n\n    def handle_message(self, name=None, msg=None):\n        for sub in self.subscribers.get(name, []):\n            sub._put(msg)\n\n    def trigger_cleanup(self):\n        self.worker.loop.add_callback(self.cleanup)\n\n    def cleanup(self):\n        for name, s in dict(self.subscribers).items():\n            if not len(s):\n                msg = {'op': 'pubsub-remove-subscriber',\n                       'name': name}\n                self.worker.batched_stream.send(msg)\n                del self.subscribers[name]\n\n        for name, p in dict(self.publishers).items():\n            if not len(p):\n                msg = {'op': 'pubsub-remove-publisher',\n                       'name': name}\n                self.worker.batched_stream.send(msg)\n                del self.publishers[name]\n                del self.publish_to_scheduler[name]\n\n\nclass PubSubClientExtension(object):\n    \"\"\" Extend Dask's Client with handlers to handle PubSub machinery \"\"\"\n    def __init__(self, client):\n        self.client = client\n        self.client._stream_handlers.update({\n            'pubsub-msg': self.handle_message\n        })\n\n        self.subscribers = defaultdict(weakref.WeakSet)\n        self.client.extensions['pubsub'] = self  # TODO: circular reference\n\n    def handle_message(self, name=None, msg=None):\n        for sub in self.subscribers[name]:\n            sub._put(msg)\n\n        if not self.subscribers[name]:\n            self.client.scheduler_comm.send({'op': 'pubsub-remove-subscribers',\n                                             'name': name})\n\n    def trigger_cleanup(self):\n        self.client.loop.add_callback(self.cleanup)\n\n    def cleanup(self):\n        for name, s in self.subscribers.items():\n            if not s:\n                msg = {'op': 'pubsub-remove-subscriber',\n                       'name': name}\n                self.client.scheduler_comm.send(msg)\n\n\nclass Pub(object):\n    \"\"\" Publish data with Publish-Subscribe pattern\n\n    This allows clients and workers to directly communicate data between each\n    other with a typical Publish-Subscribe pattern.  This involves two\n    components,\n\n    Pub objects, into which we put data:\n\n        >>> pub = Pub('my-topic')\n        >>> pub.put(123)\n\n    And Sub objects, from which we collect data:\n\n        >>> sub = Sub('my-topic')\n        >>> sub.get()\n        123\n\n    Many Pub and Sub objects can exist for the same topic.  All data sent from\n    any Pub will be sent to all Sub objects on that topic that are currently\n    connected.  Pub's and Sub's find each other using the scheduler, but they\n    communicate directly with each other without coordination from the\n    scheduler.\n\n    Pubs and Subs use the central scheduler to find each other, but not to\n    mediate the communication.  This means that there is very little additional\n    latency or overhead, and they are appropriate for very frequent data\n    transfers.  For context, most data transfer first checks with the scheduler to find which\n    workers should participate, and then does direct worker-to-worker\n    transfers.  This checking in with the scheduler provides some stability\n    guarnatees, but also adds in a few extra network hops.  PubSub doesn't do\n    this, and so is faster, but also can easily drop messages if Pubs or Subs\n    disappear without notice.\n\n    When using a Pub or Sub from a Client all communications will be routed\n    through the scheduler.  This can cause some performance degredation.  Pubs\n    an Subs only operate at top-speed when they are both on workers.\n\n    Parameters\n    ----------\n    name: object (msgpack serializable)\n        The name of the group of Pubs and Subs on which to participate\n\n    Examples\n    --------\n    >>> pub = Pub('my-topic')\n    >>> sub = Sub('my-topic')\n    >>> pub.put([1, 2, 3])\n    >>> sub.get()\n    [1, 2, 3]\n\n    You can also use sub within a for loop:\n\n    >>> for msg in sub:  # doctest: +SKIP\n    ...     print(msg)\n\n    or an async for loop\n\n    >>> async for msg in sub:  # doctest: +SKIP\n    ...     print(msg)\n\n    Similarly the ``.get`` method will return an awaitable if used by an async\n    client or within the IOLoop thread of a worker\n\n    >>> await sub.get()  # doctest: +SKIP\n\n    You can see the set of connected worker subscribers by looking at the\n    ``.subscribers`` attribute:\n\n    >>> pub.subscribers\n    {'tcp://...': {},\n     'tcp://...': {}}\n\n    See Also\n    --------\n    Sub\n    \"\"\"\n    def __init__(self, name, worker=None, client=None):\n        if worker is None and client is None:\n            from distributed import get_worker, get_client\n            try:\n                worker = get_worker()\n            except Exception:\n                client = get_client()\n\n        self.subscribers = dict()\n        self.worker = worker\n        self.client = client\n        assert client or worker\n        if self.worker:\n            self.scheduler = self.worker.scheduler\n            self.loop = self.worker.loop\n        elif self.client:\n            self.scheduler = self.client.scheduler\n            self.loop = self.client.loop\n\n        self.name = name\n        self._started = False\n        self._buffer = []\n\n        self.loop.add_callback(self._start)\n\n        if self.worker:\n            pubsub = self.worker.extensions['pubsub']\n            self.loop.add_callback(pubsub.publishers[name].add, self)\n            finalize(self, pubsub.trigger_cleanup)\n\n    @gen.coroutine\n    def _start(self):\n        if self.worker:\n            result = yield self.scheduler.pubsub_add_publisher(\n                    name=self.name,\n                    worker=self.worker.address\n            )\n            self.subscribers.update(result['subscribers'])\n            pubsub = self.worker.extensions['pubsub']\n            pubsub.publish_to_scheduler[self.name] = result['publish-scheduler']\n\n        self._started = True\n\n        for msg in self._buffer:\n            self.put(msg)\n        del self._buffer[:]\n\n    def _put(self, msg):\n        if not self._started:\n            self._buffer.append(msg)\n            return\n\n        data = {'op': 'pubsub-msg', 'name': self.name, 'msg': to_serialize(msg)}\n\n        if self.worker:\n            for sub in self.subscribers:\n                self.worker.send_to_worker(sub, data)\n\n            if self.worker.extensions['pubsub'].publish_to_scheduler[self.name]:\n                self.worker.batched_stream.send(data)\n        elif self.client:\n            self.client.scheduler_comm.send(data)\n\n    def put(self, msg):\n        \"\"\" Publish a message to all subscribers of this topic \"\"\"\n        self.loop.add_callback(self._put, msg)\n\n\nclass Sub(object):\n    \"\"\" Subscribe to a Publish/Subscribe topic\n\n    See Also\n    --------\n    Pub: for full docstring\n    \"\"\"\n    def __init__(self, name, worker=None,",
+      "total_lines": 405,
+      "ref": "175fccd82bc1b3d37dfcf940e6b925081e3be0d0"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "__init__",
+      "class_name": "PubSubClientExtension",
+      "start_line": 152,
+      "end_line": 159,
+      "satd_line": 159,
+      "matched_by": "normalized_source",
+      "source": "    def __init__(self, client):\n        self.client = client\n        self.client._stream_handlers.update({\n            'pubsub-msg': self.handle_message\n        })\n\n        self.subscribers = defaultdict(weakref.WeakSet)\n        self.client.extensions['pubsub'] = self  # TODO: circular reference",
+      "calls": [
+        "defaultdict"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "client",
+        "handle_message",
+        "subscribers"
+      ],
+      "global_uses": [
+        "defaultdict",
+        "weakref"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": "PubSubClientExtension",
+      "related_methods_count": 2,
+      "related_attributes_count": 2,
+      "related_methods": [
+        {
+          "symbol_name": "handle_message",
+          "start_line": 161,
+          "end_line": 167,
+          "relevance": [
+            "shared_attrs=2"
+          ],
+          "source": "    def handle_message(self, name=None, msg=None):\n        for sub in self.subscribers[name]:\n            sub._put(msg)\n\n        if not self.subscribers[name]:\n            self.client.scheduler_comm.send({'op': 'pubsub-remove-subscribers',\n                                             'name': name})"
+        },
+        {
+          "symbol_name": "cleanup",
+          "start_line": 172,
+          "end_line": 177,
+          "relevance": [
+            "shared_attrs=2"
+          ],
+          "source": "    def cleanup(self):\n        for name, s in self.subscribers.items():\n            if not s:\n                msg = {'op': 'pubsub-remove-subscriber',\n                       'name': name}\n                self.client.scheduler_comm.send(msg)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "subscribers",
+          "start_line": 157,
+          "end_line": 159,
+          "relevance": [
+            "direct_attribute_use",
+            "keyword_source_overlap=2"
+          ],
+          "snippet": "\n        self.subscribers = defaultdict(weakref.WeakSet)\n        self.client.extensions['pubsub'] = self  # TODO: circular reference"
+        },
+        {
+          "attribute": "client",
+          "start_line": 152,
+          "end_line": 154,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "    def __init__(self, client):\n        self.client = client\n        self.client._stream_handlers.update({"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "handle_message",
+          "class_name": "PubSubClientExtension",
+          "start_line": 161,
+          "end_line": 167,
+          "source": "    def handle_message(self, name=None, msg=None):\n        for sub in self.subscribers[name]:\n            sub._put(msg)\n\n        if not self.subscribers[name]:\n            self.client.scheduler_comm.send({'op': 'pubsub-remove-subscribers',\n                                             'name': name})"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

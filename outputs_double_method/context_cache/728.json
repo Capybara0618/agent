@@ -1,0 +1,220 @@
+{
+  "task_id": "728",
+  "repo_owner": "containerbuildsystem",
+  "repo_name": "osbs-client",
+  "file_path": "osbs/api.py",
+  "commit": "cb53da246a9c1a013c74afe78703918d0b66201a",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T18:47:12+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "cb53da246a9c1a013c74afe78703918d0b66201a",
+    "symbol_name": "create_source_container_build",
+    "satd_line": 865,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 5,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T18:47:12+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "osbs/api.py",
+    "original_signature": "def create_source_container_build(",
+    "target_file": {
+      "ok": true,
+      "path": "osbs/api.py",
+      "sha": "f8ba4ec744af08fdeee4a6113c3bccf7da201115",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/osbs-client/cb53da246a9c1a013c74afe78703918d0b66201a/osbs/api.py",
+      "content_excerpt": "\"\"\"\nCopyright (c) 2015 Red Hat, Inc\nAll rights reserved.\n\nThis software may be modified and distributed under the terms\nof the BSD license. See the LICENSE file for details.\n\"\"\"\nfrom __future__ import print_function, unicode_literals, absolute_import\n\nfrom collections import namedtuple\nimport json\nimport logging\nimport os\nimport os.path\nimport stat\nimport sys\nimport warnings\nimport getpass\nfrom functools import wraps\nfrom contextlib import contextmanager\nfrom types import GeneratorType\n\nfrom osbs.build.build_requestv2 import (\n    BaseBuildRequest,\n    BuildRequestV2,\n    SourceBuildRequest,\n)\nfrom osbs.build.user_params import load_user_params_from_json\nfrom osbs.build.plugins_configuration import PluginsConfiguration\nfrom osbs.build.build_response import BuildResponse\nfrom osbs.build.pod_response import PodResponse\nfrom osbs.build.config_map_response import ConfigMapResponse\nfrom osbs.constants import (BUILD_RUNNING_STATES, WORKER_OUTER_TEMPLATE,\n                            WORKER_INNER_TEMPLATE, WORKER_CUSTOMIZE_CONF,\n                            ORCHESTRATOR_OUTER_TEMPLATE, ORCHESTRATOR_INNER_TEMPLATE,\n                            ORCHESTRATOR_CUSTOMIZE_CONF, BUILD_TYPE_WORKER,\n                            BUILD_TYPE_ORCHESTRATOR, BUILD_FINISHED_STATES,\n                            DEFAULT_ARRANGEMENT_VERSION, REACTOR_CONFIG_ARRANGEMENT_VERSION,\n                            ANNOTATION_SOURCE_REPO, ANNOTATION_INSECURE_REPO, FILTER_KEY,\n                            RELEASE_LABEL_FORMAT,\n                            ORCHESTRATOR_SOURCES_OUTER_TEMPLATE,\n                            )\nfrom osbs.core import Openshift\nfrom osbs.exceptions import (OsbsException, OsbsValidationException, OsbsResponseException,\n                             OsbsOrchestratorNotEnabled)\n# import utils in this way, so that we can mock standalone functions with flexmock\nfrom osbs import utils\nfrom osbs.utils import (retry_on_conflict, graceful_chain_get, RegistryURI,\n                        strip_registry_and_tag_from_image)\n\nfrom six.moves import http_client, input\n\n\n# Decorator for API methods.\ndef osbsapi(func):\n    @wraps(func)\n    def catch_exceptions(*args, **kwargs):\n        # XXX: remove this in the future\n        if kwargs.pop(\"namespace\", None):\n            warnings.warn(\"OSBS.%s: the 'namespace' argument is no longer supported\" %\n                          func.__name__)\n        try:\n            return func(*args, **kwargs)\n        except OsbsException:\n            # Re-raise OsbsExceptions\n            raise\n        except Exception as ex:\n            # Propogate flexmock errors immediately (used in test cases)\n            if getattr(ex, '__module__', None) == 'flexmock':\n                raise\n\n            # Convert anything else to OsbsException\n\n            # Python 3 has implicit exception chaining and enhanced\n            # reporting, so you get the original traceback as well as\n            # the one originating here.\n            # For Python 2, let's do that explicitly.\n            raise OsbsException(cause=ex, traceback=sys.exc_info()[2])\n\n    return catch_exceptions\n\n\nlogger = logging.getLogger(__name__)\n\nLogEntry = namedtuple('LogEntry', ['platform', 'line'])\n\n\ndef validate_arrangement_version(arrangement_version):\n    \"\"\"Validate if the arrangement_version is supported\n\n    Shows a warning when version is deprecated\n\n    :param int|None arrangement_version: version to be validated\n    :raises ValueError: when version is not supported\n    \"\"\"\n    if arrangement_version is None:\n        return\n\n    if arrangement_version <= 5:\n        raise ValueError('arrangement_version <= 5 is no longer supported')\n\n\nclass OSBS(object):\n    \"\"\"\n    Note: all API methods return osbs.http.Response object. This is, due to historical\n    reasons, untrue for list_builds and get_user, which return list of BuildResponse objects\n    and dict respectively.\n    \"\"\"\n\n    _GIT_LABEL_KEYS = ('git-repo-name', 'git-branch', 'git-full-repo')\n    _OLD_LABEL_KEYS = ('git-repo-name', 'git-branch')\n\n    @osbsapi\n    def __init__(self, openshift_configuration, build_configuration):\n        \"\"\" \"\"\"\n        self.os_conf = openshift_configuration\n        self.build_conf = build_configuration\n        self.os = Openshift(openshift_api_url=self.os_conf.get_openshift_api_uri(),\n                            openshift_oauth_url=self.os_conf.get_openshift_oauth_api_uri(),\n                            k8s_api_url=self.os_conf.get_k8s_api_uri(),\n                            verbose=self.os_conf.get_verbosity(),\n                            username=self.os_conf.get_username(),\n                            password=self.os_conf.get_password(),\n                            use_kerberos=self.os_conf.get_use_kerberos(),\n                            client_cert=self.os_conf.get_client_cert(),\n                            client_key=self.os_conf.get_client_key(),\n                            kerberos_keytab=self.os_conf.get_kerberos_keytab(),\n                            kerberos_principal=self.os_conf.get_kerberos_principal(),\n                            kerberos_ccache=self.os_conf.get_kerberos_ccache(),\n                            use_auth=self.os_conf.get_use_auth(),\n                            verify_ssl=self.os_conf.get_verify_ssl(),\n                            token=self.os_conf.get_oauth2_token(),\n                            namespace=self.os_conf.get_namespace())\n        self._bm = None\n\n    @osbsapi\n    def list_builds(self, field_selector=None, koji_task_id=None, running=None,\n                    labels=None):\n        \"\"\"\n        List builds with matching fields\n\n        :param field_selector: str, field selector for Builds\n        :param koji_task_id: str, only list builds for Koji Task ID\n        :return: BuildResponse list\n        \"\"\"\n\n        if running:\n            running_fs = \",\".join([\"status!={status}\".format(status=status.capitalize())\n                                  for status in BUILD_FINISHED_STATES])\n            if not field_selector:\n                field_selector = running_fs\n            else:\n                field_selector = ','.join([field_selector, running_fs])\n        response = self.os.list_builds(field_selector=field_selector,\n                                       koji_task_id=koji_task_id, labels=labels)\n        serialized_response = response.json()\n        build_list = []\n        for build in serialized_response[\"items\"]:\n            build_list.append(BuildResponse(build, self))\n\n        return build_list\n\n    def watch_builds(self, field_selector=None):\n        kwargs = {}\n        if field_selector is not None:\n            kwargs['fieldSelector'] = field_selector\n\n        for changetype, obj in self.os.watch_resource(\"builds\", **kwargs):\n            yield changetype, obj\n\n    @osbsapi\n    def get_build(self, build_id):\n        response = self.os.get_build(build_id)\n        build_response = BuildResponse(response.json(), self)\n        return build_response\n\n    @osbsapi\n    def cancel_build(self, build_id):\n        response = self.os.cancel_build(build_id)\n        build_response = BuildResponse(response.json(), self)\n        return build_response\n\n    @osbsapi\n    def get_pod_for_build(self, build_id):\n        \"\"\"\n        :return: PodResponse object for pod relating to the build\n        \"\"\"\n        pods = self.os.list_pods(label='openshift.io/build.name=%s' % build_id)\n        serialized_response = pods.json()\n        pod_list = [PodResponse(pod) for pod in serialized_response[\"items\"]]\n        if not pod_list:\n            raise OsbsException(\"No pod for build\")\n        elif len(pod_list) != 1:\n            raise OsbsException(\"Only one pod expected but %d returned\" % len(pod_list))\n        return pod_list[0]\n\n    def _set_build_request_resource_limits(self, build_request):\n        \"\"\"Apply configured resource limits to build_request\"\"\"\n        assert isinstance(build_request, BaseBuildRequest)\n        cpu_limit = self.build_conf.get_cpu_limit()\n        memory_limit = self.build_conf.get_memory_limit()\n        storage_limit = self.build_conf.get_storage_limit()\n        if any(\n                limit is not None\n                for limit in (cpu_limit, memory_limit, storage_limit)\n        ):\n            build_request.set_resource_limits(cpu=cpu_limit,\n                                              memory=memory_limit,\n                                              storage=storage_limit)\n\n    @osbsapi\n    def get_build_request(self, build_type=None, inner_template=None,\n                          outer_template=None, customize_conf=None,\n                          arrangement_version=DEFAULT_ARRANGEMENT_VERSION):\n        \"\"\"\n        return instance of BuildRequest or BuildRequestV2\n\n        :param build_type: str, unused\n        :param inner_template: str, name of inner template for BuildRequest\n        :param outer_template: str, name of outer template for BuildRequest\n        :param customize_conf: str, name of customization config for BuildRequest\n        :param arrangement_version: int, value of the arrangement version\n\n        :return: instance of BuildRequest or BuildRequestV2\n        \"\"\"\n        if build_type is not None:\n            warnings.warn(\"build types are deprecated, do not use the build_type argument\")\n\n        validate_arrangement_version(arrangement_version)\n\n        build_request = BuildRequestV2(build_json_store=self.os_conf.get_build_json_store(),\n                                       outer_template=outer_template,\n                                       customize_conf=customize_conf)\n\n        self._set_build_request_resource_limits(build_request)\n        return build_request\n\n    @osbsapi\n    def get_source_container_build_request(\n            self, outer_template=None,\n            arrangement_version=DEFAULT_ARRANGEMENT_VERSION,\n    ):\n        \"\"\"\n        return instance of SourceBuildRequest\n\n        :param str outer_template: name of outer template for SourceBuildRequest\n        :return: instance of SourceBuildRequest\n        \"\"\"\n        validate_arrangement_version(arrangement_version)\n\n        build_request = SourceBuildRequest(\n            build_json_store=self.os_conf.get_build_json_store(),\n            outer_template=outer_template,\n        )\n\n        self._set_build_request_resource_limits(build_request)\n        return build_request\n\n    @osbsapi\n    def create_build_from_buildrequest(self, build_request):\n        \"\"\"\n        render provided build_request and submit build from it\n\n        :param build_request: instance of build.build_request.BuildRequest\n        :return: instance of build.build_response.BuildResponse\n        \"\"\"\n        build_request.set_openshift_required_version(self.os_conf.get_openshift_required_version())\n        build = build_request.render()\n        response = self.os.create_build(json.dumps(build))\n        build_response = BuildResponse(response.json(), self)\n        return build_response\n\n    def _get_running_builds_for_build_config(self, build_config_id):\n        all_builds_for_bc = self.os.list_builds(build_config_id=build_config_id).json()['items']\n        running = []\n        for b in all_builds_for_bc:\n            br = BuildResponse(b, self)\n            if br.is_pending() or br.is_running():\n                running.append(br)\n        return running\n\n    def _get_not_cancelled_builds_for_koji_task(self, koji_task_id):\n        all_builds_for_task = self.os.list_builds(koji_task_id=koji_task_id).json()['items']\n        not_cancelled = []\n\n        for b in all_builds_for_task:\n            br = BuildResponse(b, self)\n            build_labels = br.get_labels()\n            if not br.is_cancelled() and build_labels['is_autorebuild'] == \"false\":\n                not_cancelled.append(br)\n\n        return not_cancelled\n\n    def _verify_labels_match(self, new_build_config, existing_build_config):\n        new_labels = new_build_config['metadata']['labels']\n        existing_labels = existing_build_config['metadata']['labels']\n\n        for key in self._GIT_LABEL_KEYS:\n       ",
+      "total_lines": 1445,
+      "ref": "cb53da246a9c1a013c74afe78703918d0b66201a"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "create_source_container_build",
+      "class_name": "OSBS",
+      "start_line": 834,
+      "end_line": 905,
+      "satd_line": 865,
+      "matched_by": "signature_or_comment",
+      "source": "    def create_source_container_build(\n        self,\n        sources_for_koji_build_nvr=None,\n        outer_template=None,\n        arrangement_version=None,\n        scratch=None,\n        user=None,\n        platform=None,\n        koji_task_id=None,\n        reactor_config_override=None,\n        target=None,\n    ):\n        \"\"\"\n        Take input args, create build request and submit the source image build\n\n        :return: instance of BuildRequest\n        \"\"\"\n        build_request = self.get_source_container_build_request(\n            outer_template=outer_template or ORCHESTRATOR_SOURCES_OUTER_TEMPLATE,\n            arrangement_version=arrangement_version\n        )\n\n        if not sources_for_koji_build_nvr:\n            raise OsbsValidationException(\n                \"required argument 'sources_for_koji_build_nvr' can't be None\"\n            )\n\n        name, version, release = sources_for_koji_build_nvr.split('-', 3)\n\n        build_request.set_params(\n            arrangement_version=arrangement_version,\n            component=name,  # TODO check this\n            build_image=self.build_conf.get_build_image(),\n            build_imagestream=self.build_conf.get_build_imagestream(),\n            build_from=self.build_conf.get_build_from(),\n            builder_build_json_dir=self.build_conf.get_builder_build_json_store(),\n            koji_target=target,\n            koji_task_id=koji_task_id,\n            orchestrator_deadline=self.build_conf.get_orchestor_deadline(),\n            platform=platform,\n            reactor_config_map=self.build_conf.get_reactor_config_map(),\n            reactor_config_override=reactor_config_override,\n            scratch=self.build_conf.get_scratch(scratch),\n            sources_for_koji_build_nvr=sources_for_koji_build_nvr,\n            user=user,\n            worker_deadline=self.build_conf.get_worker_deadline(),\n        )\n        build_request.set_openshift_required_version(\n            self.os_conf.get_openshift_required_version()\n        )\n\n        builds_for_koji_task = []\n        if koji_task_id:\n            # try to find build for koji_task which isn't canceled and use that one\n            builds_for_koji_task = self._get_not_cancelled_builds_for_koji_task(koji_task_id)\n\n        builds_count = len(builds_for_koji_task)\n        if builds_count == 1:\n            logger.info(\"found running build for koji task: %s\",\n                        builds_for_koji_task[0].get_build_name())\n            response =\\\n                BuildResponse(self.os.get_build(builds_for_koji_task[0].get_build_name()).json(),\n                              self)\n        elif builds_count > 1:\n            raise OsbsException(\"Multiple builds %s for koji task id %s\" %\n                                (builds_count, koji_task_id))\n        else:\n            logger.info(\"creating source container image build\")\n            response = self._create_build_directly(build_request)\n\n        logger.debug(response.json)\n        return response",
+      "calls": [
+        "BuildResponse",
+        "OsbsException",
+        "OsbsValidationException",
+        "len"
+      ],
+      "self_calls": [
+        "_create_build_directly",
+        "_get_not_cancelled_builds_for_koji_task",
+        "get_source_container_build_request"
+      ],
+      "self_attrs": [
+        "_create_build_directly",
+        "_get_not_cancelled_builds_for_koji_task",
+        "build_conf",
+        "get_source_container_build_request",
+        "os",
+        "os_conf"
+      ],
+      "global_uses": [
+        "BuildResponse",
+        "ORCHESTRATOR_SOURCES_OUTER_TEMPLATE",
+        "OsbsException",
+        "OsbsValidationException",
+        "logger",
+        "osbsapi",
+        "response"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "get_source_container_build_request",
+          "class_name": "OSBS",
+          "start_line": 239,
+          "end_line": 257,
+          "relevance": [
+            "direct_call",
+            "same_class"
+          ],
+          "source": "    def get_source_container_build_request(\n            self, outer_template=None,\n            arrangement_version=DEFAULT_ARRANGEMENT_VERSION,\n    ):\n        \"\"\"\n        return instance of SourceBuildRequest\n\n        :param str outer_template: name of outer template for SourceBuildRequest\n        :return: instance of SourceBuildRequest\n        \"\"\"\n        validate_arrangement_version(arrangement_version)\n\n        build_request = SourceBuildRequest(\n            build_json_store=self.os_conf.get_build_json_store(),\n            outer_template=outer_template,\n        )\n\n        self._set_build_request_resource_limits(build_request)\n        return build_request"
+        },
+        {
+          "symbol_name": "_get_not_cancelled_builds_for_koji_task",
+          "class_name": "OSBS",
+          "start_line": 282,
+          "end_line": 292,
+          "relevance": [
+            "direct_call",
+            "same_class"
+          ],
+          "source": "    def _get_not_cancelled_builds_for_koji_task(self, koji_task_id):\n        all_builds_for_task = self.os.list_builds(koji_task_id=koji_task_id).json()['items']\n        not_cancelled = []\n\n        for b in all_builds_for_task:\n            br = BuildResponse(b, self)\n            build_labels = br.get_labels()\n            if not br.is_cancelled() and build_labels['is_autorebuild'] == \"false\":\n                not_cancelled.append(br)\n\n        return not_cancelled"
+        },
+        {
+          "symbol_name": "_create_build_directly",
+          "class_name": "OSBS",
+          "start_line": 375,
+          "end_line": 409,
+          "relevance": [
+            "direct_call",
+            "same_class"
+          ],
+          "source": "    def _create_build_directly(self, build_request, unique=None):\n        logger.debug(build_request)\n        build_json = build_request.render()\n        build_json['kind'] = 'Build'\n        build_json['spec']['serviceAccount'] = 'builder'\n\n        builder_img = build_json['spec']['strategy']['customStrategy']['from']\n        build_name = builder_img['name']\n        build_kind = builder_img['kind']\n\n        kind = builder_img['kind']\n        if kind == 'ImageStreamTag':\n            # Only BuildConfigs get to specify an ImageStreamTag. When\n            # creating Builds directly we need to specify a\n            # DockerImage.\n            response = self.get_image_stream_tag(builder_img['name'])\n            ref = response.json()['image']['dockerImageReference']\n            builder_img['kind'] = 'DockerImage'\n            builder_img['name'] = ref\n\n        build_json['metadata'].setdefault('annotations', {})\n        build_json['metadata']['annotations']['from'] = json.dumps({\n            'kind': build_kind,\n            'name': build_name})\n\n        if unique:\n            unique_labels = {}\n            for u in unique:\n                unique_labels[u] = build_json['metadata']['labels'][u]\n            running_builds = self.list_builds(running=True, labels=unique_labels)\n            if running_builds:\n                raise RuntimeError('Matching build(s) already running: {}'\n                                   .format(', '.join(x.get_build_name() for x in running_builds)))\n\n        return BuildResponse(self.os.create_build(build_json).json(), self)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "OSBS",
+      "related_methods_count": 2,
+      "related_attributes_count": 3,
+      "related_methods": [
+        {
+          "symbol_name": "get_source_container_build_request",
+          "start_line": 239,
+          "end_line": 257,
+          "relevance": [
+            "direct_self_call",
+            "shared_attrs=1"
+          ],
+          "source": "    def get_source_container_build_request(\n            self, outer_template=None,\n            arrangement_version=DEFAULT_ARRANGEMENT_VERSION,\n    ):\n        \"\"\"\n        return instance of SourceBuildRequest\n\n        :param str outer_template: name of outer template for SourceBuildRequest\n        :return: instance of SourceBuildRequest\n        \"\"\"\n        validate_arrangement_version(arrangement_version)\n\n        build_request = SourceBuildRequest(\n            build_json_store=self.os_conf.get_build_json_store(),\n            outer_template=outer_template,\n        )\n\n        self._set_build_request_resource_limits(build_request)\n        return build_request"
+        },
+        {
+          "symbol_name": "_get_not_cancelled_builds_for_koji_task",
+          "start_line": 282,
+          "end_line": 292,
+          "relevance": [
+            "direct_self_call",
+            "shared_attrs=1"
+          ],
+          "source": "    def _get_not_cancelled_builds_for_koji_task(self, koji_task_id):\n        all_builds_for_task = self.os.list_builds(koji_task_id=koji_task_id).json()['items']\n        not_cancelled = []\n\n        for b in all_builds_for_task:\n            br = BuildResponse(b, self)\n            build_labels = br.get_labels()\n            if not br.is_cancelled() and build_labels['is_autorebuild'] == \"false\":\n                not_cancelled.append(br)\n\n        return not_cancelled"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "os_conf",
+          "start_line": 115,
+          "end_line": 117,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        \"\"\" \"\"\"\n        self.os_conf = openshift_configuration\n        self.build_conf = build_configuration"
+        },
+        {
+          "attribute": "build_conf",
+          "start_line": 116,
+          "end_line": 118,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        self.os_conf = openshift_configuration\n        self.build_conf = build_configuration\n        self.os = Openshift(openshift_api_url=self.os_conf.get_openshift_api_uri(),"
+        },
+        {
+          "attribute": "os",
+          "start_line": 117,
+          "end_line": 134,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        self.build_conf = build_configuration\n        self.os = Openshift(openshift_api_url=self.os_conf.get_openshift_api_uri(),\n                            openshift_oauth_url=self.os_conf.get_openshift_oauth_api_uri(),\n                            k8s_api_url=self.os_conf.get_k8s_api_uri(),\n                            verbose=self.os_conf.get_verbosity(),\n                            username=self.os_conf.get_username(),\n                            password=self.os_conf.get_password(),\n                            use_kerberos=self.os_conf.get_use_kerberos(),\n                            client_cert=self.os_conf.get_client_cert(),\n                            client_key=self.os_conf.get_client_key(),\n                            kerberos_keytab=self.os_conf.get_kerberos_keytab(),\n                            kerberos_principal=self.os_conf.get_kerberos_principal(),\n                            kerberos_ccache=self.os_conf.get_kerberos_ccache(),\n                            use_auth=self.os_conf.get_use_auth(),\n                            verify_ssl=self.os_conf.get_verify_ssl(),\n                            token=self.os_conf.get_oauth2_token(),\n                            namespace=self.os_conf.get_namespace())\n        self._bm = None"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_do_create_prod_build",
+          "class_name": "OSBS",
+          "start_line": 641,
+          "end_line": 821,
+          "source": "    def _do_create_prod_build(self, git_uri, git_ref,\n                              git_branch,\n                              user,\n                              component=None,\n                              target=None,\n                              architecture=None, yum_repourls=None,\n                              koji_task_id=None,\n                              scratch=None,\n                              platform=None,\n                              platforms=None,\n                              build_type=None,\n                              release=None,\n                              inner_template=None,\n                              outer_template=None,\n                              customize_conf=None,\n                              arrangement_version=None,\n                              filesystem_koji_task_id=None,\n                              koji_upload_dir=None,\n                              is_auto=False,\n                              koji_parent_build=None,\n                              isolated=None,\n                              flatpak=False,\n                              signing_intent=None,\n                              compose_ids=None,\n                              reactor_config_override=None,\n                              parent_images_digests=None,\n                              git_commit_depth=None,\n                              operator_manifests_extract_platform=None,\n                              skip_build=False,\n                              triggered_after_koji_task=None,\n                              **kwargs):\n\n        if flatpak:\n            if isolated:\n                # Flatpak builds from a particular stream autogenerate the release\n                # as <module_version>.<n>; it doesn't make sense to make a fix\n                # from specific one of these autogenerated version. What an isolated\n                # fix for module requires will have to be determined from experience.\n                raise ValueError(\"Flatpak build cannot be isolated\")\n\n        repo_info = utils.get_repo_info(git_uri, git_ref, git_branch=git_branch,\n                                        depth=git_commit_depth)\n        build_request = self.get_build_request(inner_template=inner_template,\n                                               outer_template=outer_template,\n                                               customize_conf=customize_conf,\n                                               arrangement_version=arrangement_version)\n\n        if flatpak:\n            req_labels, base_image = self._get_flatpak_labels(repo_info)\n        else:\n            req_labels, base_image = self._check_labels(repo_info)\n\n        if not git_branch:\n            raise OsbsValidationException(\"required argument 'git_branch' can't be None\")\n\n        build_request.set_params(\n            git_uri=git_uri,\n            git_ref=git_ref,\n            git_branch=git_branch,\n            user=user,\n            component=req_labels[utils.Labels.LABEL_TYPE_COMPONENT],\n            build_image=self.build_conf.get_build_image(),\n            build_imagestream=self.build_conf.get_build_imagestream(),\n            build_from=self.build_conf.get_build_from(),\n            base_image=base_image,\n            name_label=req_labels[utils.Labels.LABEL_TYPE_NAME],\n            registry_uris=self.build_conf.get_registry_uris(),\n            registry_secrets=self.build_conf.get_registry_secrets(),\n            source_registry_uri=self.build_conf.get_source_registry_uri(),\n            registry_api_versions=self.build_conf.get_registry_api_versions(platform),\n            openshift_uri=self.os_conf.get_openshift_base_uri(),\n            builder_openshift_url=self.os_conf.get_builder_openshift_url(),\n            kojiroot=self.build_conf.get_kojiroot(),\n            kojihub=self.build_conf.get_kojihub(),\n            sources_command=self.build_conf.get_sources_command(),\n            koji_target=target,\n            koji_certs_secret=self.build_conf.get_koji_certs_secret(),\n            koji_task_id=koji_task_id,\n            koji_use_kerberos=self.build_conf.get_koji_use_kerberos(),\n            koji_kerberos_keytab=self.build_conf.get_koji_kerberos_keytab(),\n            koji_kerberos_principal=self.build_conf.get_koji_kerberos_principal(),\n            flatpak=flatpak,\n            odcs_url=self.build_conf.get_odcs_url(),\n            odcs_insecure=self.build_conf.get_odcs_insecure(),\n            odcs_openidc_secret=self.build_conf.get_odcs_openidc_secret(),\n            odcs_ssl_secret=self.build_conf.get_odcs_ssl_secret(),\n            pdc_url=self.build_conf.get_pdc_url(),\n            pdc_insecure=self.build_conf.get_pdc_insecure(),\n            architecture=architecture,\n            platforms=platforms,\n            platform=platform,\n            build_type=build_type,\n            release=release,\n            vendor=self.build_conf.get_vendor(),\n            build_host=self.build_conf.get_build_host(),\n            authoritative_registry=self.build_conf.get_authoritative_registry(),\n            distribution_scope=self.build_conf.get_distribution_scope(),\n            yum_repourls=yum_repourls,\n            proxy=self.build_conf.get_proxy(),\n            smtp_host=self.build_conf.get_smtp_host(),\n            smtp_from=self.build_conf.get_smtp_from(),\n            smtp_additional_addresses=self.build_conf.get_smtp_additional_addresses(),\n            smtp_error_addresses=self.build_conf.get_smtp_error_addresses(),\n            smtp_email_domain=self.build_conf.get_smtp_email_domain(),\n            smtp_to_submitter=self.build_conf.get_smtp_to_submitter(),\n            smtp_to_pkgowner=self.build_conf.get_smtp_to_pkgowner(),\n            use_auth=self.build_conf.get_builder_use_auth(),\n            builder_build_json_dir=self.build_conf.get_builder_build_json_store(),\n            scratch=self.build_conf.get_scratch(scratch),\n            reactor_config_secret=self.build_conf.get_reactor_config_secret(),\n            reactor_config_map=self.build_conf.get_reactor_config_map(),\n            reactor_config_override=reactor_config_override,\n            client_config_secret=self.build_conf.get_client_config_secret(),\n            token_secrets=self.build_conf.get_token_secrets(),\n            arrangement_version=arrangement_version,\n            info_url_format=self.build_conf.get_info_url_format(),\n            artifacts_allowed_domains=self.build_conf.get_artifacts_allowed_domains(),\n            equal_labels=self.build_conf.get_equal_labels(),\n            platform_node_selector=self.build_conf.get_platform_node_selector(platform),\n            scratch_build_node_selector=self.build_conf.get_scratch_build_node_selector(),\n            explicit_build_node_selector=self.build_conf.get_explicit_build_node_selector(),\n            isolated_build_node_selector=self.build_conf.get_isolated_build_node_selector(),\n            auto_build_node_selector=self.build_conf.get_auto_build_node_selector(),\n            is_auto=is_auto,\n            triggered_after_koji_task=triggered_after_koji_task,\n            skip_build=skip_build,\n            filesystem_koji_task_id=filesystem_koji_task_id,\n            koji_upload_dir=koji_upload_dir,\n            platform_descriptors=self.build_conf.get_platform_descriptors(),\n            koji_parent_build=koji_parent_build,\n            group_manifests=self.os_conf.get_group_manifests(),\n            isolated=isolated,\n            prefer_schema1_digest=self.build_conf.get_prefer_schema1_digest(),\n            signing_intent=signing_intent,\n            compose_ids=compose_ids,\n            osbs_api=self,\n            parent_images_digests=parent_images_digests,\n            tags_from_yaml=repo_info.additional_tags.from_container_yaml,\n            additional_tags=repo_info.additional_tags.tags,\n            git_commit_depth=repo_info.configuration.depth,\n            operator_manifests_extract_platform=operator_manifests_extract_platform,\n            worker_deadline=self.build_conf.get_worker_deadline(),\n            orchestrator_deadline=self.build_conf.get_orchestor_deadline(),\n        )\n        build_request.set_openshift_required_version(self.os_conf.get_openshift_required_version())\n        build_request.set_repo_info(repo_info)\n\n        if isolated:\n            if build_request.is_from_scratch_image():\n                raise ValueError('\"FROM scratch\" image build cannot be isolated')\n\n        builds_for_koji_task = []\n        if koji_task_id and build_type == BUILD_TYPE_ORCHESTRATOR:\n            # try to find build for koji_task which isn't canceled and use that one\n            builds_for_koji_task = self._get_not_cancelled_builds_for_koji_task(koji_task_id)\n\n        builds_count = len(builds_for_koji_task)\n        if builds_count == 1:\n            logger.info(\"found running build for koji task: %s\",\n                        builds_for_koji_task[0].get_build_name())\n            response =\\\n                BuildResponse(self.os.get_build(builds_for_koji_task[0].get_build_name()).json(),\n                              self)\n        elif builds_count > 1:\n            raise OsbsException(\"Multiple builds %s for koji task id %s\" %\n                                (builds_count, koji_task_id))\n        elif build_request.scratch:\n            logger.info(\"creating scratch build\")\n            response = self._create_scratch_build(build_request)\n        elif build_request.isolated:\n            logger.info(\"creating isolated build\")\n            response = self._create_isolated_build(build_request)\n        else:\n            logger.info(\"creating build from build_config\")\n            response = self._create_build_config_and_build(build_request)\n        # when build is skipped\n        if response is None:\n            return\n\n        logger.debug(response.json)\n        return response"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

@@ -1,0 +1,188 @@
+{
+  "task_id": "939",
+  "repo_owner": "label-sleuth",
+  "repo_name": "label-sleuth",
+  "file_path": "label_sleuth/orchestrator/orchestrator_api.py",
+  "commit": "064cc226a49de903f91fc6600143ee0f62d78707",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T11:04:46+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "064cc226a49de903f91fc6600143ee0f62d78707",
+    "symbol_name": "delete_workspace",
+    "satd_line": 105,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 2,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T11:04:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "label_sleuth/orchestrator/orchestrator_api.py",
+    "original_signature": "def delete_workspace(self, workspace_id: str):",
+    "target_file": {
+      "ok": true,
+      "path": "label_sleuth/orchestrator/orchestrator_api.py",
+      "sha": "6f8d27620ab6a5bc5a36f4ff74f24bc9509e0cdd",
+      "download_url": "https://raw.githubusercontent.com/label-sleuth/label-sleuth/064cc226a49de903f91fc6600143ee0f62d78707/label_sleuth/orchestrator/orchestrator_api.py",
+      "content_excerpt": "#\n#  Copyright (c) 2022 IBM Corp.\n#  Licensed under the Apache License, Version 2.0 (the \"License\");\n#  you may not use this file except in compliance with the License.\n#  You may obtain a copy of the License at\n#\n#  http://www.apache.org/licenses/LICENSE-2.0\n#\n#  Unless required by applicable law or agreed to in writing, software\n#  distributed under the License is distributed on an \"AS IS\" BASIS,\n#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n#  See the License for the specific language governing permissions and\n#  limitations under the License.\n#\n\nimport functools\nimport itertools\nimport logging\nimport os\nimport sys\nimport time\n\nfrom collections import Counter, defaultdict\nfrom concurrent.futures.thread import ThreadPoolExecutor\nfrom datetime import datetime\nfrom statistics import mean\nfrom typing import Mapping, List, Sequence, Union, Tuple\n\nimport jsonpickle\nimport pandas as pd\n\nfrom label_sleuth.active_learning.core.active_learning_factory import ActiveLearningFactory\nfrom label_sleuth.analysis_utils.labeling_reports import get_suspected_labeling_contradictions_by_distance_with_diffs, \\\n    get_disagreements_using_cross_validation\nfrom label_sleuth.config import Configuration\nfrom label_sleuth.data_access.core.data_structs import DisplayFields, Document, Label, TextElement, LABEL_POSITIVE, \\\n    LABEL_NEGATIVE, WorkspaceModelType, MulticlassLabel\nfrom label_sleuth.data_access.data_access_api import DataAccessApi, DatasetRowCountLimitExceededException\nfrom label_sleuth.data_access.label_import_utils import process_labels_dataframe\nfrom label_sleuth.data_access.processors.csv_processor import CsvFileProcessor\nfrom label_sleuth.definitions import ACTIVE_LEARNING_SUGGESTION_COUNT\nfrom label_sleuth.models.core.model_api import ModelStatus\nfrom label_sleuth.models.core.catalog import ModelsCatalog\nfrom label_sleuth.models.core.model_type import ModelType\nfrom label_sleuth.models.core.models_factory import ModelFactory\nfrom label_sleuth.models.core.prediction import Prediction\nfrom label_sleuth.models.core.tools import SentenceEmbeddingService\nfrom label_sleuth.orchestrator.background_jobs_manager import BackgroundJobsManager\nfrom label_sleuth.orchestrator.core.state_api.orchestrator_state_api import Category, Iteration, IterationStatus, \\\n    ModelInfo, MulticlassWorkspace, OrchestratorStateApi, MulticlassCategory\nfrom label_sleuth.orchestrator.utils import convert_text_elements_to_train_data, \\\n    convert_text_elements_to_multiclass_train_data\nfrom label_sleuth.training_set_selector.training_set_selector_factory import TrainingSetSelectionFactory\n\n# constants\nNUMBER_OF_MODELS_TO_KEEP = 2\nTRAIN_COUNTS_STR_KEY = \"train_counts\"\n\n# members\nnew_data_infer_thread_pool = ThreadPoolExecutor(1)\n\n\nclass OrchestratorApi:\n    def __init__(self, orchestrator_state: OrchestratorStateApi, data_access: DataAccessApi,\n                 active_learning_factory: ActiveLearningFactory, model_factory: ModelFactory,\n                 training_set_selection_factory: TrainingSetSelectionFactory,\n                 background_jobs_manager: BackgroundJobsManager,\n                 sentence_embedding_service: SentenceEmbeddingService, config: Configuration):\n        self.orchestrator_state = orchestrator_state\n        self.data_access = data_access\n        self.active_learning_factory = active_learning_factory\n        self.model_factory = model_factory\n        self.background_jobs_manager = background_jobs_manager\n        self.sentence_embedding_service = sentence_embedding_service\n        self.training_set_selection_factory = training_set_selection_factory\n        self.config = config\n        self._verify_model_and_language_compatibility()\n\n    def get_all_dataset_names(self):\n        return sorted(self.data_access.get_all_dataset_names())\n\n    # Workspace-related methods\n\n    def create_workspace(self, workspace_id: str, dataset_name: str,\n                         workspace_type:WorkspaceModelType=WorkspaceModelType.Binary):\n        \"\"\"\n        Create a new workspace\n        :param workspace_id:\n        :param dataset_name:\n        \"\"\"\n        logging.info(f\"Creating a new workspace '{workspace_id}' using dataset '{dataset_name}'\")\n        if dataset_name not in self.data_access.get_all_dataset_names():\n            message = f\"{dataset_name} does not exist. Cannot create workspace {workspace_id}\"\n            logging.error(message)\n            raise Exception(message)\n        self.data_access.initialize_user_labels(workspace_id, dataset_name, workspace_type)\n        self.orchestrator_state.create_workspace(workspace_id, dataset_name, workspace_type)\n\n\n    def delete_workspace(self, workspace_id: str):\n        \"\"\"\n        Delete a given workspace\n        :param workspace_id:\n        \"\"\"\n        # TODO handle labels deletion in multiclass workspace\n        logging.info(f\"deleting workspace '{workspace_id}'\")\n        if self.workspace_exists(workspace_id):\n            workspace = self.orchestrator_state.get_workspace(workspace_id)\n            try:\n                for category_id in workspace.categories.keys():\n                    self._delete_category_models(workspace_id, category_id)\n                self.orchestrator_state.delete_workspace_state(workspace_id)\n            except Exception as e:\n                logging.exception(f\"error deleting workspace '{workspace_id}'\")\n                raise e\n            try:\n                self.data_access.delete_all_labels(workspace_id, workspace.dataset_name)\n            except Exception as e:\n                logging.exception(f\"error clearing saved labels for workspace '{workspace_id}'\")\n                raise e\n    \n    def get_workspaces_by_dataset_name(self, dataset_name: str):\n        workspaces_ids = []\n        for workspace_id in self.list_workspaces():\n            if self.get_dataset_name(workspace_id) == dataset_name:\n                workspaces_ids.append(workspace_id)\n        return workspaces_ids\n\n    def delete_dataset(self, dataset_name: str):\n        \"\"\"\n        Delete a given workspace\n        :param dataset_name:\n        \"\"\"\n        logging.info(f\"deleting dataset '{dataset_name}'\")\n\n        workspaces_to_delete = self.get_workspaces_by_dataset_name(dataset_name)\n        for workspace_id in workspaces_to_delete:\n            self.delete_workspace(workspace_id)\n        \n        # delete dataset\n        self.data_access.delete_dataset(dataset_name)\n\n        res = {\n            'deleted_dataset': dataset_name,\n            'deleted_workspace_ids': workspaces_to_delete\n        }\n\n        return res\n\n    def workspace_exists(self, workspace_id: str) -> bool:\n        return self.orchestrator_state.workspace_exists(workspace_id)\n\n    def list_workspaces(self, include_mode=False):\n        if (include_mode):\n            return sorted([{\n                            \"id\": w.workspace_id, \n                            \"mode\": WorkspaceModelType.MultiClass.name if (type(w) == MulticlassWorkspace) else WorkspaceModelType.Binary.name\n                        } \n                       for w in self.orchestrator_state.get_all_workspaces()],\n                       key = lambda w: w['id'])\n        else:\n            return sorted([x.workspace_id for x in self.orchestrator_state.get_all_workspaces()])\n\n        \n\n    def get_dataset_name(self, workspace_id: str) -> str:\n        return self.orchestrator_state.get_workspace(workspace_id).dataset_name\n\n    # Category-related methods\n\n    def create_new_category(self, workspace_id: str, category_name: str, category_description: str):\n        \"\"\"\n        Declare a new category in the given workspace\n        :param workspace_id:\n        :param category_name:\n        :param category_description:st\n\n        :return: The new category's id\n        \"\"\"\n        logging.info(f\"Creating a new category '{category_name}' in workspace '{workspace_id}'\")\n        return self.orchestrator_state.add_category_to_workspace(workspace_id, category_name, category_description)\n\n\n    def set_category_list(self, workspace_id: str, category_to_description:Mapping):\n        \"\"\"\n        TBD\n        \"\"\"\n        logging.info(f\"setting the category list of workspace {workspace_id}\")\n        return self.orchestrator_state.set_category_list(workspace_id, category_to_description)\n\n\n    def edit_category(self, workspace_id: str, category_id: int, new_category_name: str, new_category_description: str):\n        old_category_name = self.orchestrator_state.get_workspace(workspace_id).categories[category_id].name\n        old_category_description = \\\n            self.orchestrator_state.get_workspace(workspace_id).categories[category_id].description\n        logging.info(f\"Updating category id {category_id} name from '{old_category_name}' to '{new_category_name}'\")\n        if old_category_description != new_category_description:\n            logging.info(\n                f\"Updating category id {category_id} description from '{old_category_description}' to \"\n                f\"'{new_category_description}'\")\n        return self.orchestrator_state.edit_category(workspace_id, category_id, new_category_name,\n                                                     new_category_description)\n\n    def delete_category(self, workspace_id: str, category_id: int):\n        \"\"\"\n        Delete the given category from the workspace. This call permanently deletes all data associated with the\n        category, including user labels and models.\n        :param workspace_id:\n        :param category_id:\n        \"\"\"\n        logging.info(f\"deleting category id {category_id} from workspace '{workspace_id}'\")\n        dataset_name = self.get_dataset_name(workspace_id)\n        self.data_access.delete_labels_for_category(workspace_id, dataset_name, category_id)\n        self._delete_category_models(workspace_id, category_id)\n        self.orchestrator_state.delete_category_from_workspace(workspace_id, category_id)\n\n    def get_all_categories(self, workspace_id: str) -> Mapping[int, Union[Category, MulticlassCategory]]:\n        return self.orchestrator_state.get_all_categories(workspace_id)\n\n    def get_all_category_ids(self, workspace_id):\n        return self.orchestrator_state.get_all_category_ids(workspace_id)\n\n    # Data access methods\n\n    def get_documents(self, workspace_id: str, dataset_name: str, uris: Sequence[str]) -> List[Document]:\n        \"\"\"\n        Get a list of Documents by their URIs\n        :param workspace_id:\n        :param dataset_name:\n        :param uris:\n        :return: a list of Document objects\n        \"\"\"\n        return self.data_access.get_documents(workspace_id, dataset_name, uris)\n\n    def get_all_document_uris(self, workspace_id) -> List[str]:\n        \"\"\"\n        Get a list of all document URIs in the dataset used by the given workspace.\n        :param workspace_id:\n        :return: a list of Document URIs\n        \"\"\"\n        dataset_name = self.get_dataset_name(workspace_id)\n        return self.data_access.get_all_document_uris(dataset_name)\n\n    def get_text_element_count(self, workspace_id) -> int:\n        \"\"\"\n        Return the number of TextElement objects in the given dataset_name.\n        :param workspace_id:\n        \"\"\"\n        dataset_name = self.get_dataset_name(workspace_id)\n        return self.data_access.get_text_element_count(dataset_name)\n\n    def get_all_text_elements(self, dataset_name: str) -> List[TextElement]:\n        \"\"\"\n        Get all the text elements of the given dataset.\n        :param dataset_name:\n        :return: a list of TextElement objects\n        \"\"\"\n        return self.data_access.get_all_text_elements(dataset_name=dataset_name)\n\n    def get_text_elements_by_uris(self, workspace_id: str, dataset_name: str, uris: Sequence[str]) -> List[TextElement]:\n        \"\"\"\n        Get a list of TextElements by their URIs\n        :param workspace_id:\n        :param dataset_name:\n        :param uris:\n        :return: a list of TextElement objects\n        \"\"\"\n        return self.data_access.get_text_elements_by_uris(workspace",
+      "total_lines": 1320,
+      "ref": "064cc226a49de903f91fc6600143ee0f62d78707"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "delete_workspace",
+      "class_name": "OrchestratorApi",
+      "start_line": 100,
+      "end_line": 120,
+      "satd_line": 105,
+      "matched_by": "normalized_source",
+      "source": "    def delete_workspace(self, workspace_id: str):\n        \"\"\"\n        Delete a given workspace\n        :param workspace_id:\n        \"\"\"\n        # TODO handle labels deletion in multiclass workspace\n        logging.info(f\"deleting workspace '{workspace_id}'\")\n        if self.workspace_exists(workspace_id):\n            workspace = self.orchestrator_state.get_workspace(workspace_id)\n            try:\n                for category_id in workspace.categories.keys():\n                    self._delete_category_models(workspace_id, category_id)\n                self.orchestrator_state.delete_workspace_state(workspace_id)\n            except Exception as e:\n                logging.exception(f\"error deleting workspace '{workspace_id}'\")\n                raise e\n            try:\n                self.data_access.delete_all_labels(workspace_id, workspace.dataset_name)\n            except Exception as e:\n                logging.exception(f\"error clearing saved labels for workspace '{workspace_id}'\")\n                raise e",
+      "calls": [],
+      "self_calls": [
+        "_delete_category_models",
+        "workspace_exists"
+      ],
+      "self_attrs": [
+        "_delete_category_models",
+        "data_access",
+        "orchestrator_state",
+        "workspace_exists"
+      ],
+      "global_uses": [
+        "e",
+        "logging"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "workspace_exists",
+          "class_name": "OrchestratorApi",
+          "start_line": 150,
+          "end_line": 151,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def workspace_exists(self, workspace_id: str) -> bool:\n        return self.orchestrator_state.workspace_exists(workspace_id)"
+        },
+        {
+          "symbol_name": "_delete_category_models",
+          "class_name": "OrchestratorApi",
+          "start_line": 443,
+          "end_line": 449,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def _delete_category_models(self, workspace_id, category_id):\n        workspace = self.orchestrator_state.get_workspace(workspace_id)\n        if workspace.categories[category_id] is not None:\n            for idx in range(len(workspace.categories[category_id].iterations)):\n                if workspace.categories[category_id].iterations[idx].model is not None \\\n                        and workspace.categories[category_id].iterations[idx].model.model_status != ModelStatus.DELETED:\n                    self.delete_iteration_model(workspace_id, category_id, idx)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "OrchestratorApi",
+      "related_methods_count": 2,
+      "related_attributes_count": 2,
+      "related_methods": [
+        {
+          "symbol_name": "workspace_exists",
+          "start_line": 150,
+          "end_line": 151,
+          "relevance": [
+            "direct_self_call"
+          ],
+          "source": "    def workspace_exists(self, workspace_id: str) -> bool:\n        return self.orchestrator_state.workspace_exists(workspace_id)"
+        },
+        {
+          "symbol_name": "_delete_category_models",
+          "start_line": 443,
+          "end_line": 449,
+          "relevance": [
+            "direct_self_call"
+          ],
+          "source": "    def _delete_category_models(self, workspace_id, category_id):\n        workspace = self.orchestrator_state.get_workspace(workspace_id)\n        if workspace.categories[category_id] is not None:\n            for idx in range(len(workspace.categories[category_id].iterations)):\n                if workspace.categories[category_id].iterations[idx].model is not None \\\n                        and workspace.categories[category_id].iterations[idx].model.model_status != ModelStatus.DELETED:\n                    self.delete_iteration_model(workspace_id, category_id, idx)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "orchestrator_state",
+          "start_line": 68,
+          "end_line": 70,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "                 sentence_embedding_service: SentenceEmbeddingService, config: Configuration):\n        self.orchestrator_state = orchestrator_state\n        self.data_access = data_access"
+        },
+        {
+          "attribute": "data_access",
+          "start_line": 69,
+          "end_line": 71,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "        self.orchestrator_state = orchestrator_state\n        self.data_access = data_access\n        self.active_learning_factory = active_learning_factory"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "logging",
+          "kind": "import",
+          "start_line": 18,
+          "end_line": 18,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "import logging"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

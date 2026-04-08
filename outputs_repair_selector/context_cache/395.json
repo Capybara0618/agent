@@ -1,0 +1,169 @@
+{
+  "task_id": "395",
+  "repo_owner": "modal-labs",
+  "repo_name": "modal-client",
+  "file_path": "polyester/container_entrypoint.py",
+  "commit": "1af6c4deaff8596ae04c8ecb6a1fecc1e92df671",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T04:26:33+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "1af6c4deaff8596ae04c8ecb6a1fecc1e92df671",
+    "symbol_name": "call_function",
+    "satd_line": 95,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T04:26:33+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "polyester/container_entrypoint.py",
+    "original_signature": "def call_function(",
+    "target_file": {
+      "ok": true,
+      "path": "polyester/container_entrypoint.py",
+      "sha": "9605dc326f2ee736862ee7bfbd95f95bcf909b09",
+      "download_url": "https://raw.githubusercontent.com/modal-labs/modal-client/1af6c4deaff8596ae04c8ecb6a1fecc1e92df671/polyester/container_entrypoint.py",
+      "content_excerpt": "import asyncio\nimport inspect\nimport sys\nimport threading\nimport traceback\nimport typing\nimport uuid\n\nimport aiostream\nimport google.protobuf.json_format\n\nfrom .async_utils import synchronizer\nfrom .buffer_utils import buffered_rpc_read, buffered_rpc_write\nfrom .client import Client\nfrom .config import logger\nfrom .function import Function, pack_output_buffer_item, unpack_input_buffer_item\nfrom .grpc_utils import BLOCKING_REQUEST_TIMEOUT, GRPC_REQUEST_TIMEOUT\nfrom .object import Object\nfrom .proto import api_pb2\n\n\n@synchronizer\nclass FunctionContext:\n    \"\"\"This class isn't much more than a helper method for some gRPC calls.\"\"\"\n\n    def __init__(self, container_args, client):\n        self.task_id = container_args.task_id\n        self.function_id = container_args.function_id\n        self.input_buffer_id = container_args.input_buffer_id\n        self.session_id = container_args.session_id\n        self.module_name = container_args.module_name\n        self.function_name = container_args.function_name\n        self.client = client\n\n    async def get_function(self) -> typing.Callable:\n        \"\"\"Note that this also initializes the session.\"\"\"\n        fun = Function.get_function(self.module_name, self.function_name)\n        session = fun.session\n        await session.initialize(self.session_id, self.client)\n        return fun.get_raw_f()\n\n    async def generate_inputs(\n        self,\n    ) -> typing.AsyncIterator[api_pb2.BufferReadResponse]:\n        request = api_pb2.FunctionGetNextInputRequest(\n            function_id=self.function_id,\n            task_id=self.task_id,\n        )\n        while True:\n            response = await buffered_rpc_read(\n                self.client.stub.FunctionGetNextInput, request, self.input_buffer_id, timeout=GRPC_REQUEST_TIMEOUT\n            )\n\n            if response.status == api_pb2.BufferReadResponse.BufferReadStatus.TIMEOUT:\n                logger.info(f\"Task {self.task_id} input request timed out.\")\n                break\n\n            yield response.item\n\n            if response.item.EOF:\n                logger.info(f\"Task {self.task_id} input got EOF.\")\n                break\n\n    async def output(self, request):\n        # No timeout so this can block forever.\n        await buffered_rpc_write(self.client.stub.FunctionOutput, request)\n\n\ndef make_output_request(input_id, output_buffer_id, **kwargs):\n    result = api_pb2.GenericResult(**kwargs)\n    item = pack_output_buffer_item(result)\n    buffer_req = api_pb2.BufferWriteRequest(item=item, buffer_id=output_buffer_id)\n\n    return api_pb2.FunctionOutputRequest(input_id=input_id, buffer_req=buffer_req)\n\n\ndef make_eof_request(output_buffer_id):\n    item = api_pb2.BufferItem(EOF=True)\n    buffer_req = api_pb2.BufferWriteRequest(item=item, buffer_id=output_buffer_id)\n    return api_pb2.FunctionOutputRequest(buffer_req=buffer_req)\n\n\ndef call_function(\n    function: typing.Callable,\n    buffer_item: api_pb2.BufferItem,\n    serializer: typing.Callable[[typing.Any], bytes],\n    deserializer: typing.Callable[[bytes], typing.Any],\n) -> (str, api_pb2.GenericResult):\n\n    input = unpack_input_buffer_item(buffer_item)\n    output_buffer_id = input.output_buffer_id\n\n    if buffer_item.EOF:\n        # Let the caller know that all inputs have been processed.\n        # TODO: This isn't exactly part of the function call, so could be separated out.\n        yield make_eof_request(output_buffer_id)\n        return\n\n    input_id = buffer_item.item_id\n    args = deserializer(input.args)\n    kwargs = deserializer(input.kwargs)\n\n    try:\n        res = function(*args, **kwargs)\n\n        if inspect.iscoroutine(res):\n            res = asyncio.run(res)\n\n        if inspect.isasyncgen(res):\n            res = synchronizer._run_generator_sync(res)\n\n        if inspect.isgenerator(res):\n            for value in res:\n                yield make_output_request(\n                    input_id,\n                    output_buffer_id,\n                    status=api_pb2.GenericResult.Status.SUCCESS,\n                    data=serializer(value),\n                    gen_status=api_pb2.GenericResult.GeneratorStatus.INCOMPLETE,\n                )\n\n            # send EOF\n            yield make_output_request(\n                input_id,\n                output_buffer_id,\n                status=api_pb2.GenericResult.Status.SUCCESS,\n                gen_status=api_pb2.GenericResult.GeneratorStatus.COMPLETE,\n            )\n        else:\n            yield make_output_request(\n                input_id,\n                output_buffer_id,\n                status=api_pb2.GenericResult.Status.SUCCESS,\n                data=serializer(res),\n            )\n\n    except Exception as exc:\n        # Note: we're not serializing the traceback since it contains\n        # local references that means we can't unpickle it. We *are*\n        # serializing the exception, which may have some issues (there\n        # was an earlier note about it that it might not be possible\n        # to unpickle it in some cases). Let's watch oout for issues.\n        yield make_output_request(\n            input_id,\n            output_buffer_id,\n            status=api_pb2.GenericResult.Status.FAILURE,\n            data=serializer(exc),\n            exception=repr(exc),\n            traceback=traceback.format_exc(),\n        )\n\n\ndef main(container_args, client=None):\n    # Note that we're creating the client in a synchronous context, but it will be running in a separate thread.\n    # This is good because if the function is long running then we the client can still send heartbeats\n    # The only caveat is a bunch of calls will now cross threads, which adds a bit of overhead?\n    if client is None:\n        client = Client.from_env()\n\n    function_context = FunctionContext(container_args, client)\n    function = function_context.get_function()\n\n    for buffer_item in function_context.generate_inputs():\n        for output in call_function(function, buffer_item, client.serialize, client.deserialize):\n            # Note: this blocks the call_function as well. In the future we might want to stream outputs\n            # back asynchronously, but then block the call_function if there is back-pressure.\n            function_context.output(output)\n\n\nif __name__ == \"__main__\":\n    logger.debug(\"Container: starting\")\n    container_args = google.protobuf.json_format.Parse(\n        sys.argv[1],\n        api_pb2.ContainerArguments(),\n    )\n    main(container_args)\n    logger.debug(\"Container: done\")\n",
+      "total_lines": 177,
+      "ref": "1af6c4deaff8596ae04c8ecb6a1fecc1e92df671"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "call_function",
+      "class_name": null,
+      "start_line": 83,
+      "end_line": 150,
+      "satd_line": 95,
+      "matched_by": "signature_or_comment",
+      "source": "def call_function(\n    function: typing.Callable,\n    buffer_item: api_pb2.BufferItem,\n    serializer: typing.Callable[[typing.Any], bytes],\n    deserializer: typing.Callable[[bytes], typing.Any],\n) -> (str, api_pb2.GenericResult):\n\n    input = unpack_input_buffer_item(buffer_item)\n    output_buffer_id = input.output_buffer_id\n\n    if buffer_item.EOF:\n        # Let the caller know that all inputs have been processed.\n        # TODO: This isn't exactly part of the function call, so could be separated out.\n        yield make_eof_request(output_buffer_id)\n        return\n\n    input_id = buffer_item.item_id\n    args = deserializer(input.args)\n    kwargs = deserializer(input.kwargs)\n\n    try:\n        res = function(*args, **kwargs)\n\n        if inspect.iscoroutine(res):\n            res = asyncio.run(res)\n\n        if inspect.isasyncgen(res):\n            res = synchronizer._run_generator_sync(res)\n\n        if inspect.isgenerator(res):\n            for value in res:\n                yield make_output_request(\n                    input_id,\n                    output_buffer_id,\n                    status=api_pb2.GenericResult.Status.SUCCESS,\n                    data=serializer(value),\n                    gen_status=api_pb2.GenericResult.GeneratorStatus.INCOMPLETE,\n                )\n\n            # send EOF\n            yield make_output_request(\n                input_id,\n                output_buffer_id,\n                status=api_pb2.GenericResult.Status.SUCCESS,\n                gen_status=api_pb2.GenericResult.GeneratorStatus.COMPLETE,\n            )\n        else:\n            yield make_output_request(\n                input_id,\n                output_buffer_id,\n                status=api_pb2.GenericResult.Status.SUCCESS,\n                data=serializer(res),\n            )\n\n    except Exception as exc:\n        # Note: we're not serializing the traceback since it contains\n        # local references that means we can't unpickle it. We *are*\n        # serializing the exception, which may have some issues (there\n        # was an earlier note about it that it might not be possible\n        # to unpickle it in some cases). Let's watch oout for issues.\n        yield make_output_request(\n            input_id,\n            output_buffer_id,\n            status=api_pb2.GenericResult.Status.FAILURE,\n            data=serializer(exc),\n            exception=repr(exc),\n            traceback=traceback.format_exc(),\n        )",
+      "calls": [
+        "deserializer",
+        "function",
+        "make_eof_request",
+        "make_output_request",
+        "repr",
+        "serializer",
+        "unpack_input_buffer_item"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "api_pb2",
+        "asyncio",
+        "exc",
+        "inspect",
+        "make_eof_request",
+        "make_output_request",
+        "synchronizer",
+        "traceback",
+        "typing",
+        "unpack_input_buffer_item"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "make_output_request",
+          "class_name": null,
+          "start_line": 69,
+          "end_line": 74,
+          "relevance": [
+            "direct_call",
+            "keyword_source_overlap=1"
+          ],
+          "source": "def make_output_request(input_id, output_buffer_id, **kwargs):\n    result = api_pb2.GenericResult(**kwargs)\n    item = pack_output_buffer_item(result)\n    buffer_req = api_pb2.BufferWriteRequest(item=item, buffer_id=output_buffer_id)\n\n    return api_pb2.FunctionOutputRequest(input_id=input_id, buffer_req=buffer_req)"
+        },
+        {
+          "symbol_name": "make_eof_request",
+          "class_name": null,
+          "start_line": 77,
+          "end_line": 80,
+          "relevance": [
+            "direct_call",
+            "keyword_source_overlap=1"
+          ],
+          "source": "def make_eof_request(output_buffer_id):\n    item = api_pb2.BufferItem(EOF=True)\n    buffer_req = api_pb2.BufferWriteRequest(item=item, buffer_id=output_buffer_id)\n    return api_pb2.FunctionOutputRequest(buffer_req=buffer_req)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "unpack_input_buffer_item",
+          "kind": "import_from",
+          "start_line": 16,
+          "end_line": 16,
+          "source": "from .function import Function, pack_output_buffer_item, unpack_input_buffer_item"
+        },
+        {
+          "symbol_name": "make_output_request",
+          "kind": "function",
+          "start_line": 69,
+          "end_line": 74,
+          "source": "def make_output_request(input_id, output_buffer_id, **kwargs):\n    result = api_pb2.GenericResult(**kwargs)\n    item = pack_output_buffer_item(result)\n    buffer_req = api_pb2.BufferWriteRequest(item=item, buffer_id=output_buffer_id)\n\n    return api_pb2.FunctionOutputRequest(input_id=input_id, buffer_req=buffer_req)"
+        },
+        {
+          "symbol_name": "make_eof_request",
+          "kind": "function",
+          "start_line": 77,
+          "end_line": 80,
+          "source": "def make_eof_request(output_buffer_id):\n    item = api_pb2.BufferItem(EOF=True)\n    buffer_req = api_pb2.BufferWriteRequest(item=item, buffer_id=output_buffer_id)\n    return api_pb2.FunctionOutputRequest(buffer_req=buffer_req)"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

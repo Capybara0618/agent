@@ -1,0 +1,138 @@
+{
+  "task_id": "452",
+  "repo_owner": "flexget",
+  "repo_name": "flexget",
+  "file_path": "flexget/plugins/input/backlog.py",
+  "commit": "1779d130f1b7a7032308299cfaccadbc114d4f3c",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T04:40:20+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "1779d130f1b7a7032308299cfaccadbc114d4f3c",
+    "symbol_name": "on_task_metainfo",
+    "satd_line": 128,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T04:40:25+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "flexget/plugins/input/backlog.py",
+    "original_signature": "def on_task_metainfo(self, task, config):",
+    "target_file": {
+      "ok": true,
+      "path": "flexget/plugins/input/backlog.py",
+      "sha": "7785a6a7487285cc438d72272ff3d44155dd98b7",
+      "download_url": "https://raw.githubusercontent.com/Flexget/Flexget/1779d130f1b7a7032308299cfaccadbc114d4f3c/flexget/plugins/input/backlog.py",
+      "content_excerpt": "from __future__ import unicode_literals, division, absolute_import\nfrom builtins import *  # noqa pylint: disable=unused-import, redefined-builtin\n\nimport logging\nimport pickle\nfrom datetime import datetime\n\nfrom sqlalchemy import Column, Integer, String, Unicode, DateTime, Index, select\n\nfrom flexget import db_schema, plugin\nfrom flexget.event import event\nfrom flexget.utils import json\nfrom flexget.manager import Session\nfrom flexget.utils.database import entry_synonym, with_session\nfrom flexget.utils.tools import parse_timedelta\nfrom flexget.utils.sqlalchemy_utils import table_schema, table_add_column\n\nlog = logging.getLogger('backlog')\nBase = db_schema.versioned_base('backlog', 2)\n\n\n@db_schema.upgrade('backlog')\ndef upgrade(ver, session):\n    if ver is None:\n        # Make sure there is no data we can't load in the backlog table\n        backlog_table = table_schema('backlog', session)\n        try:\n            for item in session.query('entry').select_from(backlog_table).all():\n                pickle.loads(item.entry)\n        except (ImportError, TypeError):\n            # If there were problems, we can drop the data.\n            log.info('Backlog table contains unloadable data, clearing old data.')\n            session.execute(backlog_table.delete())\n        ver = 0\n    if ver == 0:\n        backlog_table = table_schema('backlog', session)\n        log.info('Creating index on backlog table.')\n        Index('ix_backlog_feed_expire', backlog_table.c.feed, backlog_table.c.expire).create(bind=session.bind)\n        ver = 1\n    if ver == 1:\n        table = table_schema('backlog', session)\n        table_add_column(table, 'json', Unicode, session)\n        # Make sure we get the new schema with the added column\n        table = table_schema('backlog', session)\n        for row in session.execute(select([table.c.id, table.c.entry])):\n            try:\n                p = pickle.loads(row['entry'])\n                session.execute(table.update().where(table.c.id == row['id']).values(\n                    json=json.dumps(p, encode_datetime=True)))\n            except KeyError as e:\n                log.error('Unable error upgrading backlog pickle object due to %s' % str(e))\n\n        ver = 2\n    return ver\n\n\nclass BacklogEntry(Base):\n    __tablename__ = 'backlog'\n\n    id = Column(Integer, primary_key=True)\n    task = Column('feed', String)\n    title = Column(String)\n    expire = Column(DateTime)\n    _json = Column('json', Unicode)\n    entry = entry_synonym('_json')\n\n    def __repr__(self):\n        return '<BacklogEntry(title=%s)>' % (self.title)\n\n\nIndex('ix_backlog_feed_expire', BacklogEntry.task, BacklogEntry.expire)\n\n\n@with_session\ndef get_entries(task=None, session=None):\n    query = session.query(BacklogEntry)\n    if task:\n        query = query.filter(BacklogEntry.task == task)\n    return query.all()\n\n\n@with_session\ndef clear_entries(task=None, all=False, session=None):\n    \"\"\"\n    Clear entries from backlog.\n\n    :param task: If given, only entries from specified task will be cleared.\n    :param all: If True, all entries will be cleared, otherwise only expired entries will be cleared.\n    :returns: Number of entries cleared from backlog.\n    \"\"\"\n    query = session.query(BacklogEntry)\n    if task:\n        query = query.filter(BacklogEntry.task == task)\n    if not all:\n        query = query.filter(BacklogEntry.expire < datetime.now())\n    return query.delete()\n\n\nclass InputBacklog(object):\n    \"\"\"\n    Keeps task history for given amount of time.\n\n    Example::\n\n      backlog: 4 days\n\n    Rarely useful for end users, mainly used by other plugins.\n    \"\"\"\n\n    schema = {'type': 'string', 'format': 'interval'}\n\n    @plugin.priority(-255)\n    def on_task_input(self, task, config):\n        # Get a list of entries to inject\n        injections = self.get_injections(task)\n        # Take a snapshot of the entries' states after the input event in case we have to store them to backlog\n        for entry in task.entries + injections:\n            entry.take_snapshot('after_input')\n        if config:\n            # If backlog is manually enabled for this task, learn the entries.\n            self.learn_backlog(task, config)\n        # Return the entries from backlog that are not already in the task\n        return injections\n\n    @plugin.priority(255)\n    def on_task_metainfo(self, task, config):\n        # Take a snapshot of any new entries' states before metainfo event in case we have to store them to backlog\n        # This is really a hack to avoid unnecessary lazy lookups causing db locks. Ideally, saving a snapshot\n        # should not cause lazy lookups, but we currently have no other way of saving a lazy field than performing its\n        # action.\n        # https://github.com/Flexget/Flexget/issues/1000\n        for entry in task.entries:\n            snapshot = entry.snapshots.get('after_input')\n            if snapshot:\n                continue\n            entry.take_snapshot('after_input')\n\n    def on_task_abort(self, task, config):\n        \"\"\"Remember all entries until next execution when task gets aborted.\"\"\"\n        if task.entries:\n            log.debug('Remembering all entries to backlog because of task abort.')\n            self.learn_backlog(task)\n\n    @with_session\n    def add_backlog(self, task, entry, amount='', session=None):\n        \"\"\"Add single entry to task backlog\n\n        If :amount: is not specified, entry will only be injected on next execution.\"\"\"\n        snapshot = entry.snapshots.get('after_input')\n        if not snapshot:\n            if task.current_phase != 'input':\n                # Not having a snapshot is normal during input phase, don't display a warning\n                log.warning('No input snapshot available for `%s`, using current state' % entry['title'])\n            snapshot = entry\n        expire_time = datetime.now() + parse_timedelta(amount)\n        backlog_entry = session.query(BacklogEntry).filter(BacklogEntry.title == entry['title']). \\\n            filter(BacklogEntry.task == task.name).first()\n        if backlog_entry:\n            # If there is already a backlog entry for this, update the expiry time if necessary.\n            if backlog_entry.expire < expire_time:\n                log.debug('Updating expiry time for %s' % entry['title'])\n                backlog_entry.expire = expire_time\n        else:\n            log.debug('Saving %s' % entry['title'])\n            backlog_entry = BacklogEntry()\n            backlog_entry.title = entry['title']\n            backlog_entry.entry = snapshot\n            backlog_entry.task = task.name\n            backlog_entry.expire = expire_time\n            session.add(backlog_entry)\n\n    def learn_backlog(self, task, amount=''):\n        \"\"\"Learn current entries into backlog. All task inputs must have been executed.\"\"\"\n        with Session() as session:\n            for entry in task.entries:\n                self.add_backlog(task, entry, amount, session=session)\n\n    @with_session\n    def get_injections(self, task, session=None):\n        \"\"\"Insert missing entries from backlog.\"\"\"\n        entries = []\n        for backlog_entry in get_entries(task=task.name, session=session):\n            entry = backlog_entry.entry\n\n            # this is already in the task\n            if task.find_entry(title=entry['title'], url=entry['url']):\n                continue\n            log.debug('Restoring %s' % entry['title'])\n            entries.append(entry)\n        if entries:\n            log.verbose('Added %s entries from backlog' % len(entries))\n\n        # purge expired\n        purged = clear_entries(task=task.name, all=False, session=session)\n        log.debug('%s entries purged from backlog' % purged)\n\n        return entries\n\n\n@event('plugin.register')\ndef register_plugin():\n    plugin.register(InputBacklog, 'backlog', builtin=True, api_ver=2)\n",
+      "total_lines": 202,
+      "ref": "1779d130f1b7a7032308299cfaccadbc114d4f3c"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "on_task_metainfo",
+      "class_name": "InputBacklog",
+      "start_line": 126,
+      "end_line": 136,
+      "satd_line": 128,
+      "matched_by": "normalized_source",
+      "source": "    def on_task_metainfo(self, task, config):\n        # Take a snapshot of any new entries' states before metainfo event in case we have to store them to backlog\n        # This is really a hack to avoid unnecessary lazy lookups causing db locks. Ideally, saving a snapshot\n        # should not cause lazy lookups, but we currently have no other way of saving a lazy field than performing its\n        # action.\n        # https://github.com/Flexget/Flexget/issues/1000\n        for entry in task.entries:\n            snapshot = entry.snapshots.get('after_input')\n            if snapshot:\n                continue\n            entry.take_snapshot('after_input')",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "plugin"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "on_task_input",
+          "class_name": "InputBacklog",
+          "start_line": 113,
+          "end_line": 123,
+          "relevance": [
+            "keyword_source_overlap=3",
+            "same_class"
+          ],
+          "source": "    def on_task_input(self, task, config):\n        # Get a list of entries to inject\n        injections = self.get_injections(task)\n        # Take a snapshot of the entries' states after the input event in case we have to store them to backlog\n        for entry in task.entries + injections:\n            entry.take_snapshot('after_input')\n        if config:\n            # If backlog is manually enabled for this task, learn the entries.\n            self.learn_backlog(task, config)\n        # Return the entries from backlog that are not already in the task\n        return injections"
+        },
+        {
+          "symbol_name": "add_backlog",
+          "class_name": "InputBacklog",
+          "start_line": 145,
+          "end_line": 170,
+          "relevance": [
+            "keyword_source_overlap=3",
+            "same_class"
+          ],
+          "source": "    def add_backlog(self, task, entry, amount='', session=None):\n        \"\"\"Add single entry to task backlog\n\n        If :amount: is not specified, entry will only be injected on next execution.\"\"\"\n        snapshot = entry.snapshots.get('after_input')\n        if not snapshot:\n            if task.current_phase != 'input':\n                # Not having a snapshot is normal during input phase, don't display a warning\n                log.warning('No input snapshot available for `%s`, using current state' % entry['title'])\n            snapshot = entry\n        expire_time = datetime.now() + parse_timedelta(amount)\n        backlog_entry = session.query(BacklogEntry).filter(BacklogEntry.title == entry['title']). \\\n            filter(BacklogEntry.task == task.name).first()\n        if backlog_entry:\n            # If there is already a backlog entry for this, update the expiry time if necessary.\n            if backlog_entry.expire < expire_time:\n                log.debug('Updating expiry time for %s' % entry['title'])\n                backlog_entry.expire = expire_time\n        else:\n            log.debug('Saving %s' % entry['title'])\n            backlog_entry = BacklogEntry()\n            backlog_entry.title = entry['title']\n            backlog_entry.entry = snapshot\n            backlog_entry.task = task.name\n            backlog_entry.expire = expire_time\n            session.add(backlog_entry)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "InputBacklog",
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "plugin",
+          "kind": "import_from",
+          "start_line": 10,
+          "end_line": 10,
+          "source": "from flexget import db_schema, plugin"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

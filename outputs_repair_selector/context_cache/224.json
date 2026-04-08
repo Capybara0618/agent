@@ -1,0 +1,130 @@
+{
+  "task_id": "224",
+  "repo_owner": "modal-labs",
+  "repo_name": "modal-client",
+  "file_path": "modal/mount.py",
+  "commit": "42af258dc04cbc05af66de607cd8d7d729012913",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T03:45:52+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "42af258dc04cbc05af66de607cd8d7d729012913",
+    "symbol_name": "_create_client_mount",
+    "satd_line": 116,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 1,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 1,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T03:45:52+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "modal/mount.py",
+    "original_signature": "async def _create_client_mount(app):",
+    "target_file": {
+      "ok": true,
+      "path": "modal/mount.py",
+      "sha": "4805659b825fcd88a072901a8e446e62bd836ef6",
+      "download_url": "https://raw.githubusercontent.com/modal-labs/modal-client/42af258dc04cbc05af66de607cd8d7d729012913/modal/mount.py",
+      "content_excerpt": "import asyncio\nimport concurrent.futures\nimport os\nimport time\n\nimport aiostream\n\nfrom modal_proto import api_pb2\nfrom modal_utils.async_utils import synchronize_apis\nfrom modal_utils.package_utils import (\n    get_module_mount_info,\n    get_sha256_hex_from_filename,\n    module_mount_condition,\n)\n\nfrom .config import logger\nfrom .object import Object\n\n\nasync def _get_files(local_dir, condition, recursive):\n    loop = asyncio.get_event_loop()\n    with concurrent.futures.ThreadPoolExecutor() as exe:\n        futs = []\n        if recursive:\n            gen = (os.path.join(root, name) for root, dirs, files in os.walk(local_dir) for name in files)\n        else:\n            gen = (dir_entry.path for dir_entry in os.scandir(local_dir) if dir_entry.is_file())\n\n        for filename in gen:\n            rel_filename = os.path.relpath(filename, local_dir)\n            if condition(filename):\n                futs.append(loop.run_in_executor(exe, get_sha256_hex_from_filename, filename, rel_filename))\n        logger.debug(f\"Computing checksums for {len(futs)} files using {exe._max_workers} workers\")\n        for fut in asyncio.as_completed(futs):\n            filename, rel_filename, sha256_hex = await fut\n            yield filename, rel_filename, sha256_hex\n\n\nclass _Mount(Object, type_prefix=\"mo\"):\n    def __init__(self, app, local_dir, remote_dir, condition, recursive=True):\n        self._local_dir = local_dir\n        self._remote_dir = remote_dir\n        self._condition = condition\n        self._recursive = recursive\n        super().__init__(app=app)\n\n    async def load(self, app):\n        # Run a threadpool to compute hash values, and use n coroutines to put files\n        n_files = 0\n        n_missing_files = 0\n        total_bytes = 0\n        t0 = time.time()\n        n_concurrent_uploads = 16\n\n        async def _put_file(client, mount_id, filename, rel_filename, sha256_hex):\n            nonlocal n_files, n_missing_files, total_bytes\n            remote_filename = os.path.join(self._remote_dir, rel_filename)  # won't work on windows\n            request = api_pb2.MountRegisterFileRequest(\n                filename=remote_filename, sha256_hex=sha256_hex, mount_id=mount_id\n            )\n            response = await client.stub.MountRegisterFile(request)\n            n_files += 1\n            if not response.exists:\n                # TODO: this will be moved to S3 soon\n                data = open(filename, \"rb\").read()\n                n_missing_files += 1\n                total_bytes += len(data)\n                logger.debug(f\"Uploading file {filename} to {remote_filename} ({len(data)} bytes)\")\n\n                request2 = api_pb2.MountUploadFileRequest(\n                    data=data, sha256_hex=sha256_hex, size=len(data), mount_id=mount_id\n                )\n                await client.stub.MountUploadFile(request2)\n\n        req = api_pb2.MountCreateRequest(app_id=app.app_id)\n        resp = await app.client.stub.MountCreate(req)\n        mount_id = resp.mount_id\n\n        logger.debug(f\"Uploading mount {mount_id} using {n_concurrent_uploads} uploads\")\n\n        # Create async generator\n        files = _get_files(self._local_dir, self._condition, self._recursive)\n        files_stream = aiostream.stream.iterate(files)\n\n        async def put_file_tupled(tup):\n            filename, rel_filename, sha256_hex = tup\n            await _put_file(app.client, mount_id, filename, rel_filename, sha256_hex)\n\n        # Upload files\n        uploads_stream = aiostream.stream.map(files_stream, put_file_tupled, task_limit=n_concurrent_uploads)\n        await uploads_stream\n\n        logger.debug(f\"Uploaded {n_missing_files}/{n_files} files and {total_bytes} bytes in {time.time() - t0}s\")\n\n        # Set the mount to done\n        req_done = api_pb2.MountDoneRequest(mount_id=mount_id)\n        await app.client.stub.MountDone(req_done)\n\n        return mount_id\n\n\nMount, AioMount = synchronize_apis(_Mount)\n\n\nasync def create_package_mounts(package_name):\n    mount_infos = get_module_mount_info(package_name)\n    return [await _Mount.create(path, f\"/pkg/{name}\", condition) for (name, path, condition) in mount_infos]\n\n\nasync def _create_client_mount(app):\n    import modal\n\n    # Get the base_path because it also contains `modal_utils` and `modal_proto`.\n    base_path, _ = os.path.split(modal.__path__[0])\n\n    # TODO: do we need to run .create here?\n    return await _Mount.create(app, base_path, \"/pkg/\", module_mount_condition, recursive=True)\n\n\n_, aio_create_client_mount = synchronize_apis(_create_client_mount)\n",
+      "total_lines": 120,
+      "ref": "42af258dc04cbc05af66de607cd8d7d729012913"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_create_client_mount",
+      "class_name": null,
+      "start_line": 110,
+      "end_line": 117,
+      "satd_line": 116,
+      "matched_by": "normalized_source",
+      "source": "async def _create_client_mount(app):\n    import modal\n\n    # Get the base_path because it also contains `modal_utils` and `modal_proto`.\n    base_path, _ = os.path.split(modal.__path__[0])\n\n    # TODO: do we need to run .create here?\n    return await _Mount.create(app, base_path, \"/pkg/\", module_mount_condition, recursive=True)",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "_Mount",
+        "modal",
+        "module_mount_condition",
+        "os"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "create_package_mounts",
+          "class_name": null,
+          "start_line": 105,
+          "end_line": 107,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=1"
+          ],
+          "source": "async def create_package_mounts(package_name):\n    mount_infos = get_module_mount_info(package_name)\n    return [await _Mount.create(path, f\"/pkg/{name}\", condition) for (name, path, condition) in mount_infos]"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_Mount",
+          "kind": "class",
+          "start_line": 39,
+          "end_line": 99,
+          "source": "class _Mount(Object, type_prefix=\"mo\"):\n    def __init__(self, app, local_dir, remote_dir, condition, recursive=True):\n        self._local_dir = local_dir\n        self._remote_dir = remote_dir\n        self._condition = condition\n        self._recursive = recursive\n        super().__init__(app=app)\n\n    async def load(self, app):\n        # Run a threadpool to compute hash values, and use n coroutines to put files\n        n_files = 0\n        n_missing_files = 0\n        total_bytes = 0\n        t0 = time.time()\n        n_concurrent_uploads = 16\n\n        async def _put_file(client, mount_id, filename, rel_filename, sha256_hex):\n            nonlocal n_files, n_missing_files, total_bytes\n            remote_filename = os.path.join(self._remote_dir, rel_filename)  # won't work on windows\n            request = api_pb2.MountRegisterFileRequest(\n                filename=remote_filename, sha256_hex=sha256_hex, mount_id=mount_id\n            )\n            response = await client.stub.MountRegisterFile(request)\n            n_files += 1\n            if not response.exists:\n                # TODO: this will be moved to S3 soon\n                data = open(filename, \"rb\").read()\n                n_missing_files += 1\n                total_bytes += len(data)\n                logger.debug(f\"Uploading file {filename} to {remote_filename} ({len(data)} bytes)\")\n\n                request2 = api_pb2.MountUploadFileRequest(\n                    data=data, sha256_hex=sha256_hex, size=len(data), mount_id=mount_id\n                )\n                await client.stub.MountUploadFile(request2)\n\n        req = api_pb2.MountCreateRequest(app_id=app.app_id)\n        resp = await app.client.stub.MountCreate(req)\n        mount_id = resp.mount_id\n\n        logger.debug(f\"Uploading mount {mount_id} using {n_concurrent_uploads} uploads\")\n\n        # Create async generator\n        files = _get_files(self._local_dir, self._condition, self._recursive)\n        files_stream = aiostream.stream.iterate(files)\n\n        async def put_file_tupled(tup):\n            filename, rel_filename, sha256_hex = tup\n            await _put_file(app.client, mount_id, filename, rel_filename, sha256_hex)\n\n        # Upload files\n        uploads_stream = aiostream.stream.map(files_stream, put_file_tupled, task_limit=n_concurrent_uploads)\n        await uploads_stream\n\n        logger.debug(f\"Uploaded {n_missing_files}/{n_files} files and {total_bytes} bytes in {time.time() - t0}s\")\n\n        # Set the mount to done\n        req_done = api_pb2.MountDoneRequest(mount_id=mount_id)\n        await app.client.stub.MountDone(req_done)\n\n        return mount_id"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

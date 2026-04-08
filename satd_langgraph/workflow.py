@@ -11,9 +11,9 @@ bootstrap_vendor()
 
 from langgraph.graph import END, START, StateGraph
 
-from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer
+from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer, OpenAISelector
 from .csv_loader import load_satd_csv
-from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, SATDRecord, preprocess_python_code, record_to_graph_input, trace_from_state
+from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, SATDRecord, SelectorDecision, preprocess_python_code, record_to_graph_input, trace_from_state
 
 
 class LangGraphSATDWorkflow:
@@ -25,7 +25,9 @@ class LangGraphSATDWorkflow:
         write_batch_size: int = 10,
         use_analyzer: bool = False,
         use_reviewer: bool = False,
+        use_selector: bool = True,
         repair_prompt_mode: str = "lightweight",
+        dual_repair_candidates: bool = True,
     ) -> None:
         self.max_rounds = max_rounds
         self.model = model
@@ -33,11 +35,14 @@ class LangGraphSATDWorkflow:
         self.write_batch_size = write_batch_size
         self.use_analyzer = use_analyzer
         self.use_reviewer = use_reviewer
+        self.use_selector = use_selector
         self.repair_prompt_mode = repair_prompt_mode
+        self.dual_repair_candidates = dual_repair_candidates
         client = OpenAICompatClient(model=model)
         self.context_client = client
         self.analyzer = OpenAIAnalyzer(client)
         self.fixer = OpenAIFixer(client, prompt_mode=repair_prompt_mode)
+        self.selector = OpenAISelector(client)
         self.reviewer = OpenAIReviewer(client)
         self.graph = self._build_graph()
         self._current_output_dir: Path | None = None
@@ -46,12 +51,14 @@ class LangGraphSATDWorkflow:
         graph = StateGraph(GraphState)
         graph.add_node("analyze", self._analyze_node)
         graph.add_node("repair", self._repair_node)
+        graph.add_node("select", self._select_node)
         graph.add_node("review", self._review_node)
         graph.add_node("accept", self._accept_node)
         graph.add_node("drop", self._drop_node)
         graph.add_edge(START, "analyze")
         graph.add_conditional_edges("analyze", self._route_after_analysis, {"repair": "repair", "drop": "drop"})
-        graph.add_edge("repair", "review")
+        graph.add_edge("repair", "select")
+        graph.add_edge("select", "review")
         graph.add_conditional_edges("review", self._route_after_review, {"accept": "accept", "repair": "repair", "drop": "drop"})
         graph.add_edge("accept", END)
         graph.add_edge("drop", END)
@@ -83,24 +90,39 @@ class LangGraphSATDWorkflow:
         next_round = state["round_id"] + 1
         self._log(f"[task {state['task_id']}] repair start round={next_round}")
         context_bundle = self._load_or_build_shared_context(state)
-        try:
-            repair = self.fixer.run({**state, "github_context": context_bundle})
-        except Exception as exc:
-            if self.context_client._is_content_filter_error(exc):
-                self._log(f"[task {state['task_id']}] repair content-filtered; using fallback no-op repair")
-                repair = self._fallback_repair(state, next_round, reason="fixer_content_filter")
-            else:
-                self._log(f"[task {state['task_id']}] repair exception type={type(exc).__name__}; using fallback no-op repair")
-                repair = self._fallback_repair(state, next_round, reason=f"fixer_exception:{type(exc).__name__}")
-        self._log(f"[task {state['task_id']}] repair done round={repair.round_id} scope={repair.changed_scope} conf={repair.confidence:.2f}")
+        satd_route_type = self._infer_satd_route_type(state)
+        candidates = self._run_repair_candidates(state, context_bundle, next_round, satd_route_type)
+        provisional = self._select_candidate_without_selector(candidates)
+        self._log(
+            f"[task {state['task_id']}] repair done round={provisional.round_id} "
+            f"candidate={provisional.candidate_mode} scope={provisional.changed_scope} conf={provisional.confidence:.2f}"
+        )
         return {
             "github_context": context_bundle,
-            "repair_context_used": bool((context_bundle.get("metadata") or {}).get("repair_cached")),
+            "satd_route_type": satd_route_type,
+            "repair_candidates": candidates,
+            "candidate_repairs": [*state["candidate_repairs"], *candidates],
+            "repair_context_used": provisional.candidate_mode.endswith("context"),
             "repair_feedback": state.get("repair_feedback"),
             "status": "repairing",
-            "round_id": repair.round_id,
-            "latest_repair": repair,
-            "repairs": [*state["repairs"], repair],
+            "round_id": provisional.round_id,
+            "latest_repair": provisional,
+        }
+
+    def _select_node(self, state: GraphState) -> dict:
+        self._log(f"[task {state['task_id']}] select start round={state['round_id']}")
+        candidates = state.get("repair_candidates") or ([state["latest_repair"]] if state.get("latest_repair") else [])
+        decision = self._run_selector(state, candidates)
+        selected_repair = self._select_repair_from_decision(candidates, decision)
+        self._log(
+            f"[task {state['task_id']}] select done round={decision.round_id} "
+            f"route={decision.satd_route_type} candidate={selected_repair.candidate_mode} conf={decision.confidence:.2f}"
+        )
+        return {
+            "repair_context_used": selected_repair.candidate_mode.endswith("context"),
+            "latest_repair": selected_repair,
+            "selector_decisions": [*state["selector_decisions"], decision],
+            "status": "selected",
         }
 
     def _review_node(self, state: GraphState) -> dict:
@@ -120,14 +142,21 @@ class LangGraphSATDWorkflow:
                     review = self._fallback_review(state, reason=f"review_exception:{type(exc).__name__}")
         else:
             review = self._bypass_review(state)
-        self._log(f"[task {state['task_id']}] review done round={review.round_id} approved={review.approved} score={review.review_score:.2f}")
+        self._log(
+            f"[task {state['task_id']}] review done round={review.round_id} "
+            f"candidate={state['latest_repair'].candidate_mode} approved={review.approved} score={review.review_score:.2f}"
+        )
         repair_feedback = None if review.approved else self._build_repair_feedback(review)
         return {
             "github_context": context_bundle,
+            "repair_candidates": [],
+            "candidate_reviews": [*state["candidate_reviews"], review],
             "repair_feedback": repair_feedback,
             "review_strict_gate_result": "approved" if review.approved else "rejected",
             "status": "accepted" if review.approved else "review_failed",
+            "repair_context_used": state["latest_repair"].candidate_mode.endswith("context"),
             "latest_review": review,
+            "repairs": [*state["repairs"], state["latest_repair"]],
             "reviews": [*state["reviews"], review],
             "final_repaired_code": state["latest_repair"].repaired_code if review.approved else state["final_repaired_code"],
         }
@@ -136,6 +165,7 @@ class LangGraphSATDWorkflow:
         self._log(f"[task {state['task_id']}] accepted after rounds={state['round_id']}")
         return {
             "status": "accepted",
+            "repair_candidates": [],
             "repair_feedback": None,
             "review_strict_gate_result": state.get("review_strict_gate_result") or "approved",
             "final_repaired_code": state["latest_repair"].repaired_code if state["latest_repair"] else None,
@@ -144,10 +174,11 @@ class LangGraphSATDWorkflow:
     def _drop_node(self, state: GraphState) -> dict:
         if state["analysis"] and not state["analysis"].repairable:
             self._log(f"[task {state['task_id']}] dropped by analyzer reason={state['analysis'].drop_reason}")
-            return {"status": "dropped_by_analyzer", "repair_feedback": None}
+            return {"status": "dropped_by_analyzer", "repair_candidates": [], "repair_feedback": None}
         self._log(f"[task {state['task_id']}] dropped after review rounds={state['round_id']}")
         return {
             "status": "dropped_after_review",
+            "repair_candidates": [],
             "repair_feedback": state.get("repair_feedback"),
             "review_strict_gate_result": state.get("review_strict_gate_result") or "rejected",
         }
@@ -205,6 +236,130 @@ class LangGraphSATDWorkflow:
         feedback["can_retry"] = bool(feedback["reject_type"] or feedback["revision_advice"] or feedback["key_issues"])
         return feedback if feedback["can_retry"] else None
 
+    def _run_repair_candidates(
+        self,
+        state: GraphState,
+        context_bundle: dict,
+        round_id: int,
+        satd_route_type: str,
+    ) -> list[RepairAttempt]:
+        candidates: list[RepairAttempt] = []
+        candidate_modes = self._candidate_modes_for_route(satd_route_type)
+        for candidate_mode in candidate_modes:
+            candidate_state = {
+                **state,
+                "satd_route_type": satd_route_type,
+                "candidate_mode": candidate_mode,
+                "github_context": None if candidate_mode.endswith("no_context") else context_bundle,
+            }
+            try:
+                repair = self.fixer.run(candidate_state, candidate_mode=candidate_mode)
+            except Exception as exc:
+                if self.context_client._is_content_filter_error(exc):
+                    self._log(
+                        f"[task {state['task_id']}] repair candidate={candidate_mode} "
+                        f"content-filtered; using fallback no-op repair"
+                    )
+                    repair = self._fallback_repair(state, round_id, reason=f"fixer_content_filter:{candidate_mode}")
+                else:
+                    self._log(
+                        f"[task {state['task_id']}] repair candidate={candidate_mode} "
+                        f"exception type={type(exc).__name__}; using fallback no-op repair"
+                    )
+                    repair = self._fallback_repair(state, round_id, reason=f"fixer_exception:{candidate_mode}:{type(exc).__name__}")
+                repair.candidate_mode = candidate_mode
+            candidates.append(repair)
+        return candidates
+
+    def _run_selector(self, state: GraphState, candidates: list[RepairAttempt]) -> SelectorDecision:
+        if not candidates:
+            return SelectorDecision(
+                round_id=state["round_id"] + 1,
+                satd_route_type=str(state.get("satd_route_type") or "generic"),
+                selected_candidate_mode="",
+                selected_index=0,
+                confidence=0.0,
+                rationale="No candidates available.",
+                candidate_scores=[],
+            )
+        if not self.use_selector:
+            selected = self._select_candidate_without_selector(candidates)
+            index = max(0, next((i for i, item in enumerate(candidates) if item is selected), 0))
+            return SelectorDecision(
+                round_id=selected.round_id,
+                satd_route_type=str(state.get("satd_route_type") or "generic"),
+                selected_candidate_mode=selected.candidate_mode,
+                selected_index=index,
+                confidence=max(0.45, selected.confidence),
+                rationale="Selector disabled; using workflow fallback candidate ordering.",
+                candidate_scores=[{"index": i, "candidate_mode": item.candidate_mode, "score": item.confidence} for i, item in enumerate(candidates)],
+            )
+        try:
+            return self.selector.run({**state, "repair_candidates": candidates})
+        except Exception as exc:
+            if self.context_client._is_content_filter_error(exc):
+                self._log(f"[task {state['task_id']}] selector content-filtered; using fallback selection")
+            else:
+                self._log(f"[task {state['task_id']}] selector exception type={type(exc).__name__}; using fallback selection")
+            selected = self._select_candidate_without_selector(candidates)
+            index = max(0, next((i for i, item in enumerate(candidates) if item is selected), 0))
+            return SelectorDecision(
+                round_id=selected.round_id,
+                satd_route_type=str(state.get("satd_route_type") or "generic"),
+                selected_candidate_mode=selected.candidate_mode,
+                selected_index=index,
+                confidence=max(0.45, selected.confidence),
+                rationale=f"Fallback selector used because selector request failed ({type(exc).__name__}).",
+                candidate_scores=[{"index": i, "candidate_mode": item.candidate_mode, "score": item.confidence} for i, item in enumerate(candidates)],
+            )
+
+    def _select_repair_from_decision(self, candidates: list[RepairAttempt], decision: SelectorDecision) -> RepairAttempt:
+        if not candidates:
+            raise ValueError("repair candidates must not be empty")
+        index = decision.selected_index
+        if index < 0 or index >= len(candidates):
+            index = 0
+        return candidates[index]
+
+    def _select_candidate_without_selector(self, candidates: list[RepairAttempt]) -> RepairAttempt:
+        if not candidates:
+            raise ValueError("repair candidates must not be empty")
+        return max(
+            candidates,
+            key=lambda candidate: (
+                candidate.confidence,
+                1 if candidate.candidate_mode.endswith("no_context") else 0,
+            ),
+        )
+
+    def _infer_satd_route_type(self, state: GraphState) -> str:
+        comment = (state.get("satd_comment") or "").strip().lower()
+        if not comment:
+            return "generic"
+        if any(token in comment for token in ("pyre-fixme", "return type", "parameter must be annotated", "annotation", "annotated")):
+            return "type_annotation"
+        if any(token in comment for token in ("uncomment", "re-enable", "reenable", "restore", "commented out")):
+            return "restore_uncomment"
+        if any(token in comment for token in ("replace by", "switch to", "deprecated", "rename", "full_path")):
+            return "replace_symbol"
+        if any(token in comment for token in ("temporary", "hack", "workaround", "obsolete", "remove this", "drop this")):
+            return "remove_temporary"
+        if (
+            any(token in comment for token in ("default value", "set this to", "change it to", "negative", "this line is quite clearly wrong", "wrong", "chmod"))
+            and not any(token in comment for token in ("document", "docstring", "doc ", "example"))
+        ):
+            return "small_local_value_fix"
+        return "generic"
+
+    def _candidate_modes_for_route(self, satd_route_type: str) -> list[str]:
+        if satd_route_type in {"type_annotation", "remove_temporary", "restore_uncomment"}:
+            return ["baseline_no_context", "typed_no_context"]
+        if satd_route_type == "replace_symbol":
+            return ["baseline_no_context", "baseline_context", "typed_context"]
+        if satd_route_type == "small_local_value_fix":
+            return ["baseline_no_context", "baseline_context"]
+        return ["baseline_no_context", "baseline_context"] if self.dual_repair_candidates else ["baseline_context"]
+
     def run_record(self, record: SATDRecord):
         self._log(
             f"[task {record.task_id}] start project={record.project} file={record.file_path} "
@@ -253,7 +408,9 @@ class LangGraphSATDWorkflow:
                 summary["write_batch_size"] = self.write_batch_size
                 summary["use_analyzer"] = self.use_analyzer
                 summary["use_reviewer"] = self.use_reviewer
+                summary["use_selector"] = self.use_selector
                 summary["repair_prompt_mode"] = self.repair_prompt_mode
+                summary["dual_repair_candidates"] = self.dual_repair_candidates
                 if resume and completed_ids:
                     self._append_outputs(output_dir, pending_flush_traces)
                     self._write_summary_csv(output_dir / "summary.csv", summary)
@@ -272,7 +429,9 @@ class LangGraphSATDWorkflow:
             summary["write_batch_size"] = self.write_batch_size
             summary["use_analyzer"] = self.use_analyzer
             summary["use_reviewer"] = self.use_reviewer
+            summary["use_selector"] = self.use_selector
             summary["repair_prompt_mode"] = self.repair_prompt_mode
+            summary["dual_repair_candidates"] = self.dual_repair_candidates
             self._write_summary_csv(output_dir / "summary.csv", summary)
 
         assert summary is not None
@@ -299,7 +458,10 @@ class LangGraphSATDWorkflow:
         self._write_trajectory_overview_csv(output_dir / "trajectory_overview.csv", traces)
         self._write_results_csv(output_dir / "results.csv", traces)
         self._write_repairs_csv(output_dir / "repairs.csv", traces)
+        self._write_repair_candidates_csv(output_dir / "repair_candidates.csv", traces)
+        self._write_selector_decisions_csv(output_dir / "selector_decisions.csv", traces)
         self._write_reviews_csv(output_dir / "reviews.csv", traces)
+        self._write_candidate_reviews_csv(output_dir / "candidate_reviews.csv", traces)
         self._write_github_context_csv(output_dir / "github_context.csv", traces)
         self._write_context_cache_csv(output_dir / "context_cache.csv", traces)
         self._write_summary_csv(output_dir / "summary.csv", summary)
@@ -313,15 +475,15 @@ class LangGraphSATDWorkflow:
 
     def _write_trajectory_overview_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
+            "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment", "satd_route_type",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -335,6 +497,8 @@ class LangGraphSATDWorkflow:
         _, metadata = self._trace_context_metadata(trace)
         repairs = {item.get("round_id"): item for item in trace.repairs}
         reviews = {item.get("round_id"): item for item in trace.reviews}
+        selector_decisions = {item.get("round_id"): item for item in trace.selector_decisions}
+        latest_selector = trace.selector_decisions[-1] if trace.selector_decisions else {}
         row = {
             "task_id": trace.task_id,
             "project": trace.project,
@@ -349,6 +513,7 @@ class LangGraphSATDWorkflow:
             "em_label": trace.em_label,
             "exact_match": trace.exact_match,
             "satd_comment": trace.satd_comment,
+            "satd_route_type": trace.satd_route_type,
             "analysis_decision": analysis.get("decision"),
             "analysis_passed": analysis.get("repairable"),
             "analysis_repairability_score": analysis.get("repairability_score"),
@@ -379,6 +544,9 @@ class LangGraphSATDWorkflow:
             "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
             "repair_context_used": trace.repair_context_used,
             "review_strict_gate_result": trace.review_strict_gate_result,
+            "selector_selected_candidate_mode": latest_selector.get("selected_candidate_mode"),
+            "selector_confidence": latest_selector.get("confidence"),
+            "selector_rationale": latest_selector.get("rationale"),
             "original_code": trace.original_code,
             "processed_manual_code": trace.processed_manual_code,
             "processed_final_repaired_code": trace.processed_final_repaired_code,
@@ -386,6 +554,8 @@ class LangGraphSATDWorkflow:
         for round_id in (1, 2):
             repair = repairs.get(round_id, {})
             review = reviews.get(round_id, {})
+            selector = selector_decisions.get(round_id, {})
+            row[f"round_{round_id}_candidate_mode"] = repair.get("candidate_mode")
             row[f"round_{round_id}_repair_plan"] = repair.get("repair_plan")
             row[f"round_{round_id}_repaired_code"] = preprocess_python_code(repair.get("repaired_code")) if repair else None
             row[f"round_{round_id}_changed_scope"] = repair.get("changed_scope")
@@ -400,6 +570,8 @@ class LangGraphSATDWorkflow:
             row[f"round_{round_id}_review_reject_type"] = review.get("reject_type")
             row[f"round_{round_id}_review_issues"] = " | ".join(review.get("issues", [])) if review else None
             row[f"round_{round_id}_revision_advice"] = review.get("revision_advice")
+            row[f"round_{round_id}_selector_mode"] = selector.get("selected_candidate_mode")
+            row[f"round_{round_id}_selector_confidence"] = selector.get("confidence")
         return row
 
     def _select_fields(self, row: dict, fieldnames: list[str]) -> dict:
@@ -411,8 +583,16 @@ class LangGraphSATDWorkflow:
         steps.append("analysis:pass" if analysis.get("repairable") else f"analysis:{analysis.get('decision') or 'drop'}")
         if trace.repair_context_used:
             steps.append("repair_context:used")
+        selector_by_round = {item.get("round_id"): item for item in trace.selector_decisions}
         for repair in trace.repairs:
-            steps.append(f"repair{repair.get('round_id')}")
+            candidate_mode = repair.get("candidate_mode")
+            if candidate_mode:
+                steps.append(f"repair{repair.get('round_id')}:{candidate_mode}")
+            else:
+                steps.append(f"repair{repair.get('round_id')}")
+            selector = selector_by_round.get(repair.get("round_id"))
+            if selector and selector.get("selected_candidate_mode"):
+                steps.append(f"select{repair.get('round_id')}:{selector.get('selected_candidate_mode')}")
         for review in trace.reviews:
             outcome = "pass" if review.get("approved") else "reject"
             steps.append(f"review{review.get('round_id')}:{outcome}")
@@ -432,15 +612,15 @@ class LangGraphSATDWorkflow:
 
     def _write_results_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
+            "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match", "satd_route_type",
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -449,7 +629,7 @@ class LangGraphSATDWorkflow:
                 writer.writerow(self._select_fields(self._trajectory_row(trace), fieldnames))
 
     def _write_repairs_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -459,13 +639,46 @@ class LangGraphSATDWorkflow:
                     row["repaired_code"] = preprocess_python_code(repair.get("repaired_code"))
                     writer.writerow(row)
 
+    def _write_repair_candidates_csv(self, path: Path, traces: list) -> None:
+        fieldnames = ["task_id", "round_id", "candidate_mode", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for trace in traces:
+                for repair in trace.candidate_repairs:
+                    row = {"task_id": trace.task_id, **repair}
+                    row["repaired_code"] = preprocess_python_code(repair.get("repaired_code"))
+                    writer.writerow(row)
+
+    def _write_selector_decisions_csv(self, path: Path, traces: list) -> None:
+        fieldnames = ["task_id", "round_id", "satd_route_type", "selected_candidate_mode", "selected_index", "confidence", "rationale", "candidate_scores"]
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for trace in traces:
+                for decision in trace.selector_decisions:
+                    row = dict(decision)
+                    row["candidate_scores"] = json.dumps(row.get("candidate_scores", []), ensure_ascii=False)
+                    writer.writerow({"task_id": trace.task_id, **row})
+
     def _write_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for trace in traces:
                 for review in trace.reviews:
+                    row = dict(review)
+                    row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
+                    writer.writerow({"task_id": trace.task_id, **row})
+
+    def _write_candidate_reviews_csv(self, path: Path, traces: list) -> None:
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for trace in traces:
+                for review in trace.candidate_reviews:
                     row = dict(review)
                     row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
                     writer.writerow({"task_id": trace.task_id, **row})
@@ -552,45 +765,68 @@ class LangGraphSATDWorkflow:
         self._append_trajectory_overview_csv(output_dir / "trajectory_overview.csv", traces)
         self._append_results_csv(output_dir / "results.csv", traces)
         self._append_repairs_csv(output_dir / "repairs.csv", traces)
+        self._append_repair_candidates_csv(output_dir / "repair_candidates.csv", traces)
+        self._append_selector_decisions_csv(output_dir / "selector_decisions.csv", traces)
         self._append_reviews_csv(output_dir / "reviews.csv", traces)
+        self._append_candidate_reviews_csv(output_dir / "candidate_reviews.csv", traces)
         self._append_github_context_csv(output_dir / "github_context.csv", traces)
         self._append_context_cache_csv(output_dir / "context_cache.csv", traces)
 
     def _append_csv_rows(self, path: Path, fieldnames: list[str], rows: list[dict]) -> None:
         if not rows:
             return
+        self._ensure_csv_schema(path, fieldnames)
         write_header = not path.exists() or path.stat().st_size == 0
         with path.open("a", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             if write_header:
                 writer.writeheader()
             for row in rows:
-                writer.writerow(row)
+                writer.writerow(self._select_fields(row, fieldnames))
+
+    def _ensure_csv_schema(self, path: Path, fieldnames: list[str]) -> None:
+        if not path.exists() or path.stat().st_size == 0:
+            return
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            existing_fieldnames = reader.fieldnames or []
+            if existing_fieldnames == fieldnames:
+                return
+            existing_rows = list(reader)
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in existing_rows:
+                writer.writerow(self._select_fields(row, fieldnames))
 
     def _append_trajectory_overview_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment",
+            "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment", "satd_route_type",
             "analysis_decision", "analysis_passed", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         rows = [self._trajectory_row(trace) for trace in traces]
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_results_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
-            "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match",
+            "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match", "satd_route_type",
             "analysis_decision", "analysis_repairable", "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
+            "round_1_selector_mode", "round_1_selector_confidence",
+            "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence",
+            "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
         ]
         rows = []
         for trace in traces:
@@ -598,7 +834,7 @@ class LangGraphSATDWorkflow:
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_repairs_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
         rows = []
         for trace in traces:
             for repair in trace.repairs:
@@ -607,11 +843,41 @@ class LangGraphSATDWorkflow:
                 rows.append(row)
         self._append_csv_rows(path, fieldnames, rows)
 
+    def _append_repair_candidates_csv(self, path: Path, traces: list) -> None:
+        fieldnames = ["task_id", "round_id", "candidate_mode", "repair_plan", "repaired_code", "changed_scope", "confidence", "notes"]
+        rows = []
+        for trace in traces:
+            for repair in trace.candidate_repairs:
+                row = {"task_id": trace.task_id, **repair}
+                row["repaired_code"] = preprocess_python_code(repair.get("repaired_code"))
+                rows.append(row)
+        self._append_csv_rows(path, fieldnames, rows)
+
+    def _append_selector_decisions_csv(self, path: Path, traces: list) -> None:
+        fieldnames = ["task_id", "round_id", "satd_route_type", "selected_candidate_mode", "selected_index", "confidence", "rationale", "candidate_scores"]
+        rows = []
+        for trace in traces:
+            for decision in trace.selector_decisions:
+                row = dict(decision)
+                row["candidate_scores"] = json.dumps(row.get("candidate_scores", []), ensure_ascii=False)
+                rows.append({"task_id": trace.task_id, **row})
+        self._append_csv_rows(path, fieldnames, rows)
+
     def _append_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
         rows = []
         for trace in traces:
             for review in trace.reviews:
+                row = dict(review)
+                row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
+                rows.append({"task_id": trace.task_id, **row})
+        self._append_csv_rows(path, fieldnames, rows)
+
+    def _append_candidate_reviews_csv(self, path: Path, traces: list) -> None:
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        rows = []
+        for trace in traces:
+            for review in trace.candidate_reviews:
                 row = dict(review)
                 row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
                 rows.append({"task_id": trace.task_id, **row})
@@ -806,6 +1072,12 @@ class LangGraphSATDWorkflow:
             decision="drop",
             repairable=False,
             repairability_score=0.0,
+            intent_clarity=0.0,
+            change_locality=0.0,
+            semantic_risk=1.0,
+            context_sufficiency=0.0,
+            verifiability=0.0,
+            analyze_score=0.0,
             confidence=0.0,
             satd_type="content_filtered",
             reason=reason,
@@ -883,17 +1155,24 @@ class LangGraphSATDWorkflow:
         )
 
     def _fallback_review(self, state: GraphState, reason: str = "review_fallback") -> ReviewResult:
+        candidate_mode = getattr(state.get("latest_repair"), "candidate_mode", "single") if isinstance(state, dict) else "single"
         return ReviewResult(
             round_id=state["round_id"],
             approved=False,
             review_score=0.0,
+            problem_alignment=0.0,
+            minimality=0.0,
+            semantic_preservation=0.0,
+            internal_consistency=0.0,
             issues=[f"Reviewer fallback triggered: {reason}"],
             revision_advice=f"Stop automatic approval for this SATD because reviewer request failed ({reason}).",
             reject_type="content_filter" if "content_filter" in reason else "review_error",
             rationale=f"Reviewer fallback triggered: {reason}",
+            candidate_mode=candidate_mode,
         )
 
     def _bypass_review(self, state: GraphState) -> ReviewResult:
+        candidate_mode = getattr(state.get("latest_repair"), "candidate_mode", "single") if isinstance(state, dict) else "single"
         return ReviewResult(
             round_id=state["round_id"],
             approved=True,
@@ -907,6 +1186,7 @@ class LangGraphSATDWorkflow:
             reject_type=None,
             rationale="Reviewer disabled in fixer-only experiment.",
             softened_gate_used=False,
+            candidate_mode=candidate_mode,
         )
 
     def _log(self, message: str) -> None:

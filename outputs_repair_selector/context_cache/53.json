@@ -1,0 +1,136 @@
+{
+  "task_id": "53",
+  "repo_owner": "devitocodes",
+  "repo_name": "devito",
+  "file_path": "devito/yask/operator.py",
+  "commit": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T02:46:03+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5",
+    "symbol_name": "apply",
+    "satd_line": 116,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T02:46:03+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "devito/yask/operator.py",
+    "original_signature": "def apply(self, **kwargs):",
+    "target_file": {
+      "ok": true,
+      "path": "devito/yask/operator.py",
+      "sha": "e9ef85c1ac2deff985ac98f9d7f18ece99126f2b",
+      "download_url": "https://raw.githubusercontent.com/devitocodes/devito/d0a942b2f45425458ffc2f18cdfc0e476ee3cef5/devito/yask/operator.py",
+      "content_excerpt": "from __future__ import absolute_import\n\nfrom sympy import Indexed\n\nfrom devito.dimension import LoweredDimension\nfrom devito.dle import retrieve_iteration_tree\nfrom devito.logger import debug, info, warning\nfrom devito.operator import OperatorRunnable\n\nfrom devito.yask.kernel import YASK, namespace, yask_jit, _force_exit\n\n__all__ = ['Operator']\n\n\nclass Operator(OperatorRunnable):\n\n    \"\"\"\n    A special :class:`OperatorCore` to JIT-compile and run operators through YASK.\n    \"\"\"\n\n    def __init__(self, expressions, **kwargs):\n        kwargs['dle'] = 'noop'\n        super(Operator, self).__init__(expressions, **kwargs)\n\n    def _specialize(self, nodes, elemental_functions):\n        \"\"\"\n        Create a YASK representation of this Iteration/Expression tree.\n        \"\"\"\n\n        warning(\"Converting a Devito AST into a YASK AST\")\n\n        # Set up the YASK solution\n        self.soln = YASK.cfac.new_solution(namespace['kernel-real'])\n\n        # Silence YASK\n        self.yask_compiler_output = YASK.ofac.new_string_output()\n        self.soln.set_debug_output(self.yask_compiler_output)\n\n        trees = retrieve_iteration_tree(nodes)\n        if len(trees) > 1:\n            _force_exit(\"Currently unable to handle Operators w/ more than 1 loop nests\")\n\n        tree = trees[0]\n        candidate = tree[-1]\n\n        # Perform the translation on an expression basis\n        transform = sympy2yask(self.soln)\n        expressions = [e for e in candidate.nodes if e.is_Expression]\n        try:\n            for i in expressions:\n                ast = transform(i.expr)\n                info(\"Converted %s into YASK ast [%s]\", str(i.expr), ast.format_simple())\n        except:\n            _force_exit(\"Couldn't convert %s into YASK format\" % str(i.expr))\n\n        # Print some useful information about the newly constructed Yask solution\n        info(\"Solution '\" + self.soln.get_name() + \"' contains \" +\n             str(self.soln.get_num_grids()) + \" grid(s), and \" +\n             str(self.soln.get_num_equations()) + \" equation(s).\")\n\n        # Set necessary run-time parameters\n        self.soln.set_step_dim_name(YASK.time_dimension)\n        self.soln.set_domain_dim_names(YASK.space_dimensions)\n        self.soln.set_element_bytes(4)\n\n        # JIT YASK kernel\n        name = 'kernel%d' % YASK.nkernels\n        yk = yask_jit(self.soln, name)\n\n        # Build an empty kernel solution\n        kfac = yk.yk_factory()\n        env = kfac.new_env()\n        self.ksoln = kfac.new_solution(env)\n\n        # Silence YASK\n        self.yask_kernel_output = yk.yask_output_factory().new_string_output()\n        self.ksoln.set_debug_output(self.yask_kernel_output)\n\n        self.ksoln.set_num_ranks(self.ksoln.get_domain_dim_name(0), env.get_num_ranks())\n\n        # Track this Operator\n        YASK.add_kernel(name, self)\n\n        # TODO: need to update nodes and elemental_functions\n\n        return nodes, elemental_functions\n\n    def apply(self, *args, **kwargs):\n        # Build the arguments list to invoke the kernel function\n        arguments, dim_sizes = self.arguments(*args, **kwargs)\n\n        # Set the domain sizes\n        for dm in self.ksoln.get_domain_dim_names():\n            self.ksoln.set_rank_domain_size(dm, dim_sizes[dm])\n\n        # Share the grids from the hook solution\n        for kgrid in self.ksoln.get_grids():\n            name = kgrid.get_name()\n            try:\n                hook_grid = YASK.grids[name]\n            except KeyError:\n                _force_exit(\"Unknown grid %s\" % name)\n            kgrid.share_storage(hook_grid)\n            debug(\"Shared storage from grid <%s>\" % hook_grid.get_name())\n\n        # Print some info about the solution.\n        debug(\"YASK Stencil-solution '\" + self.ksoln.get_name() + \"':\")\n        debug(\"  Step dimension: \" + repr(self.ksoln.get_step_dim_name()))\n        debug(\"  Domain dimensions: \" + repr(self.ksoln.get_domain_dim_names()))\n        debug(\"  Grids:\")\n        for grid in self.ksoln.get_grids():\n            debug(\"    \" + grid.get_name() + repr(grid.get_dim_names()))\n\n        debug(\"Running Operator through YASK...\")\n        self.ksoln.prepare_solution()\n        # TODO: getting number of timesteps in a hacky way\n        self.ksoln.run_solution(arguments[\"%s_size\" % YASK.time_dimension])\n\n\nclass sympy2yask(object):\n    \"\"\"\n    Convert a SymPy expression into a YASK abstract syntax tree and create any\n    necessay YASK grids.\n    \"\"\"\n\n    def __init__(self, soln):\n        self.soln = soln\n        self.mapper = {}\n\n    def __call__(self, expr):\n\n        def nary2binary(args, op):\n            r = run(args[0])\n            return r if len(args) == 1 else op(r, nary2binary(args[1:], op))\n\n        def run(expr):\n            if expr.is_Integer:\n                return YASK.nfac.new_const_number_node(int(expr))\n            elif expr.is_Float:\n                return YASK.nfac.new_const_number_node(float(expr))\n            elif expr.is_Symbol:\n                assert expr in self.mapper\n                return self.mapper[expr]\n            elif isinstance(expr, Indexed):\n                function = expr.base.function\n                name = function.name\n                if name not in YASK.grids:\n                    function.data  # Create uninitialized grid (i.e., 0.0 everywhere)\n                if name not in self.mapper:\n                    dimensions = YASK.grids[name].get_dim_names()\n                    self.mapper[name] = self.soln.new_grid(name, dimensions)\n                indices = [int((i.origin if isinstance(i, LoweredDimension) else i) - j)\n                           for i, j in zip(expr.indices, function.indices)]\n                return self.mapper[name].new_relative_grid_point(*indices)\n            elif expr.is_Add:\n                return nary2binary(expr.args, YASK.nfac.new_add_node)\n            elif expr.is_Mul:\n                return nary2binary(expr.args, YASK.nfac.new_multiply_node)\n            elif expr.is_Pow:\n                num, den = expr.as_numer_denom()\n                if num == 1:\n                    return YASK.nfac.new_divide_node(run(num), run(den))\n            elif expr.is_Equality:\n                if expr.lhs.is_Symbol:\n                    assert expr.lhs not in self.mapper\n                    self.mapper[expr.lhs] = run(expr.rhs)\n                else:\n                    return YASK.nfac.new_equation_node(*[run(i) for i in expr.args])\n            else:\n                warning(\"Missing handler in Devito-YASK translation\")\n                raise NotImplementedError\n\n        return run(expr)\n",
+      "total_lines": 173,
+      "ref": "d0a942b2f45425458ffc2f18cdfc0e476ee3cef5"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "apply",
+      "class_name": "Operator",
+      "start_line": 88,
+      "end_line": 117,
+      "satd_line": 116,
+      "matched_by": "signature_or_comment",
+      "source": "    def apply(self, *args, **kwargs):\n        # Build the arguments list to invoke the kernel function\n        arguments, dim_sizes = self.arguments(*args, **kwargs)\n\n        # Set the domain sizes\n        for dm in self.ksoln.get_domain_dim_names():\n            self.ksoln.set_rank_domain_size(dm, dim_sizes[dm])\n\n        # Share the grids from the hook solution\n        for kgrid in self.ksoln.get_grids():\n            name = kgrid.get_name()\n            try:\n                hook_grid = YASK.grids[name]\n            except KeyError:\n                _force_exit(\"Unknown grid %s\" % name)\n            kgrid.share_storage(hook_grid)\n            debug(\"Shared storage from grid <%s>\" % hook_grid.get_name())\n\n        # Print some info about the solution.\n        debug(\"YASK Stencil-solution '\" + self.ksoln.get_name() + \"':\")\n        debug(\"  Step dimension: \" + repr(self.ksoln.get_step_dim_name()))\n        debug(\"  Domain dimensions: \" + repr(self.ksoln.get_domain_dim_names()))\n        debug(\"  Grids:\")\n        for grid in self.ksoln.get_grids():\n            debug(\"    \" + grid.get_name() + repr(grid.get_dim_names()))\n\n        debug(\"Running Operator through YASK...\")\n        self.ksoln.prepare_solution()\n        # TODO: getting number of timesteps in a hacky way\n        self.ksoln.run_solution(arguments[\"%s_size\" % YASK.time_dimension])",
+      "calls": [
+        "_force_exit",
+        "debug",
+        "repr"
+      ],
+      "self_calls": [
+        "arguments"
+      ],
+      "self_attrs": [
+        "arguments",
+        "ksoln"
+      ],
+      "global_uses": [
+        "YASK",
+        "_force_exit",
+        "debug"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": "Operator",
+      "related_methods_count": 0,
+      "related_attributes_count": 1,
+      "related_methods": [],
+      "related_attributes": [
+        {
+          "attribute": "ksoln",
+          "start_line": 72,
+          "end_line": 74,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        env = kfac.new_env()\n        self.ksoln = kfac.new_solution(env)\n"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_specialize",
+          "class_name": "Operator",
+          "start_line": 25,
+          "end_line": 86,
+          "source": "    def _specialize(self, nodes, elemental_functions):\n        \"\"\"\n        Create a YASK representation of this Iteration/Expression tree.\n        \"\"\"\n\n        warning(\"Converting a Devito AST into a YASK AST\")\n\n        # Set up the YASK solution\n        self.soln = YASK.cfac.new_solution(namespace['kernel-real'])\n\n        # Silence YASK\n        self.yask_compiler_output = YASK.ofac.new_string_output()\n        self.soln.set_debug_output(self.yask_compiler_output)\n\n        trees = retrieve_iteration_tree(nodes)\n        if len(trees) > 1:\n            _force_exit(\"Currently unable to handle Operators w/ more than 1 loop nests\")\n\n        tree = trees[0]\n        candidate = tree[-1]\n\n        # Perform the translation on an expression basis\n        transform = sympy2yask(self.soln)\n        expressions = [e for e in candidate.nodes if e.is_Expression]\n        try:\n            for i in expressions:\n                ast = transform(i.expr)\n                info(\"Converted %s into YASK ast [%s]\", str(i.expr), ast.format_simple())\n        except:\n            _force_exit(\"Couldn't convert %s into YASK format\" % str(i.expr))\n\n        # Print some useful information about the newly constructed Yask solution\n        info(\"Solution '\" + self.soln.get_name() + \"' contains \" +\n             str(self.soln.get_num_grids()) + \" grid(s), and \" +\n             str(self.soln.get_num_equations()) + \" equation(s).\")\n\n        # Set necessary run-time parameters\n        self.soln.set_step_dim_name(YASK.time_dimension)\n        self.soln.set_domain_dim_names(YASK.space_dimensions)\n        self.soln.set_element_bytes(4)\n\n        # JIT YASK kernel\n        name = 'kernel%d' % YASK.nkernels\n        yk = yask_jit(self.soln, name)\n\n        # Build an empty kernel solution\n        kfac = yk.yk_factory()\n        env = kfac.new_env()\n        self.ksoln = kfac.new_solution(env)\n\n        # Silence YASK\n        self.yask_kernel_output = yk.yask_output_factory().new_string_output()\n        self.ksoln.set_debug_output(self.yask_kernel_output)\n\n        self.ksoln.set_num_ranks(self.ksoln.get_domain_dim_name(0), env.get_num_ranks())\n\n        # Track this Operator\n        YASK.add_kernel(name, self)\n\n        # TODO: need to update nodes and elemental_functions\n\n        return nodes, elemental_functions"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

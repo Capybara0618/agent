@@ -1,0 +1,206 @@
+{
+  "task_id": "334",
+  "repo_owner": "lightning-ai",
+  "repo_name": "lightning",
+  "file_path": "pytorch_lightning/utilities/auto_restart.py",
+  "commit": "19136ac847d1a4e5b6fba5804dcc0e7cf2780a75",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T04:12:41+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "19136ac847d1a4e5b6fba5804dcc0e7cf2780a75",
+    "symbol_name": "__getitem__",
+    "satd_line": 204,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 2,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 5,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T04:12:41+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "pytorch_lightning/utilities/auto_restart.py",
+    "original_signature": "def __getitem__(self, item) -> Tuple[Any, Dict[int, Dict]]:",
+    "target_file": {
+      "ok": true,
+      "path": "pytorch_lightning/utilities/auto_restart.py",
+      "sha": "c60c42bdc9b7495583f4d23d27a0f73d4306f65f",
+      "download_url": "https://raw.githubusercontent.com/Lightning-AI/pytorch-lightning/19136ac847d1a4e5b6fba5804dcc0e7cf2780a75/pytorch_lightning/utilities/auto_restart.py",
+      "content_excerpt": "# Copyright The PyTorch Lightning team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nfrom collections.abc import Mapping\nfrom copy import deepcopy\nfrom dataclasses import dataclass, field\nfrom functools import partial, wraps\nfrom typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple, Union\n\nfrom torch.utils.data import Dataset, get_worker_info, Sampler\nfrom torch.utils.data.dataloader import _MultiProcessingDataLoaderIter, DataLoader, IterableDataset\n\nfrom pytorch_lightning.utilities.apply_func import apply_to_collection\nfrom pytorch_lightning.utilities.enums import AutoRestartBatchKeys\nfrom pytorch_lightning.utilities.exceptions import MisconfigurationException\n\n\nclass FastForwardSampler(Sampler):\n    \"\"\"\n    This FastForwardSampler wraps a :class:`torch.utils.data.Sampler` and records the number of iterations\n    performed during an epoch. It maintains a state, saved with :meth:`state_dict`, that can be reloaded with\n    :meth:`load_state_dict`. If the sampler is used in a multiprocessing context, the ``FastForwardSampler`` will record\n    the state of the current worker.\n    When reloading, the ``FastForwardSampler`` will \"fast-forward\" the wrapped sampler by iterating through all the\n    samples seen in the last iterations (for the current worker).\n    \"\"\"\n\n    def __init__(self, sampler: Union[Sampler, Generator], attr_name: Optional[str] = None) -> None:\n        super().__init__(data_source=None)\n        self._sampler = sampler\n        self.restarting: bool = False\n        self._current_iteration = 0\n        self._dataloader_batch_size: Optional[int] = None\n        self._cached_state_dict: Optional[Dict[int, Any]] = None\n        self._attr_name = attr_name\n\n    def __getattr__(self, key: str) -> Any:\n        if key in self.__dict__:\n            return self.__dict__[key]\n        return getattr(self._sampler, key, None)\n\n    def setup(self, dataloader_batch_size: Optional[int] = None) -> None:\n        \"\"\"Setup the ``FastForwardSampler``. This is required only when the provided dataset subclassed\n        :class:`torch.utils.data.Dataset`.\n        \"\"\"\n        self._dataloader_batch_size = dataloader_batch_size\n\n    @property\n    def worker_id(self) -> int:\n        worker_info = get_worker_info()\n        return worker_info.id if worker_info else 0\n\n    def __iter__(self) -> Iterator[Any]:\n        self._current_iteration = 0\n        # the `state dict` was cached as workers were unavailable before.\n        if self._cached_state_dict is not None:\n            self._load_non_random_state(self._cached_state_dict)\n\n        i = 0\n        sampler_iter = iter(self._sampler)\n        while i < self._current_iteration:\n            next(sampler_iter)\n            i += 1\n\n        # here: i == self._current_iteration\n        if self._cached_state_dict is not None:\n            self._cached_state_dict = None\n\n        # recreate iterator to be sure loading is reflected there as well\n        while True:\n            self._current_iteration += 1\n            try:\n                yield next(sampler_iter)\n            except StopIteration:\n                break\n\n        self._current_iteration = 0\n        self._cached_state_dict = None\n        self.restarting = False\n\n    def __len__(self) -> int:\n        return len(self._sampler)\n\n    def state_dict(self, num_batches_processed: Optional[int] = None) -> Dict[int, Dict[str, int]]:\n        \"\"\"Returns the state of the sampler in the current worker. The worker id indexes the state dict.\"\"\"\n        return {self.worker_id: {\"current_iteration\": self._compute_current_iteration(num_batches_processed)}}\n\n    def load_state_dict(self, state_dict: Dict[int, Any]) -> None:\n        \"\"\"\n        Loads the saved state for the wrapped sampler.\n        If the ``state_dict`` contains multiple states, it means there were multiple workers.\n        The state will be cached and fully reloaded (fast-forward) the first time :meth:`__iter__` is called.\n        \"\"\"\n        # as workers aren't available, the ``state_dict``` is cached until workers are made available.\n        state_dict = deepcopy(state_dict)\n        self._cached_state_dict = state_dict\n        self.restarting = True\n\n    def _compute_current_iteration(self, num_batches_processed: Optional[int] = None) -> int:\n        \"\"\"\n        This function is used to compute the effective iteration.\n        As DataLoader can perform ``prefecthing`` or training can fail while processing a batch,\n        the current iteration needs to be computed using the ``num_batches_processed`` processed information.\n        \"\"\"\n        if num_batches_processed is not None:\n            current_iteration = num_batches_processed\n        else:\n            current_iteration = self._current_iteration\n\n        if self._dataloader_batch_size and num_batches_processed is not None:\n            current_iteration *= self._dataloader_batch_size\n\n        return current_iteration\n\n    def _load_non_random_state(self, state_dict: Dict[int, Dict[str, Any]]) -> None:\n        self._current_iteration = state_dict[self.worker_id][\"current_iteration\"]\n\n\n@dataclass(frozen=True, unsafe_hash=True)\nclass IteratorState:\n    \"\"\"The state of an iterator in a single worker process.\"\"\"\n\n    dataset_state: Dict[int, Any] = field(default_factory=dict)\n    sampler_state: Dict[int, Any] = field(default_factory=dict)\n    worker_id: int = 0\n    num_workers: int = 0\n    num_batches_fetched: int = 0\n    name: Optional[str] = None\n\n    @classmethod\n    def from_state_dict(cls, state_dict) -> \"IteratorState\":\n        return cls(**state_dict)\n\n\n@dataclass\nclass MergedIteratorState:\n    \"\"\"This class is used to hold the current iterator state and lives on the iterator. It holds the current merged\n    states from all worker processes. Once an iterator advances, it can store updates of the worker states in this\n    merged iterator state.\"\"\"\n\n    state: Union[Dict[Union[int, str], Union[Dict[str, IteratorState], IteratorState]]] = field(default_factory=dict)\n    latest_worker_id: int = 0\n    represent_map_dataset: Optional[bool] = None\n\n    def update(self, generator_name: Optional[str], new_state: IteratorState) -> None:\n        # a map based dataset doesn't own a generator and therefore `generator_name` should be None.\n        self.represent_map_dataset = generator_name is None\n        if self.represent_map_dataset:\n            state = self.state\n        else:\n            if generator_name not in self.state:\n                self.state[generator_name] = {}\n            state = self.state[generator_name]\n\n        latest_worker_id = new_state.worker_id\n        state[latest_worker_id] = new_state\n        self.latest_worker_id = latest_worker_id\n\n    @classmethod\n    def from_state_dict(cls, state_dict) -> \"MergedIteratorState\":\n        if state_dict[\"represent_map_dataset\"]:\n            state_dict[\"state\"] = {\n                worker_id: IteratorState.from_state_dict(state) for worker_id, state in state_dict[\"state\"].items()\n            }\n        else:\n            state_dict[\"state\"] = {\n                sampler_name: {\n                    worker_id: IteratorState.from_state_dict(state) for worker_id, state in worker_state.items()\n                }\n                for sampler_name, worker_state in state_dict[\"state\"].items()\n            }\n        return cls(**state_dict)\n\n    def __len__(self) -> int:\n        return len(self.state)\n\n\nclass CaptureMapDataset(Dataset):\n    \"\"\"This class is used to capture the state from the map-based state dataset.\"\"\"\n\n    def __init__(self, dataset: Dataset) -> None:\n        self.dataset = dataset\n        self._cached_state_dict = None\n\n    @property\n    def worker_id(self) -> int:\n        worker_info = get_worker_info()\n        return worker_info.id if worker_info else 0\n\n    def __getitem__(self, item) -> Tuple[Any, Dict[int, Dict]]:\n        if self._cached_state_dict is not None:\n            if self.worker_id in self._cached_state_dict:\n                # TODO: reset random states\n                pass\n            self._cached_state_dict = None\n\n        data = self.dataset[item]\n        state_dict = self._state_dict()\n        return data, state_dict\n\n    def __len__(self) -> int:\n        return len(self.dataset)\n\n    def load_state_dict(self, state_dict: Dict[int, Any], latest_worker_id: int, num_workers: int) -> None:\n        # as workers aren't available, the ``state_dict``` is cached until workers are made available.\n        state_dict = deepcopy(state_dict)\n\n        if num_workers > 0:\n            # remap states to worker ids starting at 0\n            next_worker_id = latest_worker_id + 1\n            old_to_new_worker_id_map = [((next_worker_id + i) % num_workers, i) for i in range(num_workers)]\n            state_dict = {\n                new_id: state_dict[old_id] for old_id, new_id in old_to_new_worker_id_map if old_id in state_dict\n            }\n        self._cached_state_dict = state_dict\n\n    def _state_dict(self) -> Dict[int, Dict[str, Any]]:\n        return {self.worker_id: {\"rng_states\": {}}}\n\n\nclass CaptureIterableDataset(IterableDataset):\n    \"\"\"\n    The ``CaptureIterableDataset`` is used to wrap an :class:`torch.utils.data.IterableDataset`.\n    On ``__iter__`` function call,   the ``CaptureIterableDataset`` will wrap the wrapped dataset\n        generators into ``FastForwardSampler`` to keep track of progress.\n    On ``__next__`` function call, the ``CaptureIterableDataset`` will return a dictionary containing\n        user data and metadata containing the ``FastForwardSampler`` samplers state_dict.\n    \"\"\"\n\n    def __init__(self, dataset: IterableDataset) -> None:\n        super().__init__()\n        self.dataset = deepcopy(dataset)\n        self.samplers: Optional[Dict[str, FastForwardSampler]] = None\n        self._state_dict: Optional[Dict[int, Any]] = None\n        self._has_wrapped: bool = False\n\n    @property\n    def sampler(self) -> Sampler:\n        return self.dataset.sampler\n\n    def state_dict(self) -> Dict[str, Any]:\n        return {k: v.state_dict() for k, v in self.samplers.items()}\n\n    def load_state_dict(self, state_dict: Dict[int, Any]) -> None:\n        self._state_dict = deepcopy(state_dict)\n\n    def _wrap_generator_samplers(self) -> None:\n        self.samplers = {}\n\n        # access wrapped dataset attributes\n        dataset_dict = self.dataset.__dict__\n\n        # create a tuple of sampler names\n        samplers_names = tuple(v.__class__.__name__ for k, v in dataset_dict.items() if isinstance(v, Sampler))\n\n        # create a dictionary of generator present within the dataset attributes\n        dataset_sampler_generators = {k: v for k, v in dataset_dict.items() if isinstance(v, (Generator, Iterator))}\n\n        # iterate over the generator. If a generator was created from a `Sampler`,\n        # it will be wrapped into a `FastForwardSampler`.\n        for (generator_attr_name, generator) in dataset_sampler_generators.items():\n\n            if isinstance(generator, Sampler):\n                continue\n\n            # used to handle a weird behaviour from PyTorch 1.6\n            # where the sampler is converted to a list_iterator\n            is_legacy = False\n\n            if isinstance(generator, Generator):\n                # Generator name have the  the form `SamplerName.__iter__`\n                generator_name = generator.__qualname__.split(\".\")[0]\n            else:\n                # assume the retrieved iterator is coming from sampler.\n                is_legacy = True\n\n            # validate the base generator name ",
+      "total_lines": 569,
+      "ref": "19136ac847d1a4e5b6fba5804dcc0e7cf2780a75"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "__getitem__",
+      "class_name": "CaptureMapDataset",
+      "start_line": 201,
+      "end_line": 210,
+      "satd_line": 204,
+      "matched_by": "normalized_source",
+      "source": "    def __getitem__(self, item) -> Tuple[Any, Dict[int, Dict]]:\n        if self._cached_state_dict is not None:\n            if self.worker_id in self._cached_state_dict:\n                # TODO: reset random states\n                pass\n            self._cached_state_dict = None\n\n        data = self.dataset[item]\n        state_dict = self._state_dict()\n        return data, state_dict",
+      "calls": [],
+      "self_calls": [
+        "_state_dict"
+      ],
+      "self_attrs": [
+        "_cached_state_dict",
+        "_state_dict",
+        "dataset",
+        "worker_id"
+      ],
+      "global_uses": [
+        "Any",
+        "Dict",
+        "Tuple"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "_state_dict",
+          "class_name": "CaptureMapDataset",
+          "start_line": 228,
+          "end_line": 229,
+          "relevance": [
+            "direct_call",
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=2",
+            "same_class"
+          ],
+          "source": "    def _state_dict(self) -> Dict[int, Dict[str, Any]]:\n        return {self.worker_id: {\"rng_states\": {}}}"
+        },
+        {
+          "symbol_name": "_load_non_random_state",
+          "class_name": "FastForwardSampler",
+          "start_line": 126,
+          "end_line": 127,
+          "relevance": [
+            "keyword_name_overlap=2",
+            "keyword_source_overlap=2"
+          ],
+          "source": "    def _load_non_random_state(self, state_dict: Dict[int, Dict[str, Any]]) -> None:\n        self._current_iteration = state_dict[self.worker_id][\"current_iteration\"]"
+        },
+        {
+          "symbol_name": "load_state_dict",
+          "class_name": "CaptureMapDataset",
+          "start_line": 215,
+          "end_line": 226,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=2",
+            "same_class"
+          ],
+          "source": "    def load_state_dict(self, state_dict: Dict[int, Any], latest_worker_id: int, num_workers: int) -> None:\n        # as workers aren't available, the ``state_dict``` is cached until workers are made available.\n        state_dict = deepcopy(state_dict)\n\n        if num_workers > 0:\n            # remap states to worker ids starting at 0\n            next_worker_id = latest_worker_id + 1\n            old_to_new_worker_id_map = [((next_worker_id + i) % num_workers, i) for i in range(num_workers)]\n            state_dict = {\n                new_id: state_dict[old_id] for old_id, new_id in old_to_new_worker_id_map if old_id in state_dict\n            }\n        self._cached_state_dict = state_dict"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "CaptureMapDataset",
+      "related_methods_count": 2,
+      "related_attributes_count": 2,
+      "related_methods": [
+        {
+          "symbol_name": "_state_dict",
+          "start_line": 228,
+          "end_line": 229,
+          "relevance": [
+            "direct_self_call",
+            "shared_attrs=1",
+            "keyword_source_overlap=2",
+            "keyword_name_overlap=1"
+          ],
+          "source": "    def _state_dict(self) -> Dict[int, Dict[str, Any]]:\n        return {self.worker_id: {\"rng_states\": {}}}"
+        },
+        {
+          "symbol_name": "load_state_dict",
+          "start_line": 215,
+          "end_line": 226,
+          "relevance": [
+            "shared_attrs=1",
+            "keyword_source_overlap=2",
+            "keyword_name_overlap=1"
+          ],
+          "source": "    def load_state_dict(self, state_dict: Dict[int, Any], latest_worker_id: int, num_workers: int) -> None:\n        # as workers aren't available, the ``state_dict``` is cached until workers are made available.\n        state_dict = deepcopy(state_dict)\n\n        if num_workers > 0:\n            # remap states to worker ids starting at 0\n            next_worker_id = latest_worker_id + 1\n            old_to_new_worker_id_map = [((next_worker_id + i) % num_workers, i) for i in range(num_workers)]\n            state_dict = {\n                new_id: state_dict[old_id] for old_id, new_id in old_to_new_worker_id_map if old_id in state_dict\n            }\n        self._cached_state_dict = state_dict"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "dataset",
+          "start_line": 192,
+          "end_line": 194,
+          "relevance": [
+            "direct_attribute_use",
+            "keyword_source_overlap=1"
+          ],
+          "snippet": "    def __init__(self, dataset: Dataset) -> None:\n        self.dataset = dataset\n        self._cached_state_dict = None"
+        },
+        {
+          "attribute": "_cached_state_dict",
+          "start_line": 193,
+          "end_line": 195,
+          "relevance": [
+            "direct_attribute_use",
+            "keyword_source_overlap=1"
+          ],
+          "snippet": "        self.dataset = dataset\n        self._cached_state_dict = None\n"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "__init__",
+          "class_name": "CaptureMapDataset",
+          "start_line": 192,
+          "end_line": 194,
+          "source": "    def __init__(self, dataset: Dataset) -> None:\n        self.dataset = dataset\n        self._cached_state_dict = None"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

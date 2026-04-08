@@ -58,6 +58,7 @@ class RepairAttempt:
     changed_scope: str
     confidence: float
     notes: str
+    candidate_mode: str = "single"
 
 
 @dataclass
@@ -74,6 +75,18 @@ class ReviewResult:
     reject_type: str | None
     rationale: str
     softened_gate_used: bool = False
+    candidate_mode: str = "single"
+
+
+@dataclass
+class SelectorDecision:
+    round_id: int
+    satd_route_type: str
+    selected_candidate_mode: str
+    selected_index: int
+    confidence: float
+    rationale: str
+    candidate_scores: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -92,8 +105,13 @@ class WorkflowTrace:
     repair_feedback: dict[str, Any] | None
     review_strict_gate_result: str | None
     analysis: dict[str, Any] | None
+    satd_route_type: str | None = None
     repairs: list[dict[str, Any]] = field(default_factory=list)
     reviews: list[dict[str, Any]] = field(default_factory=list)
+    repair_candidates: list[dict[str, Any]] = field(default_factory=list)
+    candidate_repairs: list[dict[str, Any]] = field(default_factory=list)
+    candidate_reviews: list[dict[str, Any]] = field(default_factory=list)
+    selector_decisions: list[dict[str, Any]] = field(default_factory=list)
     processed_final_repaired_code: str | None = None
     em_label: str | None = None
     exact_match: bool | None = None
@@ -119,6 +137,11 @@ class GraphState(TypedDict):
     repair_feedback: dict[str, Any] | None
     review_strict_gate_result: str | None
     analysis: AnalysisResult | None
+    satd_route_type: str | None
+    repair_candidates: list[RepairAttempt]
+    candidate_repairs: list[RepairAttempt]
+    candidate_reviews: list[ReviewResult]
+    selector_decisions: list[SelectorDecision]
     repairs: list[RepairAttempt]
     reviews: list[ReviewResult]
     latest_repair: RepairAttempt | None
@@ -173,6 +196,11 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         repair_feedback=None,
         review_strict_gate_result=None,
         analysis=None,
+        satd_route_type=None,
+        repair_candidates=[],
+        candidate_repairs=[],
+        candidate_reviews=[],
+        selector_decisions=[],
         repairs=[],
         reviews=[],
         latest_repair=None,
@@ -254,6 +282,11 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         repair_feedback=state["repair_feedback"],
         review_strict_gate_result=state["review_strict_gate_result"],
         analysis=asdict(state["analysis"]) if state["analysis"] else None,
+        satd_route_type=state.get("satd_route_type"),
+        repair_candidates=[asdict(item) for item in state["repair_candidates"]],
+        candidate_repairs=[asdict(item) for item in state["candidate_repairs"]],
+        candidate_reviews=[asdict(item) for item in state["candidate_reviews"]],
+        selector_decisions=[asdict(item) for item in state["selector_decisions"]],
         repairs=[asdict(item) for item in state["repairs"]],
         reviews=[asdict(item) for item in state["reviews"]],
         processed_final_repaired_code=processed_final_repaired_code,

@@ -1,0 +1,142 @@
+{
+  "task_id": "435",
+  "repo_owner": "facebook",
+  "repo_name": "pyre-check",
+  "file_path": "client/commands/v2/persistent.py",
+  "commit": "1869fe27ff3b9e0ee5a68e37430865079675535e",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T16:29:35+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "1869fe27ff3b9e0ee5a68e37430865079675535e",
+    "symbol_name": "hover_response_for_position",
+    "satd_line": 27,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T16:29:35+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "client/commands/v2/persistent.py",
+    "original_signature": "def hover_response_for_position(",
+    "target_file": {
+      "ok": true,
+      "path": "client/commands/v2/persistent.py",
+      "sha": "b3b9692e02a974834e22677110a234480ca7d417",
+      "download_url": "https://raw.githubusercontent.com/facebook/pyre-check/1869fe27ff3b9e0ee5a68e37430865079675535e/client/commands/v2/persistent.py",
+      "content_excerpt": "# Copyright (c) Facebook, Inc. and its affiliates.\n#\n# This source code is licensed under the MIT license found in the\n# LICENSE file in the root directory of this source tree.\n\nimport asyncio\nimport dataclasses\nimport enum\nimport json\nimport logging\nimport os\nimport subprocess\nimport tempfile\nimport traceback\nfrom pathlib import Path\nfrom typing import Union, Optional, AsyncIterator, Set, List, Sequence, Dict, Callable\n\nfrom ... import (\n    log,\n    json_rpc,\n    error,\n    version,\n    command_arguments,\n    commands,\n    configuration as configuration_module,\n    statistics_logger,\n)\nfrom . import (\n    backend_arguments,\n    language_server_protocol as lsp,\n    server_connection,\n    async_server_connection as connection,\n    start,\n    incremental,\n    server_event,\n)\n\nLOG: logging.Logger = logging.getLogger(__name__)\n\nCONSECUTIVE_START_ATTEMPT_THRESHOLD: int = 5\n\n\nclass LSPEvent(enum.Enum):\n    INITIALIZED = \"initialized\"\n    NOT_INITIALIZED = \"not initialized\"\n    CONNECTED = \"connected\"\n    NOT_CONNECTED = \"not connected\"\n    NOT_CONFIGURED = \"not configured\"\n    DISCONNECTED = \"disconnected\"\n    SUSPENDED = \"suspended\"\n\n\ndef _log_lsp_event(\n    remote_logging: Optional[backend_arguments.RemoteLogging],\n    event: LSPEvent,\n    integers: Optional[Dict[str, int]] = None,\n    normals: Optional[Dict[str, Optional[str]]] = None,\n) -> None:\n    if remote_logging is not None:\n        logger = remote_logging.logger\n        if logger is not None:\n            log_identifier = remote_logging.identifier\n            statistics_logger.log(\n                category=statistics_logger.LoggerCategory.LSP_EVENTS,\n                logger=logger,\n                integers=integers,\n                normals={\n                    **(normals or {}),\n                    \"event\": event.value,\n                    \"pyre client version\": version.__version__,\n                    **(\n                        {\"identifier\": log_identifier}\n                        if log_identifier is not None\n                        else {}\n                    ),\n                },\n            )\n\n\ndef process_initialize_request(\n    parameters: lsp.InitializeParameters,\n    ide_features: Optional[configuration_module.IdeFeatures],\n) -> lsp.InitializeResult:\n    LOG.info(\n        f\"Received initialization request from {parameters.client_info} \"\n        f\" (pid = {parameters.process_id})\"\n    )\n\n    server_info = lsp.Info(name=\"pyre\", version=version.__version__)\n    server_capabilities = lsp.ServerCapabilities(\n        text_document_sync=lsp.TextDocumentSyncOptions(\n            open_close=True,\n            change=lsp.TextDocumentSyncKind.NONE,\n            save=lsp.SaveOptions(include_text=False),\n        ),\n        **(\n            {\"hover_provider\": ide_features.is_hover_enabled()}\n            if ide_features is not None\n            else {}\n        ),\n    )\n    return lsp.InitializeResult(\n        capabilities=server_capabilities, server_info=server_info\n    )\n\n\n@dataclasses.dataclass(frozen=True)\nclass InitializationSuccess:\n    client_capabilities: lsp.ClientCapabilities\n    client_info: Optional[lsp.Info] = None\n    initialization_options: Optional[lsp.InitializationOptions] = None\n\n\n@dataclasses.dataclass(frozen=True)\nclass InitializationFailure:\n    exception: Optional[json_rpc.JSONRPCException] = None\n\n\n@dataclasses.dataclass(frozen=True)\nclass InitializationExit:\n    pass\n\n\nasync def try_initialize(\n    input_channel: connection.TextReader,\n    output_channel: connection.TextWriter,\n    ide_features: Optional[configuration_module.IdeFeatures] = None,\n) -> Union[InitializationSuccess, InitializationFailure, InitializationExit]:\n    \"\"\"\n    Read an LSP message from the input channel and try to initialize an LSP\n    server. Also write to the output channel with proper response if the input\n    message is a request instead of a notification.\n\n    The function can return one of three possibilities:\n    - If the initialization succeeds, return `InitializationSuccess`.\n    - If the initialization fails, return `InitializationFailure`. There could\n      be many reasons for the failure: The incoming LSP message may not be an\n      initiailization request. The incoming LSP request may be malformed. Or the\n      client may not complete the handshake by sending back an `initialized` request.\n    - If an exit notification is received, return `InitializationExit`. The LSP\n      spec allows exiting a server without a preceding initialize request.\n    \"\"\"\n    request = None\n    try:\n        request = await lsp.read_json_rpc(input_channel)\n        LOG.debug(f\"Received pre-initialization LSP request: {request}\")\n\n        request_id = request.id\n        if request_id is None:\n            return (\n                InitializationExit()\n                if request.method == \"exit\"\n                else InitializationFailure()\n            )\n        if request.method != \"initialize\":\n            raise lsp.ServerNotInitializedError(\"An initialize request is needed.\")\n        request_parameters = request.parameters\n        if request_parameters is None:\n            raise lsp.ServerNotInitializedError(\n                \"Missing parameters for initialize request.\"\n            )\n\n        initialize_parameters = lsp.InitializeParameters.from_json_rpc_parameters(\n            request_parameters\n        )\n        result = process_initialize_request(initialize_parameters, ide_features)\n        await lsp.write_json_rpc(\n            output_channel,\n            # pyre-fixme[16]: Pyre doesn't understand `dataclasses_json`\n            json_rpc.SuccessResponse(id=request_id, result=result.to_dict()),\n        )\n\n        initialized_notification = await lsp.read_json_rpc(input_channel)\n        if initialized_notification.method == \"shutdown\":\n            await _wait_for_exit(input_channel, output_channel)\n            return InitializationExit()\n        elif initialized_notification.method != \"initialized\":\n            actual_message = json.dumps(initialized_notification.json())\n            raise lsp.ServerNotInitializedError(\n                \"Failed to receive an `initialized` request from client. \"\n                + f\"Got {log.truncate(actual_message, 100)}\"\n            )\n\n        return InitializationSuccess(\n            client_capabilities=initialize_parameters.capabilities,\n            client_info=initialize_parameters.client_info,\n            initialization_options=initialize_parameters.initialization_options,\n        )\n    except json_rpc.JSONRPCException as json_rpc_error:\n        await lsp.write_json_rpc(\n            output_channel,\n            json_rpc.ErrorResponse(\n                id=request.id if request is not None else None,\n                code=json_rpc_error.error_code(),\n                message=str(json_rpc_error),\n                data={\"retry\": False},\n            ),\n        )\n        return InitializationFailure(exception=json_rpc_error)\n\n\n@connection.asynccontextmanager\nasync def _read_lsp_request(\n    input_channel: connection.TextReader, output_channel: connection.TextWriter\n) -> AsyncIterator[json_rpc.Request]:\n    message = None\n    try:\n        message = await lsp.read_json_rpc(input_channel)\n        yield message\n    except json_rpc.JSONRPCException as json_rpc_error:\n        await lsp.write_json_rpc(\n            output_channel,\n            json_rpc.ErrorResponse(\n                # pyre-ignore[16] - refinement doesn't work here for some reason\n                id=message.id if message is not None else None,\n                code=json_rpc_error.error_code(),\n                message=str(json_rpc_error),\n            ),\n        )\n\n\nasync def _wait_for_exit(\n    input_channel: connection.TextReader, output_channel: connection.TextWriter\n) -> None:\n    \"\"\"\n    Wait for an LSP \"exit\" request from the `input_channel`. This is mostly useful\n    when the LSP server has received a \"shutdown\" request, in which case the LSP\n    specification dictates that only \"exit\" can be sent from the client side.\n\n    If a non-exit LSP request is received, drop it and keep waiting on another\n    \"exit\" request.\n    \"\"\"\n    while True:\n        async with _read_lsp_request(input_channel, output_channel) as request:\n            if request.method == \"exit\":\n                return\n            else:\n                raise json_rpc.InvalidRequestError(\n                    f\"Only exit requests are accepted after shutdown. Got {request}.\"\n                )\n\n\nasync def _publish_diagnostics(\n    output_channel: connection.TextWriter,\n    path: Path,\n    diagnostics: Sequence[lsp.Diagnostic],\n) -> None:\n    LOG.debug(f\"Publish diagnostics for {path}: {diagnostics}\")\n    await lsp.write_json_rpc(\n        output_channel,\n        json_rpc.Request(\n            method=\"textDocument/publishDiagnostics\",\n            parameters=json_rpc.ByNameParameters(\n                {\n                    \"uri\": lsp.DocumentUri.from_file_path(path).unparse(),\n                    \"diagnostics\": [\n                        # pyre-fixme[16]: Pyre doesn't understand `dataclasses_json`\n                        diagnostic.to_dict()\n                        for diagnostic in diagnostics\n                    ],\n                }\n            ),\n        ),\n    )\n\n\nTypeInfo = str\n\nLocationTypeLookup = lsp.IntervalTree[lsp.Position, TypeInfo]\n\n\n@dataclasses.dataclass\nclass PyreQueryState:\n    # Shared mutable state.\n    path_to_location_type_lookup: Dict[Path, LocationTypeLookup] = dataclasses.field(\n        default_factory=dict\n    )\n    # Queue of paths that the background query manager will look up types for.\n    paths_to_be_queried: \"asyncio.Queue[Path]\" = dataclasses.field(\n        default_factory=asyncio.Queue\n    )\n\n    def hover_response_for_position(\n        self, path: Path, position: lsp.LspPosition\n    ) -> lsp.HoverResponse:\n        # TODO(T103574623): Look up the type.\n        return lsp.HoverResponse(contents=\"Hello world!\")\n\n\n@dataclasses.dataclass\nclass ServerState:\n    # Immutable States\n    client_capabilities: lsp.ClientCapabilities = lsp.ClientCapabilities()\n\n    # Mutable States\n    consecutive_start_failure: int = 0\n    opened_documents: Set[Path] = dataclasses.field(default_factory=set)\n    diagnostics: Dict[Path, List[lsp.Diagnostic]] = dataclasses.field(\n        default_factory=dict\n    )\n    query_state: PyreQueryState = PyreQueryState()\n\n\nclass PyreServer:\n    # I/O Channels\n    input_channel: connection.TextReader\n    output_channel: connection.TextWriter\n\n    # `pyre_manager` is responsible for handling all interactions with background\n    # Pyre server.\n    pyre_manager: connection.BackgroundTaskManager\n    # NOTE: `state` is mutable and can be changed on `pyre_manager` side.\n    state: ServerState\n\n    def __init__(\n        self,\n        input_channel: connection.TextReader,\n        output_channel: connection.TextWriter,\n        state: ServerState,\n        pyre_manager: connection.BackgroundTaskManager,\n    ) -> None:\n        self.input_channel = input_channel\n        self.output_channel = output_channel\n        self.state = state\n        self.pyre_manager = pyre_manager\n\n    async def wait_for_exit(self) -> int:\n        await _wait_for_exit(self.input_channel, self.output_channel)\n        return 0\n\n    async def _try_restart_pyre_server(self) -> None:\n        if self.state.consecutive_start_failure < CONSECUTIVE_START_ATTEMPT_THRESHOLD:\n            await self.pyre_manager.ensure_task_running()\n        else:\n            LOG.info(\n                \"Not restarting Pyre since failed consecutive start attempt limit\"\n                \" has been reached.\"\n            )\n\n    async def process_open_request(\n        self, parameters: lsp.DidOpenTextDocumentParameters\n    ) -> None:\n        document_path = parameters.text_document.document_uri().to_file_path()\n        if document_path is None:\n            raise json_rpc.InvalidRequestError(\n                f\"Document URI is not a file: {parameters.text_document.uri}\"\n            )\n        self.state.opened_documents.add(document_path)",
+      "total_lines": 1077,
+      "ref": "1869fe27ff3b9e0ee5a68e37430865079675535e"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "hover_response_for_position",
+      "class_name": "PyreQueryState",
+      "start_line": 283,
+      "end_line": 287,
+      "satd_line": 27,
+      "matched_by": "normalized_source",
+      "source": "    def hover_response_for_position(\n        self, path: Path, position: lsp.LspPosition\n    ) -> lsp.HoverResponse:\n        # TODO(T103574623): Look up the type.\n        return lsp.HoverResponse(contents=\"Hello world!\")",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "Path",
+        "lsp"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "subscribe_to_type_error",
+          "class_name": "PyreServerHandler",
+          "start_line": 840,
+          "end_line": 860,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=2"
+          ],
+          "source": "    async def subscribe_to_type_error(\n        self,\n        server_input_channel: connection.TextReader,\n        server_output_channel: connection.TextWriter,\n    ) -> None:\n        try:\n            await self._subscribe_to_type_error(\n                server_input_channel, server_output_channel\n            )\n        finally:\n            await self.show_status_message_to_client(\n                \"Lost connection to the background Pyre Server. \"\n                \"This usually happens when Pyre detect changes in project which \"\n                \"it was not able to handle incrementally. \"\n                \"A new Pyre server will be started next time you open or save \"\n                \"a .py file\",\n                short_message=\"Pyre Stopped\",\n                level=lsp.MessageType.ERROR,\n            )\n            self.server_state.diagnostics = {}\n            await self.show_type_errors_to_client()"
+        },
+        {
+          "symbol_name": "type_error_to_diagnostic",
+          "class_name": null,
+          "start_line": 600,
+          "end_line": 612,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=1"
+          ],
+          "source": "def type_error_to_diagnostic(type_error: error.Error) -> lsp.Diagnostic:\n    return lsp.Diagnostic(\n        range=lsp.Range(\n            start=lsp.Position(line=type_error.line - 1, character=type_error.column),\n            end=lsp.Position(\n                line=type_error.stop_line - 1, character=type_error.stop_column\n            ),\n        ),\n        message=type_error.description,\n        severity=lsp.DiagnosticSeverity.ERROR,\n        code=None,\n        source=\"Pyre\",\n    )"
+        },
+        {
+          "symbol_name": "type_errors_to_diagnostics",
+          "class_name": null,
+          "start_line": 615,
+          "end_line": 623,
+          "relevance": [
+            "keyword_name_overlap=1",
+            "keyword_source_overlap=1"
+          ],
+          "source": "def type_errors_to_diagnostics(\n    type_errors: Sequence[error.Error],\n) -> Dict[Path, List[lsp.Diagnostic]]:\n    result: Dict[Path, List[lsp.Diagnostic]] = {}\n    for type_error in type_errors:\n        result.setdefault(type_error.path, []).append(\n            type_error_to_diagnostic(type_error)\n        )\n    return result"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "PyreQueryState",
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

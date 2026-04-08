@@ -1,0 +1,95 @@
+{
+  "task_id": "240",
+  "repo_owner": "yelp",
+  "repo_name": "mrjob",
+  "file_path": "mrjob/runner.py",
+  "commit": "82c049d84cfcde9987b106d70c54e45e882a11ed",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T03:49:20+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "82c049d84cfcde9987b106d70c54e45e882a11ed",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T03:49:24+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "mrjob/runner.py",
+    "original_signature": "def _hadoop_streaming_commands(self, step_num):",
+    "target_file": {
+      "ok": true,
+      "path": "mrjob/runner.py",
+      "sha": "93602a51f8295dc10151c9f23c74b8d8cacac024",
+      "download_url": "https://raw.githubusercontent.com/Yelp/mrjob/82c049d84cfcde9987b106d70c54e45e882a11ed/mrjob/runner.py",
+      "content_excerpt": "# Copyright 2009-2012 Yelp and Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n# http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\nfrom __future__ import with_statement\n\n\"\"\"Base class for all runners.\"\"\"\n\nimport copy\nimport datetime\nimport getpass\nimport logging\nimport os\nimport os.path\nimport pprint\nimport re\nimport shutil\nimport sys\nfrom subprocess import CalledProcessError\nfrom subprocess import Popen\nfrom subprocess import PIPE\nfrom subprocess import check_call\nimport tempfile\n\ntry:\n    from cStringIO import StringIO\n    StringIO  # quiet \"redefinition of unused ...\" warning from pyflakes\nexcept ImportError:\n    from StringIO import StringIO\n\ntry:\n    import simplejson as json\n    JSONDecodeError = json.JSONDecodeError\nexcept:\n    import json\n    JSONDecodeError = ValueError\n\nfrom mrjob.setup import WorkingDirManager\nfrom mrjob.setup import parse_legacy_hash_path\nfrom mrjob.compat import supports_combiners_in_hadoop_streaming\nfrom mrjob.compat import uses_generic_jobconf\nfrom mrjob.conf import combine_cmds\nfrom mrjob.conf import combine_dicts\nfrom mrjob.conf import combine_envs\nfrom mrjob.conf import combine_local_envs\nfrom mrjob.conf import combine_lists\nfrom mrjob.conf import combine_paths\nfrom mrjob.conf import combine_path_lists\nfrom mrjob.conf import load_opts_from_mrjob_confs\nfrom mrjob.conf import OptionStore\nfrom mrjob.fs.local import LocalFilesystem\nfrom mrjob.step import STEP_TYPES\nfrom mrjob.util import bash_wrap\nfrom mrjob.util import cmd_line\nfrom mrjob.util import file_ext\nfrom mrjob.util import tar_and_gzip\n\n\nlog = logging.getLogger('mrjob.runner')\n\n# use to detect globs and break into the part before and after the glob\nGLOB_RE = re.compile(r'^(.*?)([\\[\\*\\?].*)$')\n\n#: cleanup options:\n#:\n#: * ``'ALL'``: delete local scratch, remote scratch, and logs; stop job flow\n#:   if on EMR and the job is not done when cleanup is run.\n#: * ``'LOCAL_SCRATCH'``: delete local scratch only\n#: * ``'LOGS'``: delete logs only\n#: * ``'NONE'``: delete nothing\n#: * ``'REMOTE_SCRATCH'``: delete remote scratch only\n#: * ``'SCRATCH'``: delete local and remote scratch, but not logs\n#: * ``'JOB'``: stop job if on EMR and the job is not done when cleanup runs\n#: * ``'JOB_FLOW'``: terminate the job flow if on EMR and the job is not done\n#:    on cleanup\n#: * ``'IF_SUCCESSFUL'`` (deprecated): same as ``ALL``. Not supported for\n#:   ``cleanup_on_failure``.\nCLEANUP_CHOICES = ['ALL', 'LOCAL_SCRATCH', 'LOGS', 'NONE', 'REMOTE_SCRATCH',\n                   'SCRATCH', 'JOB', 'IF_SUCCESSFUL', 'JOB_FLOW']\n\n_STEP_RE = re.compile(r'^M?C?R?$')\n\n# buffer for piping files into sort on Windows\n_BUFFER_SIZE = 4096\n\n\nclass RunnerOptionStore(OptionStore):\n\n    # Test cases for this class live in tests.test_option_store rather than\n    # tests.test_runner.\n\n    ALLOWED_KEYS = OptionStore.ALLOWED_KEYS.union(set([\n        'base_tmp_dir',\n        'bootstrap_mrjob',\n        'cleanup',\n        'cleanup_on_failure',\n        'cmdenv',\n        'hadoop_extra_args',\n        'hadoop_streaming_jar',\n        'hadoop_version',\n        'interpreter',\n        'jobconf',\n        'label',\n        'owner',\n        'python_archives',\n        'python_bin',\n        'setup_cmds',\n        'setup_scripts',\n        'steps_interpreter',\n        'steps_python_bin',\n        'upload_archives',\n        'upload_files',\n    ]))\n\n    COMBINERS = combine_dicts(OptionStore.COMBINERS, {\n        'base_tmp_dir': combine_paths,\n        'cmdenv': combine_envs,\n        'hadoop_extra_args': combine_lists,\n        'interpreter': combine_cmds,\n        'jobconf': combine_dicts,\n        'python_archives': combine_path_lists,\n        'python_bin': combine_cmds,\n        'setup_cmds': combine_lists,\n        'setup_scripts': combine_path_lists,\n        'steps_interpreter': combine_cmds,\n        'steps_python_bin': combine_cmds,\n        'upload_archives': combine_path_lists,\n        'upload_files': combine_path_lists,\n    })\n\n    def __init__(self, alias, opts, conf_paths):\n        \"\"\"\n        :param alias: Runner alias (e.g. ``'local'``)\n        :param opts: Options from the command line\n        :param conf_paths: Either a file path or an iterable of paths to config\n                           files\n        \"\"\"\n        super(RunnerOptionStore, self).__init__()\n\n        # sanitize incoming options and issue warnings for bad keys\n        opts = self.validated_options(\n            opts, 'Got unexpected keyword arguments: %s')\n\n        unsanitized_opt_dicts = load_opts_from_mrjob_confs(\n            alias, conf_paths=conf_paths)\n\n        for path, mrjob_conf_opts in unsanitized_opt_dicts:\n            self.cascading_dicts.append(self.validated_options(\n                mrjob_conf_opts,\n                'Got unexpected opts from %s: %%s' % path))\n\n        self.cascading_dicts.append(opts)\n\n        if (len(self.cascading_dicts) > 2 and\n            all(len(d) == 0 for d in self.cascading_dicts[2:-1]) and\n            (len(conf_paths or []) > 0 or len(opts) == 0)):\n            log.warning('No configs specified for %s runner' % alias)\n\n        self.populate_values_from_cascading_dicts()\n\n        self._validate_cleanup()\n\n        self._fix_interp_options()\n\n        log.debug('Active configuration:')\n        log.debug(pprint.pformat(self))\n\n    def default_options(self):\n        super_opts = super(RunnerOptionStore, self).default_options()\n\n        try:\n            owner = getpass.getuser()\n        except:\n            owner = None\n\n        return combine_dicts(super_opts, {\n            'base_tmp_dir': tempfile.gettempdir(),\n            'bootstrap_mrjob': True,\n            'cleanup': ['ALL'],\n            'cleanup_on_failure': ['NONE'],\n            'hadoop_version': '0.20',\n            'owner': owner,\n        })\n\n    def _validate_cleanup(self):\n        # old API accepts strings for cleanup\n        # new API wants lists\n        for opt_key in ('cleanup', 'cleanup_on_failure'):\n            if isinstance(self[opt_key], basestring):\n                self[opt_key] = [self[opt_key]]\n\n        def validate_cleanup(error_str, opt_list):\n            for choice in opt_list:\n                if choice not in CLEANUP_CHOICES:\n                    raise ValueError(error_str % choice)\n            if 'NONE' in opt_list and len(set(opt_list)) > 1:\n                raise ValueError(\n                    'Cannot clean up both nothing and something!')\n\n        cleanup_error = ('cleanup must be one of %s, not %%s' %\n                         ', '.join(CLEANUP_CHOICES))\n        validate_cleanup(cleanup_error, self['cleanup'])\n\n        cleanup_failure_error = (\n            'cleanup_on_failure must be one of %s, not %%s' %\n            ', '.join(CLEANUP_CHOICES))\n        validate_cleanup(cleanup_failure_error,\n                         self['cleanup_on_failure'])\n\n    def _fix_interp_options(self):\n        if not self['steps_python_bin']:\n            self['steps_python_bin'] = (\n                self['python_bin'] or\n                [sys.executable] or\n                ['python'])\n\n        if not self['python_bin']:\n            self['python_bin'] = ['python']\n\n        if not self['steps_interpreter']:\n            if self['interpreter']:\n                self['steps_interpreter'] = self['interpreter']\n            else:\n                self['steps_interpreter'] = self['steps_python_bin']\n\n        if not self['interpreter']:\n            self['interpreter'] = self['python_bin']\n\n\nclass MRJobRunner(object):\n    \"\"\"Abstract base class for all runners\"\"\"\n\n    #: alias for this runner; used for picking section of\n    #: :py:mod:``mrjob.conf`` to load one of ``'local'``, ``'emr'``,\n    #: or ``'hadoop'``\n    alias = None\n\n    OPTION_STORE_CLASS = RunnerOptionStore\n\n    ### methods to call from your batch script ###\n\n    def __init__(self, mr_job_script=None, conf_path=None,\n                 extra_args=None, file_upload_args=None,\n                 hadoop_input_format=None, hadoop_output_format=None,\n                 input_paths=None, output_dir=None, partitioner=None,\n                 stdin=None, conf_paths=None, **opts):\n        \"\"\"All runners take the following keyword arguments:\n\n        :type mr_job_script: str\n        :param mr_job_script: the path of the ``.py`` file containing the\n                              :py:class:`~mrjob.job.MRJob`. If this is None,\n                              you won't actually be able to :py:meth:`run` the\n                              job, but other utilities (e.g. :py:meth:`ls`)\n                              will work.\n        :type conf_path: str, None, or False\n        :param conf_path: Deprecated. Alternate path to read configs from, or\n                          ``False`` to ignore all config files. Use\n                          *conf_paths* instead.\n        :type conf_paths: None or list\n        :param conf_paths: List of config files to combine and use, or None to\n                           search for mrjob.conf in the default locations.\n        :type extra_args: list of str\n        :param extra_args: a list of extra cmd-line arguments to pass to the\n                           mr_job script. This is a hook to allow jobs to take\n                           additional arguments.\n        :param file_upload_args: a list of tuples of ``('--ARGNAME', path)``.\n                                 The file at the given path will be uploaded\n                                 to the local directory of the mr_job script\n                                 when it runs, and then passed into the script\n                                 with ``--ARGNAME``. Useful for passing in\n                                 SQLite DBs and other configuration files to\n                                 your job.\n        :type hadoop_input_format: str\n        :param hadoop_input_format: name of an optional Hadoop ``InputFormat``\n                                    class. Passed to Hadoop along with your\n                                    first step with the ``-inputformat``\n                                    option. Note that if you write your own\n                                    class, you'll need to include it in your\n                                    own custom streaming jar (see\n                                    *hadoop_streaming_jar*).\n        :type hadoop_output_format: str\n        :param hadoop_output_format: name of an optional Hadoop\n                                     ``OutputFormat`` class. Passed to Hadoop\n                                     along with your first step with the\n                                     ``-outputformat`` option. Note that if you\n                                     write your own class, you'll need to\n                                     include it in your own custom streaming\n                                     jar (see *hadoop_streaming_jar*).\n        :type input_paths: list of str\n        :param input_paths: Input files for your job. Supports globs and\n                            recursively walks directories (e.g.\n                            ``['data/common/', 'data/training/*.gz']``). If\n                            this is left blank, we'll read from stdin\n        :type output_dir: str\n        :param output_dir: An empty/non-existent directory where Hadoop\n                           streaming should put the final output from the job.\n                           If you don't specify an output directory, we'll\n                           output into a subdirectory of this job's temporary\n                           directory. You can control this from the command\n                           line with ``--output-dir``",
+      "total_lines": 1154,
+      "ref": "82c049d84cfcde9987b106d70c54e45e882a11ed"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

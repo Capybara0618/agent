@@ -1,0 +1,163 @@
+{
+  "task_id": "682",
+  "repo_owner": "devitocodes",
+  "repo_name": "devito",
+  "file_path": "devito/passes/clusters/misc.py",
+  "commit": "24f29623ae508fd6d85e88ba69a948fe8d94c302",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T09:38:06+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "24f29623ae508fd6d85e88ba69a948fe8d94c302",
+    "symbol_name": "_build_dag",
+    "satd_line": 221,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 1,
+    "same_class_methods_count": 1,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 2,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T09:38:06+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "devito/passes/clusters/misc.py",
+    "original_signature": "def _build_dag(self, cgroups, prefix, peeking=False):",
+    "target_file": {
+      "ok": true,
+      "path": "devito/passes/clusters/misc.py",
+      "sha": "b2e6ba0700e596adf677588152029189131976c9",
+      "download_url": "https://raw.githubusercontent.com/devitocodes/devito/24f29623ae508fd6d85e88ba69a948fe8d94c302/devito/passes/clusters/misc.py",
+      "content_excerpt": "from collections import Counter\nfrom itertools import groupby\n\nfrom devito.ir.clusters import Cluster, ClusterGroup, Queue\nfrom devito.ir.support import TILABLE, Scope\nfrom devito.passes.clusters.utils import cluster_pass\nfrom devito.symbolics import pow_to_mul, uxreplace\nfrom devito.tools import DAG, as_tuple, filter_ordered, frozendict, timed_pass\nfrom devito.types import Scalar\n\n__all__ = ['Lift', 'fuse', 'eliminate_arrays', 'optimize_pows', 'extract_increments']\n\n\nclass Lift(Queue):\n\n    \"\"\"\n    Remove invariant Dimensions from Clusters to avoid redundant computation.\n\n    Notes\n    -----\n    This is analogous to the compiler transformation known as\n    \"loop-invariant code motion\".\n    \"\"\"\n\n    @timed_pass(name='lift')\n    def process(self, elements):\n        return super(Lift, self).process(elements)\n\n    def callback(self, clusters, prefix):\n        if not prefix:\n            # No iteration space to be lifted from\n            return clusters\n\n        hope_invariant = {i.dim for i in prefix}\n\n        lifted = []\n        processed = []\n        for n, c in enumerate(clusters):\n            # Increments prevent lifting\n            if c.has_increments:\n                processed.append(c)\n                continue\n\n            # Is `c` a real candidate -- is there at least one invariant Dimension?\n            if c.used_dimensions & hope_invariant:\n                processed.append(c)\n                continue\n\n            impacted = set(processed) | set(clusters[n+1:])\n\n            # None of the Functions appearing in a lifted Cluster can be written to\n            if any(c.functions & set(i.scope.writes) for i in impacted):\n                processed.append(c)\n                continue\n\n            # The contracted iteration and data spaces\n            key = lambda d: d not in hope_invariant\n            ispace = c.ispace.project(key).reset()\n            dspace = c.dspace.project(key).reset()\n\n            # All of the inner Dimensions must appear in the write-to region\n            # otherwise we would violate data dependencies. Consider\n            #\n            # 1)                 2)                          3)\n            # for i              for i                       for i\n            #   for x              for x                       for x\n            #     r = f(a[x])        for y                       for y\n            #                          r[x] = f(a[x, y])           r[x, y] = f(a[x, y])\n            #\n            # In 1) and 2) lifting is infeasible; in 3) the statement can be lifted\n            # outside the `i` loop as `r`'s write-to region contains both `x` and `y`\n            writes = set(c.scope.writes)\n            reads = set().union(*[i.scope.reads for i in impacted])\n            if any(set(i.dimensions) != set(ispace.intervals.dimensions)\n                   for i in writes & reads):\n                processed.append(c)\n                continue\n\n            # Some properties need to be dropped\n            properties = {d: v for d, v in c.properties.items() if key(d)}\n            properties = {d: v - {TILABLE} for d, v in properties.items()}\n\n            lifted.append(c.rebuild(ispace=ispace, dspace=dspace, properties=properties))\n\n        return lifted + processed\n\n\nclass Fusion(Queue):\n\n    \"\"\"\n    Fuse Clusters with compatible IterationSpace.\n    \"\"\"\n\n    def __init__(self, toposort):\n        super(Fusion, self).__init__()\n        self.toposort = toposort\n\n    def _make_key_hook(self, cgroup, level):\n        assert level > 0\n        assert len(cgroup.guards) == 1\n        return (tuple(cgroup.guards[0].get(i.dim) for i in cgroup.itintervals[:level-1]),)\n\n    def process(self, clusters):\n        cgroups = [ClusterGroup(c, c.itintervals) for c in clusters]\n        cgroups = self._process_fdta(cgroups, 1)\n        clusters = ClusterGroup.concatenate(*cgroups)\n        return clusters\n\n    def callback(self, cgroups, prefix):\n        # Toposort to maximize fusion\n        if self.toposort:\n            clusters = self._toposort(cgroups, prefix)\n        else:\n            clusters = ClusterGroup(cgroups)\n\n        # Fusion\n        processed = []\n        for k, g in groupby(clusters, key=self._key):\n            maybe_fusible = list(g)\n\n            if len(maybe_fusible) == 1:\n                processed.extend(maybe_fusible)\n            else:\n                try:\n                    # Perform fusion\n                    fused = Cluster.from_clusters(*maybe_fusible)\n                    processed.append(fused)\n                except ValueError:\n                    # We end up here if, for example, some Clusters have same\n                    # iteration Dimensions but different (partial) orderings\n                    processed.extend(maybe_fusible)\n\n        return [ClusterGroup(processed, prefix)]\n\n    def _key(self, c):\n        # Two Clusters/ClusterGroups are fusion candidates if their key is identical\n\n        key = (frozenset(c.itintervals), c.guards)\n\n        # We allow fusing Clusters/ClusterGroups with WaitLocks over different Locks,\n        # while the WithLocks are to be kept separated (i.e. the remain separate tasks)\n        if isinstance(c, Cluster):\n            sync_locks = (c.sync_locks,)\n        else:\n            sync_locks = c.sync_locks\n        for i in sync_locks:\n            key += (frozendict({k: frozenset(type(i) if i.is_WaitLock else i for i in v)\n                                for k, v in i.items()}),)\n\n        return key\n\n    def _toposort(self, cgroups, prefix):\n        # Are there any ClusterGroups that could potentially be fused? If\n        # not, do not waste time computing a new topological ordering\n        counter = Counter(self._key(cg) for cg in cgroups)\n        if not any(v > 1 for it, v in counter.most_common()):\n            return ClusterGroup(cgroups)\n\n        # Similarly, if all ClusterGroups have the same exact prefix and\n        # use the same form of synchronization (if any at all), no need to\n        # attempt a topological sorting\n        if len(counter.most_common()) == 1:\n            return ClusterGroup(cgroups)\n\n        dag = self._build_dag(cgroups, prefix)\n\n        def choose_element(queue, scheduled):\n            # Heuristic: let `k0` be the key of the last scheduled node; then out of\n            # the possible schedulable nodes we pick the one with key `k1` such that\n            # `max_i : k0[:i] == k1[:i]` (i.e., the one with \"the most similar key\")\n            if not scheduled:\n                return queue.pop()\n            key = self._key(scheduled[-1])\n            for i in reversed(range(len(key) + 1)):\n                candidates = [e for e in queue if self._key(e)[:i] == key[:i]]\n                try:\n                    # Ensure stability\n                    e = min(candidates, key=lambda i: cgroups.index(i))\n                except ValueError:\n                    continue\n                queue.remove(e)\n                return e\n            assert False\n\n        return ClusterGroup(dag.topological_sort(choose_element))\n\n    def _build_dag(self, cgroups, prefix):\n        \"\"\"\n        A DAG representing the data dependences across the ClusterGroups within\n        a given scope.\n        \"\"\"\n        prefix = {i.dim for i in as_tuple(prefix)}\n\n        dag = DAG(nodes=cgroups)\n        for n, cg0 in enumerate(cgroups):\n            for cg1 in cgroups[n+1:]:\n                # A Scope to compute all cross-ClusterGroup anti-dependences\n                rule = lambda i: i.is_cross\n                scope = Scope(exprs=cg0.exprs + cg1.exprs, rules=rule)\n\n                # Optimization: we exploit the following property:\n                # no prefix => (edge <=> at least one (any) dependence)\n                # to jump out of this potentially expensive loop as quickly as possible\n                if not prefix and any(scope.d_all_gen()):\n                    dag.add_edge(cg0, cg1)\n\n                # Anti-dependences along `prefix` break the execution flow\n                # (intuitively, \"the loop nests are to be kept separated\")\n                # * All ClusterGroups between `cg0` and `cg1` must precede `cg1`\n                # * All ClusterGroups after `cg1` cannot precede `cg1`\n                elif any(i.cause & prefix for i in scope.d_anti_gen()):\n                    for cg2 in cgroups[n:cgroups.index(cg1)]:\n                        dag.add_edge(cg2, cg1)\n                    for cg2 in cgroups[cgroups.index(cg1)+1:]:\n                        dag.add_edge(cg1, cg2)\n                    break\n\n                # Any anti- and iaw-dependences impose that `cg1` follows `cg0`\n                # while not being its immediate successor (unless it already is),\n                # to avoid they are fused together (thus breaking the dependence)\n                # TODO: the \"not being its immediate successor\" part *seems* to be\n                # a work around to the fact that any two Clusters characterized\n                # by anti-dependence should have been given a different stamp,\n                # and same for guarded Clusters, but that is not the case (yet)\n                elif any(scope.d_anti_gen()) or\\\n                        any(i.is_iaw for i in scope.d_output_gen()):\n                    dag.add_edge(cg0, cg1)\n                    index = cgroups.index(cg1) - 1\n                    if index > n and self._key(cg0) == self._key(cg1):\n                        dag.add_edge(cg0, cgroups[index])\n                        dag.add_edge(cgroups[index], cg1)\n\n                # Any flow-dependences along an inner Dimension (i.e., a Dimension\n                # that doesn't appear in `prefix`) impose that `cg1` follows `cg0`\n                elif any(not (i.cause and i.cause & prefix) for i in scope.d_flow_gen()):\n                    dag.add_edge(cg0, cg1)\n\n                # Clearly, output dependences must be honored\n                elif any(scope.d_output_gen()):\n                    dag.add_edge(cg0, cg1)\n\n        return dag\n\n\n@timed_pass()\ndef fuse(clusters, toposort=False):\n    \"\"\"\n    Clusters fusion.\n\n    If ``toposort=True``, then the Clusters are reordered to maximize the likelihood\n    of fusion; the new ordering is computed such that all data dependencies are honored.\n    \"\"\"\n    return Fusion(toposort=toposort).process(clusters)\n\n\n@timed_pass()\ndef eliminate_arrays(clusters):\n    \"\"\"\n    Eliminate redundant expressions stored in Arrays.\n    \"\"\"\n    mapper = {}\n    processed = []\n    for c in clusters:\n        if not c.is_dense:\n            processed.append(c)\n            continue\n\n        # Search for any redundant RHSs\n        seen = {}\n        for e in c.exprs:\n            f = e.lhs.function\n            if not f.is_Array:\n                continue\n            v = seen.get(e.rhs)\n            if v is not None:\n                # Found a redundant RHS\n                mapper[f] = v\n            else:\n                seen[e.rhs] = f\n\n        if not mapper:\n            # Do not waste time\n            processed.append(c)\n            continue\n\n        # Replace redundancies\n        subs = {}\n        for f, v in mapper.items():\n            for i in filter_ordered(i.indexed for i in c.scope[f]):\n                subs[i] = v[i.indices]\n        exprs = []\n        for e in c.exprs:\n            if e.lhs.function in mapper:\n                # Drop the write\n                continue\n            exprs.append(uxreplace(e, subs))\n\n        processed.append(c.rebuild(exprs))\n\n    return processed\n\n\n@cluster_pass(mode='all')\ndef optimize_pows(cluster, *args):\n    \"\"\"\n    Convert integer powers into Muls, such as ``a**2 => a*a``.\n    \"\"\"\n    return cluster.rebuild(exprs=[pow_to_mul(e) for e in cluster.exprs])\n\n\n@cluster_pass(mode='sparse')\ndef extract_increments(cluster, sregistry, *args):\n    \"\"\"\n    Extract the RHSs of non-local tensor expressions performing an associative\n    and commutative increment, and assign them to temporaries.\n    \"\"\"\n    processed = []\n    for e in cluster.exprs:\n        if e.is_Increment and e.lhs.function.is_Input:\n            handle = Scalar(name=sregis",
+      "total_lines": 330,
+      "ref": "24f29623ae508fd6d85e88ba69a948fe8d94c302"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_build_dag",
+      "class_name": "Fusion",
+      "start_line": 187,
+      "end_line": 242,
+      "satd_line": 221,
+      "matched_by": "signature_or_comment",
+      "source": "    def _build_dag(self, cgroups, prefix):\n        \"\"\"\n        A DAG representing the data dependences across the ClusterGroups within\n        a given scope.\n        \"\"\"\n        prefix = {i.dim for i in as_tuple(prefix)}\n\n        dag = DAG(nodes=cgroups)\n        for n, cg0 in enumerate(cgroups):\n            for cg1 in cgroups[n+1:]:\n                # A Scope to compute all cross-ClusterGroup anti-dependences\n                rule = lambda i: i.is_cross\n                scope = Scope(exprs=cg0.exprs + cg1.exprs, rules=rule)\n\n                # Optimization: we exploit the following property:\n                # no prefix => (edge <=> at least one (any) dependence)\n                # to jump out of this potentially expensive loop as quickly as possible\n                if not prefix and any(scope.d_all_gen()):\n                    dag.add_edge(cg0, cg1)\n\n                # Anti-dependences along `prefix` break the execution flow\n                # (intuitively, \"the loop nests are to be kept separated\")\n                # * All ClusterGroups between `cg0` and `cg1` must precede `cg1`\n                # * All ClusterGroups after `cg1` cannot precede `cg1`\n                elif any(i.cause & prefix for i in scope.d_anti_gen()):\n                    for cg2 in cgroups[n:cgroups.index(cg1)]:\n                        dag.add_edge(cg2, cg1)\n                    for cg2 in cgroups[cgroups.index(cg1)+1:]:\n                        dag.add_edge(cg1, cg2)\n                    break\n\n                # Any anti- and iaw-dependences impose that `cg1` follows `cg0`\n                # while not being its immediate successor (unless it already is),\n                # to avoid they are fused together (thus breaking the dependence)\n                # TODO: the \"not being its immediate successor\" part *seems* to be\n                # a work around to the fact that any two Clusters characterized\n                # by anti-dependence should have been given a different stamp,\n                # and same for guarded Clusters, but that is not the case (yet)\n                elif any(scope.d_anti_gen()) or\\\n                        any(i.is_iaw for i in scope.d_output_gen()):\n                    dag.add_edge(cg0, cg1)\n                    index = cgroups.index(cg1) - 1\n                    if index > n and self._key(cg0) == self._key(cg1):\n                        dag.add_edge(cg0, cgroups[index])\n                        dag.add_edge(cgroups[index], cg1)\n\n                # Any flow-dependences along an inner Dimension (i.e., a Dimension\n                # that doesn't appear in `prefix`) impose that `cg1` follows `cg0`\n                elif any(not (i.cause and i.cause & prefix) for i in scope.d_flow_gen()):\n                    dag.add_edge(cg0, cg1)\n\n                # Clearly, output dependences must be honored\n                elif any(scope.d_output_gen()):\n                    dag.add_edge(cg0, cg1)\n\n        return dag",
+      "calls": [
+        "DAG",
+        "Scope",
+        "any",
+        "as_tuple",
+        "enumerate"
+      ],
+      "self_calls": [
+        "_key"
+      ],
+      "self_attrs": [
+        "_key"
+      ],
+      "global_uses": [
+        "DAG",
+        "Scope",
+        "as_tuple",
+        "i"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_key",
+          "class_name": "Fusion",
+          "start_line": 135,
+          "end_line": 150,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def _key(self, c):\n        # Two Clusters/ClusterGroups are fusion candidates if their key is identical\n\n        key = (frozenset(c.itintervals), c.guards)\n\n        # We allow fusing Clusters/ClusterGroups with WaitLocks over different Locks,\n        # while the WithLocks are to be kept separated (i.e. the remain separate tasks)\n        if isinstance(c, Cluster):\n            sync_locks = (c.sync_locks,)\n        else:\n            sync_locks = c.sync_locks\n        for i in sync_locks:\n            key += (frozendict({k: frozenset(type(i) if i.is_WaitLock else i for i in v)\n                                for k, v in i.items()}),)\n\n        return key"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "Fusion",
+      "related_methods_count": 1,
+      "related_attributes_count": 0,
+      "related_methods": [
+        {
+          "symbol_name": "_key",
+          "start_line": 135,
+          "end_line": 150,
+          "relevance": [
+            "direct_self_call"
+          ],
+          "source": "    def _key(self, c):\n        # Two Clusters/ClusterGroups are fusion candidates if their key is identical\n\n        key = (frozenset(c.itintervals), c.guards)\n\n        # We allow fusing Clusters/ClusterGroups with WaitLocks over different Locks,\n        # while the WithLocks are to be kept separated (i.e. the remain separate tasks)\n        if isinstance(c, Cluster):\n            sync_locks = (c.sync_locks,)\n        else:\n            sync_locks = c.sync_locks\n        for i in sync_locks:\n            key += (frozendict({k: frozenset(type(i) if i.is_WaitLock else i for i in v)\n                                for k, v in i.items()}),)\n\n        return key"
+        }
+      ],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "Scope",
+          "kind": "import_from",
+          "start_line": 5,
+          "end_line": 5,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from devito.ir.support import TILABLE, Scope"
+        },
+        {
+          "symbol_name": "DAG",
+          "kind": "import_from",
+          "start_line": 8,
+          "end_line": 8,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from devito.tools import DAG, as_tuple, filter_ordered, frozendict, timed_pass"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

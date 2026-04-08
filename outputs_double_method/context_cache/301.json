@@ -1,0 +1,128 @@
+{
+  "task_id": "301",
+  "repo_owner": "getsentry",
+  "repo_name": "sentry",
+  "file_path": "src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+  "commit": "0d168175891d690eccfe0ac15c33cd1be1e1157c",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T15:08:11+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "0d168175891d690eccfe0ac15c33cd1be1e1157c",
+    "symbol_name": "get_parallel_metrics_consumer",
+    "satd_line": 20,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T15:08:11+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+    "original_signature": "def get_parallel_metrics_consumer(",
+    "target_file": {
+      "ok": true,
+      "path": "src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+      "sha": "dcedb0b4629fba7f29d62c142551ba6f88089bba",
+      "download_url": "https://raw.githubusercontent.com/getsentry/sentry/0d168175891d690eccfe0ac15c33cd1be1e1157c/src/sentry/sentry_metrics/consumers/indexer/parallel.py",
+      "content_excerpt": "from __future__ import annotations\n\nimport functools\nimport logging\nfrom typing import Any, Mapping, Optional, Union\n\nfrom arroyo.backends.kafka import KafkaConsumer, KafkaPayload\nfrom arroyo.commit import CommitPolicy\nfrom arroyo.processing import StreamProcessor\nfrom arroyo.processing.strategies import ProcessingStrategy\nfrom arroyo.processing.strategies import ProcessingStrategy as ProcessingStep\nfrom arroyo.processing.strategies import ProcessingStrategyFactory\nfrom arroyo.processing.strategies.transform import ParallelTransformStep\nfrom arroyo.types import Commit, Message, Partition, Topic\nfrom django.conf import settings\n\nfrom sentry.sentry_metrics.configuration import (\n    MetricsIngestConfiguration,\n    initialize_sentry_and_global_consumer_state,\n)\nfrom sentry.sentry_metrics.consumers.indexer.common import (\n    BatchMessages,\n    IndexerOutputMessageBatch,\n    get_config,\n)\nfrom sentry.sentry_metrics.consumers.indexer.multiprocess import SimpleProduceStep\nfrom sentry.sentry_metrics.consumers.indexer.processing import MessageProcessor\nfrom sentry.sentry_metrics.consumers.indexer.routing_producer import (\n    RoutingPayload,\n    RoutingProducerStep,\n)\nfrom sentry.sentry_metrics.consumers.indexer.slicing_router import SlicingRouter\nfrom sentry.utils.batching_kafka_consumer import create_topics\n\nlogger = logging.getLogger(__name__)\n\n\nclass Unbatcher(ProcessingStep[IndexerOutputMessageBatch]):\n    def __init__(\n        self,\n        next_step: ProcessingStep[Union[KafkaPayload, RoutingPayload]],\n    ) -> None:\n        self.__next_step = next_step\n        self.__closed = False\n\n    def poll(self) -> None:\n        self.__next_step.poll()\n\n    def submit(self, message: Message[IndexerOutputMessageBatch]) -> None:\n        assert not self.__closed\n\n        for transformed_message in message.payload:\n            self.__next_step.submit(transformed_message)\n\n    def close(self) -> None:\n        self.__closed = True\n\n    def terminate(self) -> None:\n        self.__closed = True\n\n        logger.debug(\"Terminating %r...\", self.__next_step)\n        self.__next_step.terminate()\n\n    def join(self, timeout: Optional[float] = None) -> None:\n        self.__next_step.close()\n        self.__next_step.join(timeout)\n\n\nclass MetricsConsumerStrategyFactory(ProcessingStrategyFactory[KafkaPayload]):\n    \"\"\"\n    Builds an indexer consumer based on the multi process transform Arroyo step.\n\n    Multi processing happens in batches, the parallel step batches messages, then\n    it dispatches them to a process. This is meant to avoid lock contention that\n    would happen by transferring one message at a time.\n    The parallel transform function is then applied to all messages one by one.\n\n    The indexer must resolve batches of messages. It cannot resolve messages in\n    isolation otherwise the amount of roundtrip to cache would be enormous.\n    So the pipeline works this way:\n    - the indexer batches messages like today.\n    - each batch is a message for the parallel transform step.\n    - the parallel transform step may or may not re-batch messages batcehs\n      together. The load tests show it is still useful.\n    - messages are exploded back into individual ones after the parallel\n      transform step.\n    \"\"\"\n\n    def __init__(\n        self,\n        max_msg_batch_size: int,\n        max_msg_batch_time: float,\n        max_parallel_batch_size: int,\n        max_parallel_batch_time: float,\n        processes: int,\n        input_block_size: int,\n        output_block_size: int,\n        config: MetricsIngestConfiguration,\n        slicing_router: Optional[SlicingRouter],\n    ):\n        self.__config = config\n\n        # This is the size of the initial message batching the indexer does\n        self.__max_msg_batch_size = max_msg_batch_size\n        self.__max_msg_batch_time = max_msg_batch_time\n\n        # This is the size of the batches sent to the parallel processes.\n        # These are batches of batches.\n        self.__max_parallel_batch_size = max_parallel_batch_size\n        self.__max_parallel_batch_time = max_parallel_batch_time\n\n        self.__processes = processes\n\n        self.__input_block_size = input_block_size\n        self.__output_block_size = output_block_size\n        self.__slicing_router = slicing_router\n\n    def create_with_partitions(\n        self,\n        commit: Commit,\n        partitions: Mapping[Partition, int],\n    ) -> ProcessingStrategy[KafkaPayload]:\n        producer = get_metrics_producer_strategy(\n            config=self.__config,\n            commit=commit,\n            slicing_router=self.__slicing_router,\n        )\n        parallel_strategy = ParallelTransformStep(\n            MessageProcessor(self.__config).process_messages,\n            Unbatcher(next_step=producer),\n            self.__processes,\n            max_batch_size=self.__max_parallel_batch_size,\n            # This is in seconds\n            max_batch_time=self.__max_parallel_batch_time / 1000,\n            input_block_size=self.__input_block_size,\n            output_block_size=self.__output_block_size,\n            # It is absolutely crucial that we pass a function reference here\n            # where the function lives in a module that does not depend on\n            # Django settings. `sentry.sentry_metrics.configuration` fulfills\n            # that requirement, but if you were to create a wrapper function in\n            # this module, and pass that function here, it would attempt to\n            # pull in a bunch of modules that try to read django settings at\n            # import time\n            initializer=functools.partial(\n                initialize_sentry_and_global_consumer_state, self.__config\n            ),\n        )\n\n        strategy = BatchMessages(\n            parallel_strategy, self.__max_msg_batch_time, self.__max_msg_batch_size\n        )\n\n        return strategy\n\n\ndef get_metrics_producer_strategy(\n    config: MetricsIngestConfiguration,\n    commit: Commit,\n    slicing_router: Optional[SlicingRouter],\n) -> Any:\n    if config.is_output_sliced:\n        if slicing_router is None:\n            raise ValueError(\"Slicing router is required for sliced output\")\n        return RoutingProducerStep(\n            commit_function=commit,\n            message_router=slicing_router,\n        )\n    else:\n        return SimpleProduceStep(\n            commit_function=commit,\n            output_topic=config.output_topic,\n        )\n\n\ndef get_parallel_metrics_consumer(\n    max_msg_batch_size: int,\n    max_msg_batch_time: float,\n    max_parallel_batch_size: int,\n    max_parallel_batch_time: float,\n    max_batch_size: int,\n    max_batch_time: float,\n    processes: int,\n    input_block_size: int,\n    output_block_size: int,\n    group_id: str,\n    auto_offset_reset: str,\n    indexer_profile: MetricsIngestConfiguration,\n    slicing_router: Optional[SlicingRouter],\n    **options: Mapping[str, Union[str, int]],\n) -> StreamProcessor[KafkaPayload]:\n    processing_factory = MetricsConsumerStrategyFactory(\n        max_msg_batch_size=max_msg_batch_size,\n        max_msg_batch_time=max_msg_batch_time,\n        max_parallel_batch_size=max_parallel_batch_size,\n        max_parallel_batch_time=max_parallel_batch_time,\n        processes=processes,\n        input_block_size=input_block_size,\n        output_block_size=output_block_size,\n        config=indexer_profile,\n        slicing_router=slicing_router,\n    )\n\n    cluster_name: str = settings.KAFKA_TOPICS[indexer_profile.input_topic][\"cluster\"]\n    create_topics(cluster_name, [indexer_profile.input_topic])\n\n    return StreamProcessor(\n        KafkaConsumer(get_config(indexer_profile.input_topic, group_id, auto_offset_reset)),\n        Topic(indexer_profile.input_topic),\n        processing_factory,\n        CommitPolicy(\n            min_commit_frequency_sec=max_parallel_batch_time / 1000,\n            # TODO(markus): honor CLI params or remove them\n            min_commit_messages=None,\n        ),\n    )\n",
+      "total_lines": 215,
+      "ref": "0d168175891d690eccfe0ac15c33cd1be1e1157c"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "get_parallel_metrics_consumer",
+      "class_name": null,
+      "start_line": 175,
+      "end_line": 215,
+      "satd_line": 20,
+      "matched_by": "signature_or_comment",
+      "source": "def get_parallel_metrics_consumer(\n    max_msg_batch_size: int,\n    max_msg_batch_time: float,\n    max_parallel_batch_size: int,\n    max_parallel_batch_time: float,\n    max_batch_size: int,\n    max_batch_time: float,\n    processes: int,\n    input_block_size: int,\n    output_block_size: int,\n    group_id: str,\n    auto_offset_reset: str,\n    indexer_profile: MetricsIngestConfiguration,\n    slicing_router: Optional[SlicingRouter],\n    **options: Mapping[str, Union[str, int]],\n) -> StreamProcessor[KafkaPayload]:\n    processing_factory = MetricsConsumerStrategyFactory(\n        max_msg_batch_size=max_msg_batch_size,\n        max_msg_batch_time=max_msg_batch_time,\n        max_parallel_batch_size=max_parallel_batch_size,\n        max_parallel_batch_time=max_parallel_batch_time,\n        processes=processes,\n        input_block_size=input_block_size,\n        output_block_size=output_block_size,\n        config=indexer_profile,\n        slicing_router=slicing_router,\n    )\n\n    cluster_name: str = settings.KAFKA_TOPICS[indexer_profile.input_topic][\"cluster\"]\n    create_topics(cluster_name, [indexer_profile.input_topic])\n\n    return StreamProcessor(\n        KafkaConsumer(get_config(indexer_profile.input_topic, group_id, auto_offset_reset)),\n        Topic(indexer_profile.input_topic),\n        processing_factory,\n        CommitPolicy(\n            min_commit_frequency_sec=max_parallel_batch_time / 1000,\n            # TODO(markus): honor CLI params or remove them\n            min_commit_messages=None,\n        ),\n    )",
+      "calls": [
+        "CommitPolicy",
+        "KafkaConsumer",
+        "MetricsConsumerStrategyFactory",
+        "StreamProcessor",
+        "Topic",
+        "create_topics",
+        "get_config"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "CommitPolicy",
+        "KafkaConsumer",
+        "KafkaPayload",
+        "Mapping",
+        "MetricsConsumerStrategyFactory",
+        "MetricsIngestConfiguration",
+        "Optional",
+        "SlicingRouter",
+        "StreamProcessor",
+        "Topic",
+        "Union",
+        "create_topics",
+        "get_config",
+        "settings"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

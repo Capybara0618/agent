@@ -1,0 +1,95 @@
+{
+  "task_id": "438",
+  "repo_owner": "roundup-tracker",
+  "repo_name": "roundup",
+  "file_path": "roundup/backends/back_metakit.py",
+  "commit": "1b8ea7397a88f09c90a50a961a7627317f56ee78",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T08:13:12+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "1b8ea7397a88f09c90a50a961a7627317f56ee78",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T08:13:12+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "roundup/backends/back_metakit.py",
+    "original_signature": "def setkey(self, propname):",
+    "target_file": {
+      "ok": true,
+      "path": "roundup/backends/back_metakit.py",
+      "sha": "a612f8b145598c1fb39c779f2ff801e7591dd569",
+      "download_url": "https://raw.githubusercontent.com/roundup-tracker/roundup/1b8ea7397a88f09c90a50a961a7627317f56ee78/roundup/backends/back_metakit.py",
+      "content_excerpt": "# $Id: back_metakit.py,v 1.52 2003-11-12 03:42:12 richard Exp $\n'''\n   Metakit backend for Roundup, originally by Gordon McMillan.\n\n   Notes by Richard:\n\n   This backend has some behaviour specific to metakit:\n\n    - there's no concept of an explicit \"unset\" in metakit, so all types\n      have some \"unset\" value:\n\n      ========= ===== ====================================================\n      Type      Value Action when fetching from mk\n      ========= ===== ====================================================\n      Strings   ''    convert to None\n      Date      0     (seconds since 1970-01-01.00:00:00) convert to None\n      Interval  ''    convert to None\n      Number    0     ambiguious :( - do nothing\n      Boolean   0     ambiguious :( - do nothing\n      Link      0     convert to None\n      Multilink []    actually, mk can handle this one ;)\n      Passowrd  ''    convert to None\n      ========= ===== ====================================================\n\n      The get/set routines handle these values accordingly by converting\n      to/from None where they can. The Number/Boolean types are not able\n      to handle an \"unset\" at all, so they default the \"unset\" to 0.\n\n    - probably a bunch of stuff that I'm not aware of yet because I haven't\n      fully read through the source. One of these days....\n'''\nfrom roundup import hyperdb, date, password, roundupdb, security\nimport metakit\nfrom sessions import Sessions, OneTimeKeys\nimport re, marshal, os, sys, weakref, time, calendar\nfrom roundup import indexer\nimport locking\nfrom roundup.date import Range\n\n_dbs = {}\n\ndef Database(config, journaltag=None):\n    ''' Only have a single instance of the Database class for each instance\n    '''\n    db = _dbs.get(config.DATABASE, None)\n    if db is None or db._db is None:\n        db = _Database(config, journaltag)\n        _dbs[config.DATABASE] = db\n    else:\n        db.journaltag = journaltag\n    return db\n\nclass _Database(hyperdb.Database, roundupdb.Database):\n    def __init__(self, config, journaltag=None):\n        self.config = config\n        self.journaltag = journaltag\n        self.classes = {}\n        self.dirty = 0\n        self.lockfile = None\n        self._db = self.__open()\n        self.indexer = Indexer(self.config.DATABASE, self._db)\n        self.sessions = Sessions(self.config)\n        self.otks = OneTimeKeys(self.config)\n        self.security = security.Security(self)\n\n        os.umask(0002)\n\n    def post_init(self):\n        if self.indexer.should_reindex():\n            self.reindex()\n\n    def refresh_database(self):\n        # XXX handle refresh\n        self.reindex()\n\n    def reindex(self):\n        for klass in self.classes.values():\n            for nodeid in klass.list():\n                klass.index(nodeid)\n        self.indexer.save_index()\n\n    # --- defined in ping's spec\n    def __getattr__(self, classname):\n        if classname == 'transactions':\n            return self.dirty\n        # fall back on the classes\n        return self.getclass(classname)\n    def getclass(self, classname):\n        try:\n            return self.classes[classname]\n        except KeyError:\n            raise KeyError, 'There is no class called \"%s\"'%classname\n    def getclasses(self):\n        return self.classes.keys()\n    # --- end of ping's spec \n\n    # --- exposed methods\n    def commit(self):\n        if self.dirty:\n            self._db.commit()\n            for cl in self.classes.values():\n                cl._commit()\n            self.indexer.save_index()\n        self.dirty = 0\n    def rollback(self):\n        if self.dirty:\n            for cl in self.classes.values():\n                cl._rollback()\n            self._db.rollback()\n            self._db = None\n            self._db = metakit.storage(self.dbnm, 1)\n            self.hist = self._db.view('history')\n            self.tables = self._db.view('tables')\n            self.indexer.rollback()\n            self.indexer.datadb = self._db\n        self.dirty = 0\n    def clearCache(self):\n        for cl in self.classes.values():\n            cl._commit()\n    def clear(self):\n        for cl in self.classes.values():\n            cl._clear()\n    def hasnode(self, classname, nodeid):\n        return self.getclass(classname).hasnode(nodeid)\n    def pack(self, pack_before):\n        mindate = int(calendar.timegm(pack_before.get_tuple()))\n        i = 0\n        while i < len(self.hist):\n            if self.hist[i].date < mindate and self.hist[i].action != _CREATE:\n                self.hist.delete(i)\n            else:\n                i = i + 1\n    def addclass(self, cl):\n        self.classes[cl.classname] = cl\n        if self.tables.find(name=cl.classname) < 0:\n            self.tables.append(name=cl.classname)\n    def addjournal(self, tablenm, nodeid, action, params, creator=None,\n                creation=None):\n        tblid = self.tables.find(name=tablenm)\n        if tblid == -1:\n            tblid = self.tables.append(name=tablenm)\n        if creator is None:\n            creator = int(self.getuid())\n        else:\n            try:\n                creator = int(creator)\n            except TypeError:\n                creator = int(self.getclass('user').lookup(creator))\n        if creation is None:\n            creation = int(time.time())\n        elif isinstance(creation, date.Date):\n            creation = int(calendar.timegm(creation.get_tuple()))\n        # tableid:I,nodeid:I,date:I,user:I,action:I,params:B\n        self.hist.append(tableid=tblid,\n                         nodeid=int(nodeid),\n                         date=creation,\n                         action=action,\n                         user = creator,\n                         params = marshal.dumps(params))\n    def getjournal(self, tablenm, nodeid):\n        rslt = []\n        tblid = self.tables.find(name=tablenm)\n        if tblid == -1:\n            return rslt\n        q = self.hist.select(tableid=tblid, nodeid=int(nodeid))\n        if len(q) == 0:\n            raise IndexError, \"no history for id %s in %s\" % (nodeid, tablenm)\n        i = 0\n        #userclass = self.getclass('user')\n        for row in q:\n            try:\n                params = marshal.loads(row.params)\n            except ValueError:\n                print \"history couldn't unmarshal %r\" % row.params\n                params = {}\n            #usernm = userclass.get(str(row.user), 'username')\n            dt = date.Date(time.gmtime(row.date))\n            #rslt.append((nodeid, dt, usernm, _actionnames[row.action], params))\n            rslt.append((nodeid, dt, str(row.user), _actionnames[row.action],\n                params))\n        return rslt\n\n    def destroyjournal(self, tablenm, nodeid):\n        nodeid = int(nodeid)\n        tblid = self.tables.find(name=tablenm)\n        if tblid == -1:\n            return \n        i = 0\n        hist = self.hist\n        while i < len(hist):\n            if hist[i].tableid == tblid and hist[i].nodeid == nodeid:\n                hist.delete(i)\n            else:\n                i = i + 1\n        self.dirty = 1\n        \n    def close(self):\n        for cl in self.classes.values():\n            cl.db = None\n        self._db = None\n        if self.lockfile is not None:\n            locking.release_lock(self.lockfile)\n        if _dbs.has_key(self.config.DATABASE):\n            del _dbs[self.config.DATABASE]\n        if self.lockfile is not None:\n            self.lockfile.close()\n            self.lockfile = None\n        self.classes = {}\n        self.indexer = None\n\n    # --- internal\n    def __open(self):\n        ''' Open the metakit database\n        '''\n        # make the database dir if it doesn't exist\n        if not os.path.exists(self.config.DATABASE):\n            os.makedirs(self.config.DATABASE)\n\n        # figure the file names\n        self.dbnm = db = os.path.join(self.config.DATABASE, 'tracker.mk4')\n        lockfilenm = db[:-3]+'lck'\n\n        # get the database lock\n        self.lockfile = locking.acquire_lock(lockfilenm)\n        self.lockfile.write(str(os.getpid()))\n        self.lockfile.flush()\n\n        # see if the schema has changed since last db access\n        self.fastopen = 0\n        if os.path.exists(db):\n            dbtm = os.path.getmtime(db)\n            pkgnm = self.config.__name__.split('.')[0]\n            schemamod = sys.modules.get(pkgnm+'.dbinit', None)\n            if schemamod:\n                if os.path.exists(schemamod.__file__):\n                    schematm = os.path.getmtime(schemamod.__file__)\n                    if schematm < dbtm:\n                        # found schema mod - it's older than the db\n                        self.fastopen = 1\n                else:\n                     # can't find schemamod - must be frozen\n                    self.fastopen = 1\n\n        # open the db\n        db = metakit.storage(db, 1)\n        hist = db.view('history')\n        tables = db.view('tables')\n        if not self.fastopen:\n            # create the database if it's brand new\n            if not hist.structure():\n                hist = db.getas('history[tableid:I,nodeid:I,date:I,user:I,action:I,params:B]')\n            if not tables.structure():\n                tables = db.getas('tables[name:S]')\n            db.commit()\n\n        # we now have an open, initialised database\n        self.tables = tables\n        self.hist = hist\n        return db\n\n    def setid(self, classname, maxid):\n        ''' No-op in metakit\n        '''\n        pass\n        \n_STRINGTYPE = type('')\n_LISTTYPE = type([])\n_CREATE, _SET, _RETIRE, _LINK, _UNLINK, _RESTORE = range(6)\n\n_actionnames = {\n    _CREATE : 'create',\n    _SET : 'set',\n    _RETIRE : 'retire',\n    _RESTORE : 'restore',\n    _LINK : 'link',\n    _UNLINK : 'unlink',\n}\n\n_marker = []\n\n_ALLOWSETTINGPRIVATEPROPS = 0\n\nclass Class:    \n    privateprops = None\n    def __init__(self, db, classname, **properties):\n        #self.db = weakref.proxy(db)\n        self.db = db\n        self.classname = classname\n        self.keyname = None\n        self.ruprops = properties\n        self.privateprops = { 'id' : hyperdb.String(),\n                              'activity' : hyperdb.Date(),\n                              'creation' : hyperdb.Date(),\n                              'creator'  : hyperdb.Link('user') }\n\n        # event -> list of callables\n        self.auditors = {'create': [], 'set': [], 'retire': [], 'restore': []}\n        self.reactors = {'create': [], 'set': [], 'retire': [], 'restore': []}\n\n        view = self.__getview()\n        self.maxid = 1\n        if view:\n            self.maxid = view[-1].id + 1\n        self.uncommitted = {}\n        self.rbactions = []\n\n        # people reach inside!!\n        self.properties = self.ruprops\n        self.db.addclass(self)\n        self.idcache = {}\n\n        # default is to journal changes\n        self.do_journal = 1\n\n    def enableJournalling(self):\n        '''Turn journalling on for this class\n        '''\n        self.do_journal = 1\n\n    def disableJournalling(self):\n        '''Turn journalling off for this class\n        '''\n        self.do_journal = 0\n        \n    # --- the roundup.Class methods\n    def audit(self, event, detector):\n        l = self.auditors[event]\n        if detector not in l:\n            self.auditors[event].append(detector)\n    def fireAuditors(self, action, nodeid, newvalues):\n        for audit in self.auditors[action]:\n            audit(self.db, self, nodeid, newvalues)\n    def fireReactors(self, action, nodeid, oldvalues):\n        for react in self.reactors[action]:\n            react(self.db, self, nodeid, oldvalues)\n    def react(self, event, detector):\n        l = self.reactors[event]\n        if detector not in l:\n            self.reactors[event].append(detector)\n\n    # --- the hyperdb.Class methods\n    def create(self, **propvalues):\n        self.fireAuditors('create', None, propvalues)\n        newid = self.create_inner(**propvalues)\n        # self.set() (called in self.create_inner()) does reactors)\n        return newid\n\n    def create_inner(self, **propvalues):\n        rowdict = {}\n        rowdict['id'] = newid ",
+      "total_lines": 1594,
+      "ref": "1b8ea7397a88f09c90a50a961a7627317f56ee78"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

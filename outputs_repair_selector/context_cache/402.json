@@ -1,0 +1,95 @@
+{
+  "task_id": "402",
+  "repo_owner": "openstack",
+  "repo_name": "swift",
+  "file_path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+  "commit": "331339246228167dfab61690327fc0c3f2fab8af",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T04:27:48+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "331339246228167dfab61690327fc0c3f2fab8af",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T04:27:53+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+    "original_signature": "def POST(self, req):",
+    "target_file": {
+      "ok": true,
+      "path": "swift/common/middleware/s3api/controllers/multi_delete.py",
+      "sha": "a4326dd33498fadf443f60f394b6699ebc913fea",
+      "download_url": "https://raw.githubusercontent.com/openstack/swift/331339246228167dfab61690327fc0c3f2fab8af/swift/common/middleware/s3api/controllers/multi_delete.py",
+      "content_excerpt": "# Copyright (c) 2010-2014 OpenStack Foundation.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#    http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or\n# implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport sys\n\nfrom swift.common.utils import public\n\nfrom swift.common.middleware.s3api.controllers.base import Controller, \\\n    bucket_operation\nfrom swift.common.middleware.s3api.etree import Element, SubElement, \\\n    fromstring, tostring, XMLSyntaxError, DocumentInvalid\nfrom swift.common.middleware.s3api.s3response import HTTPOk, S3NotImplemented, \\\n    NoSuchKey, ErrorResponse, MalformedXML, UserKeyMustBeSpecified, \\\n    AccessDenied, MissingRequestBodyError\n\nMAX_MULTI_DELETE_BODY_SIZE = 61365\n\n\nclass MultiObjectDeleteController(Controller):\n    \"\"\"\n    Handles Delete Multiple Objects, which is logged as a MULTI_OBJECT_DELETE\n    operation in the S3 server log.\n    \"\"\"\n    def _gen_error_body(self, error, elem, delete_list):\n        for key, version in delete_list:\n            if version is not None:\n                # TODO: delete the specific version of the object\n                raise S3NotImplemented()\n\n            error_elem = SubElement(elem, 'Error')\n            SubElement(error_elem, 'Key').text = key\n            SubElement(error_elem, 'Code').text = error.__class__.__name__\n            SubElement(error_elem, 'Message').text = error._msg\n\n        return tostring(elem)\n\n    @public\n    @bucket_operation\n    def POST(self, req):\n        \"\"\"\n        Handles Delete Multiple Objects.\n        \"\"\"\n        def object_key_iter(elem):\n            for obj in elem.iterchildren('Object'):\n                key = obj.find('./Key').text\n                if not key:\n                    raise UserKeyMustBeSpecified()\n                version = obj.find('./VersionId')\n                if version is not None:\n                    version = version.text\n\n                yield key, version\n\n        try:\n            xml = req.xml(MAX_MULTI_DELETE_BODY_SIZE)\n            if not xml:\n                raise MissingRequestBodyError()\n\n            req.check_md5(xml)\n            elem = fromstring(xml, 'Delete', self.logger)\n\n            quiet = elem.find('./Quiet')\n            if quiet is not None and quiet.text.lower() == 'true':\n                self.quiet = True\n            else:\n                self.quiet = False\n\n            delete_list = list(object_key_iter(elem))\n            if len(delete_list) > self.conf.max_multi_delete_objects:\n                raise MalformedXML()\n        except (XMLSyntaxError, DocumentInvalid):\n            raise MalformedXML()\n        except ErrorResponse:\n            raise\n        except Exception as e:\n            exc_type, exc_value, exc_traceback = sys.exc_info()\n            self.logger.error(e)\n            raise exc_type, exc_value, exc_traceback\n\n        elem = Element('DeleteResult')\n\n        # check bucket existence\n        try:\n            req.get_response(self.app, 'HEAD')\n        except AccessDenied as error:\n            body = self._gen_error_body(error, elem, delete_list)\n            return HTTPOk(body=body)\n\n        for key, version in delete_list:\n            if version is not None:\n                # TODO: delete the specific version of the object\n                raise S3NotImplemented()\n\n            req.object_name = key\n\n            try:\n                query = req.gen_multipart_manifest_delete_query(self.app)\n                req.get_response(self.app, method='DELETE', query=query)\n            except NoSuchKey:\n                pass\n            except ErrorResponse as e:\n                error = SubElement(elem, 'Error')\n                SubElement(error, 'Key').text = key\n                SubElement(error, 'Code').text = e.__class__.__name__\n                SubElement(error, 'Message').text = e._msg\n                continue\n\n            if not self.quiet:\n                deleted = SubElement(elem, 'Deleted')\n                SubElement(deleted, 'Key').text = key\n\n        body = tostring(elem)\n\n        return HTTPOk(body=body)\n",
+      "total_lines": 126,
+      "ref": "331339246228167dfab61690327fc0c3f2fab8af"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

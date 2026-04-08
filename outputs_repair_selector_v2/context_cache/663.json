@@ -1,0 +1,108 @@
+{
+  "task_id": "663",
+  "repo_owner": "ganeti",
+  "repo_name": "ganeti",
+  "file_path": "lib/jqueue.py",
+  "commit": "ea03467c63c0b656a85865a8a6f36126bf01f718",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T09:32:44+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ea03467c63c0b656a85865a8a6f36126bf01f718",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 1,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 1,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 1,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T09:32:56+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "lib/jqueue.py",
+    "original_signature": "def __init__(self, queue, job_id, ops):",
+    "target_file": {
+      "ok": true,
+      "path": "lib/jqueue.py",
+      "sha": "4ad1397a87ecbb3572fd4d72ce186afc8aa51662",
+      "download_url": "https://raw.githubusercontent.com/ganeti/ganeti/ea03467c63c0b656a85865a8a6f36126bf01f718/lib/jqueue.py",
+      "content_excerpt": "#\n#\n\n# Copyright (C) 2006, 2007, 2008 Google Inc.\n#\n# This program is free software; you can redistribute it and/or modify\n# it under the terms of the GNU General Public License as published by\n# the Free Software Foundation; either version 2 of the License, or\n# (at your option) any later version.\n#\n# This program is distributed in the hope that it will be useful, but\n# WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU\n# General Public License for more details.\n#\n# You should have received a copy of the GNU General Public License\n# along with this program; if not, write to the Free Software\n# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA\n# 02110-1301, USA.\n\n\n\"\"\"Module implementing the job queue handling.\n\nLocking: there's a single, large lock in the L{JobQueue} class. It's\nused by all other classes in this module.\n\n@var JOBQUEUE_THREADS: the number of worker threads we start for\n    processing jobs\n\n\"\"\"\n\nimport os\nimport logging\nimport threading\nimport errno\nimport re\nimport time\nimport weakref\n\nfrom ganeti import constants\nfrom ganeti import serializer\nfrom ganeti import workerpool\nfrom ganeti import opcodes\nfrom ganeti import errors\nfrom ganeti import mcpu\nfrom ganeti import utils\nfrom ganeti import jstore\nfrom ganeti import rpc\n\nfrom ganeti.rpc import RpcRunner\n\nJOBQUEUE_THREADS = 25\n\n\ndef TimeStampNow():\n  \"\"\"Returns the current timestamp.\n\n  @rtype: tuple\n  @return: the current time in the (seconds, microseconds) format\n\n  \"\"\"\n  return utils.SplitTime(time.time())\n\n\nclass _QueuedOpCode(object):\n  \"\"\"Encasulates an opcode object.\n\n  @ivar log: holds the execution log and consists of tuples\n  of the form C{(log_serial, timestamp, level, message)}\n  @ivar input: the OpCode we encapsulate\n  @ivar status: the current status\n  @ivar result: the result of the LU execution\n  @ivar start_timestamp: timestamp for the start of the execution\n  @ivar stop_timestamp: timestamp for the end of the execution\n\n  \"\"\"\n  def __init__(self, op):\n    \"\"\"Constructor for the _QuededOpCode.\n\n    @type op: L{opcodes.OpCode}\n    @param op: the opcode we encapsulate\n\n    \"\"\"\n    self.input = op\n    self.status = constants.OP_STATUS_QUEUED\n    self.result = None\n    self.log = []\n    self.start_timestamp = None\n    self.end_timestamp = None\n\n  @classmethod\n  def Restore(cls, state):\n    \"\"\"Restore the _QueuedOpCode from the serialized form.\n\n    @type state: dict\n    @param state: the serialized state\n    @rtype: _QueuedOpCode\n    @return: a new _QueuedOpCode instance\n\n    \"\"\"\n    obj = _QueuedOpCode.__new__(cls)\n    obj.input = opcodes.OpCode.LoadOpCode(state[\"input\"])\n    obj.status = state[\"status\"]\n    obj.result = state[\"result\"]\n    obj.log = state[\"log\"]\n    obj.start_timestamp = state.get(\"start_timestamp\", None)\n    obj.end_timestamp = state.get(\"end_timestamp\", None)\n    return obj\n\n  def Serialize(self):\n    \"\"\"Serializes this _QueuedOpCode.\n\n    @rtype: dict\n    @return: the dictionary holding the serialized state\n\n    \"\"\"\n    return {\n      \"input\": self.input.__getstate__(),\n      \"status\": self.status,\n      \"result\": self.result,\n      \"log\": self.log,\n      \"start_timestamp\": self.start_timestamp,\n      \"end_timestamp\": self.end_timestamp,\n      }\n\n\nclass _QueuedJob(object):\n  \"\"\"In-memory job representation.\n\n  This is what we use to track the user-submitted jobs. Locking must\n  be taken care of by users of this class.\n\n  @type queue: L{JobQueue}\n  @ivar queue: the parent queue\n  @ivar id: the job ID\n  @type ops: list\n  @ivar ops: the list of _QueuedOpCode that constitute the job\n  @type run_op_index: int\n  @ivar run_op_index: the currently executing opcode, or -1 if\n      we didn't yet start executing\n  @type log_serial: int\n  @ivar log_serial: holds the index for the next log entry\n  @ivar received_timestamp: the timestamp for when the job was received\n  @ivar start_timestmap: the timestamp for start of execution\n  @ivar end_timestamp: the timestamp for end of execution\n  @ivar change: a Condition variable we use for waiting for job changes\n\n  \"\"\"\n  def __init__(self, queue, job_id, ops):\n    \"\"\"Constructor for the _QueuedJob.\n\n    @type queue: L{JobQueue}\n    @param queue: our parent queue\n    @type job_id: job_id\n    @param job_id: our job id\n    @type ops: list\n    @param ops: the list of opcodes we hold, which will be encapsulated\n        in _QueuedOpCodes\n\n    \"\"\"\n    if not ops:\n      # TODO: use a better exception\n      raise Exception(\"No opcodes\")\n\n    self.queue = queue\n    self.id = job_id\n    self.ops = [_QueuedOpCode(op) for op in ops]\n    self.run_op_index = -1\n    self.log_serial = 0\n    self.received_timestamp = TimeStampNow()\n    self.start_timestamp = None\n    self.end_timestamp = None\n\n    # Condition to wait for changes\n    self.change = threading.Condition(self.queue._lock)\n\n  @classmethod\n  def Restore(cls, queue, state):\n    \"\"\"Restore a _QueuedJob from serialized state:\n\n    @type queue: L{JobQueue}\n    @param queue: to which queue the restored job belongs\n    @type state: dict\n    @param state: the serialized state\n    @rtype: _JobQueue\n    @return: the restored _JobQueue instance\n\n    \"\"\"\n    obj = _QueuedJob.__new__(cls)\n    obj.queue = queue\n    obj.id = state[\"id\"]\n    obj.run_op_index = state[\"run_op_index\"]\n    obj.received_timestamp = state.get(\"received_timestamp\", None)\n    obj.start_timestamp = state.get(\"start_timestamp\", None)\n    obj.end_timestamp = state.get(\"end_timestamp\", None)\n\n    obj.ops = []\n    obj.log_serial = 0\n    for op_state in state[\"ops\"]:\n      op = _QueuedOpCode.Restore(op_state)\n      for log_entry in op.log:\n        obj.log_serial = max(obj.log_serial, log_entry[0])\n      obj.ops.append(op)\n\n    # Condition to wait for changes\n    obj.change = threading.Condition(obj.queue._lock)\n\n    return obj\n\n  def Serialize(self):\n    \"\"\"Serialize the _JobQueue instance.\n\n    @rtype: dict\n    @return: the serialized state\n\n    \"\"\"\n    return {\n      \"id\": self.id,\n      \"ops\": [op.Serialize() for op in self.ops],\n      \"run_op_index\": self.run_op_index,\n      \"start_timestamp\": self.start_timestamp,\n      \"end_timestamp\": self.end_timestamp,\n      \"received_timestamp\": self.received_timestamp,\n      }\n\n  def CalcStatus(self):\n    \"\"\"Compute the status of this job.\n\n    This function iterates over all the _QueuedOpCodes in the job and\n    based on their status, computes the job status.\n\n    The algorithm is:\n      - if we find a cancelled, or finished with error, the job\n        status will be the same\n      - otherwise, the last opcode with the status one of:\n          - waitlock\n          - running\n\n        will determine the job status\n\n      - otherwise, it means either all opcodes are queued, or success,\n        and the job status will be the same\n\n    @return: the job status\n\n    \"\"\"\n    status = constants.JOB_STATUS_QUEUED\n\n    all_success = True\n    for op in self.ops:\n      if op.status == constants.OP_STATUS_SUCCESS:\n        continue\n\n      all_success = False\n\n      if op.status == constants.OP_STATUS_QUEUED:\n        pass\n      elif op.status == constants.OP_STATUS_WAITLOCK:\n        status = constants.JOB_STATUS_WAITLOCK\n      elif op.status == constants.OP_STATUS_RUNNING:\n        status = constants.JOB_STATUS_RUNNING\n      elif op.status == constants.OP_STATUS_ERROR:\n        status = constants.JOB_STATUS_ERROR\n        # The whole job fails if one opcode failed\n        break\n      elif op.status == constants.OP_STATUS_CANCELED:\n        status = constants.OP_STATUS_CANCELED\n        break\n\n    if all_success:\n      status = constants.JOB_STATUS_SUCCESS\n\n    return status\n\n  def GetLogEntries(self, newer_than):\n    \"\"\"Selectively returns the log entries.\n\n    @type newer_than: None or int\n    @param newer_than: if this is None, return all log enties,\n        otherwise return only the log entries with serial higher\n        than this value\n    @rtype: list\n    @return: the list of the log entries selected\n\n    \"\"\"\n    if newer_than is None:\n      serial = -1\n    else:\n      serial = newer_than\n\n    entries = []\n    for op in self.ops:\n      entries.extend(filter(lambda entry: entry[0] > serial, op.log))\n\n    return entries\n\n\nclass _JobQueueWorker(workerpool.BaseWorker):\n  \"\"\"The actual job workers.\n\n  \"\"\"\n  def _NotifyStart(self):\n    \"\"\"Mark the opcode as running, not lock-waiting.\n\n    This is called from the mcpu code as a notifier function, when the\n    LU is finally about to start the Exec() method. Of course, to have\n    end-user visible results, the opcode must be initially (before\n    calling into Processor.ExecOpCode) set to OP_STATUS_WAITLOCK.\n\n    \"\"\"\n    assert self.queue, \"Queue attribute is missing\"\n    assert self.opcode, \"Opcode attribute is missing\"\n\n    self.queue.acquire()\n    try:\n      self.opcode.status = constants.OP_STATUS_RUNNING\n    finally:\n      self.queue.release()\n\n  def RunTask(self, job):\n    \"\"\"Job executor.\n\n    This functions processes a job. It is closely tied to the _QueuedJob and\n    _QueuedOpCode classes.\n\n    @type job: L{_QueuedJob}\n    @param job: the job to be processed\n\n    \"\"\"\n    logging.debug(\"Worker %s processing job %s\",\n                  self.worker_id, job.id)\n    proc = mcpu.Processor(self.pool.queue.context)\n    self.queue = queue = job.queue\n    try:\n      try:\n        count = len(job.ops)\n        for idx, op in enumerate(job.ops):\n          try:\n            logging.debug(\"Op %s/%s: Starting %s\", idx + 1, count, op)\n\n            queue.acquire()\n            try:\n              job.run_op_index = idx\n              op.status = constants.OP_STATUS_WAITLOCK\n              op.result = None\n              op.start_timestamp = TimeStampNow()\n              if idx == 0: # first opcode\n                job.start_timestamp = op.start_timestamp\n              queue.UpdateJobUnlocked(job)\n\n              input_opcode = op.input\n            finally:\n              queue.release()\n\n            def _Log(*args):\n              \"\"\"Append a log entry.\n\n              \"\"\"\n              assert len(args) < 3\n\n              if len(args) == 1:\n                log_type = constants.ELOG_MESSAGE\n                log_msg = args[0]\n              else:\n                log_type, log_msg = args\n\n              # The time is split to make serialization easier and not lose\n              # precision.\n              timestamp = utils.SplitTime(time.time())\n\n              queue.acquire()\n              try:\n                job.log_serial += 1\n                op.log.append((job.log_serial, timestamp, log_type, log_msg))\n\n                job.change.notifyAll()\n              finally:\n                queue.release()\n\n            # Make sure not to hold lock while _Log is called\n            self.opcode = op\n            result = proc.ExecOpCode(input_opcode, _Log, self._NotifyStart)\n\n            queue.acquire()\n            try:\n              op.status = constants.OP_STATUS_SUCCESS\n              op.result = result\n              op.end_timestamp = TimeStampNow()\n              queue.UpdateJobUnlocked(job)\n            finally:\n              queue.release()\n\n            logging.debug(\"Op %s/%s: Successfully finished %s\",\n                          idx + 1, count, op)\n          except Exception, err:\n            queue.acquire()\n            try:\n              try:\n                op.status = constants.OP_STATUS_ERROR\n                op.result = str(err)\n                op.end_timestamp = TimeStampNow()\n                logging.debug(\"Op %s/%s: Error in %s\", idx + 1, count, op)\n              finally:\n                queue.UpdateJobUnlocked(job)\n            finally:\n              queue.release()\n            raise\n\n      except errors.GenericError, err:\n        logging.exception(\"Ganeti exception\")\n      except:\n        logging.exception(\"Unhandled exception\")\n    finally:\n      queue.acquire()\n      try:\n        try:\n          job.run_op_idx = -1\n          job.end_timestamp = TimeStampNow()\n          queue.UpdateJobUnlocked(job)\n        finally:\n",
+      "total_lines": 1180,
+      "ref": "ea03467c63c0b656a85865a8a6f36126bf01f718"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": true,
+      "reason": "keyword_triggered",
+      "item": {
+        "name": "backend.py",
+        "path": "lib/backend.py",
+        "sha": "207de71d14bb1fc1bcdc8afd0d2b31e632f9236d",
+        "html_url": "https://github.com/ganeti/ganeti/blob/ea03467c63c0b656a85865a8a6f36126bf01f718/lib/backend.py",
+        "score": null,
+        "snippet_ok": true,
+        "match_reason": "anchor_text",
+        "start_line": 2037,
+        "end_line": 2061,
+        "excerpt": "2037:     return (False, str(err))\n2038: \n2039: \n2040: class HooksRunner(object):\n2041:   \"\"\"Hook runner.\n2042: \n2043:   This class is instantiated on the node side (ganeti-noded) and not\n2044:   on the master side.\n2045: \n2046:   \"\"\"\n2047:   RE_MASK = re.compile(\"^[a-zA-Z0-9_-]+$\")\n2048: \n2049:   def __init__(self, hooks_base_dir=None):\n2050:     \"\"\"Constructor for hooks runner.\n2051: \n2052:     @type hooks_base_dir: str or None\n2053:     @param hooks_base_dir: if not None, this overrides the\n2054:         L{constants.HOOKS_BASE_DIR} (useful for unittests)\n2055: \n2056:     \"\"\"\n2057:     if hooks_base_dir is None:\n2058:       hooks_base_dir = constants.HOOKS_BASE_DIR\n2059:     self._BASE_DIR = hooks_base_dir\n2060: \n2061:   @staticmethod",
+        "symbol_name": null,
+        "symbol_type": null
+      }
+    }
+  },
+  "review_context": {}
+}

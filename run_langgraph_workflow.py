@@ -89,6 +89,7 @@ def main() -> None:
     print(f"Analyzer enabled: {args.enable_analyzer}")
     print(f"Review enabled: {args.enable_review}")
     print(f"Repair prompt mode: {args.repair_prompt_mode}")
+    print(f"Dual repair candidates: {summary.get('dual_repair_candidates')}")
     print(f"Resume mode: {args.resume}")
     print(f"Main trajectory file: {args.output_dir / 'trajectory_overview.csv'}")
     print(f"Context cache index: {args.output_dir / 'context_cache.csv'}")

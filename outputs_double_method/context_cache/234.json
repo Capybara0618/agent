@@ -1,0 +1,191 @@
+{
+  "task_id": "234",
+  "repo_owner": "ploomber",
+  "repo_name": "ploomber",
+  "file_path": "src/ploomber/sources/notebooksource.py",
+  "commit": "e4018d28ea78ec9ce45e1e3d9c7893c448756fc2",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T14:27:27+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "e4018d28ea78ec9ce45e1e3d9c7893c448756fc2",
+    "symbol_name": "remove_injected_cell",
+    "satd_line": 400,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 1,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T14:27:27+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/ploomber/sources/notebooksource.py",
+    "original_signature": "def remove_injected_cell(self):",
+    "target_file": {
+      "ok": true,
+      "path": "src/ploomber/sources/notebooksource.py",
+      "sha": "7d643900af0fc81d70f0b2f8f48d8a9fea18229a",
+      "download_url": "https://raw.githubusercontent.com/ploomber/ploomber/e4018d28ea78ec9ce45e1e3d9c7893c448756fc2/src/ploomber/sources/notebooksource.py",
+      "content_excerpt": "\"\"\"\nOn languages and kernels\n------------------------\nNotebookSource represents source code in a Jupyter notebook format (language\nagnostic). Apart from .ipynb, we also support any other extension supported\nby jupytext.\n\nGiven a notebook, we have to know which language it is written in to extract\nupstream/product variables (though this only happens when the option of\nextracting dependencies automatically is on), we also have to determine the\nJupyter kernel to use (this is always needed).\n\nThe unequivocal place to store this information is in the notebook metadata\nsection, but given that we advocate for the use of scripts (converted to\nnotebooks via jupytext), they most likely won't contain metadata (metadata\nsaving is turned off by default in jupytext), so we have to infer this\nourselves.\n\nTo make things more complex, jupytext adds its own metadata section but we are\nignoring that for now.\n\nGiven that there are many places where this information might be stored, we\nhave a few rules to automatically determine language and kernel given a\nscript/notebook.\n\"\"\"\nimport ast\nfrom pathlib import Path\nimport warnings\n\n# papermill is importing a deprecated module from pyarrow\nwith warnings.catch_warnings():\n    warnings.simplefilter('ignore', FutureWarning)\n    from papermill.parameterize import parameterize_notebook\n\nimport nbformat\nimport jupytext\nfrom jupytext import cli as jupytext_cli\n\nfrom ploomber.exceptions import SourceInitializationError\nfrom ploomber.placeholders.placeholder import Placeholder\nfrom ploomber.util import requires\nfrom ploomber.sources.abc import Source\nfrom ploomber.sources.nb_utils import find_cell_with_tag, find_cell_with_tags\nfrom ploomber.static_analysis.extractors import extractor_class_for_language\nfrom ploomber.static_analysis.pyflakes import check_notebook\nfrom ploomber.sources import docstring\n\n\nclass NotebookSource(Source):\n    \"\"\"\n    A source object representing a jupyter notebook (or any format supported\n    by jupytext)\n\n    Parameters\n    ----------\n    hot_reload : bool, optional\n        Makes the notebook always read the file before rendering\n\n    kernelspec_name : str, optional\n        Which kernel to use for executing the notebook, it overrides any\n        existing kernelspec metadata in the notebook. If the notebook does\n        not have kernelspec info, this parameter is required. Defaults to None.\n        To see which kernelspecs are available run \"jupyter kernelspec list\"\n\n    check_if_kernel_installed : bool, optional\n        Check if the kernel is installed during initization\n\n    Notes\n    -----\n    The render method prepares the notebook for execution: it adds the\n    parameters and it makes sure kernelspec is defined\n    \"\"\"\n    @requires([\n        'parso', 'pyflakes', 'jupytext', 'nbformat', 'papermill',\n        'jupyter_client'\n    ])\n    def __init__(self,\n                 primitive,\n                 hot_reload=False,\n                 ext_in=None,\n                 kernelspec_name=None,\n                 static_analysis=False,\n                 check_if_kernel_installed=True):\n        # any non-py file must first be converted using jupytext, we need\n        # that representation for validation, if input is already a .py file\n        # do not convert. If passed a string, try to guess format using\n        # jupytext. We also need ipynb representation for .develop(),\n        # but do lazy loading in case we don't need both\n        self._primitive = primitive\n        self._check_if_kernel_installed = check_if_kernel_installed\n\n        # this happens if using SourceLoader\n        if isinstance(primitive, Placeholder):\n            self._path = primitive.path\n            self._primitive = str(primitive)\n        elif isinstance(primitive, str):\n            self._path = None\n            self._primitive = primitive\n        elif isinstance(primitive, Path):\n            self._path = primitive\n            self._primitive = primitive.read_text()\n        else:\n            raise TypeError('Notebooks must be initialized from strings, '\n                            'Placeholder or pathlib.Path, got {}'.format(\n                                type(primitive)))\n\n        self.static_analysis = static_analysis\n        self._kernelspec_name = kernelspec_name\n        self._hot_reload = hot_reload\n\n        # TODO: validate ext_in values and extensions\n\n        if self._path is None and hot_reload:\n            raise ValueError('hot_reload only works in the notebook was '\n                             'loaded from a file')\n\n        if self._path is not None and ext_in is None:\n            self._ext_in = self._path.suffix[1:]\n        elif self._path is None and ext_in is None:\n            raise ValueError('\"ext_in\" cannot be None if the notebook is '\n                             'initialized from a string. Either pass '\n                             'a pathlib.Path object with the notebook file '\n                             'location or pass the source code as string '\n                             'and include the \"ext_in\" parameter')\n        elif self._path is not None and ext_in is not None:\n            raise ValueError('\"ext_in\" must be None if notebook is '\n                             'initialized from a pathlib.Path object')\n        elif self._path is None and ext_in is not None:\n            self._ext_in = ext_in\n\n        # try to determine language based on extension, though this test\n        # might be inconclusive if dealing with a ipynb file, though we only\n        # use this to determine the appropriate jupyter kernel when\n        # initializing from a string, when initializing from files, the\n        # extension is used to determine the kernel\n        self._language = determine_language(self._ext_in)\n\n        self._loc = None\n        self._params = None\n\n        self._nb_str_unrendered = None\n        self._nb_obj_unrendered = None\n        self._nb_str_rendered = None\n        self._nb_obj_rendered = None\n\n        # this will raise an error if kernelspec_name is invalid\n        self._read_nb_str_unrendered()\n\n        self._post_init_validation(str(self._primitive))\n\n    @property\n    def primitive(self):\n        if self._hot_reload:\n            self._primitive = self._path.read_text()\n\n        return self._primitive\n\n    def render(self, params):\n        \"\"\"Render notebook (fill parameters using papermill)\n        \"\"\"\n        self._params = json_serializable_params(params)\n        self._render()\n\n    def _render(self):\n        # _read_nb_str_unrendered uses hot_reload, this ensures we always get\n        # the latest version\n        _, nb = self._read_nb_str_unrendered()\n\n        # this is needed for parameterize_notebook to work\n        for cell in nb.cells:\n            if not hasattr(cell.metadata, 'tags'):\n                cell.metadata['tags'] = []\n        nb.metadata['papermill'] = dict()\n\n        # NOTE: we use parameterize_notebook instead of execute_notebook\n        # with the prepare_only option because the latter adds a \"papermill\"\n        # section on each cell's metadata, which makes it too verbose when\n        # using NotebookRunner.develop() when the source is script (each cell\n        # will have an empty \"papermill\" metadata dictionary)\n        nb = parameterize_notebook(nb, self._params)\n\n        # delete empty tags to prevent cluttering the notebooks\n        for cell in nb.cells:\n            if not len(cell.metadata['tags']):\n                cell.metadata.pop('tags')\n\n        self._nb_str_rendered = nbformat.writes(nb)\n        self._post_render_validation(self._params, self._nb_str_rendered)\n\n    def _read_nb_str_unrendered(self):\n        \"\"\"\n        Returns the notebook representation (JSON string), this is the raw\n        source code passed, does not contain injected parameters.\n\n        Adds kernelspec info if not present based on the kernelspec_name,\n        this metadata is required for papermill to know which kernel to use.\n\n        An exception is raised if we cannot determine kernel information.\n        \"\"\"\n        # hot_reload causes to always re-evalaute the notebook representation\n        if self._nb_str_unrendered is None or self._hot_reload:\n            # this is the notebook node representation\n            nb = _to_nb_obj(\n                self.primitive,\n                ext=self._ext_in,\n                # passing the underscored version\n                # because that's the only one available\n                # when this is initialized\n                language=self._language,\n                kernelspec_name=self._kernelspec_name,\n                check_if_kernel_installed=self._check_if_kernel_installed)\n\n            # if the user injected cells manually (with plomber nb --inject)\n            # the source will contain the injected cell, remove it because\n            # it should not be considered part of the source code\n            self._nb_obj_unrendered = _cleanup_rendered_nb(nb, print_=False)\n\n            # get the str representation. always write from nb_obj, even if\n            # this was initialized with a ipynb file, nb_obj contains\n            # kernelspec info\n            self._nb_str_unrendered = nbformat.writes(\n                self._nb_obj_unrendered, version=nbformat.NO_CONVERT)\n\n        return self._nb_str_unrendered, self._nb_obj_unrendered\n\n    def _post_init_validation(self, value):\n        \"\"\"\n        Validate notebook after initialization (run pyflakes to detect\n        syntax errors)\n        \"\"\"\n        # NOTE: what happens if I pass source code with errors to parso?\n        # maybe we don't need to use pyflakes after all\n        # we can also use compile. can pyflakes detect things that\n        # compile cannot?\n        params_cell, _ = find_cell_with_tag(self._nb_obj_unrendered,\n                                            'parameters')\n\n        if params_cell is None:\n            loc = ' \"{}\"'.format(self.loc) if self.loc else ''\n            msg = ('Notebook{} does not have a cell tagged '\n                   '\"parameters\"'.format(loc))\n\n            if self.loc and Path(self.loc).suffix == '.py':\n                msg += \"\"\".\nAdd a cell at the top like this:\n\n# + tags=[\"parameters\"]\nupstream = None\nproduct = None\n# -\n\nGo to: https://ploomber.io/s/params for more information\n\"\"\"\n            if self.loc and Path(self.loc).suffix == '.ipynb':\n                msg += ('. Add a cell at the top and tag it as \"parameters\". '\n                        'Go to the next URL for '\n                        'details: https://ploomber.io/s/params')\n\n            raise SourceInitializationError(msg)\n\n    def _post_render_validation(self, params, nb_str):\n        \"\"\"\n        Validate params passed against parameters in the notebook\n        \"\"\"\n        if self.static_analysis:\n            if self.language == 'python':\n                # check for errors (e.g., undeclared variables, syntax errors)\n                nb = self._nb_str_to_obj(nb_str)\n                check_notebook(nb, params, filename=self._path or 'notebook')\n\n    @property\n    def doc(self):\n        \"\"\"\n        Returns notebook docstring parsed either from a triple quoted string\n        in the top cell or a top markdown markdown cell\n        \"\"\"\n        return docstring.extract_from_nb(self._nb_obj_unrendered)\n\n    @property\n    def loc(self):\n        return self._path\n\n    @property\n    def name(self):\n        # filename without extension(e.g., plot.py -> plot)\n        if self._path:\n            return self._path.stem\n\n    @property\n    def nb_str_rendered(self):\n        \"\"\"\n        Returns the notebook (as a string) with parameters injected, hot\n        reloadig if necessary\n        \"\"\"\n        if self._nb_str_rendered is None:\n            raise RuntimeError('Attempted to get location for an unrendered '\n                               'notebook, render it first')\n\n        if self._hot_reload:\n            self._render()\n\n        return self._nb_str_rendered\n\n    @property\n    def nb_obj_rendered(self):\n        \"\"\"\n        Returns the notebook (as an objet) with p",
+      "total_lines": 729,
+      "ref": "e4018d28ea78ec9ce45e1e3d9c7893c448756fc2"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "remove_injected_cell",
+      "class_name": "NotebookSource",
+      "start_line": 405,
+      "end_line": 417,
+      "satd_line": 400,
+      "matched_by": "signature_or_comment",
+      "source": "    def remove_injected_cell(self):\n        \"\"\"\n        Delete injected cell (if any)\n        \"\"\"\n        nb_clean = _cleanup_rendered_nb(self._nb_obj_unrendered)\n\n        # TODO: test when initialized from str\n        # what's the second returned obj?\n        fmt, cfg = jupytext.guess_format(self._primitive, f'.{self._ext_in}')\n        fmt_ = f'{self._ext_in}:{fmt}'\n\n        # overwrite\n        jupytext.write(nb_clean, self._path, fmt=fmt_)",
+      "calls": [
+        "_cleanup_rendered_nb"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "_ext_in",
+        "_nb_obj_unrendered",
+        "_path",
+        "_primitive"
+      ],
+      "global_uses": [
+        "_cleanup_rendered_nb",
+        "jupytext"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_cleanup_rendered_nb",
+          "class_name": null,
+          "start_line": 634,
+          "end_line": 660,
+          "relevance": [
+            "direct_call",
+            "keyword_source_overlap=1"
+          ],
+          "source": "def _cleanup_rendered_nb(nb, print_=True):\n    \"\"\"\n    Cleans up a rendered notebook object. Removes cells with tags:\n    injected-parameters, debugging-settings, and metadata injected by\n    papermill\n    \"\"\"\n    out = find_cell_with_tags(nb,\n                              ['injected-parameters', 'debugging-settings'])\n\n    if print_:\n        for key in out.keys():\n            print(f'Removing {key} cell...')\n\n    idxs = set(cell['index'] for cell in out.values())\n\n    nb['cells'] = [\n        cell for idx, cell in enumerate(nb['cells']) if idx not in idxs\n    ]\n\n    # papermill adds \"tags\" to all cells that don't have them, remove them\n    # if they are empty to avoid cluttering the script\n    for cell in nb['cells']:\n        if 'tags' in cell.get('metadata', {}):\n            if not len(cell['metadata']['tags']):\n                del cell['metadata']['tags']\n\n    return nb"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "NotebookSource",
+      "related_methods_count": 2,
+      "related_attributes_count": 3,
+      "related_methods": [
+        {
+          "symbol_name": "__init__",
+          "start_line": 77,
+          "end_line": 149,
+          "relevance": [
+            "shared_attrs=4"
+          ],
+          "source": "    def __init__(self,\n                 primitive,\n                 hot_reload=False,\n                 ext_in=None,\n                 kernelspec_name=None,\n                 static_analysis=False,\n                 check_if_kernel_installed=True):\n        # any non-py file must first be converted using jupytext, we need\n        # that representation for validation, if input is already a .py file\n        # do not convert. If passed a string, try to guess format using\n        # jupytext. We also need ipynb representation for .develop(),\n        # but do lazy loading in case we don't need both\n        self._primitive = primitive\n        self._check_if_kernel_installed = check_if_kernel_installed\n\n        # this happens if using SourceLoader\n        if isinstance(primitive, Placeholder):\n            self._path = primitive.path\n            self._primitive = str(primitive)\n        elif isinstance(primitive, str):\n            self._path = None\n            self._primitive = primitive\n        elif isinstance(primitive, Path):\n            self._path = primitive\n            self._primitive = primitive.read_text()\n        else:\n            raise TypeError('Notebooks must be initialized from strings, '\n                            'Placeholder or pathlib.Path, got {}'.format(\n                                type(primitive)))\n\n        self.static_analysis = static_analysis\n        self._kernelspec_name = kernelspec_name\n        self._hot_reload = hot_reload\n\n        # TODO: validate ext_in values and extensions\n\n        if self._path is None and hot_reload:\n            raise ValueError('hot_reload only works in the notebook was '\n                             'loaded from a file')\n\n        if self._path is not None and ext_in is None:\n            self._ext_in = self._path.suffix[1:]\n        elif self._path is None and ext_in is None:\n            raise ValueError('\"ext_in\" cannot be None if the notebook is '\n                             'initialized from a string. Either pass '\n                             'a pathlib.Path object with the notebook file '\n                             'location or pass the source code as string '\n                             'and include the \"ext_in\" parameter')\n        elif self._path is not None and ext_in is not None:\n            raise ValueError('\"ext_in\" must be None if notebook is '\n                             'initialized from a pathlib.Path object')\n        elif self._path is None and ext_in is not None:\n            self._ext_in = ext_in\n\n        # try to determine language based on extension, though this test\n        # might be inconclusive if dealing with a ipynb file, though we only\n        # use this to determine the appropriate jupyter kernel when\n        # initializing from a string, when initializing from files, the\n        # extension is used to determine the kernel\n        self._language = determine_language(self._ext_in)\n\n        self._loc = None\n        self._params = None\n\n        self._nb_str_unrendered = None\n        self._nb_obj_unrendered = None\n        self._nb_str_rendered = None\n        self._nb_obj_rendered = None\n\n        # this will raise an error if kernelspec_name is invalid\n        self._read_nb_str_unrendered()\n\n        self._post_init_validation(str(self._primitive))"
+        },
+        {
+          "symbol_name": "save_injected_cell",
+          "start_line": 376,
+          "end_line": 403,
+          "relevance": [
+            "shared_attrs=3",
+            "keyword_source_overlap=1"
+          ],
+          "source": "    def save_injected_cell(self):\n        \"\"\"\n        Inject cell and overwrite the source file\n        \"\"\"\n        # TODO: test when initialized from str\n        # what's the second returned obj?\n        # try multiple times, ensure parameter cell isnt duplicated\n        fmt, cfg = jupytext.guess_format(self._primitive, f'.{self._ext_in}')\n        fmt_ = f'{self._ext_in}:{fmt}'\n\n        # add metadata to flag that the cell was injected manually\n        recursive_update(\n            self.nb_obj_rendered,\n            dict(metadata=dict(ploomber=dict(injected_manually=True))))\n\n        # Are we updating a text file that has a metadata filter? If so,\n        # add ploomber as a section that must be stored\n        if (self.nb_obj_rendered.metadata.get(\n                'jupytext', {}).get('notebook_metadata_filter') == '-all'):\n            recursive_update(\n                self.nb_obj_rendered,\n                dict(metadata=dict(jupytext=dict(\n                    notebook_metadata_filter='ploomber,-all'))))\n\n        # TODO: remove metadata in remove_injected_cell\n\n        # overwrite\n        jupytext.write(self.nb_obj_rendered, self._path, fmt=fmt_)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "_primitive",
+          "start_line": 88,
+          "end_line": 90,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        # but do lazy loading in case we don't need both\n        self._primitive = primitive\n        self._check_if_kernel_installed = check_if_kernel_installed"
+        },
+        {
+          "attribute": "_path",
+          "start_line": 93,
+          "end_line": 95,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        if isinstance(primitive, Placeholder):\n            self._path = primitive.path\n            self._primitive = str(primitive)"
+        },
+        {
+          "attribute": "_ext_in",
+          "start_line": 117,
+          "end_line": 119,
+          "relevance": [
+            "direct_attribute_use"
+          ],
+          "snippet": "        if self._path is not None and ext_in is None:\n            self._ext_in = self._path.suffix[1:]\n        elif self._path is None and ext_in is None:"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_cleanup_rendered_nb",
+          "kind": "function",
+          "start_line": 634,
+          "end_line": 660,
+          "source": "def _cleanup_rendered_nb(nb, print_=True):\n    \"\"\"\n    Cleans up a rendered notebook object. Removes cells with tags:\n    injected-parameters, debugging-settings, and metadata injected by\n    papermill\n    \"\"\"\n    out = find_cell_with_tags(nb,\n                              ['injected-parameters', 'debugging-settings'])\n\n    if print_:\n        for key in out.keys():\n            print(f'Removing {key} cell...')\n\n    idxs = set(cell['index'] for cell in out.values())\n\n    nb['cells'] = [\n        cell for idx, cell in enumerate(nb['cells']) if idx not in idxs\n    ]\n\n    # papermill adds \"tags\" to all cells that don't have them, remove them\n    # if they are empty to avoid cluttering the script\n    for cell in nb['cells']:\n        if 'tags' in cell.get('metadata', {}):\n            if not len(cell['metadata']['tags']):\n                del cell['metadata']['tags']\n\n    return nb"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "__init__",
+          "class_name": "NotebookSource",
+          "start_line": 77,
+          "end_line": 149,
+          "source": "    def __init__(self,\n                 primitive,\n                 hot_reload=False,\n                 ext_in=None,\n                 kernelspec_name=None,\n                 static_analysis=False,\n                 check_if_kernel_installed=True):\n        # any non-py file must first be converted using jupytext, we need\n        # that representation for validation, if input is already a .py file\n        # do not convert. If passed a string, try to guess format using\n        # jupytext. We also need ipynb representation for .develop(),\n        # but do lazy loading in case we don't need both\n        self._primitive = primitive\n        self._check_if_kernel_installed = check_if_kernel_installed\n\n        # this happens if using SourceLoader\n        if isinstance(primitive, Placeholder):\n            self._path = primitive.path\n            self._primitive = str(primitive)\n        elif isinstance(primitive, str):\n            self._path = None\n            self._primitive = primitive\n        elif isinstance(primitive, Path):\n            self._path = primitive\n            self._primitive = primitive.read_text()\n        else:\n            raise TypeError('Notebooks must be initialized from strings, '\n                            'Placeholder or pathlib.Path, got {}'.format(\n                                type(primitive)))\n\n        self.static_analysis = static_analysis\n        self._kernelspec_name = kernelspec_name\n        self._hot_reload = hot_reload\n\n        # TODO: validate ext_in values and extensions\n\n        if self._path is None and hot_reload:\n            raise ValueError('hot_reload only works in the notebook was '\n                             'loaded from a file')\n\n        if self._path is not None and ext_in is None:\n            self._ext_in = self._path.suffix[1:]\n        elif self._path is None and ext_in is None:\n            raise ValueError('\"ext_in\" cannot be None if the notebook is '\n                             'initialized from a string. Either pass '\n                             'a pathlib.Path object with the notebook file '\n                             'location or pass the source code as string '\n                             'and include the \"ext_in\" parameter')\n        elif self._path is not None and ext_in is not None:\n            raise ValueError('\"ext_in\" must be None if notebook is '\n                             'initialized from a pathlib.Path object')\n        elif self._path is None and ext_in is not None:\n            self._ext_in = ext_in\n\n        # try to determine language based on extension, though this test\n        # might be inconclusive if dealing with a ipynb file, though we only\n        # use this to determine the appropriate jupyter kernel when\n        # initializing from a string, when initializing from files, the\n        # extension is used to determine the kernel\n        self._language = determine_language(self._ext_in)\n\n        self._loc = None\n        self._params = None\n\n        self._nb_str_unrendered = None\n        self._nb_obj_unrendered = None\n        self._nb_str_rendered = None\n        self._nb_obj_rendered = None\n\n        # this will raise an error if kernelspec_name is invalid\n        self._read_nb_str_unrendered()\n\n        self._post_init_validation(str(self._primitive))"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

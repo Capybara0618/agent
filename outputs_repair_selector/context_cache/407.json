@@ -1,0 +1,162 @@
+{
+  "task_id": "407",
+  "repo_owner": "mergifyio",
+  "repo_name": "mergify-engine",
+  "file_path": "mergify_engine/actions/merge/queue.py",
+  "commit": "88a247a8195ea52f95e9d26c0f1c368cce615529",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T04:29:33+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "88a247a8195ea52f95e9d26c0f1c368cce615529",
+    "symbol_name": "log",
+    "satd_line": 44,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T04:29:33+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "mergify_engine/actions/merge/queue.py",
+    "original_signature": "async def get_config(",
+    "target_file": {
+      "ok": true,
+      "path": "mergify_engine/actions/merge/queue.py",
+      "sha": "997620fc65cd47aae95ba22c3d8b81200dc2c6d7",
+      "download_url": "https://raw.githubusercontent.com/Mergifyio/mergify/88a247a8195ea52f95e9d26c0f1c368cce615529/mergify_engine/actions/merge/queue.py",
+      "content_excerpt": "# -*- encoding: utf-8 -*-\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n# not use this file except in compliance with the License. You may obtain\n# a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n# License for the specific language governing permissions and limitations\n# under the License.\nimport dataclasses\nimport json\n\nimport redis\n\nfrom mergify_engine import check_api\nfrom mergify_engine import context\nfrom mergify_engine import exceptions\nfrom mergify_engine import logs\nfrom mergify_engine import sub_utils\nfrom mergify_engine import utils\nfrom mergify_engine.actions.merge import helpers\nfrom mergify_engine.clients import github\n\n\nLOG = logs.getLogger(__name__)\n\n\n@dataclasses.dataclass\nclass Queue:\n    redis: redis.Redis\n    installation_id: int\n    owner: str\n    repo: str\n    ref: str\n\n    @property\n    def log(self):\n        return logs.getLogger(\n            __name__, gh_owner=self.owner, gh_repo=self.repo, gh_branch=self.ref\n        )\n\n    @classmethod\n    def from_queue_name(cls, redis, name):\n        _, installation_id, owner, repo, branch = name.split(\"~\")\n        return cls(redis, int(installation_id), owner, repo, branch)\n\n    @classmethod\n    def from_context(cls, ctxt):\n        return cls(\n            utils.get_redis_for_cache(),\n            ctxt.client.installation[\"id\"],\n            ctxt.pull[\"base\"][\"repo\"][\"owner\"][\"login\"],\n            ctxt.pull[\"base\"][\"repo\"][\"name\"],\n            ctxt.pull[\"base\"][\"ref\"],\n        )\n\n    @property\n    def _cache_key(self):\n        return f\"strict-merge-queues~{self.installation_id}~{self.owner.lower()}~{self.repo.lower()}~{self.ref}\"\n\n    def _config_cache_key(self, pull_number):\n        return f\"strict-merge-config~{self.installation_id}~{self.owner.lower()}~{self.repo.lower()}~{pull_number}\"\n\n    # TODO(sileht): To delete in a couple of days when redis will not have keys like this\n    # anymore\n    def _method_cache_key(self, pull_number):\n        return f\"strict-merge-method~{self.installation_id}~{self.owner.lower()}~{self.repo.lower()}~{pull_number}\"\n\n    def get_merge_method(self, pull_number: int) -> str:\n        \"\"\"Return merge method for a pull request.\n\n        :param pull_number: The pull request number.\n        :param default: The default method to return if not found.\n        \"\"\"\n        return self.get_config(pull_number)[\"strict_method\"]\n\n    def get_config(self, pull_number: int) -> dict:\n        \"\"\"Return merge config for a pull request.\n\n        :param pull_number: The pull request number.\n        \"\"\"\n        config = self.redis.get(self._config_cache_key(pull_number))\n        if config is None:\n            return {\n                \"strict_method\": self.redis.get(\n                    self._method_cache_key(pull_number), \"merge\"\n                ),\n                \"priority\": 2000,\n                \"effective_priority\": 2000,\n            }\n        config = json.loads(config)\n        # TODO(sileht): for compatibility purpose, we can drop that in a couple of week\n        config.setdefault(\"effective_priority\", config[\"priority\"])\n        return config\n\n    def _add_pull(self, pull_number, priority, update=False):\n        \"\"\"Add a pull without setting its method.\n\n        :param update: If update is True, don't create PR if it's not there.\n        \"\"\"\n        score = utils.utcnow().timestamp() / priority\n        if update:\n            flags = dict(xx=True)\n        else:\n            flags = dict(nx=True)\n        self.redis.zadd(self._cache_key, {pull_number: score}, **flags)\n\n    def add_pull(self, ctxt, config):\n        config = config.copy()\n        config[\"effective_priority\"] = config[\"priority\"]\n\n        if not ctxt.subscription[\"subscription_active\"]:\n            config[\"effective_priority\"] = helpers.PriorityAliases.medium.value\n\n        self.redis.set(\n            self._config_cache_key(ctxt.pull[\"number\"]), json.dumps(config),\n        )\n        self._add_pull(ctxt.pull[\"number\"], config[\"effective_priority\"])\n        self.log.info(\n            \"pull request added to merge queue\",\n            gh_pull=ctxt.pull[\"number\"],\n            config=config,\n        )\n\n    def remove_pull(self, pull_number):\n        self.redis.zrem(self._cache_key, pull_number)\n        self.redis.delete(self._method_cache_key(pull_number))\n        self.redis.delete(self._config_cache_key(pull_number))\n        self.log.info(\"pull request removed from merge queue\", gh_pull=pull_number)\n\n    def _move_pull_at_end(self, pull_number):  # pragma: no cover\n        priority = self.get_config(pull_number)[\"effective_priority\"]\n        self._add_pull(pull_number, priority=priority, update=True)\n        self.log.info(\n            \"pull request moved at the end of the merge queue\", gh_pull=pull_number\n        )\n\n    def _move_pull_to_new_base_branch(self, pull_number, old_base_branch):\n        old_queue = self.__class__(\n            self.installation_id, self.owner, self.repo, old_base_branch, pull_number\n        )\n        self.redis.zrem(old_queue._cache_key, pull_number)\n        priority = self.get_config(pull_number)[\"effective_priority\"]\n        self._add_pull(pull_number, priority)\n        self.log.info(\n            \"pull request moved from queue %s to this queue\",\n            old_queue,\n            gh_pull=pull_number,\n        )\n\n    def is_first_pull(self, pull_number):\n        pull_requests = self.get_pulls()\n        if not pull_requests:\n            return True\n        return pull_requests[0] == pull_number\n\n    def get_pulls(self):\n        return [\n            int(pull)\n            for pull in self.redis.zrangebyscore(self._cache_key, \"-inf\", \"+inf\")\n        ]\n\n    def delete_queue(self):\n        self.redis.delete(self._cache_key)\n\n    def handle_first_pull_in_queue(self, ctxt):\n        old_checks = [\n            c for c in ctxt.pull_engine_check_runs if c[\"name\"].endswith(\" (merge)\")\n        ]\n\n        output = helpers.merge_report(ctxt, True)\n        if output:\n            conclusion, title, summary = output\n            ctxt.log.info(\n                \"pull request closed in the meantime\",\n                conclusion=conclusion,\n                title=title,\n                summary=summary,\n            )\n            self.remove_pull(ctxt.pull[\"number\"])\n        else:\n            ctxt.log.info(\"updating base branch of pull request\")\n            method = self.get_merge_method(ctxt.pull[\"number\"])\n            conclusion, title, summary = helpers.update_pull_base_branch(ctxt, method)\n\n            if ctxt.pull[\"state\"] == \"closed\":\n                ctxt.log.info(\n                    \"pull request closed in the meantime\",\n                    conclusion=conclusion,\n                    title=title,\n                    summary=summary,\n                )\n                self.remove_pull(ctxt.pull[\"number\"])\n            elif conclusion == \"failure\":\n                ctxt.log.info(\"base branch update failed\", title=title, summary=summary)\n                self._move_pull_at_end(ctxt.pull[\"number\"])\n\n        status = \"completed\" if conclusion else \"in_progress\"\n        for c in old_checks:\n            check_api.set_check_run(\n                ctxt,\n                c[\"name\"],\n                status,\n                conclusion,\n                output={\"title\": title, \"summary\": summary},\n            )\n\n    @classmethod\n    def process_queues(cls):\n        redis = utils.get_redis_for_cache()\n        LOG.info(\"smart strict workflow loop start\")\n        for queue_name in redis.keys(\"strict-merge-queues~*\"):\n            queue = cls.from_queue_name(redis, queue_name)\n            queue.log.info(\"handling queue\")\n            try:\n                queue.process()\n            except Exception:\n                queue.log.error(\"Fail to process merge queue\", exc_info=True)\n        LOG.info(\"smart strict workflow loop end\")\n\n    def process(self):\n        pull_numbers = self.get_pulls()\n\n        self.log.info(\"%d pulls queued\", len(pull_numbers), queue=list(pull_numbers))\n\n        if not pull_numbers:\n            return\n\n        pull_number = pull_numbers[0]\n\n        try:\n            installation = github.get_installation(\n                self.owner, self.repo, self.installation_id\n            )\n        except exceptions.MergifyNotInstalled:\n            self.delete_queue()\n            return\n\n        subscription = sub_utils.get_subscription(\n            utils.get_redis_for_cache(), self.installation_id,\n        )\n\n        with github.get_client(self.owner, self.repo, installation) as client:\n            data = client.item(f\"pulls/{pull_number}\")\n\n            try:\n                ctxt = context.Context(client, data, subscription)\n            except exceptions.RateLimited as e:\n                self.log.debug(\"rate limited\", remaining_seconds=e.countdown)\n                return\n            except exceptions.MergeableStateUnknown as e:  # pragma: no cover\n                e.ctxt.log.warning(\n                    \"pull request with mergeable_state unknown retrying later\",\n                )\n                self._move_pull_at_end(pull_number)\n                return\n            try:\n                if ctxt.pull[\"base\"][\"ref\"] != self.ref:\n                    ctxt.log.info(\n                        \"pull request base branch have changed\",\n                        old_branch=self.ref,\n                        new_branch=ctxt.pull[\"base\"][\"ref\"],\n                    )\n                    self._move_pull_to_new_base_branch(ctxt, self.ref)\n                elif ctxt.pull[\"state\"] == \"closed\" or ctxt.is_behind:\n                    # NOTE(sileht): Pick up this pull request and rebase it again\n                    # or update its status and remove it from the queue\n                    ctxt.log.info(\n                        \"pull request needs to be updated again or has been closed\",\n                    )\n                    self.handle_first_pull_in_queue(ctxt)\n                else:\n                    # NOTE(sileht): Pull request has not been merged or cancelled\n                    # yet wait next loop\n                    ctxt.log.info(\"pull request checks are still in progress\")\n            except Exception:  # pragma: no cover\n                ctxt.log.error(\"Fail to process merge queue\", exc_info=True)\n                self._move_pull_at_end(pull_number)\n",
+      "total_lines": 282,
+      "ref": "88a247a8195ea52f95e9d26c0f1c368cce615529"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "log",
+      "class_name": "Queue",
+      "start_line": 41,
+      "end_line": 44,
+      "satd_line": 44,
+      "matched_by": "signature_or_comment",
+      "source": "    def log(self):\n        return logs.getLogger(\n            __name__, gh_owner=self.owner, gh_repo=self.repo, gh_branch=self.ref\n        )",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [
+        "owner",
+        "ref",
+        "repo"
+      ],
+      "global_uses": [
+        "logs"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "get_config",
+          "class_name": "Queue",
+          "start_line": 81,
+          "end_line": 98,
+          "relevance": [
+            "keyword_source_overlap=8",
+            "same_class"
+          ],
+          "source": "    def get_config(self, pull_number: int) -> dict:\n        \"\"\"Return merge config for a pull request.\n\n        :param pull_number: The pull request number.\n        \"\"\"\n        config = self.redis.get(self._config_cache_key(pull_number))\n        if config is None:\n            return {\n                \"strict_method\": self.redis.get(\n                    self._method_cache_key(pull_number), \"merge\"\n                ),\n                \"priority\": 2000,\n                \"effective_priority\": 2000,\n            }\n        config = json.loads(config)\n        # TODO(sileht): for compatibility purpose, we can drop that in a couple of week\n        config.setdefault(\"effective_priority\", config[\"priority\"])\n        return config"
+        },
+        {
+          "symbol_name": "process",
+          "class_name": "Queue",
+          "start_line": 225,
+          "end_line": 282,
+          "relevance": [
+            "keyword_source_overlap=3",
+            "same_class"
+          ],
+          "source": "    def process(self):\n        pull_numbers = self.get_pulls()\n\n        self.log.info(\"%d pulls queued\", len(pull_numbers), queue=list(pull_numbers))\n\n        if not pull_numbers:\n            return\n\n        pull_number = pull_numbers[0]\n\n        try:\n            installation = github.get_installation(\n                self.owner, self.repo, self.installation_id\n            )\n        except exceptions.MergifyNotInstalled:\n            self.delete_queue()\n            return\n\n        subscription = sub_utils.get_subscription(\n            utils.get_redis_for_cache(), self.installation_id,\n        )\n\n        with github.get_client(self.owner, self.repo, installation) as client:\n            data = client.item(f\"pulls/{pull_number}\")\n\n            try:\n                ctxt = context.Context(client, data, subscription)\n            except exceptions.RateLimited as e:\n                self.log.debug(\"rate limited\", remaining_seconds=e.countdown)\n                return\n            except exceptions.MergeableStateUnknown as e:  # pragma: no cover\n                e.ctxt.log.warning(\n                    \"pull request with mergeable_state unknown retrying later\",\n                )\n                self._move_pull_at_end(pull_number)\n                return\n            try:\n                if ctxt.pull[\"base\"][\"ref\"] != self.ref:\n                    ctxt.log.info(\n                        \"pull request base branch have changed\",\n                        old_branch=self.ref,\n                        new_branch=ctxt.pull[\"base\"][\"ref\"],\n                    )\n                    self._move_pull_to_new_base_branch(ctxt, self.ref)\n                elif ctxt.pull[\"state\"] == \"closed\" or ctxt.is_behind:\n                    # NOTE(sileht): Pick up this pull request and rebase it again\n                    # or update its status and remove it from the queue\n                    ctxt.log.info(\n                        \"pull request needs to be updated again or has been closed\",\n                    )\n                    self.handle_first_pull_in_queue(ctxt)\n                else:\n                    # NOTE(sileht): Pull request has not been merged or cancelled\n                    # yet wait next loop\n                    ctxt.log.info(\"pull request checks are still in progress\")\n            except Exception:  # pragma: no cover\n                ctxt.log.error(\"Fail to process merge queue\", exc_info=True)\n                self._move_pull_at_end(pull_number)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "Queue",
+      "related_methods_count": 2,
+      "related_attributes_count": 0,
+      "related_methods": [
+        {
+          "symbol_name": "process",
+          "start_line": 225,
+          "end_line": 282,
+          "relevance": [
+            "shared_attrs=3",
+            "keyword_source_overlap=3"
+          ],
+          "source": "    def process(self):\n        pull_numbers = self.get_pulls()\n\n        self.log.info(\"%d pulls queued\", len(pull_numbers), queue=list(pull_numbers))\n\n        if not pull_numbers:\n            return\n\n        pull_number = pull_numbers[0]\n\n        try:\n            installation = github.get_installation(\n                self.owner, self.repo, self.installation_id\n            )\n        except exceptions.MergifyNotInstalled:\n            self.delete_queue()\n            return\n\n        subscription = sub_utils.get_subscription(\n            utils.get_redis_for_cache(), self.installation_id,\n        )\n\n        with github.get_client(self.owner, self.repo, installation) as client:\n            data = client.item(f\"pulls/{pull_number}\")\n\n            try:\n                ctxt = context.Context(client, data, subscription)\n            except exceptions.RateLimited as e:\n                self.log.debug(\"rate limited\", remaining_seconds=e.countdown)\n                return\n            except exceptions.MergeableStateUnknown as e:  # pragma: no cover\n                e.ctxt.log.warning(\n                    \"pull request with mergeable_state unknown retrying later\",\n                )\n                self._move_pull_at_end(pull_number)\n                return\n            try:\n                if ctxt.pull[\"base\"][\"ref\"] != self.ref:\n                    ctxt.log.info(\n                        \"pull request base branch have changed\",\n                        old_branch=self.ref,\n                        new_branch=ctxt.pull[\"base\"][\"ref\"],\n                    )\n                    self._move_pull_to_new_base_branch(ctxt, self.ref)\n                elif ctxt.pull[\"state\"] == \"closed\" or ctxt.is_behind:\n                    # NOTE(sileht): Pick up this pull request and rebase it again\n                    # or update its status and remove it from the queue\n                    ctxt.log.info(\n                        \"pull request needs to be updated again or has been closed\",\n                    )\n                    self.handle_first_pull_in_queue(ctxt)\n                else:\n                    # NOTE(sileht): Pull request has not been merged or cancelled\n                    # yet wait next loop\n                    ctxt.log.info(\"pull request checks are still in progress\")\n            except Exception:  # pragma: no cover\n                ctxt.log.error(\"Fail to process merge queue\", exc_info=True)\n                self._move_pull_at_end(pull_number)"
+        },
+        {
+          "symbol_name": "get_config",
+          "start_line": 81,
+          "end_line": 98,
+          "relevance": [
+            "keyword_source_overlap=8"
+          ],
+          "source": "    def get_config(self, pull_number: int) -> dict:\n        \"\"\"Return merge config for a pull request.\n\n        :param pull_number: The pull request number.\n        \"\"\"\n        config = self.redis.get(self._config_cache_key(pull_number))\n        if config is None:\n            return {\n                \"strict_method\": self.redis.get(\n                    self._method_cache_key(pull_number), \"merge\"\n                ),\n                \"priority\": 2000,\n                \"effective_priority\": 2000,\n            }\n        config = json.loads(config)\n        # TODO(sileht): for compatibility purpose, we can drop that in a couple of week\n        config.setdefault(\"effective_priority\", config[\"priority\"])\n        return config"
+        }
+      ],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "process",
+          "class_name": "Queue",
+          "start_line": 225,
+          "end_line": 282,
+          "source": "    def process(self):\n        pull_numbers = self.get_pulls()\n\n        self.log.info(\"%d pulls queued\", len(pull_numbers), queue=list(pull_numbers))\n\n        if not pull_numbers:\n            return\n\n        pull_number = pull_numbers[0]\n\n        try:\n            installation = github.get_installation(\n                self.owner, self.repo, self.installation_id\n            )\n        except exceptions.MergifyNotInstalled:\n            self.delete_queue()\n            return\n\n        subscription = sub_utils.get_subscription(\n            utils.get_redis_for_cache(), self.installation_id,\n        )\n\n        with github.get_client(self.owner, self.repo, installation) as client:\n            data = client.item(f\"pulls/{pull_number}\")\n\n            try:\n                ctxt = context.Context(client, data, subscription)\n            except exceptions.RateLimited as e:\n                self.log.debug(\"rate limited\", remaining_seconds=e.countdown)\n                return\n            except exceptions.MergeableStateUnknown as e:  # pragma: no cover\n                e.ctxt.log.warning(\n                    \"pull request with mergeable_state unknown retrying later\",\n                )\n                self._move_pull_at_end(pull_number)\n                return\n            try:\n                if ctxt.pull[\"base\"][\"ref\"] != self.ref:\n                    ctxt.log.info(\n                        \"pull request base branch have changed\",\n                        old_branch=self.ref,\n                        new_branch=ctxt.pull[\"base\"][\"ref\"],\n                    )\n                    self._move_pull_to_new_base_branch(ctxt, self.ref)\n                elif ctxt.pull[\"state\"] == \"closed\" or ctxt.is_behind:\n                    # NOTE(sileht): Pick up this pull request and rebase it again\n                    # or update its status and remove it from the queue\n                    ctxt.log.info(\n                        \"pull request needs to be updated again or has been closed\",\n                    )\n                    self.handle_first_pull_in_queue(ctxt)\n                else:\n                    # NOTE(sileht): Pull request has not been merged or cancelled\n                    # yet wait next loop\n                    ctxt.log.info(\"pull request checks are still in progress\")\n            except Exception:  # pragma: no cover\n                ctxt.log.error(\"Fail to process merge queue\", exc_info=True)\n                self._move_pull_at_end(pull_number)"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

@@ -1,0 +1,242 @@
+{
+  "task_id": "58",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/rllib/optimizers/apex_optimizer.py",
+  "commit": "b41bdcefa0351a4bf77f0c46917663b5014a364b",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T02:47:37+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "b41bdcefa0351a4bf77f0c46917663b5014a364b",
+    "symbol_name": "_init",
+    "satd_line": 166,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T02:47:43+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "python/ray/rllib/optimizers/apex_optimizer.py",
+    "original_signature": "def _init(",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/rllib/optimizers/apex_optimizer.py",
+      "sha": "dc9a9752fa167940b5689a67318d799264e2ded2",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/b41bdcefa0351a4bf77f0c46917663b5014a364b/python/ray/rllib/optimizers/apex_optimizer.py",
+      "content_excerpt": "\"\"\"Implements Distributed Prioritized Experience Replay.\n\nhttps://arxiv.org/abs/1803.00933\"\"\"\n\nfrom __future__ import absolute_import\nfrom __future__ import division\nfrom __future__ import print_function\n\nimport os\nimport queue\nimport random\nimport time\nimport threading\n\nimport numpy as np\n\nimport ray\nfrom ray.rllib.optimizers.policy_optimizer import PolicyOptimizer\nfrom ray.rllib.optimizers.replay_buffer import PrioritizedReplayBuffer\nfrom ray.rllib.optimizers.sample_batch import SampleBatch\nfrom ray.rllib.utils.actors import TaskPool\nfrom ray.rllib.utils.timer import TimerStat\nfrom ray.rllib.utils.window_stat import WindowStat\n\nSAMPLE_QUEUE_DEPTH = 2\nREPLAY_QUEUE_DEPTH = 4\nLEARNER_QUEUE_MAX_SIZE = 16\n\n\n@ray.remote\nclass ReplayActor(object):\n    \"\"\"A replay buffer shard.\n\n    Ray actors are single-threaded, so for scalability multiple replay actors\n    may be created to increase parallelism.\"\"\"\n\n    def __init__(\n            self, num_shards, learning_starts, buffer_size, train_batch_size,\n            prioritized_replay_alpha, prioritized_replay_beta,\n            prioritized_replay_eps, clip_rewards):\n        self.replay_starts = learning_starts // num_shards\n        self.buffer_size = buffer_size // num_shards\n        self.train_batch_size = train_batch_size\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n\n        self.replay_buffer = PrioritizedReplayBuffer(\n            self.buffer_size, alpha=prioritized_replay_alpha,\n            clip_rewards=clip_rewards)\n\n        # Metrics\n        self.add_batch_timer = TimerStat()\n        self.replay_timer = TimerStat()\n        self.update_priorities_timer = TimerStat()\n\n    def get_host(self):\n        return os.uname()[1]\n\n    def add_batch(self, batch):\n        with self.add_batch_timer:\n            for row in batch.rows():\n                self.replay_buffer.add(\n                    row[\"obs\"], row[\"actions\"], row[\"rewards\"], row[\"new_obs\"],\n                    row[\"dones\"], row[\"weights\"])\n\n    def replay(self):\n        with self.replay_timer:\n            if len(self.replay_buffer) < self.replay_starts:\n                return None\n\n            (obses_t, actions, rewards, obses_tp1,\n                dones, weights, batch_indexes) = self.replay_buffer.sample(\n                    self.train_batch_size,\n                    beta=self.prioritized_replay_beta)\n\n            batch = SampleBatch({\n                \"obs\": obses_t, \"actions\": actions, \"rewards\": rewards,\n                \"new_obs\": obses_tp1, \"dones\": dones, \"weights\": weights,\n                \"batch_indexes\": batch_indexes})\n            return batch\n\n    def update_priorities(self, batch_indexes, td_errors):\n        with self.update_priorities_timer:\n            new_priorities = (\n                np.abs(td_errors) + self.prioritized_replay_eps)\n            self.replay_buffer.update_priorities(batch_indexes, new_priorities)\n\n    def stats(self):\n        stat = {\n            \"add_batch_time_ms\": round(\n                1000 * self.add_batch_timer.mean, 3),\n            \"replay_time_ms\": round(\n                1000 * self.replay_timer.mean, 3),\n            \"update_priorities_time_ms\": round(\n                1000 * self.update_priorities_timer.mean, 3),\n        }\n        stat.update(self.replay_buffer.stats())\n        return stat\n\n\nclass LearnerThread(threading.Thread):\n    \"\"\"Background thread that updates the local model from replay data.\n\n    The learner thread communicates with the main thread through Queues. This\n    is needed since Ray operations can only be run on the main thread. In\n    addition, moving heavyweight gradient ops session runs off the main thread\n    improves overall throughput.\n    \"\"\"\n\n    def __init__(self, local_evaluator):\n        threading.Thread.__init__(self)\n        self.learner_queue_size = WindowStat(\"size\", 50)\n        self.local_evaluator = local_evaluator\n        self.inqueue = queue.Queue(maxsize=LEARNER_QUEUE_MAX_SIZE)\n        self.outqueue = queue.Queue()\n        self.queue_timer = TimerStat()\n        self.grad_timer = TimerStat()\n        self.daemon = True\n        self.weights_updated = False\n\n    def run(self):\n        while True:\n            self.step()\n\n    def step(self):\n        with self.queue_timer:\n            ra, replay = self.inqueue.get()\n        if replay is not None:\n            with self.grad_timer:\n                td_error = self.local_evaluator.compute_apply(replay)[\n                    \"td_error\"]\n            self.outqueue.put((ra, replay, td_error))\n        self.learner_queue_size.push(self.inqueue.qsize())\n        self.weights_updated = True\n\n\nclass ApexOptimizer(PolicyOptimizer):\n    \"\"\"Main event loop of the Ape-X optimizer.\n\n    This class coordinates the data transfers between the learner thread,\n    remote evaluators (Ape-X actors), and replay buffer actors.\n\n    This optimizer requires that policy evaluators return an additional\n    \"td_error\" array in the info return of compute_gradients(). This error\n    term will be used for sample prioritization.\"\"\"\n\n    def _init(\n            self, learning_starts=1000, buffer_size=10000,\n            prioritized_replay=True, prioritized_replay_alpha=0.6,\n            prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n            train_batch_size=512, sample_batch_size=50,\n            num_replay_buffer_shards=1, max_weight_sync_delay=400,\n            clip_rewards=True, debug=False):\n\n        self.debug = debug\n        self.replay_starts = learning_starts\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n        self.train_batch_size = train_batch_size\n        self.sample_batch_size = sample_batch_size\n        self.max_weight_sync_delay = max_weight_sync_delay\n\n        self.learner = LearnerThread(self.local_evaluator)\n        self.learner.start()\n\n        # TODO(ekl) use create_colocated() for these actors once\n        # https://github.com/ray-project/ray/issues/1734 is fixed\n        self.replay_actors = [\n            ReplayActor.remote(\n                num_replay_buffer_shards, learning_starts, buffer_size,\n                train_batch_size, prioritized_replay_alpha,\n                prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n            for _ in range(num_replay_buffer_shards)\n        ]\n        assert len(self.remote_evaluators) > 0\n\n        # Stats\n        self.timers = {k: TimerStat() for k in [\n            \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n            \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n        self.num_weight_syncs = 0\n        self.learning_started = False\n\n        # Number of worker steps since the last weight update\n        self.steps_since_update = {}\n\n        # Otherwise kick of replay tasks for local gradient updates\n        self.replay_tasks = TaskPool()\n        for ra in self.replay_actors:\n            for _ in range(REPLAY_QUEUE_DEPTH):\n                self.replay_tasks.add(ra, ra.replay.remote())\n\n        # Kick off async background sampling\n        self.sample_tasks = TaskPool()\n        weights = self.local_evaluator.get_weights()\n        for ev in self.remote_evaluators:\n            ev.set_weights.remote(weights)\n            self.steps_since_update[ev] = 0\n            for _ in range(SAMPLE_QUEUE_DEPTH):\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n    def step(self):\n        start = time.time()\n        sample_timesteps, train_timesteps = self._step()\n        time_delta = time.time() - start\n        self.timers[\"sample\"].push(time_delta)\n        self.timers[\"sample\"].push_units_processed(sample_timesteps)\n        if train_timesteps > 0:\n            self.learning_started = True\n        if self.learning_started:\n            self.timers[\"train\"].push(time_delta)\n            self.timers[\"train\"].push_units_processed(train_timesteps)\n        self.num_steps_sampled += sample_timesteps\n        self.num_steps_trained += train_timesteps\n\n    def _step(self):\n        sample_timesteps, train_timesteps = 0, 0\n        weights = None\n\n        with self.timers[\"sample_processing\"]:\n            for ev, sample_batch in self.sample_tasks.completed():\n                sample_timesteps += self.sample_batch_size\n\n                # Send the data to the replay buffer\n                random.choice(self.replay_actors).add_batch.remote(\n                    sample_batch)\n\n                # Update weights if needed\n                self.steps_since_update[ev] += self.sample_batch_size\n                if self.steps_since_update[ev] >= self.max_weight_sync_delay:\n                    # Note that it's important to pull new weights once\n                    # updated to avoid excessive correlation between actors\n                    if weights is None or self.learner.weights_updated:\n                        self.learner.weights_updated = False\n                        with self.timers[\"put_weights\"]:\n                            weights = ray.put(\n                                self.local_evaluator.get_weights())\n                    ev.set_weights.remote(weights)\n                    self.num_weight_syncs += 1\n                    self.steps_since_update[ev] = 0\n\n                # Kick off another sample request\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n        with self.timers[\"replay_processing\"]:\n            for ra, replay in self.replay_tasks.completed():\n                self.replay_tasks.add(ra, ra.replay.remote())\n                with self.timers[\"get_samples\"]:\n                    samples = ray.get(replay)\n                with self.timers[\"enqueue\"]:\n                    self.learner.inqueue.put((ra, samples))\n\n        with self.timers[\"update_priorities\"]:\n            while not self.learner.outqueue.empty():\n                ra, replay, td_error = self.learner.outqueue.get()\n                ra.update_priorities.remote(replay[\"batch_indexes\"], td_error)\n                train_timesteps += self.train_batch_size\n\n        return sample_timesteps, train_timesteps\n\n    def stats(self):\n        replay_stats = ray.get(self.replay_actors[0].stats.remote())\n        timing = {\n            \"{}_time_ms\".format(k): round(1000 * self.timers[k].mean, 3)\n            for k in self.timers\n        }\n        timing[\"learner_grad_time_ms\"] = round(\n            1000 * self.learner.grad_timer.mean, 3)\n        timing[\"learner_dequeue_time_ms\"] = round(\n            1000 * self.learner.queue_timer.mean, 3)\n        stats = {\n            \"sample_throughput\": round(\n                self.timers[\"sample\"].mean_throughput, 3),\n            \"train_throughput\": round(self.timers[\"train\"].mean_throughput, 3),\n            \"num_weight_syncs\": self.num_weight_syncs,\n        }\n        debug_stats = {\n            \"replay_shard_0\": replay_stats,\n            \"timing_breakdown\": timing,\n            \"pending_sample_tasks\": self.sample_tasks.count,\n            \"pending_replay_tasks\": self.replay_tasks.count,\n            \"learner_queue\": self.learner.learner_queue_size.stats(),\n        }\n        if self.debug:\n            stats.update(debug_stats)\n        return dict(PolicyOptimizer.stats(self), **stats)\n",
+      "total_lines": 286,
+      "ref": "b41bdcefa0351a4bf77f0c46917663b5014a364b"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_init",
+      "class_name": "ApexOptimizer",
+      "start_line": 147,
+      "end_line": 200,
+      "satd_line": 166,
+      "matched_by": "normalized_source",
+      "source": "    def _init(\n            self, learning_starts=1000, buffer_size=10000,\n            prioritized_replay=True, prioritized_replay_alpha=0.6,\n            prioritized_replay_beta=0.4, prioritized_replay_eps=1e-6,\n            train_batch_size=512, sample_batch_size=50,\n            num_replay_buffer_shards=1, max_weight_sync_delay=400,\n            clip_rewards=True, debug=False):\n\n        self.debug = debug\n        self.replay_starts = learning_starts\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n        self.train_batch_size = train_batch_size\n        self.sample_batch_size = sample_batch_size\n        self.max_weight_sync_delay = max_weight_sync_delay\n\n        self.learner = LearnerThread(self.local_evaluator)\n        self.learner.start()\n\n        # TODO(ekl) use create_colocated() for these actors once\n        # https://github.com/ray-project/ray/issues/1734 is fixed\n        self.replay_actors = [\n            ReplayActor.remote(\n                num_replay_buffer_shards, learning_starts, buffer_size,\n                train_batch_size, prioritized_replay_alpha,\n                prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n            for _ in range(num_replay_buffer_shards)\n        ]\n        assert len(self.remote_evaluators) > 0\n\n        # Stats\n        self.timers = {k: TimerStat() for k in [\n            \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n            \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n        self.num_weight_syncs = 0\n        self.learning_started = False\n\n        # Number of worker steps since the last weight update\n        self.steps_since_update = {}\n\n        # Otherwise kick of replay tasks for local gradient updates\n        self.replay_tasks = TaskPool()\n        for ra in self.replay_actors:\n            for _ in range(REPLAY_QUEUE_DEPTH):\n                self.replay_tasks.add(ra, ra.replay.remote())\n\n        # Kick off async background sampling\n        self.sample_tasks = TaskPool()\n        weights = self.local_evaluator.get_weights()\n        for ev in self.remote_evaluators:\n            ev.set_weights.remote(weights)\n            self.steps_since_update[ev] = 0\n            for _ in range(SAMPLE_QUEUE_DEPTH):\n                self.sample_tasks.add(ev, ev.sample.remote())",
+      "calls": [
+        "LearnerThread",
+        "TaskPool",
+        "TimerStat",
+        "len",
+        "range"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "debug",
+        "learner",
+        "learning_started",
+        "local_evaluator",
+        "max_weight_sync_delay",
+        "num_weight_syncs",
+        "prioritized_replay_beta",
+        "prioritized_replay_eps",
+        "remote_evaluators",
+        "replay_actors",
+        "replay_starts",
+        "replay_tasks",
+        "sample_batch_size",
+        "sample_tasks",
+        "steps_since_update",
+        "timers",
+        "train_batch_size"
+      ],
+      "global_uses": [
+        "LearnerThread",
+        "REPLAY_QUEUE_DEPTH",
+        "ReplayActor",
+        "SAMPLE_QUEUE_DEPTH",
+        "TaskPool",
+        "TimerStat",
+        "k"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "_step",
+          "class_name": "ApexOptimizer",
+          "start_line": 216,
+          "end_line": 259,
+          "relevance": [
+            "keyword_source_overlap=6",
+            "same_class"
+          ],
+          "source": "    def _step(self):\n        sample_timesteps, train_timesteps = 0, 0\n        weights = None\n\n        with self.timers[\"sample_processing\"]:\n            for ev, sample_batch in self.sample_tasks.completed():\n                sample_timesteps += self.sample_batch_size\n\n                # Send the data to the replay buffer\n                random.choice(self.replay_actors).add_batch.remote(\n                    sample_batch)\n\n                # Update weights if needed\n                self.steps_since_update[ev] += self.sample_batch_size\n                if self.steps_since_update[ev] >= self.max_weight_sync_delay:\n                    # Note that it's important to pull new weights once\n                    # updated to avoid excessive correlation between actors\n                    if weights is None or self.learner.weights_updated:\n                        self.learner.weights_updated = False\n                        with self.timers[\"put_weights\"]:\n                            weights = ray.put(\n                                self.local_evaluator.get_weights())\n                    ev.set_weights.remote(weights)\n                    self.num_weight_syncs += 1\n                    self.steps_since_update[ev] = 0\n\n                # Kick off another sample request\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n        with self.timers[\"replay_processing\"]:\n            for ra, replay in self.replay_tasks.completed():\n                self.replay_tasks.add(ra, ra.replay.remote())\n                with self.timers[\"get_samples\"]:\n                    samples = ray.get(replay)\n                with self.timers[\"enqueue\"]:\n                    self.learner.inqueue.put((ra, samples))\n\n        with self.timers[\"update_priorities\"]:\n            while not self.learner.outqueue.empty():\n                ra, replay, td_error = self.learner.outqueue.get()\n                ra.update_priorities.remote(replay[\"batch_indexes\"], td_error)\n                train_timesteps += self.train_batch_size\n\n        return sample_timesteps, train_timesteps"
+        },
+        {
+          "symbol_name": "stats",
+          "class_name": "ApexOptimizer",
+          "start_line": 261,
+          "end_line": 286,
+          "relevance": [
+            "keyword_source_overlap=4",
+            "same_class"
+          ],
+          "source": "    def stats(self):\n        replay_stats = ray.get(self.replay_actors[0].stats.remote())\n        timing = {\n            \"{}_time_ms\".format(k): round(1000 * self.timers[k].mean, 3)\n            for k in self.timers\n        }\n        timing[\"learner_grad_time_ms\"] = round(\n            1000 * self.learner.grad_timer.mean, 3)\n        timing[\"learner_dequeue_time_ms\"] = round(\n            1000 * self.learner.queue_timer.mean, 3)\n        stats = {\n            \"sample_throughput\": round(\n                self.timers[\"sample\"].mean_throughput, 3),\n            \"train_throughput\": round(self.timers[\"train\"].mean_throughput, 3),\n            \"num_weight_syncs\": self.num_weight_syncs,\n        }\n        debug_stats = {\n            \"replay_shard_0\": replay_stats,\n            \"timing_breakdown\": timing,\n            \"pending_sample_tasks\": self.sample_tasks.count,\n            \"pending_replay_tasks\": self.replay_tasks.count,\n            \"learner_queue\": self.learner.learner_queue_size.stats(),\n        }\n        if self.debug:\n            stats.update(debug_stats)\n        return dict(PolicyOptimizer.stats(self), **stats)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "ApexOptimizer",
+      "related_methods_count": 2,
+      "related_attributes_count": 3,
+      "related_methods": [
+        {
+          "symbol_name": "_step",
+          "start_line": 216,
+          "end_line": 259,
+          "relevance": [
+            "shared_attrs=11",
+            "keyword_source_overlap=6"
+          ],
+          "source": "    def _step(self):\n        sample_timesteps, train_timesteps = 0, 0\n        weights = None\n\n        with self.timers[\"sample_processing\"]:\n            for ev, sample_batch in self.sample_tasks.completed():\n                sample_timesteps += self.sample_batch_size\n\n                # Send the data to the replay buffer\n                random.choice(self.replay_actors).add_batch.remote(\n                    sample_batch)\n\n                # Update weights if needed\n                self.steps_since_update[ev] += self.sample_batch_size\n                if self.steps_since_update[ev] >= self.max_weight_sync_delay:\n                    # Note that it's important to pull new weights once\n                    # updated to avoid excessive correlation between actors\n                    if weights is None or self.learner.weights_updated:\n                        self.learner.weights_updated = False\n                        with self.timers[\"put_weights\"]:\n                            weights = ray.put(\n                                self.local_evaluator.get_weights())\n                    ev.set_weights.remote(weights)\n                    self.num_weight_syncs += 1\n                    self.steps_since_update[ev] = 0\n\n                # Kick off another sample request\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n        with self.timers[\"replay_processing\"]:\n            for ra, replay in self.replay_tasks.completed():\n                self.replay_tasks.add(ra, ra.replay.remote())\n                with self.timers[\"get_samples\"]:\n                    samples = ray.get(replay)\n                with self.timers[\"enqueue\"]:\n                    self.learner.inqueue.put((ra, samples))\n\n        with self.timers[\"update_priorities\"]:\n            while not self.learner.outqueue.empty():\n                ra, replay, td_error = self.learner.outqueue.get()\n                ra.update_priorities.remote(replay[\"batch_indexes\"], td_error)\n                train_timesteps += self.train_batch_size\n\n        return sample_timesteps, train_timesteps"
+        },
+        {
+          "symbol_name": "stats",
+          "start_line": 261,
+          "end_line": 286,
+          "relevance": [
+            "shared_attrs=7",
+            "keyword_source_overlap=4"
+          ],
+          "source": "    def stats(self):\n        replay_stats = ray.get(self.replay_actors[0].stats.remote())\n        timing = {\n            \"{}_time_ms\".format(k): round(1000 * self.timers[k].mean, 3)\n            for k in self.timers\n        }\n        timing[\"learner_grad_time_ms\"] = round(\n            1000 * self.learner.grad_timer.mean, 3)\n        timing[\"learner_dequeue_time_ms\"] = round(\n            1000 * self.learner.queue_timer.mean, 3)\n        stats = {\n            \"sample_throughput\": round(\n                self.timers[\"sample\"].mean_throughput, 3),\n            \"train_throughput\": round(self.timers[\"train\"].mean_throughput, 3),\n            \"num_weight_syncs\": self.num_weight_syncs,\n        }\n        debug_stats = {\n            \"replay_shard_0\": replay_stats,\n            \"timing_breakdown\": timing,\n            \"pending_sample_tasks\": self.sample_tasks.count,\n            \"pending_replay_tasks\": self.replay_tasks.count,\n            \"learner_queue\": self.learner.learner_queue_size.stats(),\n        }\n        if self.debug:\n            stats.update(debug_stats)\n        return dict(PolicyOptimizer.stats(self), **stats)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "replay_actors",
+          "start_line": 167,
+          "end_line": 175,
+          "relevance": [
+            "direct_attribute_use",
+            "keyword_source_overlap=12"
+          ],
+          "snippet": "        # https://github.com/ray-project/ray/issues/1734 is fixed\n        self.replay_actors = [\n            ReplayActor.remote(\n                num_replay_buffer_shards, learning_starts, buffer_size,\n                train_batch_size, prioritized_replay_alpha,\n                prioritized_replay_beta, prioritized_replay_eps, clip_rewards)\n            for _ in range(num_replay_buffer_shards)\n        ]\n        assert len(self.remote_evaluators) > 0"
+        },
+        {
+          "attribute": "replay_tasks",
+          "start_line": 187,
+          "end_line": 189,
+          "relevance": [
+            "direct_attribute_use",
+            "keyword_source_overlap=3"
+          ],
+          "snippet": "        # Otherwise kick of replay tasks for local gradient updates\n        self.replay_tasks = TaskPool()\n        for ra in self.replay_actors:"
+        },
+        {
+          "attribute": "timers",
+          "start_line": 177,
+          "end_line": 181,
+          "relevance": [
+            "direct_attribute_use",
+            "keyword_source_overlap=1"
+          ],
+          "snippet": "        # Stats\n        self.timers = {k: TimerStat() for k in [\n            \"put_weights\", \"get_samples\", \"enqueue\", \"sample_processing\",\n            \"replay_processing\", \"update_priorities\", \"train\", \"sample\"]}\n        self.num_weight_syncs = 0"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "TaskPool",
+          "kind": "import_from",
+          "start_line": 21,
+          "end_line": 21,
+          "source": "from ray.rllib.utils.actors import TaskPool"
+        },
+        {
+          "symbol_name": "TimerStat",
+          "kind": "import_from",
+          "start_line": 22,
+          "end_line": 22,
+          "source": "from ray.rllib.utils.timer import TimerStat"
+        },
+        {
+          "symbol_name": "ReplayActor",
+          "kind": "class",
+          "start_line": 31,
+          "end_line": 98,
+          "source": "class ReplayActor(object):\n    \"\"\"A replay buffer shard.\n\n    Ray actors are single-threaded, so for scalability multiple replay actors\n    may be created to increase parallelism.\"\"\"\n\n    def __init__(\n            self, num_shards, learning_starts, buffer_size, train_batch_size,\n            prioritized_replay_alpha, prioritized_replay_beta,\n            prioritized_replay_eps, clip_rewards):\n        self.replay_starts = learning_starts // num_shards\n        self.buffer_size = buffer_size // num_shards\n        self.train_batch_size = train_batch_size\n        self.prioritized_replay_beta = prioritized_replay_beta\n        self.prioritized_replay_eps = prioritized_replay_eps\n\n        self.replay_buffer = PrioritizedReplayBuffer(\n            self.buffer_size, alpha=prioritized_replay_alpha,\n            clip_rewards=clip_rewards)\n\n        # Metrics\n        self.add_batch_timer = TimerStat()\n        self.replay_timer = TimerStat()\n        self.update_priorities_timer = TimerStat()\n\n    def get_host(self):\n        return os.uname()[1]\n\n    def add_batch(self, batch):\n        with self.add_batch_timer:\n            for row in batch.rows():\n                self.replay_buffer.add(\n                    row[\"obs\"], row[\"actions\"], row[\"rewards\"], row[\"new_obs\"],\n                    row[\"dones\"], row[\"weights\"])\n\n    def replay(self):\n        with self.replay_timer:\n            if len(self.replay_buffer) < self.replay_starts:\n                return None\n\n            (obses_t, actions, rewards, obses_tp1,\n                dones, weights, batch_indexes) = self.replay_buffer.sample(\n                    self.train_batch_size,\n                    beta=self.prioritized_replay_beta)\n\n            batch = SampleBatch({\n                \"obs\": obses_t, \"actions\": actions, \"rewards\": rewards,\n                \"new_obs\": obses_tp1, \"dones\": dones, \"weights\": weights,\n                \"batch_indexes\": batch_indexes})\n            return batch\n\n    def update_priorities(self, batch_indexes, td_errors):\n        with self.update_priorities_timer:\n            new_priorities = (\n                np.abs(td_errors) + self.prioritized_replay_eps)\n            self.replay_buffer.update_priorities(batch_indexes, new_priorities)\n\n    def stats(self):\n        stat = {\n            \"add_batch_time_ms\": round(\n                1000 * self.add_batch_timer.mean, 3),\n            \"replay_time_ms\": round(\n                1000 * self.replay_timer.mean, 3),\n            \"update_priorities_time_ms\": round(\n                1000 * self.update_priorities_timer.mean, 3),\n        }\n        stat.update(self.replay_buffer.stats())\n        return stat"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_step",
+          "class_name": "ApexOptimizer",
+          "start_line": 216,
+          "end_line": 259,
+          "source": "    def _step(self):\n        sample_timesteps, train_timesteps = 0, 0\n        weights = None\n\n        with self.timers[\"sample_processing\"]:\n            for ev, sample_batch in self.sample_tasks.completed():\n                sample_timesteps += self.sample_batch_size\n\n                # Send the data to the replay buffer\n                random.choice(self.replay_actors).add_batch.remote(\n                    sample_batch)\n\n                # Update weights if needed\n                self.steps_since_update[ev] += self.sample_batch_size\n                if self.steps_since_update[ev] >= self.max_weight_sync_delay:\n                    # Note that it's important to pull new weights once\n                    # updated to avoid excessive correlation between actors\n                    if weights is None or self.learner.weights_updated:\n                        self.learner.weights_updated = False\n                        with self.timers[\"put_weights\"]:\n                            weights = ray.put(\n                                self.local_evaluator.get_weights())\n                    ev.set_weights.remote(weights)\n                    self.num_weight_syncs += 1\n                    self.steps_since_update[ev] = 0\n\n                # Kick off another sample request\n                self.sample_tasks.add(ev, ev.sample.remote())\n\n        with self.timers[\"replay_processing\"]:\n            for ra, replay in self.replay_tasks.completed():\n                self.replay_tasks.add(ra, ra.replay.remote())\n                with self.timers[\"get_samples\"]:\n                    samples = ray.get(replay)\n                with self.timers[\"enqueue\"]:\n                    self.learner.inqueue.put((ra, samples))\n\n        with self.timers[\"update_priorities\"]:\n            while not self.learner.outqueue.empty():\n                ra, replay, td_error = self.learner.outqueue.get()\n                ra.update_priorities.remote(replay[\"batch_indexes\"], td_error)\n                train_timesteps += self.train_batch_size\n\n        return sample_timesteps, train_timesteps"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

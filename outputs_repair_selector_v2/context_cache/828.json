@@ -1,0 +1,145 @@
+{
+  "task_id": "828",
+  "repo_owner": "galaxyproject",
+  "repo_name": "galaxy",
+  "file_path": "lib/galaxy/jobs/runners/kubernetes.py",
+  "commit": "a931b4b37dbdea5df238a8b7079d5dd64c8fb6aa",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T10:28:24+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "a931b4b37dbdea5df238a8b7079d5dd64c8fb6aa",
+    "symbol_name": "__get_k8s_containers",
+    "satd_line": 157,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 1,
+    "same_class_methods_count": 1,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T10:28:24+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "lib/galaxy/jobs/runners/kubernetes.py",
+    "original_signature": "def __get_k8s_containers(self, job_wrapper):",
+    "target_file": {
+      "ok": true,
+      "path": "lib/galaxy/jobs/runners/kubernetes.py",
+      "sha": "3829ed8da7fc9eec5dd5c6881ac84c87b5bcd54a",
+      "download_url": "https://raw.githubusercontent.com/galaxyproject/galaxy/a931b4b37dbdea5df238a8b7079d5dd64c8fb6aa/lib/galaxy/jobs/runners/kubernetes.py",
+      "content_excerpt": "\"\"\"\nOffload jobs to a Kubernetes cluster.\n\"\"\"\n\nimport logging\n\nfrom galaxy import model\nfrom galaxy.jobs.runners import AsynchronousJobState, AsynchronousJobRunner\nfrom os import environ as os_environ\n\n# pykube imports:\ntry:\n    import operator\n\n    from pykube.config import KubeConfig\n    from pykube.http import HTTPClient\n    from pykube.objects import Job\n    from pykube.objects import Pod\nexcept ImportError as exc:\n    operator = None\n    K8S_IMPORT_MESSAGE = ('The Python pykube package is required to use '\n                          'this feature, please install it or correct the '\n                          'following error:\\nImportError %s' % str(exc))\n\nlog = logging.getLogger(__name__)\n\n__all__ = ['KubernetesJobRunner']\n\n\nclass KubernetesJobRunner(AsynchronousJobRunner):\n    \"\"\"\n    Job runner backed by a finite pool of worker threads. FIFO scheduling\n    \"\"\"\n    runner_name = \"KubernetesRunner\"\n\n    def __init__(self, app, nworkers, **kwargs):\n        # Check if pykube was importable, fail if not\n        assert operator is not None, K8S_IMPORT_MESSAGE\n        runner_param_specs = dict(\n            k8s_config_path=dict(map=str, default=os_environ.get('KUBECONFIG', None)),\n            k8s_persistent_volume_claim_name=dict(map=str),\n            k8s_persistent_volume_claim_mount_path=dict(map=str),\n            k8s_namespace=dict(map=str, default=\"default\"),\n            k8s_pod_retrials=dict(map=int, valid=lambda x: int > 0, default=3))\n\n        if 'runner_param_specs' not in kwargs:\n            kwargs['runner_param_specs'] = dict()\n        kwargs['runner_param_specs'].update(runner_param_specs)\n\n        \"\"\"Start the job runner parent object \"\"\"\n        super(KubernetesJobRunner, self).__init__(app, nworkers, **kwargs)\n\n        # self.cli_interface = CliInterface()\n\n        # here we need to fetch the default kubeconfig path from the plugin defined in job_conf...\n        self._pykube_api = HTTPClient(KubeConfig.from_file(self.runner_params[\"k8s_config_path\"]))\n        self._galaxy_vol_name = \"pvc-galaxy\"  # TODO this needs to be read from params!!\n\n        self._init_monitor_thread()\n        self._init_worker_threads()\n\n    def queue_job(self, job_wrapper):\n        \"\"\"Create job script and submit it to Kubernetes cluster\"\"\"\n        # prepare the job\n        # We currently don't need to include_metadata or include_work_dir_outputs, as working directory is the same\n        # were galaxy will expect results.\n        log.debug(\"Starting queue_job for job \" + job_wrapper.get_id_tag())\n        if not self.prepare_job(job_wrapper, include_metadata=False, include_work_dir_outputs=False,\n                                modify_command_for_container=False):\n            return\n\n        job_destination = job_wrapper.job_destination\n\n        # Construction of the Kubernetes Job object follows: http://kubernetes.io/docs/user-guide/persistent-volumes/\n        k8s_job_name = self.__produce_unique_k8s_job_name(job_wrapper)\n        k8s_job_obj = {\n            \"apiVersion\": \"extensions/v1beta1\",\n            \"kind\": \"Job\",\n            \"metadata\":\n            # metadata.name is the name of the pod resource created, and must be unique\n            # http://kubernetes.io/docs/user-guide/configuring-containers/\n                {\n                    \"name\": k8s_job_name,\n                    \"namespace\": \"default\",  # TODO this should be set\n                    \"labels\": {\"app\": k8s_job_name},\n                }\n            ,\n            \"spec\": self.__get_k8s_job_spec(job_wrapper)\n        }\n\n        # Creates the Kubernetes Job\n        Job(self._pykube_api, k8s_job_obj).create()\n\n        # define job attributes in the AsyncronousJobState for follow-up\n        ajs = AsynchronousJobState(files_dir=job_wrapper.working_directory, job_wrapper=job_wrapper,\n                                   job_id=k8s_job_name, job_destination=job_destination)\n        self.monitor_queue.put(ajs)\n\n        # external_runJob_script can be None, in which case it's not used.\n        external_runjob_script = None\n        return external_runjob_script\n\n    def __produce_unique_k8s_job_name(self, job_wrapper):\n        # wrapper.get_id_tag() instead of job_id for compatibility with TaskWrappers.\n        return \"galaxy-\" + job_wrapper.get_id_tag()\n\n    def __get_k8s_job_spec(self, job_wrapper):\n        \"\"\"Creates the k8s Job spec. For a Job spec, the only requirement is to have a .spec.template.\"\"\"\n        k8s_job_spec = {\"template\": self.__get_k8s_job_spec_template(job_wrapper)}\n        return k8s_job_spec\n\n    def __get_k8s_job_spec_template(self, job_wrapper):\n        \"\"\"The k8s spec template is nothing but a Pod spec, except that it is nested and does not have an apiversion\n        nor kind. In addition to required fields for a Pod, a pod template in a job must specify appropriate labels\n        (see pod selector) and an appropriate restart policy.\"\"\"\n        k8s_spec_template = {\n            \"metadata\": {\n                \"labels\": {\"app\": self.__produce_unique_k8s_job_name(job_wrapper)}\n            },\n            \"spec\": {\n                \"volumes\": self.__get_k8s_mountable_volumes(job_wrapper),\n                \"restartPolicy\": self.__get_k8s_restart_policy(job_wrapper),\n                \"containers\": self.__get_k8s_containers(job_wrapper)\n            }\n        }\n        # TODO include other relevant elements that people might want to use from\n        # TODO http://kubernetes.io/docs/api-reference/v1/definitions/#_v1_podspec\n\n        return k8s_spec_template\n\n    def __get_k8s_restart_policy(self, job_wrapper):\n        \"\"\"The default Kubernetes restart policy for Jobs\"\"\"\n        return \"Never\"\n\n    def __get_k8s_mountable_volumes(self, job_wrapper):\n        \"\"\"Provides the required volumes that the containers in the pod should be able to mount. This should be using\n        the new persistent volumes and persistent volumes claim objects. This requires that both a PersistentVolume and\n        a PersistentVolumeClaim are created before starting galaxy (starting a k8s job).\n        \"\"\"\n        # TODO on this initial version we only support a single volume to be mounted.\n        k8s_mountable_volume = {\n            \"name\": self._galaxy_vol_name,\n            \"persistentVolumeClaim\": {\n                \"claimName\": self.runner_params['k8s_persistent_volume_claim_name']\n            }\n        }\n        return [k8s_mountable_volume]\n\n    def __get_k8s_containers(self, job_wrapper):\n        \"\"\"Fills in all required for setting up the docker containers to be used.\"\"\"\n        k8s_container = {\n            \"name\": self.__get_k8s_container_name(job_wrapper),\n            \"image\": self._find_container(job_wrapper).container_id,\n            # this form of command overrides the entrypoint and allows multi command\n            # command line execution, separated by ;, which is what Galaxy does\n            # to assemble the command.\n            # TODO possibly shell needs to be set by job_wrapper\n            \"command\": [\"/bin/bash\", \"-c\", job_wrapper.runner_command_line],\n            \"volumeMounts\": [{\n                \"mountPath\": self.runner_params['k8s_persistent_volume_claim_mount_path'],\n                \"name\": self._galaxy_vol_name\n            }]\n        }\n\n        # if self.__requires_ports(job_wrapper):\n        #    k8s_container['ports'] = self.__get_k8s_containers_ports(job_wrapper)\n\n        return [k8s_container]\n\n    # def __get_k8s_containers_ports(self, job_wrapper):\n\n    #    for k,v self.runner_params:\n    #        if k.startswith(\"container_port_\"):\n\n    def __assemble_k8s_container_image_name(self, job_wrapper):\n        \"\"\"Assembles the container image name as repo/owner/image:tag, where repo, owner and tag are optional\"\"\"\n        job_destination = job_wrapper.job_destination\n\n        # Determine the job's Kubernetes destination (context, namespace) and options from the job destination\n        # definition\n        repo = \"\"\n        owner = \"\"\n        if 'repo' in job_destination.params:\n            repo = job_destination.params['repo'] + \"/\"\n        if 'owner' in job_destination.params:\n            owner = job_destination.params['owner'] + \"/\"\n\n        k8s_cont_image = repo + owner + job_destination.params['image']\n\n        if 'tag' in job_destination.params:\n            k8s_cont_image += \":\" + job_destination.params['tag']\n\n        return k8s_cont_image\n\n    def __get_k8s_container_name(self, job_wrapper):\n        # TODO check if this is correct\n        return job_wrapper.job_destination.id\n\n    def check_watched_item(self, job_state):\n        \"\"\"Checks the state of a job already submitted on k8s. Job state is a AsynchronousJobState\"\"\"\n        jobs = Job.objects(self._pykube_api).filter(selector=\"app=\" + job_state.job_id)\n        if len(jobs.response['items']) == 1:\n            job = Job(self._pykube_api, jobs.response['items'][0])\n            succeeded = 0\n            active = 0\n            failed = 0\n            if 'succeeded' in job.obj['status']:\n                succeeded = job.obj['status']['succeeded']\n            if 'active' in job.obj['status']:\n                active = job.obj['status']['active']\n            if 'failed' in job.obj['status']:\n                failed = job.obj['status']['failed']\n\n            # This assumes jobs dependent on a single pod, single container\n            if succeeded > 0:\n                self.__produce_log_file(job_state)\n                error_file = open(job_state.error_file, 'w')\n                error_file.write(\"\")\n                error_file.close()\n                job_state.running = False\n                self.mark_as_finished(job_state)\n                return None\n\n            elif active > 0 or succeeded + active + failed == 0:\n                job_state.running = True\n                return job_state\n            elif failed > job_state.job_destination.params['max_pod_retrials']:\n                self.__produce_log_file(job_state)\n                error_file = open(job_state.error_file, 'w')\n                error_file.write(\"Exceeded max number of Kubernetes pod retrials allowed for job\\n\")\n                error_file.close()\n                job_state.running = False\n                self.mark_as_failed(job_state)\n                job.scale(replicas=0)\n                return None\n\n            # We should not get here\n            log.debug(\n                \"Reaching unexpected point for Kubernetes job, where it is not classified as succ., active nor failed.\")\n            return job_state\n\n        elif len(jobs.response['items']) == 0:\n            # there is no job responding to this job_id, it is either lost or something happened.\n            log.error(\"No Jobs are available under expected selector app=\" + job_state.job_id)\n            error_file = open(job_state.error_file, 'w')\n            error_file.write(\"No Kubernetes Jobs are available under expected selector app=\" + job_state.job_id + \"\\n\")\n            error_file.close()\n            self.mark_as_failed(job_state)\n            return job_state\n        else:\n            # there is more than one job associated to the expected unique job id used as selector.\n            log.error(\"There is more than one Kubernetes Job associated to job id \" + job_state.job_id)\n            self.__produce_log_file(job_state)\n            error_file = open(job_state.error_file, 'w')\n            error_file.write(\"There is more than one Kubernetes Job associated to job id \" + job_state.job_id + \"\\n\")\n            error_file.close()\n            self.mark_as_failed(job_state)\n            return job_state\n\n    def __produce_log_file(self, job_state):\n        pod_r = Pod.objects(self._pykube_api).filter(selector=\"app=\" + job_state.job_id)\n        logs = \"\"\n        for pod_obj in pod_r.response['items']:\n            pod = Pod(self._pykube_api, pod_obj)\n            logs += \"\\n\\n==== Pod \" + pod.name + \" log start ====\\n\\n\"\n            logs += pod.logs(timestamps=True)\n            logs += \"\\n\\n==== Pod \" + pod.name + \" log end   ====\"\n        logs_file_path = job_state.out",
+      "total_lines": 311,
+      "ref": "a931b4b37dbdea5df238a8b7079d5dd64c8fb6aa"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "__get_k8s_containers",
+      "class_name": "KubernetesJobRunner",
+      "start_line": 149,
+      "end_line": 168,
+      "satd_line": 157,
+      "matched_by": "signature_or_comment",
+      "source": "    def __get_k8s_containers(self, job_wrapper):\n        \"\"\"Fills in all required for setting up the docker containers to be used.\"\"\"\n        k8s_container = {\n            \"name\": self.__get_k8s_container_name(job_wrapper),\n            \"image\": self._find_container(job_wrapper).container_id,\n            # this form of command overrides the entrypoint and allows multi command\n            # command line execution, separated by ;, which is what Galaxy does\n            # to assemble the command.\n            # TODO possibly shell needs to be set by job_wrapper\n            \"command\": [\"/bin/bash\", \"-c\", job_wrapper.runner_command_line],\n            \"volumeMounts\": [{\n                \"mountPath\": self.runner_params['k8s_persistent_volume_claim_mount_path'],\n                \"name\": self._galaxy_vol_name\n            }]\n        }\n\n        # if self.__requires_ports(job_wrapper):\n        #    k8s_container['ports'] = self.__get_k8s_containers_ports(job_wrapper)\n\n        return [k8s_container]",
+      "calls": [],
+      "self_calls": [
+        "__get_k8s_container_name",
+        "_find_container"
+      ],
+      "self_attrs": [
+        "__get_k8s_container_name",
+        "_find_container",
+        "_galaxy_vol_name",
+        "runner_params"
+      ],
+      "global_uses": []
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "__get_k8s_container_name",
+          "class_name": "KubernetesJobRunner",
+          "start_line": 195,
+          "end_line": 197,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def __get_k8s_container_name(self, job_wrapper):\n        # TODO check if this is correct\n        return job_wrapper.job_destination.id"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "KubernetesJobRunner",
+      "related_methods_count": 1,
+      "related_attributes_count": 1,
+      "related_methods": [
+        {
+          "symbol_name": "__get_k8s_container_name",
+          "start_line": 195,
+          "end_line": 197,
+          "relevance": [
+            "direct_self_call"
+          ],
+          "source": "    def __get_k8s_container_name(self, job_wrapper):\n        # TODO check if this is correct\n        return job_wrapper.job_destination.id"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "_galaxy_vol_name",
+          "start_line": 56,
+          "end_line": 58,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "        self._pykube_api = HTTPClient(KubeConfig.from_file(self.runner_params[\"k8s_config_path\"]))\n        self._galaxy_vol_name = \"pvc-galaxy\"  # TODO this needs to be read from params!!\n"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

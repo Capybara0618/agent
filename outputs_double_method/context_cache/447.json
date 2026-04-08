@@ -1,0 +1,182 @@
+{
+  "task_id": "447",
+  "repo_owner": "openaddresses",
+  "repo_name": "machine",
+  "file_path": "openaddr/conform.py",
+  "commit": "d06c1f1dc46b1ff72ed16dfc8fdfd99c10b633f8",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T16:36:34+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "d06c1f1dc46b1ff72ed16dfc8fdfd99c10b633f8",
+    "symbol_name": "excerpt",
+    "satd_line": 337,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 2,
+    "same_file_pattern_count": 1,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T16:36:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "openaddr/conform.py",
+    "original_signature": "def excerpt(self, source_paths, workdir, conform):",
+    "target_file": {
+      "ok": true,
+      "path": "openaddr/conform.py",
+      "sha": "cd284dd587d71a1c47569eeed4ef639038450c26",
+      "download_url": "https://raw.githubusercontent.com/openaddresses/machine/d06c1f1dc46b1ff72ed16dfc8fdfd99c10b633f8/openaddr/conform.py",
+      "content_excerpt": "# coding=ascii\n\nfrom __future__ import absolute_import, division, print_function\nimport logging; _L = logging.getLogger('openaddr.conform')\n\nimport os\nimport errno\nimport tempfile\nimport itertools\nimport mimetypes\nimport json\nimport copy\nimport sys\nimport csv\nimport re\n\nfrom zipfile import ZipFile\nfrom argparse import ArgumentParser\nfrom locale import getpreferredencoding\nfrom os.path import splitext\nfrom hashlib import sha1\nfrom uuid import uuid4\n\nfrom .sample import sample_geojson, stream_geojson\n\nfrom osgeo import ogr, osr, gdal\nogr.UseExceptions()\n\n\ndef gdal_error_handler(err_class, err_num, err_msg):\n    errtype = {\n            gdal.CE_None:'None',\n            gdal.CE_Debug:'Debug',\n            gdal.CE_Warning:'Warning',\n            gdal.CE_Failure:'Failure',\n            gdal.CE_Fatal:'Fatal'\n    }\n    err_msg = err_msg.replace('\\n',' ')\n    err_class = errtype.get(err_class, 'None')\n    _L.error(\"GDAL gave %s %s: %s\", err_class, err_num, err_msg)\ngdal.PushErrorHandler(gdal_error_handler)\n\n\n# The canonical output schema for conform\nOPENADDR_CSV_SCHEMA = ['LON', 'LAT', 'NUMBER', 'STREET', 'UNIT', 'CITY',\n                       'DISTRICT', 'REGION', 'POSTCODE', 'ID', 'HASH']\n\n# Field names for use in cached CSV files.\n# We add columns to the extracted CSV with our own data with these names.\nGEOM_FIELDNAME = 'OA:geom'\nX_FIELDNAME, Y_FIELDNAME = 'OA:x', 'OA:y'\nattrib_types = {\n    'street':   'OA:street',\n    'number':   'OA:number',\n    'unit':     'OA:unit',\n    'city':     'OA:city',\n    'postcode': 'OA:postcode',\n    'district': 'OA:district',\n    'region':   'OA:region',\n    'id':       'OA:id'\n}\n\nvar_types = attrib_types.copy()\n\nUNZIPPED_DIRNAME = 'unzipped'\n\ngeometry_types = {\n    ogr.wkbPoint: 'Point',\n    ogr.wkbPoint25D: 'Point 2.5D',\n    ogr.wkbLineString: 'LineString',\n    ogr.wkbLineString25D: 'LineString 2.5D',\n    ogr.wkbLinearRing: 'LinearRing',\n    ogr.wkbPolygon: 'Polygon',\n    ogr.wkbPolygon25D: 'Polygon 2.5D',\n    ogr.wkbMultiPoint: 'MultiPoint',\n    ogr.wkbMultiPoint25D: 'MultiPoint 2.5D',\n    ogr.wkbMultiLineString: 'MultiLineString',\n    ogr.wkbMultiLineString25D: 'MultiLineString 2.5D',\n    ogr.wkbMultiPolygon: 'MultiPolygon',\n    ogr.wkbMultiPolygon25D: 'MultiPolygon 2.5D',\n    ogr.wkbGeometryCollection: 'GeometryCollection',\n    ogr.wkbGeometryCollection25D: 'GeometryCollection 2.5D',\n    ogr.wkbUnknown: 'Unknown'\n    }\n\n# extracts:\n# - '123' from '123 Main St'\n# - '123 1/2' from '123 1/2 Main St'\n# - '123-1/2' from '123-1/2 Main St'\n# - '123-1' from '123-1 Main St'\n# - '123a' from '123a Main St'\n# - '123-a' from '123-a Main St'\n# - '' from '3rd St' (the 3 belongs to the street, it's not a house number)\n#\n# this regex can be optimized but number scenarios are much cleaner this way:\n# - just digits with optional fractional\n# - two groups of digits separated by a hyphen (for queens-style addresses, eg - 69-15 51st Ave)\n# - digits and a letter, optionally separated by a hyphen\nprefixed_number_pattern = re.compile(\"^\\s*(\\d+(?:[ -]\\d/\\d)?|\\d+-\\d+|\\d+-?[A-Z])\\s+\", re.IGNORECASE)\n\n# extracts:\n# - 'Main St' from '123 Main St'\n# - 'Main St' from '123 1/2 Main St'\n# - 'Main St' from '123-1/2 Main St'\n# - 'Main St' from '123-1 Main St'\n# - 'Main St' from '123a Main St'\n# - 'Main St' from '123-a Main St'\n# - 'Main St' from 'Main St'\n#\n# like prefixed_number_pattern, this regex can be optimized but this is cleaner\npostfixed_street_pattern = re.compile(\"^(?:\\s*(?:\\d+(?:[ -]\\d/\\d)?|\\d+-\\d+|\\d+-?[A-Z])\\s+)?(.*)\", re.IGNORECASE)\n\n# extracts:\n# - 'Main Street' from '123 Main Street Unit 3'\n# - 'Main Street' from '123 Main Street Apartment 3'\n# - 'Main Street' from '123 Main Street Apt 3'\n# - 'Main Street' from '123 Main Street Apt. 3'\n# - 'Main Street' from '123 Main Street Suite 3'\n# - 'Main Street' from '123 Main Street Ste 3'\n# - 'Main Street' from '123 Main Street Ste. 3'\n# - 'Main Street' from '123 Main Street Building 3'\n# - 'Main Street' from '123 Main Street Bldg 3'\n# - 'Main Street' from '123 Main Street Bldg. 3'\n# - 'Main Street' from '123 Main Street Lot 3'\n# - 'Main Street' from '123 Main Street #3'\n# - 'Main Street' from '123 Main Street # 3'\n# This regex contains 3 groups: optional house number, street, optional unit\n# only street is a matching group, house number and unit are non-matching\npostfixed_street_with_units_pattern = re.compile(\"^(?:\\s*(?:\\d+(?:[ -]\\d/\\d)?|\\d+-\\d+|\\d+-?[A-Z])\\s+)?(.+?)(?:\\s+(?:(?:UNIT|APARTMENT|APT\\.?|SUITE|STE\\.?|BUILDING|BLDG\\.?|LOT)\\s+|#).+)?$\", re.IGNORECASE)\n\n# extracts:\n# - 'Unit 3' from 'Main Street Unit 3'\n# - 'Apartment 3' from 'Main Street Apartment 3'\n# - 'Apt 3' from 'Main Street Apt 3'\n# - 'Apt. 3' from 'Main Street Apt. 3'\n# - 'Suite 3' from 'Main Street Suite 3'\n# - 'Ste 3' from 'Main Street Ste 3'\n# - 'Ste. 3' from 'Main Street Ste. 3'\n# - 'Building 3' from 'Main Street Building 3'\n# - 'Bldg 3' from 'Main Street Bldg 3'\n# - 'Bldg. 3' from 'Main Street Bldg. 3'\n# - 'Lot 3' from 'Main Street Lot 3'\n# - '#3' from 'Main Street #3'\n# - '# 3' from 'Main Street # 3'\npostfixed_unit_pattern = re.compile(\"\\s((?:(?:UNIT|APARTMENT|APT\\.?|SUITE|STE\\.?|BUILDING|BLDG\\.?|LOT)\\s+|#).+)$\", re.IGNORECASE)\n\ndef mkdirsp(path):\n    try:\n        os.makedirs(path)\n    except OSError as exc:\n        if exc.errno == errno.EEXIST and os.path.isdir(path):\n            pass\n        else:\n            raise\n\n\nclass ConformResult:\n    processed = None\n    sample = None\n    license = None\n    geometry_type = None\n    address_count = None\n    path = None\n    elapsed = None\n    sharealike_flag = None\n    attribution_flag = None\n    attribution_name = None\n\n    def __init__(self, processed, sample, website, license, geometry_type,\n                 address_count, path, elapsed, sharealike_flag,\n                 attribution_flag, attribution_name):\n        self.processed = processed\n        self.sample = sample\n        self.website = website\n        self.license = license\n        self.geometry_type = geometry_type\n        self.address_count = address_count\n        self.path = path\n        self.elapsed = elapsed\n        self.sharealike_flag = sharealike_flag\n        self.attribution_flag = attribution_flag\n        self.attribution_name = attribution_name\n\n    @staticmethod\n    def empty():\n        return ConformResult(None, None, None, None, None, None, None, None, None, None, None)\n\n    def todict(self):\n        return dict(processed=self.processed, sample=self.sample)\n\n\nclass DecompressionError(Exception):\n    pass\n\nclass DecompressionTask(object):\n    @classmethod\n    def from_format_string(clz, format_string):\n        if format_string == None:\n            return GuessDecompressTask()\n        elif format_string.lower() == 'zip':\n            return ZipDecompressTask()\n        else:\n            raise KeyError(\"I don't know how to decompress for format {}\".format(format_string))\n\n    def decompress(self, source_paths):\n        raise NotImplementedError()\n\n\nclass GuessDecompressTask(DecompressionTask):\n    ''' Decompression task that tries to guess compression from file names.\n    '''\n    def decompress(self, source_paths, workdir, filenames):\n        types = {type for (type, _) in map(mimetypes.guess_type, source_paths)}\n\n        if types == {'application/zip'}:\n            substitute_task = ZipDecompressTask()\n            _L.info('Guessing zip compression based on file names')\n            return substitute_task.decompress(source_paths, workdir, filenames)\n\n        _L.warning('Could not guess a single compression from file names')\n        return source_paths\n\ndef is_in(path, names):\n    '''\n    '''\n    if path.lower() in names:\n        # Found it!\n        return True\n\n    for name in names:\n        # Maybe one of the names is an enclosing directory?\n        if not os.path.relpath(path.lower(), name).startswith('..'):\n            # Yes, that's it.\n            return True\n\n    return False\n\nclass ZipDecompressTask(DecompressionTask):\n    def decompress(self, source_paths, workdir, filenames):\n        output_files = []\n        expand_path = os.path.join(workdir, UNZIPPED_DIRNAME)\n        mkdirsp(expand_path)\n\n        # Extract contents of zip file into expand_path directory.\n        for source_path in source_paths:\n            with ZipFile(source_path, 'r') as z:\n                for name in z.namelist():\n                    if len(filenames) and not is_in(name, filenames):\n                        # Download only the named file, if any.\n                        _L.debug(\"Skipped file {}\".format(name))\n                        continue\n\n                    z.extract(name, expand_path)\n\n        # Collect names of directories and files in expand_path directory.\n        for (dirpath, dirnames, filenames) in os.walk(expand_path):\n            for dirname in dirnames:\n                if os.path.splitext(dirname)[-1].lower() == '.gdb':\n                    output_files.append(os.path.join(dirpath, dirname))\n                    _L.debug(\"Expanded directory {}\".format(output_files[-1]))\n            for filename in filenames:\n                output_files.append(os.path.join(dirpath, filename))\n                _L.debug(\"Expanded file {}\".format(output_files[-1]))\n\n        return output_files\n\nclass ExcerptDataTask(object):\n    ''' Task for sampling three rows of data from datasource.\n    '''\n    known_types = ('.shp', '.json', '.geojson', '.csv', '.kml', '.gml', '.gdb')\n\n    def excerpt(self, source_paths, workdir, conform):\n        '''\n\n            Tested version from openaddr.excerpt() on master branch:\n\n            if ext == '.zip':\n                _L.debug('Downloading all of {cache}'.format(**extras))\n\n                with open(cachefile, 'w') as file:\n                    for chunk in got.iter_content(1024**2):\n                        file.write(chunk)\n\n                zf = ZipFile(cachefile, 'r')\n\n                for name in zf.namelist():\n                    _, ext = splitext(name)\n\n                    if ext in ('.shp', '.shx', '.dbf'):\n                        with open(join(workdir, 'cache'+ext), 'w') as file:\n                            file.write(zf.read(name))\n\n                if exists(join(workdir, 'cache.shp')):\n                    ds = ogr.Open(join(workdir, 'cache.shp'))\n                else:\n                    ds = None\n\n            elif ext == '.json':\n                _L.debug('Downloading part of {cache}'.format(**extras))\n\n                scheme, host, path, query, _, _ = urlparse(got.url)\n\n                if scheme in ('http', 'https'):\n                    conn = HTTPConnection(host, 80)\n                    conn.request('GET', path + ('?' if query else '') + query)\n                    resp = conn.getresponse()\n                elif scheme == 'file':\n                    with open(path) as rawfile:\n                        resp = StringIO(rawfile.read(1024*1024))\n                else:\n                    raise RuntimeError('Unsure what to do with {}'.format(got.url))\n\n                with open(cachefile, 'w') as file:\n                    file.write(sample_geojson(resp, 10))\n\n                ds = ogr.Open(cachefile)\n\n            else:\n                ds = None\n        '''\n        encoding = conform.get('encoding')\n        csvsplit = conform.get('csvsplit', ',')\n\n        known_paths = ExcerptDataTask._get_known_paths(source_paths, workdir, conform, self.known_types)\n\n        if not known_paths:\n            # we know nothing.\n            return None, None\n\n        data_path = known_paths[0]\n        _, data_ext = os.path.splitext(data_path.lower())\n\n        # Sample a few GeoJSON features to save on memory for large datasets.\n        if data_ext in ('.geojson', '.json'):\n            data_path = ExcerptDataTask._sample_geojson_file(data_path)\n\n        # TODO: \"type\" is a deprecated tag\n        format_string = conform.get('format') or conform.get('type')\n    \n        # GDAL has issues with weird input CSV data, so use Python instead.\n        if format_string == 'csv':\n            return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)",
+      "total_lines": 1465,
+      "ref": "d06c1f1dc46b1ff72ed16dfc8fdfd99c10b633f8"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "excerpt",
+      "class_name": "ExcerptDataTask",
+      "start_line": 272,
+      "end_line": 379,
+      "satd_line": 337,
+      "matched_by": "normalized_source",
+      "source": "    def excerpt(self, source_paths, workdir, conform):\n        '''\n\n            Tested version from openaddr.excerpt() on master branch:\n\n            if ext == '.zip':\n                _L.debug('Downloading all of {cache}'.format(**extras))\n\n                with open(cachefile, 'w') as file:\n                    for chunk in got.iter_content(1024**2):\n                        file.write(chunk)\n\n                zf = ZipFile(cachefile, 'r')\n\n                for name in zf.namelist():\n                    _, ext = splitext(name)\n\n                    if ext in ('.shp', '.shx', '.dbf'):\n                        with open(join(workdir, 'cache'+ext), 'w') as file:\n                            file.write(zf.read(name))\n\n                if exists(join(workdir, 'cache.shp')):\n                    ds = ogr.Open(join(workdir, 'cache.shp'))\n                else:\n                    ds = None\n\n            elif ext == '.json':\n                _L.debug('Downloading part of {cache}'.format(**extras))\n\n                scheme, host, path, query, _, _ = urlparse(got.url)\n\n                if scheme in ('http', 'https'):\n                    conn = HTTPConnection(host, 80)\n                    conn.request('GET', path + ('?' if query else '') + query)\n                    resp = conn.getresponse()\n                elif scheme == 'file':\n                    with open(path) as rawfile:\n                        resp = StringIO(rawfile.read(1024*1024))\n                else:\n                    raise RuntimeError('Unsure what to do with {}'.format(got.url))\n\n                with open(cachefile, 'w') as file:\n                    file.write(sample_geojson(resp, 10))\n\n                ds = ogr.Open(cachefile)\n\n            else:\n                ds = None\n        '''\n        encoding = conform.get('encoding')\n        csvsplit = conform.get('csvsplit', ',')\n\n        known_paths = ExcerptDataTask._get_known_paths(source_paths, workdir, conform, self.known_types)\n\n        if not known_paths:\n            # we know nothing.\n            return None, None\n\n        data_path = known_paths[0]\n        _, data_ext = os.path.splitext(data_path.lower())\n\n        # Sample a few GeoJSON features to save on memory for large datasets.\n        if data_ext in ('.geojson', '.json'):\n            data_path = ExcerptDataTask._sample_geojson_file(data_path)\n\n        # TODO: \"type\" is a deprecated tag\n        format_string = conform.get('format') or conform.get('type')\n    \n        # GDAL has issues with weird input CSV data, so use Python instead.\n        if format_string == 'csv':\n            return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n        ogr_data_path = normalize_ogr_filename_case(data_path)\n        datasource = ogr.Open(ogr_data_path, 0)\n        layer = datasource.GetLayer()\n\n        if not encoding:\n            encoding = guess_source_encoding(datasource, layer)\n\n        # GDAL has issues with non-UTF8 input CSV data, so use Python instead.\n        if data_ext == '.csv' and encoding not in ('utf8', 'utf-8'):\n            return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n        layer_defn = layer.GetLayerDefn()\n        fieldcount = layer_defn.GetFieldCount()\n        fieldnames = [layer_defn.GetFieldDefn(i).GetName() for i in range(fieldcount)]\n        fieldnames = [f.decode(encoding) if hasattr(f, 'decode') else f for f in fieldnames]\n\n        data_sample = [fieldnames]\n\n        for (feature, _) in zip(layer, range(5)):\n            row = [feature.GetField(i) for i in range(fieldcount)]\n            row = [v.decode(encoding) if hasattr(v, 'decode') else v for v in row]\n            data_sample.append(row)\n\n        if len(data_sample) < 2:\n            raise ValueError('Not enough rows in data source')\n\n        # Determine geometry_type from layer, sample, or give up.\n        if layer_defn.GetGeomType() in geometry_types:\n            geometry_type = geometry_types.get(layer_defn.GetGeomType(), None)\n        elif fieldnames[-3:] == [X_FIELDNAME, Y_FIELDNAME, GEOM_FIELDNAME]:\n            geometry = ogr.CreateGeometryFromWkt(data_sample[1][-1])\n            geometry_type = geometry_types.get(geometry.GetGeometryType(), None)\n        else:\n            geometry_type = None\n\n        return data_sample, geometry_type",
+      "calls": [
+        "ValueError",
+        "guess_source_encoding",
+        "hasattr",
+        "len",
+        "normalize_ogr_filename_case",
+        "range",
+        "zip"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "known_types"
+      ],
+      "global_uses": [
+        "ExcerptDataTask",
+        "GEOM_FIELDNAME",
+        "X_FIELDNAME",
+        "Y_FIELDNAME",
+        "f",
+        "geometry_types",
+        "guess_source_encoding",
+        "normalize_ogr_filename_case",
+        "ogr",
+        "os",
+        "v"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "guess_source_encoding",
+          "class_name": null,
+          "start_line": 460,
+          "end_line": 474,
+          "relevance": [
+            "direct_call"
+          ],
+          "source": "def guess_source_encoding(datasource, layer):\n    ''' Guess at a string encoding using hints from OGR and locale().\n\n        Duplicate the process used in Fiona, described and implemented here:\n\n        https://github.com/openaddresses/machine/issues/42#issuecomment-69693143\n        https://github.com/Toblerity/Fiona/blob/53df35dc70fb/docs/encoding.txt\n        https://github.com/Toblerity/Fiona/blob/53df35dc70fb/fiona/ogrext.pyx#L386\n    '''\n    ogr_recoding = layer.TestCapability(ogr.OLCStringsAsUTF8)\n    is_shapefile = datasource.GetDriver().GetName() == 'ESRI Shapefile'\n\n    return (ogr_recoding and 'UTF-8') \\\n        or (is_shapefile and 'ISO-8859-1') \\\n        or getpreferredencoding()"
+        },
+        {
+          "symbol_name": "normalize_ogr_filename_case",
+          "class_name": null,
+          "start_line": 639,
+          "end_line": 664,
+          "relevance": [
+            "direct_call"
+          ],
+          "source": "def normalize_ogr_filename_case(source_path):\n    '''\n    '''\n    base, ext = splitext(source_path)\n\n    if ext == ext.lower():\n        # Extension is already lowercase, no need to do anything.\n        return source_path\n\n    normal_path = base + ext.lower()\n\n    if os.path.exists(normal_path):\n        # We appear to be on a case-insensitive filesystem.\n        return normal_path\n\n    os.link(source_path, normal_path)\n\n    # May need to deal with some additional files.\n    extras = {'.Shp': ('.Shx', '.Dbf', '.Prj'), '.SHP': ('.SHX', '.DBF', '.PRJ')}\n\n    if ext in extras:\n        for other_ext in extras[ext]:\n            if os.path.exists(base + other_ext):\n                os.link(base + other_ext, base + other_ext.lower())\n\n    return normal_path"
+        },
+        {
+          "symbol_name": "_get_known_paths",
+          "class_name": "ExcerptDataTask",
+          "start_line": 382,
+          "end_line": 404,
+          "relevance": [
+            "keyword_source_overlap=3",
+            "same_class"
+          ],
+          "source": "    def _get_known_paths(source_paths, workdir, conform, known_types):\n        # TODO: \"type\" is a deprecated tag\n        format_string = conform.get('format') or conform.get('type')\n    \n        if format_string != 'csv' or 'file' not in conform:\n            paths = [source_path for source_path in source_paths\n                     if os.path.splitext(source_path)[1].lower() in known_types]\n\n            # If nothing was found or named but we expect a CSV, return first file.\n            if not paths and format_string == 'csv' and 'file' not in conform:\n                return source_paths[:1]\n\n            return paths\n\n        unzipped_base = os.path.join(workdir, UNZIPPED_DIRNAME)\n        unzipped_paths = dict([(os.path.relpath(source_path, unzipped_base), source_path)\n                               for source_path in source_paths])\n\n        if conform['file'] not in unzipped_paths:\n            return []\n\n        csv_path = ExcerptDataTask._make_csv_path(unzipped_paths.get(conform['file']))\n        return [csv_path]"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "ExcerptDataTask",
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 2,
+      "items": [
+        {
+          "symbol_name": "geometry_types",
+          "kind": "assign",
+          "start_line": 67,
+          "end_line": 84,
+          "source": "geometry_types = {\n    ogr.wkbPoint: 'Point',\n    ogr.wkbPoint25D: 'Point 2.5D',\n    ogr.wkbLineString: 'LineString',\n    ogr.wkbLineString25D: 'LineString 2.5D',\n    ogr.wkbLinearRing: 'LinearRing',\n    ogr.wkbPolygon: 'Polygon',\n    ogr.wkbPolygon25D: 'Polygon 2.5D',\n    ogr.wkbMultiPoint: 'MultiPoint',\n    ogr.wkbMultiPoint25D: 'MultiPoint 2.5D',\n    ogr.wkbMultiLineString: 'MultiLineString',\n    ogr.wkbMultiLineString25D: 'MultiLineString 2.5D',\n    ogr.wkbMultiPolygon: 'MultiPolygon',\n    ogr.wkbMultiPolygon25D: 'MultiPolygon 2.5D',\n    ogr.wkbGeometryCollection: 'GeometryCollection',\n    ogr.wkbGeometryCollection25D: 'GeometryCollection 2.5D',\n    ogr.wkbUnknown: 'Unknown'\n    }"
+        },
+        {
+          "symbol_name": "ExcerptDataTask",
+          "kind": "class",
+          "start_line": 267,
+          "end_line": 442,
+          "source": "class ExcerptDataTask(object):\n    ''' Task for sampling three rows of data from datasource.\n    '''\n    known_types = ('.shp', '.json', '.geojson', '.csv', '.kml', '.gml', '.gdb')\n\n    def excerpt(self, source_paths, workdir, conform):\n        '''\n\n            Tested version from openaddr.excerpt() on master branch:\n\n            if ext == '.zip':\n                _L.debug('Downloading all of {cache}'.format(**extras))\n\n                with open(cachefile, 'w') as file:\n                    for chunk in got.iter_content(1024**2):\n                        file.write(chunk)\n\n                zf = ZipFile(cachefile, 'r')\n\n                for name in zf.namelist():\n                    _, ext = splitext(name)\n\n                    if ext in ('.shp', '.shx', '.dbf'):\n                        with open(join(workdir, 'cache'+ext), 'w') as file:\n                            file.write(zf.read(name))\n\n                if exists(join(workdir, 'cache.shp')):\n                    ds = ogr.Open(join(workdir, 'cache.shp'))\n                else:\n                    ds = None\n\n            elif ext == '.json':\n                _L.debug('Downloading part of {cache}'.format(**extras))\n\n                scheme, host, path, query, _, _ = urlparse(got.url)\n\n                if scheme in ('http', 'https'):\n                    conn = HTTPConnection(host, 80)\n                    conn.request('GET', path + ('?' if query else '') + query)\n                    resp = conn.getresponse()\n                elif scheme == 'file':\n                    with open(path) as rawfile:\n                        resp = StringIO(rawfile.read(1024*1024))\n                else:\n                    raise RuntimeError('Unsure what to do with {}'.format(got.url))\n\n                with open(cachefile, 'w') as file:\n                    file.write(sample_geojson(resp, 10))\n\n                ds = ogr.Open(cachefile)\n\n            else:\n                ds = None\n        '''\n        encoding = conform.get('encoding')\n        csvsplit = conform.get('csvsplit', ',')\n\n        known_paths = ExcerptDataTask._get_known_paths(source_paths, workdir, conform, self.known_types)\n\n        if not known_paths:\n            # we know nothing.\n            return None, None\n\n        data_path = known_paths[0]\n        _, data_ext = os.path.splitext(data_path.lower())\n\n        # Sample a few GeoJSON features to save on memory for large datasets.\n        if data_ext in ('.geojson', '.json'):\n            data_path = ExcerptDataTask._sample_geojson_file(data_path)\n\n        # TODO: \"type\" is a deprecated tag\n        format_string = conform.get('format') or conform.get('type')\n    \n        # GDAL has issues with weird input CSV data, so use Python instead.\n        if format_string == 'csv':\n            return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n        ogr_data_path = normalize_ogr_filename_case(data_path)\n        datasource = ogr.Open(ogr_data_path, 0)\n        layer = datasource.GetLayer()\n\n        if not encoding:\n            encoding = guess_source_encoding(datasource, layer)\n\n        # GDAL has issues with non-UTF8 input CSV data, so use Python instead.\n        if data_ext == '.csv' and encoding not in ('utf8', 'utf-8'):\n            return ExcerptDataTask._excerpt_csv_file(data_path, encoding, csvsplit)\n\n        layer_defn = layer.GetLayerDefn()\n        fieldcount = layer_defn.GetFieldCount()\n        fieldnames = [layer_defn.GetFieldDefn(i).GetName() for i in range(fieldcount)]\n        fieldnames = [f.decode(encoding) if hasattr(f, 'decode') else f for f in fieldnames]\n\n        data_sample = [fieldnames]\n\n        for (feature, _) in zip(layer, range(5)):\n            row = [feature.GetField(i) for i in range(fieldcount)]\n            row = [v.decode(encoding) if hasattr(v, 'decode') else v for v in row]\n            data_sample.append(row)\n\n        if len(data_sample) < 2:\n            raise ValueError('Not enough rows in data source')\n\n        # Determine geometry_type from layer, sample, or give up.\n        if layer_defn.GetGeomType() in geometry_types:\n            geometry_type = geometry_types.get(layer_defn.GetGeomType(), None)\n        elif fieldnames[-3:] == [X_FIELDNAME, Y_FIELDNAME, GEOM_FIELDNAME]:\n            geometry = ogr.CreateGeometryFromWkt(data_sample[1][-1])\n            geometry_type = geometry_types.get(geometry.GetGeometryType(), None)\n        else:\n            geometry_type = None\n\n        return data_sample, geometry_type\n\n    @staticmethod\n    def _get_known_paths(source_paths, workdir, conform, known_types):\n        # TODO: \"type\" is a deprecated tag\n        format_string = conform.get('format') or conform.get('type')\n    \n        if format_string != 'csv' or 'file' not in conform:\n            paths = [source_path for source_path in source_paths\n                     if os.path.splitext(source_path)[1].lower() in known_types]\n\n            # If nothing was found or named but we expect a CSV, return first file.\n            if not paths and format_string == 'csv' and 'file' not in conform:\n                return source_paths[:1]\n\n            return paths\n\n        unzipped_base = os.path.join(workdir, UNZIPPED_DIRNAME)\n        unzipped_paths = dict([(os.path.relpath(source_path, unzipped_base), source_path)\n                               for source_path in source_paths])\n\n        if conform['file'] not in unzipped_paths:\n            return []\n\n        csv_path = ExcerptDataTask._make_csv_path(unzipped_paths.get(conform['file']))\n        return [csv_path]\n\n    @staticmethod\n    def _make_csv_path(csv_path):\n        _, csv_ext = os.path.splitext(csv_path.lower())\n\n        if csv_ext != '.csv':\n            # Convince OGR it's looking at a CSV file.\n            new_path = csv_path + '.csv'\n            os.link(csv_path, new_path)\n            csv_path = new_path\n\n        return csv_path\n\n    @staticmethod\n    def _sample_geojson_file(data_path):\n        # Sample a few GeoJSON features to save on memory for large datasets.\n        with open(data_path, 'r') as complete_layer:\n            temp_dir = os.path.dirname(data_path)\n            _, temp_path = tempfile.mkstemp(dir=temp_dir, suffix='.json')\n\n            with open(temp_path, 'w') as temp_file:\n                temp_file.write(sample_geojson(complete_layer, 10))\n                return temp_path\n\n    @staticmethod\n    def _excerpt_csv_file(data_path, encoding, csvsplit):\n        with open(data_path, 'r', encoding=encoding) as file:\n            input = csv.reader(file, delimiter=csvsplit)\n            data_sample = [row for (row, _) in zip(input, range(6))]\n\n            if len(data_sample) >= 2 and GEOM_FIELDNAME in data_sample[0]:\n                geom_index = data_sample[0].index(GEOM_FIELDNAME)\n                geometry = ogr.CreateGeometryFromWkt(data_sample[1][geom_index])\n                geometry_type = geometry_types.get(geometry.GetGeometryType(), None)\n            else:\n                geometry_type = None\n\n        return data_sample, geometry_type"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 1,
+      "items": [
+        {
+          "symbol_name": "_excerpt_csv_file",
+          "class_name": "ExcerptDataTask",
+          "start_line": 430,
+          "end_line": 442,
+          "source": "    def _excerpt_csv_file(data_path, encoding, csvsplit):\n        with open(data_path, 'r', encoding=encoding) as file:\n            input = csv.reader(file, delimiter=csvsplit)\n            data_sample = [row for (row, _) in zip(input, range(6))]\n\n            if len(data_sample) >= 2 and GEOM_FIELDNAME in data_sample[0]:\n                geom_index = data_sample[0].index(GEOM_FIELDNAME)\n                geometry = ogr.CreateGeometryFromWkt(data_sample[1][geom_index])\n                geometry_type = geometry_types.get(geometry.GetGeometryType(), None)\n            else:\n                geometry_type = None\n\n        return data_sample, geometry_type"
+        }
+      ]
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "weak_match_filtered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

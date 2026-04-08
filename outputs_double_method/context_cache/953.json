@@ -1,0 +1,95 @@
+{
+  "task_id": "953",
+  "repo_owner": "kashifrazzaqui",
+  "repo_name": "vyked",
+  "file_path": "vyked/bus.py",
+  "commit": "cdff65813879fff7b76686e01aa55cf331a9606e",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T20:25:03+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "cdff65813879fff7b76686e01aa55cf331a9606e",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T20:25:03+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "vyked/bus.py",
+    "original_signature": "def receive(self, packet, transport, protocol):",
+    "target_file": {
+      "ok": true,
+      "path": "vyked/bus.py",
+      "sha": "8f826deb14c91b8f9e3997afc5c7cddcceb57f13",
+      "download_url": "https://raw.githubusercontent.com/kashifrazzaqui/vyked/cdff65813879fff7b76686e01aa55cf331a9606e/vyked/bus.py",
+      "content_excerpt": "import asyncio\nfrom collections import defaultdict\nfrom functools import partial\nimport json\nimport logging\nimport random\n\nfrom again.utils import unique_hex\n\nfrom retrial.retrial import retry\nimport aiohttp\n\nfrom .registry_client import RegistryClient\nfrom .services import TCPServiceClient, HTTPServiceClient\nfrom .pubsub import PubSub\nfrom .packet import ControlPacket, MessagePacket\nfrom .protocol_factory import get_vyked_protocol\n\nHTTP = 'http'\nTCP = 'tcp'\n\n_logger = logging.getLogger(__name__)\n\n\ndef _retry_for_client_conn(result):\n    if isinstance(result, tuple):\n        return not isinstance(result[0], asyncio.transports.Transport) or not isinstance(result[1], asyncio.Protocol)\n    return True\n\n\ndef _retry_for_pub(result):\n    return not result\n\n\ndef _retry_for_exception(_):\n    return True\n\n\nclass HTTPBus:\n    def __init__(self, registry_client):\n        self._registry_client = registry_client\n\n    def send_http_request(self, app: str, service: str, version: str, method: str, entity: str, params: dict):\n        \"\"\"\n        A convenience method that allows you to send a well formatted http request to another service\n        \"\"\"\n        host, port, node_id, service_type = self._registry_client.resolve(service, version, entity, HTTP)\n\n        url = 'http://{}:{}{}'.format(host, port, params.pop('path'))\n\n        http_keys = ['data', 'headers', 'cookies', 'auth', 'allow_redirects', 'compress', 'chunked']\n        kwargs = {k: params[k] for k in http_keys if k in params}\n\n        query_params = params.pop('params', {})\n\n        if app is not None:\n            query_params['app'] = app\n\n        query_params['version'] = version\n        query_params['service'] = service\n\n        response = yield from aiohttp.request(method, url, params=query_params, **kwargs)\n        return response\n\n\nclass TCPBus:\n    def __init__(self, registry_client):\n        self._registry_client = registry_client\n        self._client_protocols = {}\n        self._pingers = {}\n        self._node_clients = {}\n        self._service_clients = []\n        self._pending_requests = []\n        self.tcp_host = None\n        self.http_host = None\n        self._host_id = unique_hex()\n        self._ronin = False\n        self._registered = False\n\n    def _create_service_clients(self):\n        futures = []\n        for sc in self._service_clients:\n            for host, port, node_id, service_type in self._registry_client.get_all_addresses(sc.properties):\n                self._node_clients[node_id] = sc\n                future = self._connect_to_client(host, node_id, port, service_type, sc)\n                futures.append(future)\n        return asyncio.gather(*futures, return_exceptions=False)\n\n    def register(self, host, port, service, version, clients, service_type):\n        for client in clients:\n            if isinstance(client, (TCPServiceClient, HTTPServiceClient)):\n                client.bus = self\n        self._service_clients = clients\n        self._registry_client.register(host, port, service, version, clients, service_type)\n\n    def registration_complete(self):\n        if not self._registered:\n            f = self._create_service_clients()\n            self._registered = True\n\n            def fun(_):\n                if self.tcp_host:\n                    self._clear_request_queue()\n\n            f.add_done_callback(fun)\n\n    def send(self, packet: dict):\n        packet['from'] = self._host_id\n        func = getattr(self, '_' + packet['type'] + '_sender')\n        func(packet)\n\n    def _request_sender(self, packet: dict):\n        \"\"\"\n        Sends a request to a server from a ServiceClient\n        auto dispatch method called from self.send()\n        \"\"\"\n        self._pending_requests.append(packet)\n        self._clear_request_queue()\n\n    @retry(should_retry_for_result=_retry_for_client_conn, should_retry_for_exception=_retry_for_exception, timeout=10,\n           strategy=[0, 2, 2, 4])\n    def _connect_to_client(self, host, node_id, port, service_type, service_client):\n        _logger.info('node_id' + node_id)\n        future = asyncio.async(\n            asyncio.get_event_loop().create_connection(partial(get_vyked_protocol, service_client), host, port))\n        future.add_done_callback(\n            partial(self._service_client_connection_callback, self._node_clients[node_id], node_id, service_type))\n        return future\n\n    def _service_client_connection_callback(self, sc, node_id, service_type, future):\n        _, protocol = future.result()\n        # TODO : handle pinging\n        # if service_type == TCP:\n        #     pinger = Pinger(self, asyncio.get_event_loop())\n        #     self._pingers[node_id] = pinger\n        #     pinger.register_tcp_service(protocol, node_id)\n        #     asyncio.async(pinger.start_ping())\n        self._client_protocols[node_id] = protocol\n\n    @staticmethod\n    def _create_json_service_name(app, service, version):\n        return {'app': app, 'service': service, 'version': version}\n\n    @staticmethod\n    def _handle_ping(packet, protocol):\n        protocol.send(ControlPacket.pong(packet['node_id'], packet['count']))\n\n    def _handle_pong(self, node_id, count):\n        pinger = self._pingers[node_id]\n        asyncio.async(pinger.pong_received(count))\n\n    def _clear_request_queue(self):\n        self._pending_requests[:] = [each for each in self._pending_requests if not self._send_packet(each)]\n\n    def _send_packet(self, packet):\n        node_id = self._get_node_id_for_packet(packet)\n        if node_id is not None:\n            client_protocol = self._client_protocols[node_id]\n            if client_protocol.is_connected():\n                packet['to'] = node_id\n                client_protocol.send(packet)\n                return True\n            else:\n                return False\n        return False\n\n    def _get_node_id_for_packet(self, packet):\n        app, service, version, entity = packet['app'], packet['service'], packet['version'], packet['entity']\n        node = self._registry_client.resolve(service, version, entity, TCP)\n        return node[2] if node else None\n\n    def handle_ping_timeout(self, node_id):\n        _logger.info(\"Service client connection timed out {}\".format(node_id))\n        self._pingers.pop(node_id, None)\n        service_props = self._registry_client.get_for_node(node_id)\n        _logger.info('service client props {}'.format(service_props))\n        if service_props is not None:\n            host, port, _node_id, _type = service_props\n            asyncio.async(self._connect_to_client(host, _node_id, port, _type))\n\n    def receive(self, packet: dict, protocol, transport):\n        if packet['type'] == 'ping':\n            self._handle_ping(packet, protocol)\n        elif packet['type'] == 'pong':\n            self._handle_pong(packet['node_id'], packet['count'])\n        elif packet['type'] == 'publish':\n            self._handle_publish(packet, protocol)\n        else:\n            if self.tcp_host.is_for_me(packet['service'], packet['version']):\n                func = getattr(self, '_' + packet['type'] + '_receiver')\n                func(packet, protocol)\n            else:\n                _logger.warn('wrongly routed packet: ', packet)\n\n    def _request_receiver(self, packet, protocol):\n        api_fn = getattr(self.tcp_host, packet['endpoint'])\n        if api_fn.is_api:\n            from_node_id = packet['from']\n            entity = packet['entity']\n            future = asyncio.async(api_fn(from_id=from_node_id, entity=entity, **packet['payload']))\n\n            def send_result(f):\n                result_packet = f.result()\n                protocol.send(result_packet)\n\n            future.add_done_callback(send_result)\n        else:\n            print('no api found for packet: ', packet)\n\n    def _handle_publish(self, packet, protocol):\n        service, version, endpoint, payload = packet['service'], packet['version'], packet['endpoint'], packet[\n            'payload']\n        for client in self._service_clients:\n            if client.name == service and client.version == version:\n                fun = getattr(client, endpoint)\n                asyncio.async(fun(payload))\n        protocol.send(MessagePacket.ack())\n\n\nclass PubSubBus:\n    def __init__(self, registry_client):\n        self._pubsub_handler = None\n        self._registry_client = registry_client\n        self._clients = None\n\n    def create_pubsub_handler(self, host, port):\n        self._pubsub_handler = PubSub(host, port)\n        yield from self._pubsub_handler.connect()\n\n    def register_for_subscription(self, clients):\n        self._clients = clients\n        subscription_list = []\n        xsubscription_list = []\n        for client in clients:\n            if isinstance(client, TCPServiceClient):\n                for each in dir(client):\n                    fn = getattr(client, each)\n                    if callable(fn) and getattr(fn, 'is_subscribe', False):\n                        subscription_list.append(self._get_pubsub_key(client.name, client.version, fn.__name__))\n                    elif callable(fn) and getattr(fn, 'is_xsubscribe', False):\n                        xsubscription_list.append((client.name, client.version, fn.__name__, getattr(fn, 'strategy')))\n        self._registry_client.x_subscribe(xsubscription_list)\n        yield from self._pubsub_handler.subscribe(subscription_list, handler=self.subscription_handler)\n\n    def publish(self, service, version, endpoint, payload):\n        endpoint_key = self._get_pubsub_key(service, version, endpoint)\n        asyncio.async(self._retry_publish(endpoint_key, json.dumps(payload)))\n        future = asyncio.async(self._registry_client.get_subscribers(service, version, endpoint))\n        future.add_done_callback(partial(self._subscriber_callback, service, version, endpoint, payload))\n\n    def _subscriber_callback(self, service, version, endpoint, payload, fut):\n        subscribers = fut.result()\n        strategies = defaultdict(list)\n        for subscriber in subscribers:\n            strategies[(subscriber['service'], subscriber['version'])].append(\n                (subscriber['host'], subscriber['port'], subscriber['node_id'], subscriber['strategy']))\n        self._connect_and_publish(service, version, endpoint, strategies, payload)\n\n    def receive(self, packet, transport, protocol):\n        if packet['type'] == 'ack':\n            # TODO : remove from retrial\n            pass\n\n    def _retry_publish(self, endpoint, payload):\n        return (yield from self._pubsub_handler.publish(endpoint, payload))\n\n    def subscription_handler(self, endpoint, payload):\n        service, version, endpoint = endpoint.split('/')\n        client = [sc for sc in self._clients if (sc.name == service and sc.version == int(version))][0]\n        func = getattr(client, endpoint)\n        asyncio.async(func(**json.loads(payload)))\n\n    @staticmethod\n    def _get_pubsub_key(service, version, endpoint):\n        return '/'.join((service, str(version), endpoint))\n\n    def _connect_and_publish(self, service, version, endpoint, strategies, payload):\n        print(strategies)\n\n        def publish(future):\n            transport, protocol = future.result()\n            packet = MessagePacket.publish(service, version, endpoint, payload)\n            protocol.send(packet)\n\n        for key, value in strategies.items():\n            if value[0][3] == 'LEADER':\n                host, port = value[0][0], value[0][1]\n            else:\n                random_metadata = random.choice(value)\n                host, port = random_metadata[0], random_metadata[1]\n            fut = asyncio.async(\n                asyncio.get_event_loop().create_connection(partial(get_vyked_protocol, self), host, port))\n            fut.add_done_callback(publish)\n",
+      "total_lines": 293,
+      "ref": "cdff65813879fff7b76686e01aa55cf331a9606e"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

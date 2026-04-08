@@ -1,0 +1,225 @@
+{
+  "task_id": "945",
+  "repo_owner": "windelbouwman",
+  "repo_name": "ppci",
+  "file_path": "ppci/c3/codegenerator.py",
+  "commit": "de331563d97fceeaeb7bdd5109d4704c319583ef",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-08T11:06:54+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "de331563d97fceeaeb7bdd5109d4704c319583ef",
+    "symbol_name": "gen_stmt",
+    "satd_line": 125,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 5,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-08T11:06:54+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "ppci/c3/codegenerator.py",
+    "original_signature": "def gen_stmt(self, code):",
+    "target_file": {
+      "ok": true,
+      "path": "ppci/c3/codegenerator.py",
+      "sha": "1d353f01e2ebfe82b9b011d775dc25547aad04f5",
+      "download_url": "https://raw.githubusercontent.com/windelbouwman/ppci/de331563d97fceeaeb7bdd5109d4704c319583ef/ppci/c3/codegenerator.py",
+      "content_excerpt": "import logging\nimport struct\nfrom .. import ir\nfrom .. import irutils\nfrom . import astnodes as ast\n\n\nclass SemanticError(Exception):\n    \"\"\" Error thrown when a semantic issue is observed \"\"\"\n    def __init__(self, msg, loc):\n        super().__init__()\n        self.msg = msg\n        self.loc = loc\n\n\ndef pack_string(txt):\n    \"\"\" Pack a string using 4 bytes length followed by text data \"\"\"\n    length = struct.pack('<I', len(txt))\n    data = txt.encode('ascii')\n    return length + data\n\n\nclass CodeGenerator:\n    \"\"\"\n      Generates intermediate (IR) code from a package. The entry function is\n      'genModule'. The main task of this part is to rewrite complex control\n      structures, such as while and for loops into simple conditional\n      jump statements. Also complex conditional statements are simplified.\n      Such as 'and' and 'or' statements are rewritten in conditional jumps.\n      And structured datatypes are rewritten.\n\n      Type checking is done in one run with code generation.\n    \"\"\"\n    def __init__(self, diag):\n        self.logger = logging.getLogger('c3cgen')\n        self.builder = irutils.Builder()\n        self.diag = diag\n\n    def gencode(self, pkg):\n        \"\"\" Generate code for a single module \"\"\"\n        self.builder.prepare()\n        assert type(pkg) is ast.Package\n        self.pkg = pkg\n        self.intType = pkg.scope['int']\n        self.boolType = pkg.scope['bool']\n        self.pointerSize = 4\n        self.logger.debug('Generating ir-code for {}'.format(pkg.name),\n                          extra={'c3_ast': pkg})\n        self.varMap = {}    # Maps variables to storage locations.\n        self.builder.m = ir.Module(pkg.name)\n        try:\n            for typ in pkg.Types:\n                self.check_type(typ)\n            # Only generate function if function contains a body:\n            real_functions = list(filter(\n                lambda f: f.body, pkg.Functions))\n            for v in pkg.innerScope.Variables:\n                v2 = ir.GlobalVariable(v.name, ir.i32)\n                self.varMap[v] = v2\n                if not v.isLocal:\n                    self.builder.m.add_variable(v2)\n            for s in real_functions:\n                self.gen_function(s)\n        except SemanticError as e:\n            self.error(e.msg, e.loc)\n        if self.pkg.ok:\n            return self.builder.m\n\n    def error(self, msg, loc=None):\n        self.pkg.ok = False\n        self.diag.error(msg, loc)\n\n    def gen_function(self, fn):\n        # TODO: handle arguments\n        ir_function = self.builder.new_function(fn.name)\n        self.builder.setFunction(ir_function)\n        l2 = self.builder.newBlock()\n        self.builder.emit(ir.Jump(l2))\n        self.builder.setBlock(l2)\n\n        # Generate storage for return value:\n        ir_function.return_value = ir.Alloc('ret_val', ir.i32)\n        self.builder.emit(ir_function.return_value)\n        # generate room for locals:\n\n        for sym in fn.innerScope:\n            self.check_type(sym.typ)\n            if sym.isParameter:\n                parameter = ir.Parameter(sym.name, ir.i32)\n                variable = ir.Alloc(sym.name + '_copy', ir.i32)\n                self.builder.emit(variable)\n                ir_function.addParameter(parameter)\n                # Move parameter into local copy:\n                self.builder.emit(ir.Store(parameter, variable))\n            elif sym.isLocal or isinstance(sym, ast.Variable):\n                variable = ir.Alloc(sym.name, ir.i32)\n                self.builder.emit(variable)\n            else:\n                raise NotImplementedError('{}'.format(sym))\n            self.varMap[sym] = variable\n\n        self.gen_stmt(fn.body)\n        # self.builder.emit(ir.Move(f.return_value, ir.Const(0)))\n        self.builder.emit(ir.Jump(ir_function.epiloog))\n        self.builder.setFunction(None)\n\n    def gen_stmt(self, code):\n        \"\"\" Generate code for a statement \"\"\"\n        try:\n            assert isinstance(code, ast.Statement)\n            self.builder.setLoc(code.loc)\n            if type(code) is ast.Compound:\n                for s in code.statements:\n                    self.gen_stmt(s)\n            elif type(code) is ast.Empty:\n                pass\n            elif type(code) is ast.Assignment:\n                self.gen_assignment_stmt(code)\n            elif type(code) is ast.ExpressionStatement:\n                self.gen_expr_code(code.ex)\n            elif type(code) is ast.If:\n                self.gen_if_stmt(code)\n            elif type(code) is ast.Return:\n                re = self.gen_expr_code(code.expr)\n                # TODO: handle return value??\n                # self.builder.emit(ir.Move(self.builder.fn.return_value, re))\n                self.builder.emit(ir.Jump(self.builder.fn.epiloog))\n                b = self.builder.newBlock()\n                self.builder.setBlock(b)\n            elif type(code) is ast.While:\n                self.gen_while(code)\n            elif type(code) is ast.For:\n                self.gen_for_stmt(code)\n            elif type(code) is ast.Switch:\n                raise NotImplementedError('Unknown stmt {}'.format(code))\n            else:\n                raise NotImplementedError('Unknown stmt {}'.format(code))\n        except SemanticError as exc:\n            self.error(exc.msg, exc.loc)\n\n    def gen_assignment_stmt(self, code):\n        \"\"\" Generate code for assignment statement \"\"\"\n        lval = self.gen_expr_code(code.lval)\n        rval = self.make_rvalue_expr(code.rval)\n        if not self.equal_types(code.lval.typ, code.rval.typ):\n            raise SemanticError('Cannot assign {} to {}'\n                                .format(code.rval.typ, code.lval.typ),\n                                code.loc)\n        if not code.lval.lvalue:\n            raise SemanticError('No valid lvalue {}'.format(code.lval),\n                                code.lval.loc)\n        store_ins = ir.Store(rval, lval)\n        self.builder.emit(store_ins)\n\n    def gen_if_stmt(self, code):\n        \"\"\" Generate code for if statement \"\"\"\n        true_block = self.builder.newBlock()\n        bbfalse = self.builder.newBlock()\n        final_block = self.builder.newBlock()\n        self.gen_cond_code(code.condition, true_block, bbfalse)\n        self.builder.setBlock(true_block)\n        self.gen_stmt(code.truestatement)\n        self.builder.emit(ir.Jump(final_block))\n        self.builder.setBlock(bbfalse)\n        self.gen_stmt(code.falsestatement)\n        self.builder.emit(ir.Jump(final_block))\n        self.builder.setBlock(final_block)\n\n    def gen_while(self, code):\n        \"\"\" Generate code for while statement \"\"\"\n        bbdo = self.builder.newBlock()\n        test_block = self.builder.newBlock()\n        final_block = self.builder.newBlock()\n        self.builder.emit(ir.Jump(test_block))\n        self.builder.setBlock(test_block)\n        self.gen_cond_code(code.condition, bbdo, final_block)\n        self.builder.setBlock(bbdo)\n        self.gen_stmt(code.statement)\n        self.builder.emit(ir.Jump(test_block))\n        self.builder.setBlock(final_block)\n\n    def gen_for_stmt(self, code):\n        \"\"\" Generate for statement code \"\"\"\n        bbdo = self.builder.newBlock()\n        test_block = self.builder.newBlock()\n        final_block = self.builder.newBlock()\n        self.gen_stmt(code.init)\n        self.builder.emit(ir.Jump(test_block))\n        self.builder.setBlock(test_block)\n        self.gen_cond_code(code.condition, bbdo, final_block)\n        self.builder.setBlock(bbdo)\n        self.gen_stmt(code.statement)\n        self.gen_stmt(code.final)\n        self.builder.emit(ir.Jump(test_block))\n        self.builder.setBlock(final_block)\n\n    def gen_cond_code(self, expr, bbtrue, bbfalse):\n        \"\"\" Generate conditional logic.\n            Implement sequential logical operators. \"\"\"\n        if type(expr) is ast.Binop:\n            if expr.op == 'or':\n                l2 = self.builder.newBlock()\n                self.gen_cond_code(expr.a, bbtrue, l2)\n                if not self.equal_types(expr.a.typ, self.boolType):\n                    raise SemanticError('Must be boolean', expr.a.loc)\n                self.builder.setBlock(l2)\n                self.gen_cond_code(expr.b, bbtrue, bbfalse)\n                if not self.equal_types(expr.b.typ, self.boolType):\n                    raise SemanticError('Must be boolean', expr.b.loc)\n            elif expr.op == 'and':\n                l2 = self.builder.newBlock()\n                self.gen_cond_code(expr.a, l2, bbfalse)\n                if not self.equal_types(expr.a.typ, self.boolType):\n                    self.error('Must be boolean', expr.a.loc)\n                self.builder.setBlock(l2)\n                self.gen_cond_code(expr.b, bbtrue, bbfalse)\n                if not self.equal_types(expr.b.typ, self.boolType):\n                    raise SemanticError('Must be boolean', expr.b.loc)\n            elif expr.op in ['==', '>', '<', '!=', '<=', '>=']:\n                ta = self.make_rvalue_expr(expr.a)\n                tb = self.make_rvalue_expr(expr.b)\n                if not self.equal_types(expr.a.typ, expr.b.typ):\n                    raise SemanticError('Types unequal {} != {}'\n                                        .format(expr.a.typ, expr.b.typ),\n                                        expr.loc)\n                self.builder.emit(ir.CJump(ta, expr.op, tb, bbtrue, bbfalse))\n            else:\n                raise SemanticError('non-bool: {}'.format(expr.op), expr.loc)\n            expr.typ = self.boolType\n        elif type(expr) is ast.Literal:\n            self.gen_expr_code(expr)\n            if expr.val:\n                self.builder.emit(ir.Jump(bbtrue))\n            else:\n                self.builder.emit(ir.Jump(bbfalse))\n        else:\n            raise NotImplementedError('Unknown cond {}'.format(expr))\n\n        # Check that the condition is a boolean value:\n        if not self.equal_types(expr.typ, self.boolType):\n            self.error('Condition must be boolean', expr.loc)\n\n    def make_rvalue_expr(self, expr):\n        \"\"\" Generate expression code and insert an extra load instruction\n            when required\n        \"\"\"\n        x = self.gen_expr_code(expr)\n        if expr.lvalue:\n            load_ins = ir.Load(x, 'loaded', ir.i32)\n            self.builder.emit(load_ins)\n            return load_ins\n        else:\n            return x\n\n    def gen_expr_code(self, expr):\n        \"\"\" Generate code for an expression. Return the generated ir-value \"\"\"\n        assert isinstance(expr, ast.Expression)\n        if type(expr) is ast.Binop:\n            expr.lvalue = False\n            if expr.op in ['+', '-', '*', '/', '<<', '>>', '|', '&']:\n                a_val = self.make_rvalue_expr(expr.a)\n                b_val = self.make_rvalue_expr(expr.b)\n                if self.equal_types(expr.a.typ, self.intType) and \\\n                        self.equal_types(expr.b.typ, self.intType):\n                    expr.typ = expr.a.typ\n                elif self.equal_types(expr.b.typ, self.intType) and \\\n                        type(expr.a.typ) is ast.PointerType:\n                    # Special case for pointer arithmatic TODO: coerce!\n                    expr.typ = expr.a.typ\n                else:\n                    raise SemanticError('Can only add integers', expr.loc)\n            else:\n                raise NotImplementedError(\"Cannot use equality as expressions\")\n            value = ir.Binop(a_val, expr.op, b_val, \"op\", ir.i32)\n            self.builder.emit(value)\n            return value\n        elif type(expr) is ast.Unop:\n            if expr.op == '&':\n                ra = self.gen_expr_code(expr.a)\n                expr.typ = ast.PointerType(expr.a.typ)\n                if not expr.a.lvalue:\n                    raise SemanticError('No valid lvalue', expr.a.loc)\n                expr.lvalue = False\n                return ra\n            else:\n                raise NotImplementedError('Unknown unop {0}'.format(expr.op))\n        elif type(expr) is ast.Identifier:\n            # Generate code for this id",
+      "total_lines": 606,
+      "ref": "de331563d97fceeaeb7bdd5109d4704c319583ef"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "gen_stmt",
+      "class_name": "CodeGenerator",
+      "start_line": 107,
+      "end_line": 139,
+      "satd_line": 125,
+      "matched_by": "signature_or_comment",
+      "source": "    def gen_stmt(self, code):\n        \"\"\" Generate code for a statement \"\"\"\n        try:\n            assert isinstance(code, ast.Statement)\n            self.builder.setLoc(code.loc)\n            if type(code) is ast.Compound:\n                for s in code.statements:\n                    self.gen_stmt(s)\n            elif type(code) is ast.Empty:\n                pass\n            elif type(code) is ast.Assignment:\n                self.gen_assignment_stmt(code)\n            elif type(code) is ast.ExpressionStatement:\n                self.gen_expr_code(code.ex)\n            elif type(code) is ast.If:\n                self.gen_if_stmt(code)\n            elif type(code) is ast.Return:\n                re = self.gen_expr_code(code.expr)\n                # TODO: handle return value??\n                # self.builder.emit(ir.Move(self.builder.fn.return_value, re))\n                self.builder.emit(ir.Jump(self.builder.fn.epiloog))\n                b = self.builder.newBlock()\n                self.builder.setBlock(b)\n            elif type(code) is ast.While:\n                self.gen_while(code)\n            elif type(code) is ast.For:\n                self.gen_for_stmt(code)\n            elif type(code) is ast.Switch:\n                raise NotImplementedError('Unknown stmt {}'.format(code))\n            else:\n                raise NotImplementedError('Unknown stmt {}'.format(code))\n        except SemanticError as exc:\n            self.error(exc.msg, exc.loc)",
+      "calls": [
+        "NotImplementedError",
+        "isinstance",
+        "type"
+      ],
+      "self_calls": [
+        "error",
+        "gen_assignment_stmt",
+        "gen_expr_code",
+        "gen_for_stmt",
+        "gen_if_stmt",
+        "gen_stmt",
+        "gen_while"
+      ],
+      "self_attrs": [
+        "builder",
+        "error",
+        "gen_assignment_stmt",
+        "gen_expr_code",
+        "gen_for_stmt",
+        "gen_if_stmt",
+        "gen_stmt",
+        "gen_while"
+      ],
+      "global_uses": [
+        "SemanticError",
+        "ast",
+        "exc",
+        "ir"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "error",
+          "class_name": "CodeGenerator",
+          "start_line": 69,
+          "end_line": 71,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def error(self, msg, loc=None):\n        self.pkg.ok = False\n        self.diag.error(msg, loc)"
+        },
+        {
+          "symbol_name": "gen_stmt",
+          "class_name": "CodeGenerator",
+          "start_line": 107,
+          "end_line": 139,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def gen_stmt(self, code):\n        \"\"\" Generate code for a statement \"\"\"\n        try:\n            assert isinstance(code, ast.Statement)\n            self.builder.setLoc(code.loc)\n            if type(code) is ast.Compound:\n                for s in code.statements:\n                    self.gen_stmt(s)\n            elif type(code) is ast.Empty:\n                pass\n            elif type(code) is ast.Assignment:\n                self.gen_assignment_stmt(code)\n            elif type(code) is ast.ExpressionStatement:\n                self.gen_expr_code(code.ex)\n            elif type(code) is ast.If:\n                self.gen_if_stmt(code)\n            elif type(code) is ast.Return:\n                re = self.gen_expr_code(code.expr)\n                # TODO: handle return value??\n                # self.builder.emit(ir.Move(self.builder.fn.return_value, re))\n                self.builder.emit(ir.Jump(self.builder.fn.epiloog))\n                b = self.builder.newBlock()\n                self.builder.setBlock(b)\n            elif type(code) is ast.While:\n                self.gen_while(code)\n            elif type(code) is ast.For:\n                self.gen_for_stmt(code)\n            elif type(code) is ast.Switch:\n                raise NotImplementedError('Unknown stmt {}'.format(code))\n            else:\n                raise NotImplementedError('Unknown stmt {}'.format(code))\n        except SemanticError as exc:\n            self.error(exc.msg, exc.loc)"
+        },
+        {
+          "symbol_name": "gen_assignment_stmt",
+          "class_name": "CodeGenerator",
+          "start_line": 141,
+          "end_line": 153,
+          "relevance": [
+            "direct_call_reference",
+            "same_class"
+          ],
+          "source": "    def gen_assignment_stmt(self, code):\n        \"\"\" Generate code for assignment statement \"\"\"\n        lval = self.gen_expr_code(code.lval)\n        rval = self.make_rvalue_expr(code.rval)\n        if not self.equal_types(code.lval.typ, code.rval.typ):\n            raise SemanticError('Cannot assign {} to {}'\n                                .format(code.rval.typ, code.lval.typ),\n                                code.loc)\n        if not code.lval.lvalue:\n            raise SemanticError('No valid lvalue {}'.format(code.lval),\n                                code.lval.loc)\n        store_ins = ir.Store(rval, lval)\n        self.builder.emit(store_ins)"
+        }
+      ]
+    },
+    "same_class_evidence": {
+      "class_name": "CodeGenerator",
+      "related_methods_count": 2,
+      "related_attributes_count": 1,
+      "related_methods": [
+        {
+          "symbol_name": "error",
+          "start_line": 69,
+          "end_line": 71,
+          "relevance": [
+            "direct_self_call"
+          ],
+          "source": "    def error(self, msg, loc=None):\n        self.pkg.ok = False\n        self.diag.error(msg, loc)"
+        },
+        {
+          "symbol_name": "gen_assignment_stmt",
+          "start_line": 141,
+          "end_line": 153,
+          "relevance": [
+            "direct_self_call"
+          ],
+          "source": "    def gen_assignment_stmt(self, code):\n        \"\"\" Generate code for assignment statement \"\"\"\n        lval = self.gen_expr_code(code.lval)\n        rval = self.make_rvalue_expr(code.rval)\n        if not self.equal_types(code.lval.typ, code.rval.typ):\n            raise SemanticError('Cannot assign {} to {}'\n                                .format(code.rval.typ, code.lval.typ),\n                                code.loc)\n        if not code.lval.lvalue:\n            raise SemanticError('No valid lvalue {}'.format(code.lval),\n                                code.lval.loc)\n        store_ins = ir.Store(rval, lval)\n        self.builder.emit(store_ins)"
+        }
+      ],
+      "related_attributes": [
+        {
+          "attribute": "builder",
+          "start_line": 35,
+          "end_line": 37,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "        self.logger = logging.getLogger('c3cgen')\n        self.builder = irutils.Builder()\n        self.diag = diag"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "ir",
+          "kind": "import_from",
+          "start_line": 3,
+          "end_line": 3,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from .. import ir"
+        },
+        {
+          "symbol_name": "ast",
+          "kind": "import_from",
+          "start_line": 5,
+          "end_line": 5,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from . import astnodes as ast"
+        },
+        {
+          "symbol_name": "SemanticError",
+          "kind": "class",
+          "start_line": 8,
+          "end_line": 13,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "class SemanticError(Exception):\n    \"\"\" Error thrown when a semantic issue is observed \"\"\"\n    def __init__(self, msg, loc):\n        super().__init__()\n        self.msg = msg\n        self.loc = loc"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

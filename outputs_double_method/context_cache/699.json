@@ -1,0 +1,95 @@
+{
+  "task_id": "699",
+  "repo_owner": "nocproject",
+  "repo_name": "noc",
+  "file_path": "core/service/rpc.py",
+  "commit": "2cc5f4e96f3e91e6ffdada9d17009f9538b6d6e4",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-07T18:33:46+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "2cc5f4e96f3e91e6ffdada9d17009f9538b6d6e4",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-07T18:33:46+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "core/service/rpc.py",
+    "original_signature": "def _call(self, method, *args, **kwargs):",
+    "target_file": {
+      "ok": true,
+      "path": "core/service/rpc.py",
+      "sha": "b92b8a4e275430ff8480a5c86cd0505e707be013",
+      "download_url": "https://raw.githubusercontent.com/nocproject/noc/2cc5f4e96f3e91e6ffdada9d17009f9538b6d6e4/core/service/rpc.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n##----------------------------------------------------------------------\n## RPC Wrapper\n##----------------------------------------------------------------------\n## Copyright (C) 2007-2015 The NOC Project\n## See LICENSE for details\n##----------------------------------------------------------------------\n\n## Python modules\nimport itertools\nimport uuid\nimport json\nimport logging\n## Third-party modules\nimport tornado.concurrent\nimport tornado.gen\nimport tornado.httpclient\n## NOC modules\nfrom noc.lib.log import PrefixLoggerAdapter\n\nlogger = logging.getLogger(__name__)\n\n\nclass RPCError(Exception):\n    pass\n\n\nclass RPCProxy(object):\n    \"\"\"\n    API Proxy\n    \"\"\"\n    def __init__(self, service, service_name):\n        self._logger = PrefixLoggerAdapter(logger, service_name)\n        self._service = service\n        self._service_name = service_name\n        self._api = service_name.split(\"-\")[0]\n        self._tid = itertools.count()\n        self._transactions = {}\n        self._methods = {}\n\n    def __del__(self):\n        self.close()\n\n    def __getattr__(self, item):\n        if item.startswith(\"_\"):\n            return self.__dict__[item]\n        else:\n            mw = self._methods.get(item)\n            if not mw:\n                mw = RPCMethod(self, item)\n                self._methods[item] = mw\n            return mw\n\n    @tornado.gen.coroutine\n    def _call(self, method, *args, **kwargs):\n        tid = self._tid.next()\n        msg = {\n            \"method\": method,\n            \"params\": list(args)\n        }\n        is_notify = \"_notify\" in kwargs\n        if not is_notify:\n            msg[\"id\"] = tid\n        msg = json.dumps(msg)\n        for timeout in self._service.iter_rpc_retry_timeout():\n            services = self._service.resolve_service(self._service_name)\n            if not services:\n                raise RPCError(\"Service not found\")\n            for svc in services:\n                client = tornado.httpclient.AsyncHTTPClient()\n                try:\n                    response = yield client.fetch(\n                        \"http://%s/api/%s/\" % (svc, self._api),\n                        method=\"POST\",\n                        body=msg\n                    )\n                except tornado.httpclient.HTTPError, why:\n                    if why.code != 499:\n                        raise RPCError(\"RPC Call Failed: %s\", why)\n                    else:\n                        self._service.logger.info(\n                            \"Service is not available at %s. Retrying\",\n                            svc\n                        )\n                        continue\n                except Exception, why:\n                    # @todo: Grab connection refused\n                    # wait for timeout\n                    raise RPCError(\"RPC Call Failed: %s\" % why)\n                if not is_notify:\n                    result = json.loads(response.body)\n                    if result.get(\"error\"):\n                        raise RPCError(\"RPC Call Failed: %s\" % result[\"error\"])\n                    else:\n                        raise tornado.gen.Return(result[\"result\"])\n            self._service.logger.info(\n                \"All services are not available. Waiting %s seconds\"\n            )\n            yield tornado.gen.sleep(timeout)\n\n\nclass RPCMethod(object):\n    \"\"\"\n    API Method wrapper\n    \"\"\"\n    def __init__(self, proxy, name):\n        self._proxy = proxy\n        self._name = name\n        self._metric = \"rpc_call_%s_%s\" % (proxy._service_name, name)\n\n    @tornado.gen.coroutine\n    def __call__(self, *args, **kwargs):\n        self._proxy._service.logger.debug(\n            \"[REMOTE CALL>] %s.%s(%s, %s)\",\n            self._proxy._service_name,\n            self._name, args, kwargs\n        )\n        self._proxy._service.metrics[self._metric] += 1\n        result = yield self._proxy._call(self._name, *args, **kwargs)\n        self._proxy._service.logger.debug(\n            \"[REMOTE CALL<] %s.%s\",\n            self._proxy._service_name,\n            self._name\n        )\n        raise tornado.gen.Return(result)\n",
+      "total_lines": 125,
+      "ref": "2cc5f4e96f3e91e6ffdada9d17009f9538b6d6e4"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": null,
+      "related_methods_count": 0,
+      "related_attributes_count": 0,
+      "related_methods": [],
+      "related_attributes": []
+    },
+    "module_symbols": {
+      "count": 0,
+      "items": []
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

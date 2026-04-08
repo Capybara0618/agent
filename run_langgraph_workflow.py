@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from satd_langgraph import LangGraphSATDWorkflow
-
+ 
 
 # python run_langgraph_workflow.py --input code.csv --output-dir outputs_langgraph_smoke5 --limit 5 --model gpt-4o-mini --verbose --write-batch-size 10 --resume
 
@@ -29,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Print per-task and per-stage progress logs while running.",
+    )
+    parser.add_argument(
+        "--acceptance-profile",
+        choices=("baseline", "balanced_em"),
+        default="baseline",
+        help="Reviewer acceptance profile.",
     )
     parser.add_argument(
         "--write-batch-size",

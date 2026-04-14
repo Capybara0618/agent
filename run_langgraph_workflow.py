@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from satd_langgraph import LangGraphSATDWorkflow
@@ -63,11 +64,37 @@ def build_parser() -> argparse.ArgumentParser:
         default="lightweight",
         help="Repair prompt style. Default keeps a baseline-style lightweight fixer prompt.",
     )
+    parser.add_argument(
+        "--repair-context-mode",
+        choices=["clone_treesitter", "method_query"],
+        default="clone_treesitter",
+        help="Repair context construction mode. Default clones the repo locally and uses Tree-sitter to find relevant methods.",
+    )
+    parser.add_argument(
+        "--max-method-contexts",
+        type=int,
+        default=2,
+        help="Maximum number of model-identified methods to retrieve as repair context. Default is 2.",
+    )
+    parser.add_argument(
+        "--git-remote-base",
+        default=None,
+        help="Optional git remote base for repo clone/fetch, e.g. https://mirrors.tuna.tsinghua.edu.cn/git/github.com",
+    )
+    parser.add_argument(
+        "--git-remote-template",
+        default=None,
+        help="Optional git remote template with {owner} and {repo}; overrides --git-remote-base.",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.git_remote_base:
+        os.environ["SATD_GIT_REMOTE_BASE"] = args.git_remote_base
+    if args.git_remote_template:
+        os.environ["SATD_GIT_REMOTE_TEMPLATE"] = args.git_remote_template
     workflow = LangGraphSATDWorkflow(
         max_rounds=args.max_rounds,
         model=args.model,
@@ -76,6 +103,8 @@ def main() -> None:
         use_analyzer=args.enable_analyzer,
         use_reviewer=args.enable_review,
         repair_prompt_mode=args.repair_prompt_mode,
+        repair_context_mode=args.repair_context_mode,
+        max_method_contexts=args.max_method_contexts,
     )
     summary = workflow.run_csv(args.input, args.output_dir, limit=args.limit, resume=args.resume)
 
@@ -95,14 +124,23 @@ def main() -> None:
     print(f"Analyzer enabled: {args.enable_analyzer}")
     print(f"Review enabled: {args.enable_review}")
     print(f"Repair prompt mode: {args.repair_prompt_mode}")
+    print(f"Repair context mode: {summary.get('repair_context_mode')}")
+    print(f"Single repair path: {summary.get('single_repair_path')}")
+    print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")
+    print(f"Max method contexts: {summary.get('max_method_contexts')}")
     print(f"Dual repair candidates: {summary.get('dual_repair_candidates')}")
+    print(f"Git remote base: {os.environ.get('SATD_GIT_REMOTE_BASE') or 'https://mirrors.tuna.tsinghua.edu.cn/git/github.com'}")
+    print(f"Git remote template: {os.environ.get('SATD_GIT_REMOTE_TEMPLATE') or 'none'}")
     print(f"Resume mode: {args.resume}")
     print(f"Main trajectory file: {args.output_dir / 'trajectory_overview.csv'}")
+    print(f"Task progress file: {args.output_dir / 'task_progress.csv'}")
     print(f"Context cache index: {args.output_dir / 'context_cache.csv'}")
     print(f"Context cache dir: {args.output_dir / 'context_cache'}")
+    print(f"Repair debug dir: {args.output_dir / 'repair_debug'}")
     print(f"Summary file: {args.output_dir / 'summary.csv'}")
 
 
 if __name__ == "__main__":
     main()
+
 

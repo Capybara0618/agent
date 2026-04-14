@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import json
 import re
+import shutil
 from pathlib import Path
 
 from .bootstrap import bootstrap_vendor
@@ -13,7 +14,19 @@ from langgraph.graph import END, START, StateGraph
 
 from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer, OpenAISelector
 from .csv_loader import load_satd_csv
-from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, SATDRecord, SelectorDecision, preprocess_python_code, record_to_graph_input, trace_from_state
+from .schema import (
+    AnalysisResult,
+    GraphState,
+    MethodInquiryResult,
+    RepairAttempt,
+    RetrievedMethodContext,
+    ReviewResult,
+    SATDRecord,
+    SelectorDecision,
+    preprocess_python_code,
+    record_to_graph_input,
+    trace_from_state,
+)
 
 
 class LangGraphSATDWorkflow:
@@ -25,9 +38,11 @@ class LangGraphSATDWorkflow:
         write_batch_size: int = 10,
         use_analyzer: bool = False,
         use_reviewer: bool = False,
-        use_selector: bool = True,
+        use_selector: bool = False,
         repair_prompt_mode: str = "lightweight",
-        dual_repair_candidates: bool = True,
+        dual_repair_candidates: bool = False,
+        repair_context_mode: str = "clone_treesitter",
+        max_method_contexts: int = 2,
     ) -> None:
         self.max_rounds = max_rounds
         self.model = model
@@ -38,10 +53,20 @@ class LangGraphSATDWorkflow:
         self.use_selector = use_selector
         self.repair_prompt_mode = repair_prompt_mode
         self.dual_repair_candidates = dual_repair_candidates
-        client = OpenAICompatClient(model=model)
+        self.repair_context_mode = repair_context_mode
+        self.max_method_contexts = max(1, int(max_method_contexts))
+        client = OpenAICompatClient(model=model, verbose=verbose)
         self.context_client = client
+        self.context_client.toolbox.logger = self._log
         self.analyzer = OpenAIAnalyzer(client)
-        self.fixer = OpenAIFixer(client, prompt_mode=repair_prompt_mode)
+        self.fixer = OpenAIFixer(
+            client,
+            prompt_mode=repair_prompt_mode,
+            repair_context_mode=repair_context_mode,
+            max_method_contexts=self.max_method_contexts,
+            logger=self._log,
+            checkpoint_callback=self._record_repair_debug_checkpoint,
+        )
         self.selector = OpenAISelector(client)
         self.reviewer = OpenAIReviewer(client)
         self.graph = self._build_graph()
@@ -65,22 +90,22 @@ class LangGraphSATDWorkflow:
         return graph.compile()
 
     def _analyze_node(self, state: GraphState) -> dict:
-        self._log(f"[task {state['task_id']}] analyze start")
-        context_bundle = state.get("github_context") or self._load_or_build_shared_context(state)
+        self._log(f"{self._task_label(state)} analyze start")
+        context_bundle = state.get("github_context") or self._load_or_build_base_context(state)
         if self.use_analyzer:
             try:
                 analysis = self.analyzer.run({**state, "github_context": context_bundle})
             except Exception as exc:
                 if self.context_client._is_content_filter_error(exc):
-                    self._log(f"[task {state['task_id']}] analyze content-filtered; using fallback drop")
+                    self._log(f"{self._task_label(state)} analyze content-filtered; using fallback drop")
                     analysis = self._fallback_analysis(context_bundle, reason="analyzer_content_filter")
                 else:
-                    self._log(f"[task {state['task_id']}] analyze exception type={type(exc).__name__}; using fallback drop")
+                    self._log(f"{self._task_label(state)} analyze exception type={type(exc).__name__}; using fallback drop")
                     analysis = self._fallback_analysis(context_bundle, reason=f"analyzer_exception:{type(exc).__name__}")
         else:
             analysis = self._bypass_analysis(state, context_bundle)
         self._log(
-            f"[task {state['task_id']}] analyze done decision={analysis.decision} "
+            f"{self._task_label(state)} analyze done decision={analysis.decision} "
             f"repairable={analysis.repairable} score={analysis.repairability_score:.2f} "
             f"mismatch={analysis.historical_snapshot_mismatch} github={analysis.github_evidence_strength}"
         )
@@ -88,21 +113,35 @@ class LangGraphSATDWorkflow:
 
     def _repair_node(self, state: GraphState) -> dict:
         next_round = state["round_id"] + 1
-        self._log(f"[task {state['task_id']}] repair start round={next_round}")
-        context_bundle = self._load_or_build_shared_context(state)
+        self._log(f"{self._task_label(state)} repair start round={next_round}")
+        context_bundle = state.get("github_context") or self._load_or_build_base_context(state)
         satd_route_type = self._infer_satd_route_type(state)
-        candidates = self._run_repair_candidates(state, context_bundle, next_round, satd_route_type)
+        candidates, method_inquiry, retrieved_method_contexts, missing_method_names = self._run_repair_candidates(
+            state,
+            context_bundle,
+            next_round,
+            satd_route_type,
+        )
         provisional = self._select_candidate_without_selector(candidates)
+        context_bundle = self._attach_method_context(
+            context_bundle,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=retrieved_method_contexts,
+            missing_method_names=missing_method_names,
+        )
         self._log(
-            f"[task {state['task_id']}] repair done round={provisional.round_id} "
+            f"{self._task_label(state)} repair done round={provisional.round_id} "
             f"candidate={provisional.candidate_mode} scope={provisional.changed_scope} conf={provisional.confidence:.2f}"
         )
         return {
             "github_context": context_bundle,
             "satd_route_type": satd_route_type,
+            "method_inquiry": method_inquiry,
+            "retrieved_method_contexts": retrieved_method_contexts,
+            "missing_method_names": missing_method_names,
             "repair_candidates": candidates,
             "candidate_repairs": [*state["candidate_repairs"], *candidates],
-            "repair_context_used": provisional.candidate_mode.endswith("context"),
+            "repair_context_used": bool(retrieved_method_contexts),
             "repair_feedback": state.get("repair_feedback"),
             "status": "repairing",
             "round_id": provisional.round_id,
@@ -110,23 +149,23 @@ class LangGraphSATDWorkflow:
         }
 
     def _select_node(self, state: GraphState) -> dict:
-        self._log(f"[task {state['task_id']}] select start round={state['round_id']}")
+        self._log(f"{self._task_label(state)} select start round={state['round_id']}")
         candidates = state.get("repair_candidates") or ([state["latest_repair"]] if state.get("latest_repair") else [])
         decision = self._run_selector(state, candidates)
         selected_repair = self._select_repair_from_decision(candidates, decision)
         self._log(
-            f"[task {state['task_id']}] select done round={decision.round_id} "
+            f"{self._task_label(state)} select done round={decision.round_id} "
             f"route={decision.satd_route_type} candidate={selected_repair.candidate_mode} conf={decision.confidence:.2f}"
         )
         return {
-            "repair_context_used": selected_repair.candidate_mode.endswith("context"),
+            "repair_context_used": bool(state.get("retrieved_method_contexts")),
             "latest_repair": selected_repair,
             "selector_decisions": [*state["selector_decisions"], decision],
             "status": "selected",
         }
 
     def _review_node(self, state: GraphState) -> dict:
-        self._log(f"[task {state['task_id']}] review start round={state['round_id']}")
+        self._log(f"{self._task_label(state)} review start round={state['round_id']}")
         assert state["analysis"] is not None
         assert state["latest_repair"] is not None
         context_bundle = self._ensure_review_context_cache(state)
@@ -135,15 +174,15 @@ class LangGraphSATDWorkflow:
                 review = self.reviewer.run({**state, "github_context": context_bundle})
             except Exception as exc:
                 if self.context_client._is_content_filter_error(exc):
-                    self._log(f"[task {state['task_id']}] review content-filtered; using fallback reject")
+                    self._log(f"{self._task_label(state)} review content-filtered; using fallback reject")
                     review = self._fallback_review(state, reason="review_content_filter")
                 else:
-                    self._log(f"[task {state['task_id']}] review exception type={type(exc).__name__}; using fallback reject")
+                    self._log(f"{self._task_label(state)} review exception type={type(exc).__name__}; using fallback reject")
                     review = self._fallback_review(state, reason=f"review_exception:{type(exc).__name__}")
         else:
             review = self._bypass_review(state)
         self._log(
-            f"[task {state['task_id']}] review done round={review.round_id} "
+            f"{self._task_label(state)} review done round={review.round_id} "
             f"candidate={state['latest_repair'].candidate_mode} approved={review.approved} score={review.review_score:.2f}"
         )
         repair_feedback = None if review.approved else self._build_repair_feedback(review)
@@ -154,7 +193,7 @@ class LangGraphSATDWorkflow:
             "repair_feedback": repair_feedback,
             "review_strict_gate_result": "approved" if review.approved else "rejected",
             "status": "accepted" if review.approved else "review_failed",
-            "repair_context_used": state["latest_repair"].candidate_mode.endswith("context"),
+            "repair_context_used": bool(state.get("retrieved_method_contexts")),
             "latest_review": review,
             "repairs": [*state["repairs"], state["latest_repair"]],
             "reviews": [*state["reviews"], review],
@@ -162,7 +201,7 @@ class LangGraphSATDWorkflow:
         }
 
     def _accept_node(self, state: GraphState) -> dict:
-        self._log(f"[task {state['task_id']}] accepted after rounds={state['round_id']}")
+        self._log(f"{self._task_label(state)} accepted after rounds={state['round_id']}")
         return {
             "status": "accepted",
             "repair_candidates": [],
@@ -173,9 +212,9 @@ class LangGraphSATDWorkflow:
 
     def _drop_node(self, state: GraphState) -> dict:
         if state["analysis"] and not state["analysis"].repairable:
-            self._log(f"[task {state['task_id']}] dropped by analyzer reason={state['analysis'].drop_reason}")
+            self._log(f"{self._task_label(state)} dropped by analyzer reason={state['analysis'].drop_reason}")
             return {"status": "dropped_by_analyzer", "repair_candidates": [], "repair_feedback": None}
-        self._log(f"[task {state['task_id']}] dropped after review rounds={state['round_id']}")
+        self._log(f"{self._task_label(state)} dropped after review rounds={state['round_id']}")
         return {
             "status": "dropped_after_review",
             "repair_candidates": [],
@@ -242,34 +281,40 @@ class LangGraphSATDWorkflow:
         context_bundle: dict,
         round_id: int,
         satd_route_type: str,
-    ) -> list[RepairAttempt]:
+    ) -> tuple[list[RepairAttempt], MethodInquiryResult, list[RetrievedMethodContext], list[str]]:
         candidates: list[RepairAttempt] = []
         candidate_modes = self._candidate_modes_for_route(satd_route_type)
+        method_inquiry = MethodInquiryResult()
+        retrieved_method_contexts: list[RetrievedMethodContext] = []
+        missing_method_names: list[str] = []
         for candidate_mode in candidate_modes:
             candidate_state = {
                 **state,
                 "satd_route_type": satd_route_type,
                 "candidate_mode": candidate_mode,
-                "github_context": None if candidate_mode.endswith("no_context") else context_bundle,
+                "github_context": context_bundle,
             }
             try:
-                repair = self.fixer.run(candidate_state, candidate_mode=candidate_mode)
+                repair, inquiry, contexts, missing = self.fixer.run(candidate_state, candidate_mode=candidate_mode)
+                method_inquiry = inquiry
+                retrieved_method_contexts = contexts
+                missing_method_names = missing
             except Exception as exc:
                 if self.context_client._is_content_filter_error(exc):
                     self._log(
-                        f"[task {state['task_id']}] repair candidate={candidate_mode} "
+                        f"{self._task_label(state)} repair candidate={candidate_mode} "
                         f"content-filtered; using fallback no-op repair"
                     )
                     repair = self._fallback_repair(state, round_id, reason=f"fixer_content_filter:{candidate_mode}")
                 else:
                     self._log(
-                        f"[task {state['task_id']}] repair candidate={candidate_mode} "
+                        f"{self._task_label(state)} repair candidate={candidate_mode} "
                         f"exception type={type(exc).__name__}; using fallback no-op repair"
                     )
                     repair = self._fallback_repair(state, round_id, reason=f"fixer_exception:{candidate_mode}:{type(exc).__name__}")
                 repair.candidate_mode = candidate_mode
             candidates.append(repair)
-        return candidates
+        return candidates, method_inquiry, retrieved_method_contexts, missing_method_names
 
     def _run_selector(self, state: GraphState, candidates: list[RepairAttempt]) -> SelectorDecision:
         if not candidates:
@@ -298,9 +343,9 @@ class LangGraphSATDWorkflow:
             return self.selector.run({**state, "repair_candidates": candidates})
         except Exception as exc:
             if self.context_client._is_content_filter_error(exc):
-                self._log(f"[task {state['task_id']}] selector content-filtered; using fallback selection")
+                self._log(f"{self._task_label(state)} selector content-filtered; using fallback selection")
             else:
-                self._log(f"[task {state['task_id']}] selector exception type={type(exc).__name__}; using fallback selection")
+                self._log(f"{self._task_label(state)} selector exception type={type(exc).__name__}; using fallback selection")
             selected = self._select_candidate_without_selector(candidates)
             index = max(0, next((i for i, item in enumerate(candidates) if item is selected), 0))
             return SelectorDecision(
@@ -352,23 +397,24 @@ class LangGraphSATDWorkflow:
         return "generic"
 
     def _candidate_modes_for_route(self, satd_route_type: str) -> list[str]:
-        if satd_route_type in {"type_annotation", "remove_temporary", "restore_uncomment"}:
-            return ["baseline_no_context", "typed_no_context"]
-        if satd_route_type == "replace_symbol":
-            return ["baseline_no_context", "baseline_context", "typed_context"]
-        if satd_route_type == "small_local_value_fix":
+        if self._dual_candidate_enabled():
             return ["baseline_no_context", "baseline_context"]
-        return ["baseline_no_context", "baseline_context"] if self.dual_repair_candidates else ["baseline_context"]
+        return ["baseline_context"]
 
-    def run_record(self, record: SATDRecord):
-        self._log(
-            f"[task {record.task_id}] start project={record.project} file={record.file_path} "
-            f"commit={(record.commit or '')[:12]}"
-        )
+    def _dual_candidate_enabled(self) -> bool:
+        return bool(getattr(self, "dual_repair_candidates", False) or getattr(self, "use_selector", False))
+
+    def run_record(self, record: SATDRecord, task_index: int = 0, task_total: int = 0):
         initial_state = record_to_graph_input(record, self.max_rounds)
-        initial_state["github_context"] = self._load_or_build_shared_context(initial_state)
+        initial_state["task_index"] = task_index
+        initial_state["task_total"] = task_total
+        self._log(
+            f"{self._task_label(initial_state)} start project={record.project} file={record.file_path} "
+            f"commit={(record.commit or '')[:12]} satd={self._compact_satd_comment(record.satd_comment)}"
+        )
+        initial_state["github_context"] = self._load_or_build_base_context(initial_state)
         final_state = self.graph.invoke(initial_state)
-        self._log(f"[task {record.task_id}] end status={final_state['status']}")
+        self._log(f"{self._task_label(final_state)} end status={final_state['status']}")
         return trace_from_state(final_state, record.em_label)
 
     def run_csv(self, input_path: Path, output_dir: Path, limit: int | None = None, resume: bool = False) -> dict:
@@ -377,7 +423,11 @@ class LangGraphSATDWorkflow:
         summary: dict | None = None
         output_dir.mkdir(parents=True, exist_ok=True)
         self._current_output_dir = output_dir
+        if not resume:
+            self._reset_output_dir_for_fresh_run(output_dir)
         self._context_cache_dir().mkdir(parents=True, exist_ok=True)
+        if not resume:
+            self._write_task_progress_csv(output_dir / "task_progress.csv", [])
 
         existing_rows = self._load_existing_rows(output_dir) if resume else self._empty_existing_rows()
         completed_ids = {row.get("task_id") for row in existing_rows["results"] if row.get("task_id")}
@@ -393,9 +443,10 @@ class LangGraphSATDWorkflow:
             overall_index = len(completed_ids) + offset
             if self.verbose:
                 print(f"[progress] {overall_index}/{total} task_id={record.task_id} begin")
-            trace = self.run_record(record)
+            trace = self.run_record(record, task_index=overall_index, task_total=total)
             new_traces.append(trace)
             pending_flush_traces.append(trace)
+            self._append_task_progress_csv(output_dir / "task_progress.csv", [trace], overall_index, total)
             if self.verbose:
                 print(f"[progress] {overall_index}/{total} task_id={record.task_id} status={trace.status} rounds={trace.rounds_used} exact={trace.exact_match}")
 
@@ -411,6 +462,10 @@ class LangGraphSATDWorkflow:
                 summary["use_selector"] = self.use_selector
                 summary["repair_prompt_mode"] = self.repair_prompt_mode
                 summary["dual_repair_candidates"] = self.dual_repair_candidates
+                summary["repair_context_mode"] = self.repair_context_mode
+                summary["max_method_contexts"] = self.max_method_contexts
+                summary["single_repair_path"] = not self._dual_candidate_enabled()
+                summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
                 if resume and completed_ids:
                     self._append_outputs(output_dir, pending_flush_traces)
                     self._write_summary_csv(output_dir / "summary.csv", summary)
@@ -432,10 +487,35 @@ class LangGraphSATDWorkflow:
             summary["use_selector"] = self.use_selector
             summary["repair_prompt_mode"] = self.repair_prompt_mode
             summary["dual_repair_candidates"] = self.dual_repair_candidates
+            summary["repair_context_mode"] = self.repair_context_mode
+            summary["max_method_contexts"] = self.max_method_contexts
+            summary["single_repair_path"] = not self._dual_candidate_enabled()
+            summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
             self._write_summary_csv(output_dir / "summary.csv", summary)
 
         assert summary is not None
         return summary
+
+    def _reset_output_dir_for_fresh_run(self, output_dir: Path) -> None:
+        for directory in (output_dir / "repair_debug", output_dir / "context_cache"):
+            if directory.exists():
+                shutil.rmtree(directory)
+        for filename in (
+            "task_progress.csv",
+            "trajectory_overview.csv",
+            "results.csv",
+            "repairs.csv",
+            "repair_candidates.csv",
+            "selector_decisions.csv",
+            "reviews.csv",
+            "candidate_reviews.csv",
+            "github_context.csv",
+            "context_cache.csv",
+            "summary.csv",
+        ):
+            path = output_dir / filename
+            if path.exists():
+                path.unlink()
 
     def _summarize(self, traces: list) -> dict:
         total = len(traces)
@@ -481,6 +561,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -499,6 +580,12 @@ class LangGraphSATDWorkflow:
         reviews = {item.get("round_id"): item for item in trace.reviews}
         selector_decisions = {item.get("round_id"): item for item in trace.selector_decisions}
         latest_selector = trace.selector_decisions[-1] if trace.selector_decisions else {}
+        method_inquiry = trace.method_inquiry or {}
+        retrieved_method_names = [
+            item.get("method_name")
+            for item in trace.retrieved_method_contexts
+            if item.get("method_name")
+        ]
         row = {
             "task_id": trace.task_id,
             "project": trace.project,
@@ -542,6 +629,11 @@ class LangGraphSATDWorkflow:
             "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
             "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
             "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
+            "identified_method_names": " | ".join(method_inquiry.get("required_methods", [])),
+            "retrieved_method_names": " | ".join(retrieved_method_names),
+            "missing_method_names": " | ".join(trace.missing_method_names),
+            "retrieved_method_count": len(trace.retrieved_method_contexts),
+            "method_context_json": json.dumps(trace.retrieved_method_contexts, ensure_ascii=False),
             "repair_context_used": trace.repair_context_used,
             "review_strict_gate_result": trace.review_strict_gate_result,
             "selector_selected_candidate_mode": latest_selector.get("selected_candidate_mode"),
@@ -618,6 +710,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -686,7 +779,7 @@ class LangGraphSATDWorkflow:
     def _write_github_context_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
-            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "base_context_json", "repair_context_json", "review_context_json",
+            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count", "base_context_json", "repair_context_json", "review_context_json", "method_context_json",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -716,15 +809,19 @@ class LangGraphSATDWorkflow:
                     "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
                     "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
                     "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
+                    "identified_method_count": metadata.get("identified_method_count"),
+                    "retrieved_method_count": metadata.get("retrieved_method_count"),
+                    "missing_method_count": metadata.get("missing_method_count"),
                     "base_context_json": json.dumps(context.get("base_context", {}), ensure_ascii=False),
                     "repair_context_json": json.dumps(context.get("repair_context", {}), ensure_ascii=False),
                     "review_context_json": json.dumps(context.get("review_context", {}), ensure_ascii=False),
+                    "method_context_json": json.dumps((context.get("repair_context", {}) or {}).get("retrieved_methods", []), ensure_ascii=False),
                 })
 
     def _write_context_cache_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "commit", "context_commit", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
-            "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
+            "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -759,6 +856,9 @@ class LangGraphSATDWorkflow:
                     "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
                     "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
                     "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
+                    "identified_method_count": metadata.get("identified_method_count"),
+                    "retrieved_method_count": metadata.get("retrieved_method_count"),
+                    "missing_method_count": metadata.get("missing_method_count"),
                 })
 
     def _append_outputs(self, output_dir: Path, traces: list) -> None:
@@ -771,6 +871,89 @@ class LangGraphSATDWorkflow:
         self._append_candidate_reviews_csv(output_dir / "candidate_reviews.csv", traces)
         self._append_github_context_csv(output_dir / "github_context.csv", traces)
         self._append_context_cache_csv(output_dir / "context_cache.csv", traces)
+
+    def _write_task_progress_csv(self, path: Path, traces: list) -> None:
+        fieldnames = [
+            "task_id",
+            "task_index",
+            "task_total",
+            "project",
+            "file_path",
+            "commit",
+            "status",
+            "rounds_used",
+            "exact_match",
+            "identified_method_names",
+            "retrieved_method_names",
+            "missing_method_names",
+            "retrieved_method_count",
+            "latest_stage",
+            "debug_file",
+        ]
+        with path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self._task_progress_rows(traces):
+                writer.writerow(row)
+
+    def _append_task_progress_csv(self, path: Path, traces: list, task_index: int | None = None, task_total: int | None = None) -> None:
+        fieldnames = [
+            "task_id",
+            "task_index",
+            "task_total",
+            "project",
+            "file_path",
+            "commit",
+            "status",
+            "rounds_used",
+            "exact_match",
+            "identified_method_names",
+            "retrieved_method_names",
+            "missing_method_names",
+            "retrieved_method_count",
+            "latest_stage",
+            "debug_file",
+        ]
+        rows = self._task_progress_rows(traces, task_index=task_index, task_total=task_total)
+        self._append_csv_rows(path, fieldnames, rows)
+
+    def _task_progress_rows(self, traces: list, task_index: int | None = None, task_total: int | None = None) -> list[dict]:
+        rows = []
+        for trace in traces:
+            method_inquiry = trace.method_inquiry or {}
+            retrieved_method_names = [
+                item.get("method_name")
+                for item in trace.retrieved_method_contexts
+                if item.get("method_name")
+            ]
+            debug_path = self._repair_debug_file(trace.task_id) if self._current_output_dir is not None else None
+            latest_stage = ""
+            if debug_path and debug_path.exists():
+                try:
+                    debug_payload = json.loads(debug_path.read_text(encoding="utf-8"))
+                    latest_stage = str(debug_payload.get("latest_stage") or "")
+                except json.JSONDecodeError:
+                    latest_stage = ""
+            rows.append(
+                {
+                    "task_id": trace.task_id,
+                    "task_index": task_index,
+                    "task_total": task_total,
+                    "project": trace.project,
+                    "file_path": trace.file_path,
+                    "commit": trace.commit,
+                    "status": trace.status,
+                    "rounds_used": trace.rounds_used,
+                    "exact_match": trace.exact_match,
+                    "identified_method_names": " | ".join(method_inquiry.get("required_methods", [])),
+                    "retrieved_method_names": " | ".join(retrieved_method_names),
+                    "missing_method_names": " | ".join(trace.missing_method_names),
+                    "retrieved_method_count": len(trace.retrieved_method_contexts),
+                    "latest_stage": latest_stage,
+                    "debug_file": str(debug_path) if debug_path else "",
+                }
+            )
+        return rows
 
     def _append_csv_rows(self, path: Path, fieldnames: list[str], rows: list[dict]) -> None:
         if not rows:
@@ -807,6 +990,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -822,6 +1006,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence",
             "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
@@ -886,7 +1071,7 @@ class LangGraphSATDWorkflow:
     def _append_github_context_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line",
-            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "base_context_json", "repair_context_json", "review_context_json",
+            "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count", "base_context_json", "repair_context_json", "review_context_json", "method_context_json",
         ]
         rows = []
         for trace in traces:
@@ -914,16 +1099,20 @@ class LangGraphSATDWorkflow:
                 "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
                 "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
                 "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
+                "identified_method_count": metadata.get("identified_method_count"),
+                "retrieved_method_count": metadata.get("retrieved_method_count"),
+                "missing_method_count": metadata.get("missing_method_count"),
                 "base_context_json": json.dumps(context.get("base_context", {}), ensure_ascii=False),
                 "repair_context_json": json.dumps(context.get("repair_context", {}), ensure_ascii=False),
                 "review_context_json": json.dumps(context.get("review_context", {}), ensure_ascii=False),
+                "method_context_json": json.dumps((context.get("repair_context", {}) or {}).get("retrieved_methods", []), ensure_ascii=False),
             })
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_context_cache_csv(self, path: Path, traces: list) -> None:
         fieldnames = [
             "task_id", "commit", "context_commit", "cache_file", "base_cached", "base_cache_source", "base_context_fetched_at", "repair_cached", "repair_cache_source", "repair_context_fetched_at", "review_cached", "review_cache_source", "review_context_fetched_at",
-            "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
+            "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count",
         ]
         rows = []
         for trace in traces:
@@ -956,6 +1145,9 @@ class LangGraphSATDWorkflow:
                 "retrieved_test_snippets_count": metadata.get("retrieved_test_snippets_count"),
                 "retrieved_callsite_snippets_count": metadata.get("retrieved_callsite_snippets_count"),
                 "retrieved_history_snippets_count": metadata.get("retrieved_history_snippets_count"),
+                "identified_method_count": metadata.get("identified_method_count"),
+                "retrieved_method_count": metadata.get("retrieved_method_count"),
+                "missing_method_count": metadata.get("missing_method_count"),
             })
         self._append_csv_rows(path, fieldnames, rows)
 
@@ -1023,30 +1215,85 @@ class LangGraphSATDWorkflow:
         return built
 
     def _load_or_build_shared_context(self, state: GraphState) -> dict:
-        bundle = self._ensure_repair_context_cache(state)
+        bundle = state.get("github_context") or self._load_or_build_base_context(state)
         bundle.setdefault("metadata", {})["shared_context_mode"] = True
         self._persist_context_cache(state["task_id"], bundle)
         return bundle
 
     def _ensure_repair_context_cache(self, state: GraphState) -> dict:
         bundle = state.get("github_context") or self._load_or_build_base_context(state)
-        before = bool((bundle.get("metadata") or {}).get("repair_cached"))
-        enriched = self.context_client.ensure_repair_context(state, bundle)
-        if not before:
-            enriched.setdefault("metadata", {})["repair_cache_source"] = "github_fetch"
-        self._persist_context_cache(state["task_id"], enriched)
-        return enriched
+        self._persist_context_cache(state["task_id"], bundle)
+        return bundle
 
     def _ensure_review_context_cache(self, state: GraphState) -> dict:
-        bundle = state.get("github_context") or self._load_or_build_shared_context(state)
+        bundle = state.get("github_context") or self._load_or_build_base_context(state)
         bundle.setdefault("metadata", {})["review_cache_source"] = "shared_context"
         self._persist_context_cache(state["task_id"], bundle)
         return bundle
+
+    def _attach_method_context(
+        self,
+        bundle: dict,
+        *,
+        method_inquiry: MethodInquiryResult,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+        missing_method_names: list[str],
+    ) -> dict:
+        updated = dict(bundle or {})
+        metadata = dict(updated.get("metadata", {}) or {})
+        updated["metadata"] = metadata
+        context_strategy = self.repair_context_mode or "clone_treesitter"
+        updated["repair_context"] = {
+            "context_strategy": context_strategy,
+            "method_inquiry": {
+                "required_methods": list(method_inquiry.required_methods),
+                "reason": method_inquiry.reason,
+            },
+            "retrieved_methods": [
+                {
+                    "method_name": item.method_name,
+                    "path": item.path,
+                    "class_name": item.class_name,
+                    "start_line": item.start_line,
+                    "end_line": item.end_line,
+                    "source": item.source,
+                    "found": item.found,
+                }
+                for item in retrieved_method_contexts
+            ],
+            "missing_method_names": list(missing_method_names),
+        }
+        metadata.update(
+            {
+                "repair_cached": True,
+                "repair_cache_source": context_strategy,
+                "repair_context_fetched_at": metadata.get("repair_context_fetched_at") or self.context_client._timestamp(),
+                "context_strategy": context_strategy,
+                "identified_method_count": len(method_inquiry.required_methods),
+                "retrieved_method_count": len(retrieved_method_contexts),
+                "missing_method_count": len(missing_method_names),
+                "repair_evidence_mode": "strong" if retrieved_method_contexts else "weak",
+                "retrieved_test_snippets_count": 0,
+                "retrieved_callsite_snippets_count": 0,
+                "retrieved_history_snippets_count": 0,
+            }
+        )
+        if "github_evidence_strength" not in metadata:
+            metadata["github_evidence_strength"] = "medium" if retrieved_method_contexts else "low"
+        task_id = str(updated.get("task_id") or "")
+        if task_id:
+            self._persist_context_cache(task_id, updated)
+        return updated
 
     def _context_cache_dir(self) -> Path:
         if self._current_output_dir is None:
             raise RuntimeError("Output directory is not set for context caching.")
         return self._current_output_dir / "context_cache"
+
+    def _repair_debug_dir(self) -> Path:
+        if self._current_output_dir is None:
+            raise RuntimeError("Output directory is not set for repair debug output.")
+        return self._current_output_dir / "repair_debug"
 
     def _context_cache_file(self, task_id: str) -> Path:
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", task_id)
@@ -1065,6 +1312,47 @@ class LangGraphSATDWorkflow:
         path = self._context_cache_file(task_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _repair_debug_file(self, task_id: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", task_id)
+        return self._repair_debug_dir() / f"{safe}.json"
+
+    def _record_repair_debug_checkpoint(self, state: GraphState | dict, stage: str, payload: dict) -> None:
+        if self._current_output_dir is None:
+            return
+        task_id = str(state.get("task_id") or "")
+        if not task_id:
+            return
+        path = self._repair_debug_file(task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current: dict[str, object]
+        if path.exists():
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                current = {}
+        else:
+            current = {}
+        current.update(
+            {
+                "task_id": task_id,
+                "task_index": state.get("task_index"),
+                "task_total": state.get("task_total"),
+                "project": state.get("project"),
+                "user": state.get("user"),
+                "file_path": state.get("file_path"),
+                "commit": state.get("commit"),
+                "satd_comment": state.get("satd_comment"),
+                "latest_stage": stage,
+                "updated_at": self.context_client._timestamp(),
+            }
+        )
+        stages = current.get("stages")
+        if not isinstance(stages, dict):
+            stages = {}
+        stages[stage] = payload
+        current["stages"] = stages
+        path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _fallback_analysis(self, context_bundle: dict, reason: str = "analyzer_fallback") -> AnalysisResult:
         metadata = context_bundle.get("metadata", {}) if isinstance(context_bundle, dict) else {}
@@ -1192,6 +1480,21 @@ class LangGraphSATDWorkflow:
     def _log(self, message: str) -> None:
         if self.verbose:
             print(message)
+
+    def _task_label(self, state: GraphState | dict) -> str:
+        task_id = state.get("task_id", "?")
+        task_index = state.get("task_index") or 0
+        task_total = state.get("task_total") or 0
+        if task_index and task_total:
+            return f"[task {task_id} {task_index}/{task_total}]"
+        return f"[task {task_id}]"
+
+    def _compact_satd_comment(self, comment: str, limit: int = 80) -> str:
+        text = re.sub(r"\s+", " ", (comment or "").strip())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
 
 
 

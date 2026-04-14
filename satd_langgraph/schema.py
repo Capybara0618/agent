@@ -62,6 +62,23 @@ class RepairAttempt:
 
 
 @dataclass
+class MethodInquiryResult:
+    required_methods: list[str] = field(default_factory=list)
+    reason: str = ""
+
+
+@dataclass
+class RetrievedMethodContext:
+    method_name: str
+    path: str
+    class_name: str | None
+    start_line: int | None
+    end_line: int | None
+    source: str
+    found: bool
+
+
+@dataclass
 class ReviewResult:
     round_id: int
     approved: bool
@@ -106,6 +123,9 @@ class WorkflowTrace:
     review_strict_gate_result: str | None
     analysis: dict[str, Any] | None
     satd_route_type: str | None = None
+    method_inquiry: dict[str, Any] | None = None
+    retrieved_method_contexts: list[dict[str, Any]] = field(default_factory=list)
+    missing_method_names: list[str] = field(default_factory=list)
     repairs: list[dict[str, Any]] = field(default_factory=list)
     reviews: list[dict[str, Any]] = field(default_factory=list)
     repair_candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -122,6 +142,8 @@ class WorkflowTrace:
 
 class GraphState(TypedDict):
     task_id: str
+    task_index: int
+    task_total: int
     satd_comment: str
     original_code: str
     manual_code: str
@@ -138,6 +160,9 @@ class GraphState(TypedDict):
     review_strict_gate_result: str | None
     analysis: AnalysisResult | None
     satd_route_type: str | None
+    method_inquiry: MethodInquiryResult | None
+    retrieved_method_contexts: list[RetrievedMethodContext]
+    missing_method_names: list[str]
     repair_candidates: list[RepairAttempt]
     candidate_repairs: list[RepairAttempt]
     candidate_reviews: list[ReviewResult]
@@ -181,6 +206,8 @@ class _DocstringStripper(ast.NodeTransformer):
 def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
     return GraphState(
         task_id=record.task_id,
+        task_index=0,
+        task_total=0,
         satd_comment=record.satd_comment,
         original_code=record.original_code,
         manual_code=record.manual_code,
@@ -197,6 +224,9 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         review_strict_gate_result=None,
         analysis=None,
         satd_route_type=None,
+        method_inquiry=None,
+        retrieved_method_contexts=[],
+        missing_method_names=[],
         repair_candidates=[],
         candidate_repairs=[],
         candidate_reviews=[],
@@ -283,6 +313,9 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         review_strict_gate_result=state["review_strict_gate_result"],
         analysis=asdict(state["analysis"]) if state["analysis"] else None,
         satd_route_type=state.get("satd_route_type"),
+        method_inquiry=asdict(state["method_inquiry"]) if state.get("method_inquiry") else None,
+        retrieved_method_contexts=[asdict(item) for item in state["retrieved_method_contexts"]],
+        missing_method_names=list(state["missing_method_names"]),
         repair_candidates=[asdict(item) for item in state["repair_candidates"]],
         candidate_repairs=[asdict(item) for item in state["candidate_repairs"]],
         candidate_reviews=[asdict(item) for item in state["candidate_reviews"]],

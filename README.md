@@ -2,75 +2,75 @@
 
 This workspace contains a LangGraph-based SATD workflow for `code.csv`.
 
-The workflow now uses a layered GitHub context cache and three specialized LLM agents:
+The workflow now defaults to a repair-only method-context pipeline with a lightweight compatibility shell around the old graph:
 
-- analyzer node: reads only the shared `base_context` and filters out obviously poor repair candidates
-- fixer node: enriches `repair_context` and generates repaired code with richer project evidence
-- reviewer node: reads `base_context + repair_context + review_context` and acts as a strict final gate
-- loop limit: 2 repair-review rounds by default
+- analyzer node: disabled by default and bypassed with a heuristic pass-through result
+- fixer node: first asks the model which methods must be understood, then strictly retrieves those methods from the target commit, then performs a single repair
+- reviewer node: disabled by default and bypassed to accept the fixer output directly
+- selector: disabled by default; only a single repair candidate is produced
+- loop limit: 2 rounds remain available for compatibility, but the default experiment is a single repair path
 - evaluation: compares the final repaired code with `manual_code` only after the workflow finishes
-- all three agents use the same OpenAI-compatible `gpt-4o-mini` interface
+- all stages use the same OpenAI-compatible `gpt-4o-mini` interface
 
 The graph never sees the ground-truth answer while making decisions.
 The final comparison is done offline after preprocessing both sides.
 
-## Layered Context Cache
+## Repair Pipeline
 
-Each SATD now gets a persistent per-task context bundle under `context_cache/`.
+Each SATD now follows three repair steps:
+
+1. Method inquiry
+   - send `SATD comment + original_code` to the model
+   - ask which called methods/functions must be understood before repair
+2. Strict method retrieval
+   - retrieve only the named methods from the target `commit`
+   - search current file first, then the historical repo tree
+   - if a named method is missing, record it explicitly and do not broaden retrieval
+3. Context-injected repair
+   - inject only the retrieved method implementations plus the missing-method list
+   - generate one repair candidate
+
+Each SATD still gets a persistent per-task context bundle under `context_cache/`.
 
 Layers:
 
 - `base_context`
   - file path
   - original code
-  - SATD comment
   - target file summary
-  - SATD window
-  - enclosing symbol
-  - imports
-  - issue refs
-  - module docs
 - `repair_context`
-  - related tests
-  - call sites
-  - repo tree
-  - neighbor files
-  - commits for path
-  - similar history
-  - issue comments
-  - related PR files
+  - method inquiry result
+  - retrieved method implementations
+  - missing method names
 - `review_context`
-  - validation signal summary
-  - risk indicators
-  - change-scope evidence
+  - compatibility shell for the bypassed reviewer stage
 
 Workflow behavior:
 
 - every SATD builds or loads `base_context` before analyze
-- repair adds `repair_context` only when the task passes analyzer
-- review derives `review_context` without re-fetching large GitHub payloads
+- repair writes method-query retrieval results into `repair_context`
+- review reuses the existing context bundle when reviewer bypass is active
 - all layers are saved to disk and reused on reruns
 
-## Analyzer Design
+## Default Experiment Mode
 
-The analyzer is now intentionally narrower:
+The default CLI configuration is now:
 
-- primary evidence: `SATD comment + original_code + file_path`
-- auxiliary evidence: current GitHub repository state
-- GitHub mismatch is treated as `historical_snapshot_mismatch`, not automatic failure
-- clear, local, non-high-risk SATD items are biased toward `repairable`
+- `analyzer` disabled
+- `reviewer` disabled
+- `selector` disabled
+- single repair candidate
+- `repair_context_mode=clone_treesitter`
+- `max_method_contexts=5`
 
-Analyzer output includes:
+Clone/fetch acceleration options:
 
-- `decision`
-- `repairability_score`
-- `scope_radius`
-- `validation_signals`
-- `context_gaps`
-- `evidence_summary`
-- `drop_reason`
-- `historical_snapshot_mismatch`
-- `github_evidence_strength`
+- default remote now points to TUNA mirror: `https://mirrors.tuna.tsinghua.edu.cn/git/github.com`
+- use `--git-remote-base` to rewrite `https://github.com/<owner>/<repo>.git`
+- for TUNA mirror, pass `--git-remote-base https://mirrors.tuna.tsinghua.edu.cn/git/github.com`
+- use `--git-remote-template` if you need a fully custom pattern with `{owner}` and `{repo}`
+- clone/fetch progress emits heartbeat logs while running under `--verbose`
+- repo cache reuse is now strict: only repositories with a `clone_complete.json` marker and passing git self-checks are reused; invalid caches are rebuilt automatically
 
 ## Preprocessed Evaluation
 
@@ -144,7 +144,8 @@ The main file to inspect is:
 It gives one row per SATD and includes:
 
 - analyzer decision, score, scope, validation signals, context gaps, and drop reason
-- whether repair context was actually used
+- identified method names, retrieved method names, missing method names, and retrieved method count
+- whether repair method context was actually used
 - the strict review gate result
 - processed repaired code for round 1 and round 2
 - review result for each round
@@ -160,7 +161,8 @@ Other files:
 - `summary.csv`: dataset-level metrics
 - `results.csv`: task-level compact result table
 - `repairs.csv`: per-repair detail table
+- `repair_candidates.csv`: repair candidate table; default experiment writes one candidate per task
 - `reviews.csv`: per-review detail table
-- `github_context.csv`: flattened context content used during execution
+- `github_context.csv`: flattened context content including `method_context_json`
 - `context_cache.csv`: context cache index with cache status/source/timestamps
 - `context_cache/`: per-task JSON context bundles

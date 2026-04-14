@@ -1,10 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ast
 import builtins
 import json
 import os
 import re
+import textwrap
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -14,7 +15,16 @@ from openai import OpenAI
 from .github_tools import GitHubToolbox
 from .local_settings import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
 from .local_settings import OPENAI_BASE_URL as LOCAL_OPENAI_BASE_URL
-from .schema import AnalysisResult, GraphState, RepairAttempt, ReviewResult, SelectorDecision, preprocess_python_code
+from .schema import (
+    AnalysisResult,
+    GraphState,
+    MethodInquiryResult,
+    RepairAttempt,
+    RetrievedMethodContext,
+    ReviewResult,
+    SelectorDecision,
+    preprocess_python_code,
+)
 
 
 VALID_DECISIONS = {"repairable", "drop", "needs_more_context"}
@@ -36,7 +46,7 @@ MODEL_ALIASES = {"gpt-4o-mini-global": "gpt-4o-mini"}
 
 
 class OpenAICompatClient:
-    def __init__(self, model: str = "gpt-4o-mini") -> None:
+    def __init__(self, model: str = "gpt-4o-mini", verbose: bool = False) -> None:
         api_key = os.environ.get("OPENAI_API_KEY") or LOCAL_OPENAI_API_KEY
         if api_key == "PASTE_YOUR_OPENAI_COMPAT_KEY_HERE":
             api_key = None
@@ -56,6 +66,7 @@ class OpenAICompatClient:
         self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=self.request_timeout)
         self.requested_model = model
         self.model = self._normalize_model_name(model)
+        self.verbose = bool(verbose)
         self.toolbox = GitHubToolbox()
 
     def generate_json(
@@ -73,7 +84,9 @@ class OpenAICompatClient:
         label = request_label or "llm_request"
         for attempt in range(self.max_attempts):
             attempt_started = time.time()
-            print(f"[llm] start label={label} attempt={attempt + 1}/{self.max_attempts} model={active_model} timeout={self.request_timeout:.0f}s")
+            self._emit_log(
+                f"[llm] start label={label} attempt={attempt + 1}/{self.max_attempts} model={active_model} timeout={self.request_timeout:.0f}s"
+            )
             try:
                 response = self.client.chat.completions.create(
                     model=active_model,
@@ -86,23 +99,23 @@ class OpenAICompatClient:
                 )
                 content = response.choices[0].message.content or "{}"
                 elapsed = time.time() - attempt_started
-                print(f"[llm] success label={label} attempt={attempt + 1}/{self.max_attempts} elapsed={elapsed:.2f}s")
+                self._emit_log(f"[llm] success label={label} attempt={attempt + 1}/{self.max_attempts} elapsed={elapsed:.2f}s")
                 return json.loads(content)
             except Exception as exc:
                 last_error = exc
                 elapsed = time.time() - attempt_started
-                print(
+                self._emit_log(
                     f"[llm] error label={label} attempt={attempt + 1}/{self.max_attempts} "
                     f"elapsed={elapsed:.2f}s type={type(exc).__name__} message={self._short_error(exc)}"
                 )
                 fallback_model = self._fallback_model_for_error(exc, active_model)
                 if fallback_model and fallback_model != active_model:
-                    print(f"[llm] fallback_model label={label} from={active_model} to={fallback_model}")
+                    self._emit_log(f"[llm] fallback_model label={label} from={active_model} to={fallback_model}")
                     active_model = fallback_model
                     self.model = fallback_model
                     continue
                 if self._is_content_filter_error(exc) and not sanitized:
-                    print(f"[llm] sanitize_prompts label={label}")
+                    self._emit_log(f"[llm] sanitize_prompts label={label}")
                     active_system_prompt, active_user_prompt = self._sanitize_prompts(system_prompt, user_prompt)
                     sanitized = True
                     continue
@@ -113,6 +126,10 @@ class OpenAICompatClient:
         if last_error:
             raise last_error
         raise RuntimeError("OpenAI-compatible request failed unexpectedly.")
+
+    def _emit_log(self, message: str) -> None:
+        if self.verbose:
+            print(message)
 
     def _short_error(self, exc: Exception) -> str:
         message = " ".join(str(exc).split())
@@ -1616,24 +1633,161 @@ class OpenAIAnalyzer:
 
 
 class OpenAIFixer:
-    def __init__(self, client: OpenAICompatClient, prompt_mode: str = "lightweight") -> None:
+    def __init__(
+        self,
+        client: OpenAICompatClient,
+        prompt_mode: str = "lightweight",
+        repair_context_mode: str = "clone_treesitter",
+        max_method_contexts: int = 2,
+        logger: Any | None = None,
+        checkpoint_callback: Any | None = None,
+    ) -> None:
         self.client = client
         self.prompt_mode = prompt_mode
+        self.repair_context_mode = repair_context_mode
+        self.max_method_contexts = max(1, int(max_method_contexts))
+        self.logger = logger
+        self.checkpoint_callback = checkpoint_callback
 
-    def run(self, state: GraphState, candidate_mode: str = "single") -> RepairAttempt:
-        metadata = ((state.get("github_context") or {}).get("metadata") or {}) if isinstance(state.get("github_context"), dict) else {}
+    def run(
+        self,
+        state: GraphState,
+        candidate_mode: str = "baseline_context",
+    ) -> tuple[RepairAttempt, MethodInquiryResult, list[RetrievedMethodContext], list[str]]:
         round_id = state["round_id"] + 1
-        github_context = self.client.compact_shared_context(state.get("github_context"))
-        repair_evidence_mode = str(metadata.get("repair_evidence_mode") or "weak")
-        snapshot_alignment_status = str(metadata.get("snapshot_alignment_status") or "mismatch")
         contextual_repair_hint = self._contextual_repair_hint(state["original_code"], state["satd_comment"])
+        use_method_context = self._candidate_uses_method_context(candidate_mode)
+        self._checkpoint(
+            state,
+            stage="question_start",
+            payload={"round_id": round_id, "candidate_mode": candidate_mode},
+        )
+        if use_method_context:
+            method_inquiry = self.identify_required_methods(state)
+            self._log(
+                state,
+                f"context questions={self._format_method_list(method_inquiry.required_methods)} "
+                f"reason={method_inquiry.reason or 'unspecified'}"
+            )
+        else:
+            method_inquiry = MethodInquiryResult(reason="candidate_mode_without_method_context")
+            self._log(state, f"context questions=skipped mode={candidate_mode}")
+        effective_use_method_context = use_method_context and bool(method_inquiry.required_methods)
+        self._checkpoint(
+            state,
+            stage="question_done",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": candidate_mode,
+                "required_methods": list(method_inquiry.required_methods),
+                "reason": method_inquiry.reason,
+            },
+        )
+        self._checkpoint(
+            state,
+            stage="retrieval_start",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": candidate_mode,
+                "required_methods": list(method_inquiry.required_methods),
+            },
+        )
+        if effective_use_method_context:
+            method_location_hints = self.resolve_method_locations(state, method_inquiry.required_methods)
+            self._checkpoint(
+                state,
+                stage="retrieval_route_done",
+                payload={
+                    "round_id": round_id,
+                    "candidate_mode": candidate_mode,
+                    "required_methods": list(method_inquiry.required_methods),
+                    "method_location_hints": method_location_hints,
+                },
+            )
+            retrieved_method_contexts = self._retrieve_method_contexts(
+                state,
+                method_inquiry.required_methods,
+                method_location_hints=method_location_hints,
+            )
+            missing_method_names = [item.method_name for item in retrieved_method_contexts if not item.found]
+            found_method_contexts = [item for item in retrieved_method_contexts if item.found]
+            self._log(
+                state,
+                "context results "
+                f"found={len(found_method_contexts)}/{len(method_inquiry.required_methods)} "
+                f"missing={self._format_method_list(missing_method_names, empty='none')}"
+            )
+        else:
+            method_location_hints = {}
+            retrieved_method_contexts = []
+            missing_method_names = []
+            found_method_contexts = []
+            if use_method_context:
+                self._log(state, "context results=skipped reason=no_indispensable_methods")
+            else:
+                self._log(state, f"context results=skipped mode={candidate_mode}")
+            self._checkpoint(
+                state,
+                stage="retrieval_route_done",
+                payload={
+                    "round_id": round_id,
+                    "candidate_mode": candidate_mode,
+                    "required_methods": [],
+                    "method_location_hints": {},
+                },
+            )
+        self._checkpoint(
+            state,
+            stage="retrieval_done",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": candidate_mode,
+                "required_methods": list(method_inquiry.required_methods),
+                "method_location_hints": method_location_hints,
+                "retrieved_method_contexts": [
+                    {
+                        "method_name": item.method_name,
+                        "path": item.path,
+                        "class_name": item.class_name,
+                        "start_line": item.start_line,
+                        "end_line": item.end_line,
+                        "source": item.source,
+                        "found": item.found,
+                    }
+                    for item in retrieved_method_contexts
+                ],
+                "missing_method_names": list(missing_method_names),
+            },
+        )
+        self._checkpoint(
+            state,
+            stage="generation_start",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": candidate_mode,
+                "required_methods": list(method_inquiry.required_methods),
+                "retrieved_method_contexts": [
+                    {
+                        "method_name": item.method_name,
+                        "path": item.path,
+                        "class_name": item.class_name,
+                        "start_line": item.start_line,
+                        "end_line": item.end_line,
+                        "source": item.source,
+                        "found": item.found,
+                    }
+                    for item in retrieved_method_contexts
+                ],
+                "missing_method_names": list(missing_method_names),
+            },
+        )
         system_prompt, user_prompt = self._build_repair_prompts(
             state=state,
             round_id=round_id,
-            github_context=github_context,
-            repair_evidence_mode=repair_evidence_mode,
-            snapshot_alignment_status=snapshot_alignment_status,
             contextual_repair_hint=contextual_repair_hint,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=found_method_contexts,
+            missing_method_names=missing_method_names,
         )
         payload = self.client.generate_json(
             system_prompt,
@@ -1650,37 +1804,410 @@ class OpenAIFixer:
         except (TypeError, ValueError):
             confidence = 0.45
         notes = str(payload.get("notes") or "model response normalized with fixer fallback")
+        if method_inquiry.required_methods and not found_method_contexts:
+            notes = f"{notes} | no_method_context_found"
+        elif found_method_contexts:
+            notes = f"{notes} | method_contexts={len(found_method_contexts)}"
+        else:
+            notes = f"{notes} | no_required_methods_identified"
 
         em_risk_notes = self._em_risk_notes(state["original_code"], repaired_code)
-        if em_risk_notes and repair_evidence_mode != "strong":
+        if em_risk_notes:
             confidence = min(confidence, 0.42)
             notes = f"{notes} | em_risk={','.join(em_risk_notes)}"
-
-        return RepairAttempt(
-            round_id=round_id,
-            repair_plan=repair_plan,
-            repaired_code=repaired_code,
-            changed_scope=changed_scope,
-            confidence=confidence,
-            notes=notes,
-            candidate_mode=candidate_mode,
+        self._log(
+            state,
+            f"repair output scope={changed_scope} confidence={confidence:.2f} mode={candidate_mode}"
         )
+        self._checkpoint(
+            state,
+            stage="generation_done",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": candidate_mode,
+                "repair_plan": repair_plan,
+                "repaired_code": repaired_code,
+                "changed_scope": changed_scope,
+                "confidence": confidence,
+                "notes": notes,
+            },
+        )
+
+        return (
+            RepairAttempt(
+                round_id=round_id,
+                repair_plan=repair_plan,
+                repaired_code=repaired_code,
+                changed_scope=changed_scope,
+                confidence=confidence,
+                notes=notes,
+                candidate_mode=candidate_mode,
+            ),
+            method_inquiry,
+            found_method_contexts,
+            missing_method_names,
+        )
+
+    def identify_required_methods(self, state: GraphState) -> MethodInquiryResult:
+        if self.repair_context_mode not in {"method_query", "clone_treesitter"}:
+            return MethodInquiryResult()
+        satd_route_type = str(state.get("satd_route_type") or "generic").strip().lower()
+        if satd_route_type == "remove_temporary":
+            return MethodInquiryResult(required_methods=[], reason="route_remove_temporary_comment_code_only")
+        candidates = self._extract_method_candidates_from_satd_code(state["original_code"])
+        if not candidates:
+            return MethodInquiryResult(required_methods=[], reason="llm_no_static_candidates")
+
+        system_prompt = textwrap.dedent(
+            """
+            You are the engineer who must repair this SATD in the next step.
+            Before you repair it, decide which methods are truly indispensable to understand first.
+
+            Only keep methods that are so important that, without understanding their implementation or semantics,
+            you would likely repair the SATD incorrectly.
+
+            Rules:
+            - There is NO quota. Return every indispensable method, and return none if nothing is truly indispensable.
+            - Favor false negatives over false positives. When unsure, leave the method out.
+            - Be conservative. Do not include methods that are merely nearby, obvious, builtin-like, or easy to infer locally.
+            - Prefer methods whose definitions materially affect behavior, compatibility, protocol, data shape, or side effects.
+            - Do not include a method just because it appears in the code. Include it only if understanding it is required before repair.
+            - You must only choose from the provided candidate methods.
+
+            Return JSON with:
+            {
+              "required_methods": ["..."],
+              "reason": "short explanation"
+            }
+            """
+        ).strip()
+        user_prompt = textwrap.dedent(
+            f"""
+            You are about to repair this SATD yourself.
+
+            SATD comment:
+            {state["satd_comment"]}
+
+            Original code:
+            {state["original_code"]}
+
+            Candidate methods extracted from the code:
+            {self._format_method_candidates_for_prompt(candidates)}
+
+            Question:
+            Which of these candidate methods must you understand before you can safely repair this SATD?
+
+            Apply a "better to miss than over-include" standard.
+            If none of them are truly indispensable, return an empty list.
+            """
+        ).strip()
+        payload = self.client.generate_json(
+            system_prompt,
+            user_prompt,
+            temperature=0.0,
+            request_label=f"method_inquiry:task_{state['task_id']}",
+        )
+        inquiry = self._coerce_method_inquiry(
+            payload,
+            allowed_methods=[str(item.get("normalized_name") or "") for item in candidates],
+        )
+        if not inquiry.reason:
+            inquiry.reason = "llm_filtered_static_candidates"
+        return inquiry
+
+    def _coerce_method_inquiry(
+        self,
+        payload: dict[str, Any],
+        allowed_methods: list[str] | None = None,
+    ) -> MethodInquiryResult:
+        raw_methods = payload.get("required_methods")
+        required_methods: list[str] = []
+        seen: set[str] = set()
+        allowed = set(allowed_methods or [])
+        if isinstance(raw_methods, list):
+            for item in raw_methods:
+                normalized = self._normalize_method_name(item)
+                if not normalized or normalized in seen:
+                    continue
+                if allowed and normalized not in allowed:
+                    continue
+                seen.add(normalized)
+                required_methods.append(normalized)
+        reason = str(payload.get("reason") or "").strip()
+        return MethodInquiryResult(required_methods=required_methods, reason=reason)
+
+    def _candidate_uses_method_context(self, candidate_mode: str) -> bool:
+        mode = str(candidate_mode or "").strip().lower()
+        if not mode:
+            return True
+        return not mode.endswith("no_context")
+
+    def _extract_method_candidates_from_satd_code(self, code: str) -> list[dict[str, Any]]:
+        snippet = textwrap.dedent((code or "").strip("\n"))
+        if not snippet.strip():
+            return []
+        try:
+            tree = ast.parse(snippet)
+        except (SyntaxError, ValueError):
+            return []
+
+        builtin_names = set(dir(builtins))
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        class CallCollector(ast.NodeVisitor):
+            def __init__(self, outer: "OpenAIFixer") -> None:
+                self.outer = outer
+
+            def visit_Call(self, node: ast.Call) -> Any:
+                raw_call = self.outer._call_chain_from_node(node.func)
+                normalized = self.outer._normalize_method_name(raw_call)
+                if normalized and normalized not in seen:
+                    tail = normalized.split(".")[-1]
+                    if raw_call.count(".") == 0 and tail in builtin_names:
+                        self.generic_visit(node)
+                        return
+                    seen.add(normalized)
+                    candidates.append(
+                        {
+                            "raw_call": raw_call,
+                            "normalized_name": normalized,
+                            "line": getattr(node, "lineno", None),
+                        }
+                    )
+                self.generic_visit(node)
+
+        CallCollector(self).visit(tree)
+        candidates.sort(
+            key=lambda item: (
+                item.get("line") if isinstance(item.get("line"), int) else 10**9,
+                item.get("raw_call") or "",
+            )
+        )
+        return candidates
+
+    def _call_chain_from_node(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = self._call_chain_from_node(node.value)
+            return f"{parent}.{node.attr}" if parent else node.attr
+        if isinstance(node, ast.Call):
+            return self._call_chain_from_node(node.func)
+        return ""
+
+    def _format_method_candidates_for_prompt(self, candidates: list[dict[str, Any]]) -> str:
+        lines = []
+        for item in candidates:
+            raw_call = str(item.get("raw_call") or "")
+            normalized_name = str(item.get("normalized_name") or "")
+            line_no = item.get("line")
+            line_part = f" line={line_no}" if isinstance(line_no, int) else ""
+            lines.append(f"- normalized_name={normalized_name} raw_call={raw_call}{line_part}")
+        return "\n".join(lines)
+
+    def _normalize_method_name(self, value: Any) -> str:
+        text = str(value or "").strip().strip("`").strip()
+        if not text:
+            return ""
+        text = text.split("(", 1)[0].strip()
+        parts = [part for part in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text) if part]
+        while len(parts) > 1 and parts[0] in {"self", "cls", "super"}:
+            parts = parts[1:]
+        if not parts:
+            return ""
+        normalized = ".".join(parts) if len(parts) > 1 else parts[0]
+        return "" if self._is_low_quality_method_name(normalized) else normalized
+
+    def _is_low_quality_method_name(self, value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return True
+        generic_terms = {
+            "time", "get", "set", "info", "values", "isinstance", "append", "wait", "super",
+            "len", "print", "list", "dict", "str", "int", "float", "bool", "type",
+        }
+        parts = [part for part in text.split(".") if part]
+        if not parts:
+            return True
+        if len(parts) >= 2 and parts[-1].lower() in {"info", "debug", "warning", "error", "exception", "critical"}:
+            return True
+        if len(parts) > 1:
+            return False
+        tail = parts[-1].lower()
+        return tail in generic_terms
+    def _retrieve_method_contexts(
+        self,
+        state: GraphState,
+        method_names: list[str],
+        method_location_hints: dict[str, list[str]] | None = None,
+    ) -> list[RetrievedMethodContext]:
+        if not method_names:
+            return []
+        payloads = self.client.toolbox.fetch_method_contexts(
+            state["user"],
+            state["project"],
+            state["file_path"],
+            method_names,
+            ref=(state.get("commit") or "").strip() or None,
+            log_prefix=self._task_prefix(state),
+            path_hints_by_method=method_location_hints or {},
+        )
+        contexts: list[RetrievedMethodContext] = []
+        for item in payloads:
+            contexts.append(
+                RetrievedMethodContext(
+                    method_name=str(item.get("method_name") or ""),
+                    path=str(item.get("path") or ""),
+                    class_name=str(item.get("class_name")) if item.get("class_name") is not None else None,
+                    start_line=item.get("start_line"),
+                    end_line=item.get("end_line"),
+                    source=str(item.get("source") or ""),
+                    found=bool(item.get("found")),
+                )
+            )
+        return contexts
+
+    def resolve_method_locations(self, state: GraphState, method_names: list[str]) -> dict[str, list[str]]:
+        if not method_names:
+            return {}
+        file_payload = self.client.toolbox.fetch_repo_file(
+            state["user"],
+            state["project"],
+            state["file_path"],
+            ref=(state.get("commit") or "").strip() or None,
+        )
+        file_content = file_payload.get("full_content") or "" if file_payload.get("ok") else ""
+        tree_payload = self.client.toolbox.fetch_repo_tree(
+            state["user"],
+            state["project"],
+            ref=(state.get("commit") or "").strip() or None,
+        )
+        repo_paths = [
+            str(item.get("path") or "")
+            for item in tree_payload.get("entries", [])
+            if item.get("type") == "file"
+        ]
+        hints = self.client.toolbox.infer_method_path_hints(
+            current_path=state["file_path"],
+            method_names=method_names,
+            current_content=file_content,
+            repo_paths=repo_paths,
+        )
+        return hints
+
+    def _coerce_method_location_hints(
+        self,
+        payload: dict[str, Any],
+        current_path: str,
+        method_names: list[str],
+    ) -> dict[str, list[str]]:
+        resolutions = payload.get("resolutions")
+        valid_methods = {self._normalize_method_name(name) for name in method_names}
+        hints: dict[str, list[str]] = {}
+        if not isinstance(resolutions, list):
+            return hints
+        for item in resolutions:
+            if not isinstance(item, dict):
+                continue
+            method_name = self._normalize_method_name(item.get("method_name"))
+            if not method_name or method_name not in valid_methods:
+                continue
+            file_path = self._normalize_file_path_hint(str(item.get("file_path") or ""), current_path)
+            if not file_path:
+                continue
+            hints.setdefault(method_name, [])
+            if file_path not in hints[method_name]:
+                hints[method_name].append(file_path)
+        return hints
+
+    def _normalize_file_path_hint(self, value: str, current_path: str) -> str:
+        text = (value or "").strip().strip("`").strip()
+        if not text:
+            return ""
+        text = text.replace("\\", "/").strip("/")
+        if text.endswith(".py") or text.endswith("/__init__.py"):
+            return self._prepend_repo_prefix_if_needed(text, current_path)
+        dotted = text.replace("/", ".")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\.]*", dotted):
+            module_path = dotted.replace(".", "/")
+            return self._prepend_repo_prefix_if_needed(f"{module_path}.py", current_path)
+        return ""
+
+    def _prepend_repo_prefix_if_needed(self, path: str, current_path: str) -> str:
+        normalized = path.replace("\\", "/").strip("/")
+        top_level = normalized.split("/", 1)[0] if normalized else ""
+        current_parts = [part for part in current_path.replace("\\", "/").split("/") if part]
+        if top_level and top_level in current_parts:
+            index = current_parts.index(top_level)
+            prefix = "/".join(current_parts[:index])
+            if prefix:
+                return f"{prefix}/{normalized}"
+        return normalized
+
+    def _extract_import_block(self, file_content: str) -> str:
+        lines = []
+        for raw_line in (file_content or "").splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                lines.append(raw_line)
+        return "\n".join(lines[:40])
+
+    def _log(self, state: GraphState, message: str) -> None:
+        if not self.logger:
+            return
+        self.logger(f"{self._task_prefix(state)} {message}")
+
+    def _format_method_list(self, method_names: list[str], empty: str = "none") -> str:
+        items = [str(item).strip() for item in method_names if str(item).strip()]
+        if not items:
+            return empty
+        if len(items) <= 3:
+            return ", ".join(items)
+        return ", ".join(items[:3]) + f", ... (+{len(items) - 3})"
+
+    def _checkpoint(self, state: GraphState, stage: str, payload: dict[str, Any]) -> None:
+        if not self.checkpoint_callback:
+            return
+        self.checkpoint_callback(state, stage, payload)
+
+    def _task_prefix(self, state: GraphState) -> str:
+        task_id = state.get("task_id", "?")
+        task_index = state.get("task_index") or 0
+        task_total = state.get("task_total") or 0
+        if task_index and task_total:
+            return f"[task {task_id} {task_index}/{task_total}]"
+        return f"[task {task_id}]"
 
     def _build_repair_prompts(
         self,
         *,
         state: GraphState,
         round_id: int,
-        github_context: str,
-        repair_evidence_mode: str,
-        snapshot_alignment_status: str,
         contextual_repair_hint: str,
+        method_inquiry: MethodInquiryResult,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+        missing_method_names: list[str],
     ) -> tuple[str, str]:
         repair_feedback = state.get("repair_feedback") or {}
         reviewer_feedback_block = self._format_reviewer_feedback_block(repair_feedback)
         satd_route_type = str(state.get("satd_route_type") or "generic")
         candidate_mode = str(state.get("candidate_mode") or "single")
         type_hint = self._type_hint_for_route(satd_route_type, state.get("satd_comment") or "") if candidate_mode.startswith("typed_") else ""
+        method_context_block = ""
+        if self._candidate_uses_method_context(candidate_mode):
+            method_context_block = self._format_method_context_block(
+                method_inquiry=method_inquiry,
+                retrieved_method_contexts=retrieved_method_contexts,
+                missing_method_names=missing_method_names,
+            )
+        if satd_route_type == "remove_temporary":
+            return self._build_remove_temporary_repair_prompts(
+                state=state,
+                round_id=round_id,
+                contextual_repair_hint=contextual_repair_hint,
+                reviewer_feedback_block=reviewer_feedback_block,
+            )
         if self.prompt_mode == "analysis_heavy":
             system_prompt = (
                 "You are the fixer agent in a SATD repair workflow. "
@@ -1688,18 +2215,17 @@ class OpenAIFixer:
                 "Optimize for the most conservative plausible human repair and preserve the original code skeleton whenever possible. "
                 "Prefer comment-driven, minimal textual repairs over broader rewrites. "
                 "Unless the evidence clearly requires it, do not add parameters, helper functions, return statements, exception paths, renames, or control-flow rewrites. "
-                "Treat external repository context as optional evidence, not a mandate. If it is weak, generic, or indirect, ignore it and stay with the smallest comment-driven local edit. "
+                "Treat retrieved method context as optional evidence, not a mandate. If it is weak or absent, stay with the smallest comment-driven local edit. "
                 "If a previous review warns about API shape drift, overwritten repair, or no-op output, fix that issue first with a smaller in-place edit. "
                 "A pure comment removal is acceptable only when the SATD itself explicitly says the obsolete comment or TODO should be removed. "
-                "Use the repair context to localize the smallest valid repair. Return JSON only."
+                "Use only the provided method context to localize the smallest valid repair. Return JSON only."
             )
             user_prompt = (
                 "Return a JSON object with keys: "
                 "repair_plan (string), repaired_code (string), changed_scope (string), "
                 "confidence (float 0-1), notes (string).\n"
                 "repaired_code must be the complete repaired version of the provided original code block.\n"
-                "If evidence is weak or snapshot alignment is poor, prefer tiny local edits inside the existing structure.\n"
-                "If external context does not contain a decisive helper, method, callsite, or test constraint, ignore generic imports, broad patterns, and indirect snippets.\n"
+                "If retrieved method context is weak or absent, prefer tiny local edits inside the existing structure.\n"
                 "Do not invent APIs, helper methods, parameters, or control-flow changes without direct evidence from the provided context.\n"
                 "If the previous review asked for a smaller change, follow that advice before trying anything broader.\n"
                 "When a SATD comment sits directly above an existing workaround, guard, or commented-out behavior, prefer deleting that obsolete workaround and restoring the nearby intended lines before inventing new logic.\n"
@@ -1709,35 +2235,107 @@ class OpenAIFixer:
                 f"Repository name: {state['project']}\n"
                 f"File path: {state['file_path']}\n"
                 f"SATD comment: {state['satd_comment']}\n"
-                f"Snapshot alignment status: {snapshot_alignment_status}\n"
-                f"Repair evidence mode: {repair_evidence_mode}\n"
                 f"SATD route type: {satd_route_type}\n"
                 f"Contextual repair hint: {contextual_repair_hint}\n"
                 f"Original code block:\n{state['original_code']}\n\n"
-                f"Unified GitHub context:\n{github_context}\n"
+                f"{method_context_block}"
                 f"{type_hint}"
                 f"{reviewer_feedback_block}"
             )
             return system_prompt, user_prompt
-
         system_prompt = (
+            "You are the fixer agent in a SATD repair workflow. "
             "Return valid JSON only with keys: "
             "repair_plan (string), repaired_code (string), changed_scope (string), "
             "confidence (float 0-1), notes (string). "
-            "repaired_code must be the full updated version of the provided code."
+            "Your goal is to resolve the SATD with the smallest plausible local edit. "
+            "Use the SATD comment and original code as primary evidence. "
+            "Use retrieved method context only as supporting evidence, not as a reason to rewrite more code. "
+            "Do not invent new APIs, helper functions, parameters, or broad control-flow rewrites unless the SATD clearly requires them. "
+            "repaired_code must be the complete repaired version of the provided code block, not a patch or partial snippet."
         )
         user_prompt = (
-            "How to update the following code to resolve the SATD?\n\n"
-            f"### Code:\n{state['original_code']}\n\n"
-            f"### SATD comment:\n{state['satd_comment']}\n"
-            f"### Optional external evidence:\n{github_context}\n\n"
-            f"{type_hint}"
+            "Resolve the SATD in the following code.\n\n"
+            f"### Original code:\n{state['original_code']}\n\n"
+            f"### SATD comment:\n{state['satd_comment']}\n\n"
+            "Requirements:\n"
+            "- Prefer the smallest in-place edit that directly addresses the SATD.\n"
+            "- Keep unchanged lines unchanged whenever possible.\n"
+            "- Keep the original signature unless the SATD explicitly asks for a signature-local fix.\n"
+            "- If method context is helpful, use it only to validate a local repair.\n"
+            "- Do not output partial code; repaired_code must contain the full updated code block.\n\n"
+            f"### Method context (supporting evidence only):\n{method_context_block}\n"
             f"{reviewer_feedback_block}"
-            "### Consider the following questions in your answer:\n"
-            "Shortly explain how to resolve the SATD.\n"
-            "Provide the updated code."
         )
         return system_prompt, user_prompt
+
+    def _build_remove_temporary_repair_prompts(
+        self,
+        *,
+        state: GraphState,
+        round_id: int,
+        contextual_repair_hint: str,
+        reviewer_feedback_block: str,
+    ) -> tuple[str, str]:
+        system_prompt = (
+            "You are the fixer agent for a remove_temporary SATD. "
+            "These tasks are usually solved by deleting an obsolete workaround, temporary log, compatibility hack, or dead branch. "
+            "Default to the smallest deletion or restoration that makes the temporary code disappear. "
+            "Do not preserve a temporary workaround just because it currently executes. "
+            "Do not add new logic, helper functions, parameters, or broader rewrites unless the SATD comment explicitly demands that behavior. "
+            "Return valid JSON only with keys: "
+            "repair_plan (string), repaired_code (string), changed_scope (string), confidence (float 0-1), notes (string)."
+        )
+        user_prompt = (
+            "Resolve this remove_temporary SATD.\n\n"
+            "Primary goal:\n"
+            "- Remove the temporary workaround, temporary log, obsolete compatibility branch, or dead comment-driven code.\n"
+            "- Prefer deleting or restoring nearby intended lines over inventing replacement logic.\n"
+            "- If a one-line or few-line deletion solves the SATD, do that.\n"
+            "- Keep unchanged lines unchanged whenever possible.\n"
+            "- Keep the original signature unchanged.\n"
+            "- Use only the SATD comment and the provided code block as the main evidence.\n"
+            "- If the SATD clearly says the code is temporary, obsolete, hacky, or for short-term compatibility, bias strongly toward removal.\n"
+            "- Only keep the temporary code if the comment explicitly says it must stay for correctness today.\n"
+            "- repaired_code must contain the complete updated code block.\n\n"
+            f"Round: {round_id}\n"
+            f"Repository owner: {state['user']}\n"
+            f"Repository name: {state['project']}\n"
+            f"File path: {state['file_path']}\n"
+            f"SATD comment: {state['satd_comment']}\n"
+            f"SATD route type: remove_temporary\n"
+            f"Contextual repair hint: {contextual_repair_hint}\n\n"
+            f"### Original code:\n{state['original_code']}\n\n"
+            f"{reviewer_feedback_block}"
+        )
+        return system_prompt, user_prompt
+
+    def _format_method_context_block(
+        self,
+        *,
+        method_inquiry: MethodInquiryResult,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+        missing_method_names: list[str],
+    ) -> str:
+        lines = ["### Method inquiry:"]
+        lines.append(
+            "Required methods: "
+            + (", ".join(method_inquiry.required_methods) if method_inquiry.required_methods else "[none identified]")
+        )
+        if method_inquiry.reason:
+            lines.append(f"Reason: {method_inquiry.reason}")
+        if missing_method_names:
+            lines.append("Missing methods: " + ", ".join(missing_method_names))
+        if not retrieved_method_contexts:
+            lines.append("Retrieved method context: [none found]")
+            return "\n".join(lines) + "\n\n"
+        lines.append("Retrieved method context:")
+        for item in retrieved_method_contexts:
+            location = f"{item.path}:{item.start_line}-{item.end_line}" if item.path else "[unknown]"
+            class_part = f" class={item.class_name}" if item.class_name else ""
+            lines.append(f"- {item.method_name} @ {location}{class_part}")
+            lines.append(item.source)
+        return "\n".join(lines) + "\n\n"
 
     def _format_reviewer_feedback_block(self, repair_feedback: dict[str, Any]) -> str:
         if not repair_feedback:
@@ -2410,3 +3008,4 @@ class OpenAISelector:
         if satd_route_type in {"type_annotation", "restore_uncomment"}:
             return 0.12
         return 0.10
+

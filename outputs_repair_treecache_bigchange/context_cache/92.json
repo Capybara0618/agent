@@ -1,0 +1,132 @@
+{
+  "task_id": "92",
+  "repo_owner": "dipdup-io",
+  "repo_name": "dipdup",
+  "file_path": "src/dipdup/context.py",
+  "commit": "4c05ab11a6429ebb0536ccf738d74dcaa714985c",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-18T10:41:56+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "4c05ab11a6429ebb0536ccf738d74dcaa714985c",
+    "symbol_name": "rollback",
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-18T10:42:16+00:00",
+    "identified_method_count": 7,
+    "retrieved_method_count": 2,
+    "missing_method_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/dipdup/context.py",
+    "original_signature": "async def rollback(self, index: str, from_level: int, to_level: int) -> None:",
+    "target_file": {
+      "ok": true,
+      "path": "src/dipdup/context.py",
+      "sha": "7441cc48007ffbe59d74ba2b502ee40c154a6ae1",
+      "download_url": "https://raw.githubusercontent.com/dipdup-io/dipdup/4c05ab11a6429ebb0536ccf738d74dcaa714985c/src/dipdup/context.py",
+      "content_excerpt": "import asyncio\nimport importlib\nimport logging\nimport os\nimport sys\nfrom collections import deque\nfrom contextlib import AsyncExitStack\nfrom contextlib import ExitStack\nfrom contextlib import contextmanager\nfrom contextlib import suppress\nfrom os.path import exists\nfrom os.path import join\nfrom pprint import pformat\nfrom typing import Any\nfrom typing import Awaitable\nfrom typing import Deque\nfrom typing import Dict\nfrom typing import Iterator\nfrom typing import Optional\nfrom typing import Set\nfrom typing import Tuple\nfrom typing import Type\nfrom typing import TypeVar\nfrom typing import Union\nfrom typing import cast\n\nfrom tortoise import Tortoise\nfrom tortoise.exceptions import OperationalError\n\nfrom dipdup.config import BigMapIndexConfig\nfrom dipdup.config import ContractConfig\nfrom dipdup.config import DipDupConfig\nfrom dipdup.config import HandlerConfig\nfrom dipdup.config import HeadIndexConfig\nfrom dipdup.config import HookConfig\nfrom dipdup.config import OperationIndexConfig\nfrom dipdup.config import PostgresDatabaseConfig\nfrom dipdup.config import ResolvedIndexConfigT\nfrom dipdup.config import TokenTransferIndexConfig\nfrom dipdup.config import TzktDatasourceConfig\nfrom dipdup.datasources.coinbase.datasource import CoinbaseDatasource\nfrom dipdup.datasources.datasource import Datasource\nfrom dipdup.datasources.datasource import HttpDatasource\nfrom dipdup.datasources.ipfs.datasource import IpfsDatasource\nfrom dipdup.datasources.metadata.datasource import MetadataDatasource\nfrom dipdup.datasources.tzkt.datasource import TzktDatasource\nfrom dipdup.enums import ReindexingAction\nfrom dipdup.enums import ReindexingReason\nfrom dipdup.exceptions import CallbackError\nfrom dipdup.exceptions import CallbackTypeError\nfrom dipdup.exceptions import ConfigurationError\nfrom dipdup.exceptions import ContractAlreadyExistsError\nfrom dipdup.exceptions import InitializationRequiredError\nfrom dipdup.exceptions import ReindexingRequiredError\nfrom dipdup.models import Contract\nfrom dipdup.models import ContractMetadata\nfrom dipdup.models import Index\nfrom dipdup.models import ModelUpdate\nfrom dipdup.models import Schema\nfrom dipdup.models import TokenMetadata\nfrom dipdup.prometheus import Metrics\nfrom dipdup.transactions import TransactionManager\nfrom dipdup.utils import FormattedLogger\nfrom dipdup.utils.database import execute_sql_scripts\nfrom dipdup.utils.database import get_connection\nfrom dipdup.utils.database import wipe_schema\n\nDatasourceT = TypeVar('DatasourceT', bound=Datasource)\n# NOTE: Dependency cycle\npending_indexes = deque()  # type: ignore\npending_hooks: Deque[Awaitable[None]] = deque()\nrolled_back_indexes: Set[str] = set()\n\n\nclass MetadataCursor:\n    _contract = 0\n    _token = 0\n\n    def __new__(cls):\n        raise NotImplementedError\n\n    @classmethod\n    async def initialize(cls) -> None:\n        if last_contract := await ContractMetadata.filter().order_by('-update_id').first():\n            cls._contract = last_contract.update_id\n        if last_token := await TokenMetadata.filter().order_by('-update_id').first():\n            cls._token = last_token.update_id\n\n    @classmethod\n    def contract(cls) -> int:\n        cls._contract += 1\n        return cls._contract\n\n    @classmethod\n    def token(cls) -> int:\n        cls._token += 1\n        return cls._token\n\n\n# TODO: Dataclasses are cool, everyone loves them. Resolve issue with pydantic serialization.\nclass DipDupContext:\n    \"\"\"Class to store application context\n\n    :param datasources: Mapping of available datasources\n    :param config: DipDup configuration\n    :param callbacks: Low-level callback interface (intented for internal use)\n    :param logger: Context-aware logger instance\n    \"\"\"\n\n    def __init__(\n        self,\n        datasources: Dict[str, Datasource],\n        config: DipDupConfig,\n        callbacks: 'CallbackManager',\n        transactions: TransactionManager,\n    ) -> None:\n        self.datasources = datasources\n        self.config = config\n        self._callbacks = callbacks\n        self._transactions = transactions\n        self.logger = FormattedLogger('dipdup.context')\n\n    def __str__(self) -> str:\n        return pformat(self.__dict__)\n\n    async def fire_hook(\n        self,\n        name: str,\n        fmt: Optional[str] = None,\n        wait: bool = True,\n        *args,\n        **kwargs: Any,\n    ) -> None:\n        \"\"\"Fire hook with given name and arguments.\n\n        :param name: Hook name\n        :param fmt: Format string for `ctx.logger` messages\n        :param wait: Wait for hook to finish or fire and forget\n        \"\"\"\n        await self._callbacks.fire_hook(self, name, fmt, wait, *args, **kwargs)\n\n    async def fire_handler(\n        self,\n        name: str,\n        index: str,\n        datasource: TzktDatasource,\n        fmt: Optional[str] = None,\n        *args,\n        **kwargs: Any,\n    ) -> None:\n        \"\"\"Fire handler with given name and arguments.\n\n        :param name: Handler name\n        :param index: Index name\n        :param datasource: An instance of datasource that triggered the handler\n        :param fmt: Format string for `ctx.logger` messages\n        \"\"\"\n        await self._callbacks.fire_handler(self, name, index, datasource, fmt, *args, **kwargs)\n\n    async def execute_sql(self, name: str) -> None:\n        \"\"\"Execute SQL script with given name\n\n        :param name: SQL script name within `<project>/sql` directory\n        \"\"\"\n        await self._callbacks.execute_sql(self, name)\n\n    async def restart(self) -> None:\n        \"\"\"Restart indexer preserving CLI arguments\"\"\"\n        os.execl(sys.executable, sys.executable, *sys.argv)\n\n    async def reindex(self, reason: Optional[Union[str, ReindexingReason]] = None, **context) -> None:\n        \"\"\"Drop the whole database and restart with the same CLI arguments\"\"\"\n        if reason is None:\n            reason = ReindexingReason.manual\n        # NOTE: Do not check for `str`!\n        elif not isinstance(reason, ReindexingReason):\n            context['message'] = reason\n            reason = ReindexingReason.manual\n\n        action = self.config.advanced.reindex.get(reason, ReindexingAction.exception)\n        self.logger.warning('Reindexing requested: reason `%s`, action `%s`', reason.value, action.value)\n\n        if action == ReindexingAction.ignore:\n            # NOTE: Recalculate hashes on the next run\n            if reason == ReindexingReason.schema_modified:\n                await Schema.filter(name=self.config.schema_name).update(hash='')\n            elif reason == ReindexingReason.config_modified:\n                await Index.filter().update(config_hash='')\n            return\n\n        elif action == ReindexingAction.exception:\n            schema = await Schema.filter(name=self.config.schema_name).get()\n            if not schema.reindex:\n                schema.reindex = reason\n                await schema.save()\n            raise ReindexingRequiredError(schema.reindex, context)\n\n        elif action == ReindexingAction.wipe:\n            conn = get_connection()\n            if isinstance(self.config.database, PostgresDatabaseConfig):\n                await wipe_schema(conn, self.config.database.schema_name, self.config.database.immune_tables)\n            else:\n                await Tortoise._drop_databases()\n            await self.restart()\n\n        else:\n            raise NotImplementedError\n\n    async def add_contract(self, name: str, address: str, typename: Optional[str] = None) -> None:\n        self.logger.info('Creating contract `%s` with typename `%s`', name, typename)\n        if name in self.config.contracts:\n            raise ContractAlreadyExistsError(self, name, address)\n\n        contract_config = ContractConfig(\n            address=address,\n            typename=typename,\n        )\n        contract_config.name = name\n        self.config.contracts[name] = contract_config\n\n        with suppress(OperationalError):\n            await Contract(\n                name=contract_config.name,\n                address=contract_config.address,\n                typename=contract_config.typename,\n            ).save()\n\n    # TODO: Option to override first_level/last_level?\n    async def add_index(self, name: str, template: str, values: Dict[str, Any], state: Optional[Index] = None) -> None:\n        self.config.add_index(name, template, values)\n        await self.spawn_index(name, state)\n\n    async def spawn_index(self, name: str, state: Optional[Index] = None) -> None:\n        # NOTE: Avoiding circular import\n        from dipdup.index import BigMapIndex\n        from dipdup.index import HeadIndex\n        from dipdup.index import OperationIndex\n        from dipdup.index import TokenTransferIndex\n\n        index_config = cast(ResolvedIndexConfigT, self.config.get_index(name))\n        index: Union[OperationIndex, BigMapIndex, HeadIndex, TokenTransferIndex]\n\n        datasource_name = cast(TzktDatasourceConfig, index_config.datasource).name\n        datasource = self.get_tzkt_datasource(datasource_name)\n\n        if isinstance(index_config, OperationIndexConfig):\n            index = OperationIndex(self, index_config, datasource)\n        elif isinstance(index_config, BigMapIndexConfig):\n            index = BigMapIndex(self, index_config, datasource)\n        elif isinstance(index_config, HeadIndexConfig):\n            index = HeadIndex(self, index_config, datasource)\n        elif isinstance(index_config, TokenTransferIndexConfig):\n            index = TokenTransferIndex(self, index_config, datasource)\n        else:\n            raise NotImplementedError\n\n        await datasource.add_index(index_config)\n        for handler_config in index_config.handlers:\n            self._callbacks.register_handler(handler_config)\n        await index.initialize_state(state)\n\n        # NOTE: IndexDispatcher will handle further initialization when it's time\n        pending_indexes.append(index)\n\n    async def update_contract_metadata(\n        self,\n        network: str,\n        address: str,\n        metadata: Dict[str, Any],\n    ) -> None:\n        if not self.config.advanced.metadata_interface:\n            return\n        update_id = MetadataCursor.contract()\n        await ContractMetadata.update_or_create(\n            network=network,\n            contract=address,\n            defaults={'metadata': metadata, 'update_id': update_id},\n        )\n\n    async def update_token_metadata(\n        self,\n        network: str,\n        address: str,\n        token_id: str,\n        metadata: Dict[str, Any],\n    ) -> None:\n        if not self.config.advanced.metadata_interface:\n            return\n        if not all(str.isdigit(c) for c in token_id):\n            raise ValueError('`token_id` must be a number')\n\n        update_id = MetadataCursor.token()\n        await TokenMetadata.update_or_create(\n            network=network,\n            contract=address,\n            token_id=token_id,\n            defaults={'metadata': metadata, 'update_id': update_id},\n        )\n\n    def _get_datasource(self, name: str, type_: Type[DatasourceT]) -> DatasourceT:\n        datasource = self.datasources.get(name)\n        if not datasource:\n            raise ConfigurationError(f'Datasource `{name}` is missing')\n        if not isinstance(datasource, type_):\n            raise ConfigurationError(f'Datasource `{name}` is not a `{type.__name__}`')\n        return datasource\n\n    def get_tzkt_datasource(self, name: str) -> TzktDatasource:\n        return self._get_datasource(name, TzktDatasource)\n\n    def get_coinbase_datasource(self, name: str) -> CoinbaseDatasource:\n        return self._get_datasource(name, CoinbaseDatasource)\n\n    def get_metadata_datasource(self, name: str) -> MetadataDatasource:\n        return self._get_datasource(name, MetadataDatasource)\n\n    def get_ipfs_datasource(self, name: str) -> IpfsDatasource:\n        return self._get_datasource(name, IpfsDatasource)\n\n    def get_http_datasource(self, name: str) -> HttpDatasource:\n        return self._get_datasource(name, HttpDatasource)\n\n\nclass HookContext(DipDupContext):",
+      "total_lines": 545,
+      "ref": "4c05ab11a6429ebb0536ccf738d74dcaa714985c"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "rollback",
+      "class_name": "HookContext",
+      "start_line": 340,
+      "end_line": 363,
+      "satd_line": null,
+      "matched_by": "signature_or_comment",
+      "source": "    async def rollback(self, index: str, from_level: int, to_level: int) -> None:\n        self.logger.info('Rolling back `%s`: %s -> %s', index, from_level, to_level)\n        if from_level <= to_level:\n            raise RuntimeError(f'Attempt to rollback in future: {from_level} <= {to_level}')\n        if from_level - to_level > self.config.advanced.rollback_depth:\n            # TODO: More context\n            await self.reindex(ReindexingReason.rollback)\n\n        models = importlib.import_module(f'{self.config.package}.models')\n        async with self._transactions.in_transaction():\n            updates = await ModelUpdate.filter(\n                level__lte=from_level,\n                level__gt=to_level,\n                index=index,\n            ).order_by('-id')\n\n            if updates:\n                self.logger.info(f'Reverting {len(updates)} updates')\n            for update in updates:\n                model = getattr(models, update.model_name)\n                await update.revert(model)\n\n        await Index.filter(name=index).update(level=to_level)\n        rolled_back_indexes.add(index)",
+      "calls": [
+        "RuntimeError",
+        "getattr",
+        "len"
+      ],
+      "self_calls": [
+        "reindex"
+      ],
+      "self_attrs": [
+        "_transactions",
+        "config",
+        "logger",
+        "reindex"
+      ],
+      "global_uses": [
+        "Index",
+        "ModelUpdate",
+        "ReindexingReason",
+        "importlib",
+        "rolled_back_indexes"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "reindex",
+        "transactions.in_transaction",
+        "ModelUpdate.filter",
+        "ModelUpdate.filter.order_by",
+        "update.revert",
+        "Index.filter",
+        "Index.filter.update"
+      ],
+      "reason": "These methods are directly involved in the rollback process, and understanding them is essential for accurately repairing the SATD related to the rollback functionality."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "DipDupContext.reindex",
+        "path": "src/dipdup/context.py",
+        "class_name": "DipDupContext",
+        "start_line": 171,
+        "end_line": 207,
+        "source": "async def reindex(self, reason: Optional[Union[str, ReindexingReason]] = None, **context) -> None:\n        \"\"\"Drop the whole database and restart with the same CLI arguments\"\"\"\n        if reason is None:\n            reason = ReindexingReason.manual\n        # NOTE: Do not check for `str`!\n        elif not isinstance(reason, ReindexingReason):\n            context['message'] = reason\n            reason = ReindexingReason.manual\n\n        action = self.config.advanced.reindex.get(reason, ReindexingAction.exception)\n        self.logger.warning('Reindexing requested: reason `%s`, action `%s`', reason.value, action.value)\n\n        if action == ReindexingAction.ignore:\n            # NOTE: Recalculate hashes on the next run\n            if reason == ReindexingReason.schema_modified:\n                await Schema.filter(name=self.config.schema_name).update(hash='')\n            elif reason == ReindexingReason.config_modified:\n                await Index.filter().update(config_hash='')\n            return\n\n        elif action == ReindexingAction.exception:\n            schema = await Schema.filter(name=self.config.schema_name).get()\n            if not schema.reindex:\n                schema.reindex = reason\n                await schema.save()\n            raise ReindexingRequiredError(schema.reindex, context)\n\n        elif action == ReindexingAction.wipe:\n            conn = get_connection()\n            if isinstance(self.config.database, PostgresDatabaseConfig):\n                await wipe_schema(conn, self.config.database.schema_name, self.config.database.immune_tables)\n            else:\n                await Tortoise._drop_databases()\n            await self.restart()\n\n        else:\n            raise NotImplementedError",
+        "found": true
+      },
+      {
+        "method_name": "in_transaction",
+        "path": "src/dipdup/transactions.py",
+        "class_name": "TransactionManager",
+        "start_line": 50,
+        "end_line": 79,
+        "source": "async def in_transaction(\n        self,\n        level: Optional[int] = None,\n        sync_level: Optional[int] = None,\n        index: Optional[str] = None,\n    ) -> AsyncIterator[None]:\n        \"\"\"Enforce using transaction for all queries inside wrapped block. Works for a single DB only.\"\"\"\n        try:\n            original_conn = get_connection()\n            async with in_transaction() as conn:\n                set_connection(conn)\n\n                if self._transaction:\n                    raise ValueError('Transaction is already started')\n\n                if level and index and self._depth:\n                    if not sync_level or sync_level - level <= self._depth:\n                        self._transaction = dipdup.models.VersionedTransaction(\n                            level,\n                            index,\n                            self._immune_tables,\n                        )\n\n                yield\n\n                if self._transaction:\n                    await self._commit()\n        finally:\n            self._transaction = None\n            set_connection(original_conn)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "filter",
+      "order_by",
+      "filter"
+    ]
+  },
+  "review_context": {}
+}

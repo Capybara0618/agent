@@ -59,12 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable reviewer gating after repair. Default is off for fixer-only experiments.",
     )
     parser.add_argument(
-        "--repair-prompt-mode",
-        choices=["lightweight", "analysis_heavy"],
-        default="lightweight",
-        help="Repair prompt style. Default keeps a baseline-style lightweight fixer prompt.",
-    )
-    parser.add_argument(
         "--repair-context-mode",
         choices=["clone_treesitter", "method_query"],
         default="clone_treesitter",
@@ -102,7 +96,6 @@ def main() -> None:
         write_batch_size=args.write_batch_size,
         use_analyzer=args.enable_analyzer,
         use_reviewer=args.enable_review,
-        repair_prompt_mode=args.repair_prompt_mode,
         repair_context_mode=args.repair_context_mode,
         max_method_contexts=args.max_method_contexts,
     )
@@ -123,7 +116,6 @@ def main() -> None:
     print(f"Write batch size: {summary['write_batch_size']}")
     print(f"Analyzer enabled: {args.enable_analyzer}")
     print(f"Review enabled: {args.enable_review}")
-    print(f"Repair prompt mode: {args.repair_prompt_mode}")
     print(f"Repair context mode: {summary.get('repair_context_mode')}")
     print(f"Single repair path: {summary.get('single_repair_path')}")
     print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")

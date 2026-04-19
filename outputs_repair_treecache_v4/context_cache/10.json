@@ -1,0 +1,195 @@
+{
+  "task_id": "10",
+  "repo_owner": "openvstorage",
+  "repo_name": "framework",
+  "file_path": "ovs/lib/vpool.py",
+  "commit": "da746b6bdbb05ac20d1cd3686ba6080b45033167",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-16T04:01:37+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "da746b6bdbb05ac20d1cd3686ba6080b45033167",
+    "symbol_name": "get_configuration",
+    "satd_line": 127,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-16T04:01:49+00:00",
+    "identified_method_count": 3,
+    "retrieved_method_count": 2,
+    "missing_method_count": 1,
+    "edit_constraint_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "ovs/lib/vpool.py",
+    "original_signature": "def get_configuration(vpool_guid):",
+    "target_file": {
+      "ok": true,
+      "path": "ovs/lib/vpool.py",
+      "sha": "5d0c119ac4546b8ae26cf84b7ec7d70f9e907a78",
+      "download_url": "https://raw.githubusercontent.com/openvstorage/framework/da746b6bdbb05ac20d1cd3686ba6080b45033167/ovs/lib/vpool.py",
+      "content_excerpt": "# Copyright 2014 Open vStorage NV\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"\nVPool module\n\"\"\"\n\nfrom ovs.celery_run import celery\nfrom ovs.dal.hybrids.vpool import VPool\nfrom ovs.dal.lists.vmachinelist import VMachineList\nfrom ovs.dal.lists.storagedriverlist import StorageDriverList\nfrom ovs.extensions.fs.exportfs import Nfsexports\nfrom ovs.extensions.generic.sshclient import SSHClient\nfrom ovs.extensions.hypervisor.factory import Factory\nfrom ovs.lib.vmachine import VMachineController\nfrom ovs.lib.helpers.decorators import log\nfrom ovs.log.logHandler import LogHandler\nfrom ovs.extensions.storageserver.storagedriver import StorageDriverConfiguration\n\nlogger = LogHandler.get('lib', name='vpool')\n\n\nclass VPoolController(object):\n    \"\"\"\n    Contains all BLL related to VPools\n    \"\"\"\n\n    @staticmethod\n    @celery.task(name='ovs.vpool.up_and_running')\n    @log('VOLUMEDRIVER_TASK')\n    def up_and_running(mountpoint, storagedriver_id):\n        \"\"\"\n        Volumedriver informs us that the service is completely started. Post-start events can be executed\n        \"\"\"\n        storagedriver = StorageDriverList.get_by_storagedriver_id(storagedriver_id)\n        if storagedriver is None:\n            raise RuntimeError('A Storage Driver with id {0} could not be found.'.format(storagedriver_id))\n        storagedriver.startup_counter += 1\n        storagedriver.save()\n        if storagedriver.storagerouter.pmachine.hvtype == 'VMWARE':\n            client = SSHClient(storagedriver.storagerouter)\n            if client.config_read('ovs.storagedriver.vmware_mode') == 'classic':\n                nfs = Nfsexports()\n                nfs.unexport(mountpoint)\n                nfs.export(mountpoint)\n                nfs.trigger_rpc_mountd()\n\n    @staticmethod\n    @celery.task(name='ovs.vpool.sync_with_hypervisor')\n    def sync_with_hypervisor(vpool_guid):\n        \"\"\"\n        Syncs all vMachines of a given vPool with the hypervisor\n        \"\"\"\n        vpool = VPool(vpool_guid)\n        for storagedriver in vpool.storagedrivers:\n            pmachine = storagedriver.storagerouter.pmachine\n            hypervisor = Factory.get(pmachine)\n            for vm_object in hypervisor.get_vms_by_nfs_mountinfo(storagedriver.storage_ip, storagedriver.mountpoint):\n                search_vpool = None if pmachine.hvtype == 'KVM' else vpool\n                vmachine = VMachineList.get_by_devicename_and_vpool(\n                    devicename=vm_object['backing']['filename'],\n                    vpool=search_vpool\n                )\n                VMachineController.update_vmachine_config(vmachine, vm_object, pmachine)\n\n    @staticmethod\n    def can_be_served_on(storagerouter_guid):\n        \"\"\"\n        temporary check to avoid creating 2 ganesha nfs exported vpools\n        as this is not yet supported on storage driver level\n        \"\"\"\n        _ = storagerouter_guid\n        return True\n\n    @staticmethod\n    @celery.task(name='ovs.vpool.get_configuration')\n    def get_configuration(vpool_guid):\n        vpool = VPool(vpool_guid)\n        if not vpool.storagedrivers or not vpool.storagedrivers[0].storagerouter:\n            return {}\n\n        onread = 'CacheOnRead'\n        onwrite = 'CacheOnWrite'\n        deduped = 'ContentBased'\n        non_deduped = 'LocationBased'\n        cache_mapping = {None: 'none',\n                         onread: 'onread',\n                         onwrite: 'onwrite'}\n        dedupe_mapping = {deduped: 'dedupe',\n                          non_deduped: 'nondedupe'}\n        dtl_mode_mapping = {'': 'sync',\n                            '': 'async',\n                            '': 'nosync'}\n\n        client = SSHClient(vpool.storagedrivers[0].storagerouter)\n        storagedriver_config = StorageDriverConfiguration('storagedriver', vpool.name)\n        storagedriver_config.load(client)\n\n        volume_router = storagedriver_config.configuration.get('volume_router', {})\n        volume_manager = storagedriver_config.configuration.get('volume_manager', {})\n\n        dedupe_mode = volume_manager.get('read_cache_default_mode', 'ContentBased')\n        cache_strategy = volume_manager.get('read_cache_default_behaviour', 'CacheOnRead')\n        sco_multiplier = volume_router.get('vrouter_sco_multiplier', 1024)\n        tlog_multiplier = volume_manager.get('number_of_scos_in_tlog', 20)\n        non_disposable_sco_factor = volume_manager.get('non_disposable_scos_factor', 12)\n\n        dtl_mode = storagedriver_config.configuration.get('', {}).get('', None)\n        sco_size = sco_multiplier * 4 / 1024  # SCO size is in MiB ==> SCO multiplier * cluster size (4 KiB by default)\n        dtl_enabled = storagedriver_config.configuration.get('', {}).get('', None)\n        dtl_location = storagedriver_config.configuration.get('', {}).get('', None)\n        write_buffer = tlog_multiplier * sco_size * non_disposable_sco_factor / 1024.0  # SCO size is in MiB, but write buffer must be GiB\n\n        return {'sco_size': sco_size,\n                'dtl_mode': dtl_mode,\n                'dtl_enabled': dtl_enabled,  # @TODO: Must be boolean value once implemented correctly\n                'dedupe_mode': dedupe_mapping[dedupe_mode],\n                'write_buffer': write_buffer,\n                'dtl_location': dtl_location,\n                'cache_strategy': cache_mapping[cache_strategy]}\n",
+      "total_lines": 131,
+      "ref": "da746b6bdbb05ac20d1cd3686ba6080b45033167"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "get_configuration",
+      "class_name": "VPoolController",
+      "start_line": 88,
+      "end_line": 131,
+      "satd_line": 127,
+      "matched_by": "normalized_source",
+      "source": "    def get_configuration(vpool_guid):\n        vpool = VPool(vpool_guid)\n        if not vpool.storagedrivers or not vpool.storagedrivers[0].storagerouter:\n            return {}\n\n        onread = 'CacheOnRead'\n        onwrite = 'CacheOnWrite'\n        deduped = 'ContentBased'\n        non_deduped = 'LocationBased'\n        cache_mapping = {None: 'none',\n                         onread: 'onread',\n                         onwrite: 'onwrite'}\n        dedupe_mapping = {deduped: 'dedupe',\n                          non_deduped: 'nondedupe'}\n        dtl_mode_mapping = {'': 'sync',\n                            '': 'async',\n                            '': 'nosync'}\n\n        client = SSHClient(vpool.storagedrivers[0].storagerouter)\n        storagedriver_config = StorageDriverConfiguration('storagedriver', vpool.name)\n        storagedriver_config.load(client)\n\n        volume_router = storagedriver_config.configuration.get('volume_router', {})\n        volume_manager = storagedriver_config.configuration.get('volume_manager', {})\n\n        dedupe_mode = volume_manager.get('read_cache_default_mode', 'ContentBased')\n        cache_strategy = volume_manager.get('read_cache_default_behaviour', 'CacheOnRead')\n        sco_multiplier = volume_router.get('vrouter_sco_multiplier', 1024)\n        tlog_multiplier = volume_manager.get('number_of_scos_in_tlog', 20)\n        non_disposable_sco_factor = volume_manager.get('non_disposable_scos_factor', 12)\n\n        dtl_mode = storagedriver_config.configuration.get('', {}).get('', None)\n        sco_size = sco_multiplier * 4 / 1024  # SCO size is in MiB ==> SCO multiplier * cluster size (4 KiB by default)\n        dtl_enabled = storagedriver_config.configuration.get('', {}).get('', None)\n        dtl_location = storagedriver_config.configuration.get('', {}).get('', None)\n        write_buffer = tlog_multiplier * sco_size * non_disposable_sco_factor / 1024.0  # SCO size is in MiB, but write buffer must be GiB\n\n        return {'sco_size': sco_size,\n                'dtl_mode': dtl_mode,\n                'dtl_enabled': dtl_enabled,  # @TODO: Must be boolean value once implemented correctly\n                'dedupe_mode': dedupe_mapping[dedupe_mode],\n                'write_buffer': write_buffer,\n                'dtl_location': dtl_location,\n                'cache_strategy': cache_mapping[cache_strategy]}",
+      "calls": [
+        "SSHClient",
+        "StorageDriverConfiguration",
+        "VPool"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "SSHClient",
+        "StorageDriverConfiguration",
+        "VPool",
+        "celery"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "VPool",
+        "SSHClient",
+        "StorageDriverConfiguration"
+      ],
+      "reason": "These methods are essential for creating instances and retrieving configurations that directly impact the boolean value needed for the SATD repair.",
+      "uncertainty_items": [
+        {
+          "kind": "method",
+          "raw_name": "VPool",
+          "normalized_name": "VPool",
+          "line": 2,
+          "source_excerpt": "vpool = VPool(vpool_guid)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "SSHClient",
+          "normalized_name": "SSHClient",
+          "line": 19,
+          "source_excerpt": "client = SSHClient(vpool.storagedrivers[0].storagerouter)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "StorageDriverConfiguration",
+          "normalized_name": "StorageDriverConfiguration",
+          "line": 20,
+          "source_excerpt": "storagedriver_config = StorageDriverConfiguration('storagedriver', vpool.name)",
+          "retrieval_eligible": true
+        }
+      ]
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "VPool",
+        "path": "ovs/dal/hybrids/vpool.py",
+        "class_name": null,
+        "start_line": 25,
+        "end_line": 69,
+        "source": "class VPool(DataObject):\n    \"\"\"\n    The VPool class represents a vPool. A vPool is a Virtual Storage Pool, a Filesystem, used to\n    deploy vMachines. a vPool can span multiple Storage Drivers and connects to a single Storage BackendType.\n    \"\"\"\n    __properties = [Property('name', str, doc='Name of the vPool'),\n                    Property('description', str, mandatory=False, doc='Description of the vPool'),\n                    Property('size', int, mandatory=False, doc='Size of the vPool expressed in Bytes. Set to zero if not applicable.'),\n                    Property('login', str, mandatory=False, doc='Login/Username for the Storage BackendType.'),\n                    Property('password', str, mandatory=False, doc='Password for the Storage BackendType.'),\n                    Property('connection', str, mandatory=False, doc='Connection (IP, URL, Domain name, Zone, ...) for the Storage BackendType.'),\n                    Property('metadata', dict, mandatory=False, doc='Metadata for the backend, as used by the Storage Drivers.')]\n    __relations = [Relation('backend_type', BackendType, 'vpools', doc='Type of storage backend.')]\n    __dynamics = [Dynamic('status', str, 10),\n                  Dynamic('statistics', dict, 4, locked=True),\n                  Dynamic('stored_data', int, 60)]\n\n    def _status(self):\n        \"\"\"\n        Fetches the Status of the vPool.\n        \"\"\"\n        _ = self\n        return None\n\n    def _statistics(self, dynamic):\n        \"\"\"\n        Aggregates the Statistics (IOPS, Bandwidth, ...) of each vDisk served by the vPool.\n        \"\"\"\n        from ovs.dal.hybrids.vdisk import VDisk\n        statistics = {}\n        for key in StorageDriverClient.stat_keys:\n            statistics[key] = 0\n            statistics['{0}_ps'.format(key)] = 0\n        for vdisk in self.vdisks:\n            for key, value in vdisk.fetch_statistics().iteritems():\n                statistics[key] += value\n        statistics['timestamp'] = time.time()\n        VDisk.calculate_delta(self._key, dynamic, statistics)\n        return statistics\n\n    def _stored_data(self):\n        \"\"\"\n        Aggregates the Stored Data of each vDisk served by the vPool.\n        \"\"\"\n        return sum([disk.info['stored'] for disk in self.vdisks])",
+        "found": true
+      },
+      {
+        "method_name": "SSHClient",
+        "path": "ovs/extensions/generic/sshclient.py",
+        "class_name": null,
+        "start_line": 79,
+        "end_line": 454,
+        "source": "class SSHClient(object):\n    \"\"\"\n    Remote/local client\n    \"\"\"\n\n    client_cache = {}\n    IP_REGEX = re.compile('^(((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))$')\n\n    def __init__(self, endpoint, username='ovs', password=None):\n        \"\"\"\n        Initializes an SSHClient\n        \"\"\"\n        storagerouter = None\n        if isinstance(endpoint, basestring):\n            ip = endpoint\n            if not re.findall(SSHClient.IP_REGEX, ip):\n                raise ValueError('Incorrect IP {0} specified'.format(ip))\n        elif Descriptor.isinstance(endpoint, StorageRouter):\n            # Refresh the object before checking its attributes\n            storagerouter = StorageRouter(endpoint.guid)\n            ip = storagerouter.ip\n        else:\n            raise ValueError('The endpoint parameter should be either an ip address or a StorageRouter')\n\n        self.ip = ip\n        local_ips = check_output(\"ip a | grep 'inet ' | sed 's/\\s\\s*/ /g' | cut -d ' ' -f 3 | cut -d '/' -f 1\", shell=True).strip().splitlines()\n        self.local_ips = [ip.strip() for ip in local_ips]\n        self.is_local = self.ip in self.local_ips\n\n        if self.is_local is False and storagerouter is not None:\n            process_heartbeat = storagerouter.heartbeats.get('process')\n            if process_heartbeat is not None:\n                if time.time() - process_heartbeat > 300:\n                    message = 'StorageRouter {0} process heartbeat > 300s'.format(ip)\n                    logger.error(message)\n                    raise UnableToConnectException(message)\n\n        current_user = check_output('whoami', shell=True).strip()\n        if username is None:\n            self.username = current_user\n        else:\n            self.username = username\n            if username != current_user:\n                self.is_local = False  # If specified user differs from current executing user, we always use the paramiko SSHClient\n        self.password = password\n\n        self.client = None\n        if not self.is_local:\n            logging.getLogger('paramiko').setLevel(logging.WARNING)\n            key = '{0}@{1}'.format(self.ip, self.username)\n            if key not in SSHClient.client_cache:\n                client = paramiko.SSHClient()\n                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())\n                client.is_connected = types.MethodType(is_connected, client)\n                SSHClient.client_cache[key] = client\n            self.client = SSHClient.client_cache[key]\n\n    def __del__(self):\n        \"\"\"\n        Class destructor\n        \"\"\"\n        try:\n            if not self.is_local:\n                self._disconnect()\n        except Exception:\n            pass  # Absorb destructor exceptions\n\n    def _connect(self):\n        \"\"\"\n        Connects to the remote end\n        \"\"\"\n        if self.is_local is True:\n            return\n\n        try:\n            self.client.connect(self.ip, username=self.username, password=self.password)\n        except socket.error as ex:\n            if 'No route to host' in str(ex):\n                message = 'SocketException: No route to host {0}'.format(ip)\n                logger.error(message)\n                raise UnableToConnectException(message)\n            raise\n\n    def _disconnect(self):\n        \"\"\"\n        Disconnects from the remote end\n        \"\"\"\n        if self.is_local is True:\n            return\n\n        self.client.close()\n\n    @staticmethod\n    def _shell_safe(path_to_check):\n        \"\"\"Makes sure that the given path/string is escaped and safe for shell\"\"\"\n        return \"\".join([(\"\\\\\" + _) if _ in \" '\\\";`|\" else _ for _ in path_to_check])\n\n    @connected()\n    def run(self, command, debug=False):\n        \"\"\"\n        Executes a shell command\n        \"\"\"\n        if self.is_local is True:\n            try:\n                try:\n                    process = Popen(command, stdout=PIPE, stderr=PIPE, shell=True)\n                except OSError as ose:\n                    logger.error('Command: \"{0}\" failed with output: \"{1}\"'.format(command, str(ose)))\n                    raise CalledProcessError(1, command, str(ose))\n                out, err = process.communicate()\n                if debug:\n                    logger.debug('stdout: {0}'.format(out))\n                    logger.debug('stderr: {0}'.format(err))\n                    return out.strip(), err\n                else:\n                    return out.strip()\n\n            except CalledProcessError as cpe:\n                logger.error('Command: \"{0}\" failed with output: \"{1}\"'.format(command, cpe.output))\n                raise cpe\n        else:\n            _, stdout, stderr = self.client.exec_command(command)  # stdin, stdout, stderr\n            exit_code = stdout.channel.recv_exit_status()\n            if exit_code != 0:  # Raise same error as check_output\n                stderr = ''.join(stderr.readlines())\n                stdout = ''.join(stdout.readlines())\n                logger.error('Command: \"{0}\" failed with output \"{1}\" and error \"{2}\"'.format(command, stdout, stderr))\n                raise CalledProcessError(exit_code, command, stderr)\n            if debug:\n                return '\\n'.join(line.rstrip() for line in stdout).strip(), stderr\n            else:\n                return '\\n'.join(line.rstrip() for line in stdout).strip()\n\n    def dir_create(self, directories):\n        \"\"\"\n        Ensures a directory exists on the remote end\n        \"\"\"\n        if isinstance(directories, basestring):\n            directories = [directories]\n        for directory in directories:\n            directory = self._shell_safe(directory)\n            if self.is_local is True:\n                if not os.path.exists(directory):\n                    os.makedirs(directory)\n            else:\n                self.run('mkdir -p \"{0}\"; echo true'.format(directory))\n\n    def dir_delete(self, directories):\n        \"\"\"\n        Remove a directory (or multiple directories) from the remote filesystem recursively\n        \"\"\"\n        if isinstance(directories, basestring):\n            directories = [directories]\n        for directory in directories:\n            directory = self._shell_safe(directory)\n            if self.is_local is True:\n                if os.path.exists(directory):\n                    for dirpath, dirnames, filenames in os.walk(directory, topdown=False):\n                        for filename in filenames:\n                            os.remove(os.path.join(dirpath, filename))\n                        for sub_directory in dirnames:\n                            os.rmdir(os.path.join(dirpath, sub_directory))\n                    os.rmdir(directory)\n            else:\n                if self.dir_exists(directory):\n                    self.run('rm -rf \"{0}\"'.format(directory))\n\n    def dir_exists(self, directory):\n        \"\"\"\n        Checks if a directory exists on a remote host\n        \"\"\"\n        if self.is_local is True:\n            return os.path.isdir(self._shell_safe(directory))\n        else:\n            command = \"\"\"import os, json\nprint json.dumps(os.path.isdir('{0}'))\"\"\".format(self._shell_safe(directory))\n            return json.loads(self.run('python -c \"\"\"{0}\"\"\"'.format(command)))\n\n    def dir_chmod(self, directories, mode, recursive=False):\n        if not isinstance(mode, int):\n            raise ValueError('Mode should be an integer')\n\n        if isinstance(directories, basestring):\n            directories = [directories]\n        for directory in directories:\n            directory = self._shell_safe(directory)\n            if self.is_local is True:\n                os.chmod(directory, mode)\n                if recursive is True:\n                    for root, dirs, _ in os.walk(directory):\n                        for sub_dir in dirs:\n                            os.chmod(os.path.join(root, sub_dir), mode)\n            else:\n                recursive_str = '-R' if recursive is True else ''\n                self.run('chmod {0} {1} {2}'.format(recursive_str, oct(mode), directory))\n\n    def dir_chown(self, directories, user, group, recursive=False):\n        all_users = [user_info[0] for user_info in pwd.getpwall()]\n        all_groups = [group_info[0] for group_info in grp.getgrall()]\n\n        if user not in all_users:\n            raise ValueError('User \"{0}\" is unknown on the system'.format(user))\n        if group not in all_groups:\n            raise ValueError('Group \"{0}\" is unknown on the system'.format(group))\n\n        uid = pwd.getpwnam(user)[2]\n        gid = grp.getgrnam(group)[2]\n        if isinstance(directories, basestring):\n            directories = [directories]\n        for directory in directories:\n            directory = self._shell_safe(directory)\n            if self.is_local is True:\n                os.chown(directory, uid, gid)\n                if recursive is True:\n                    for root, dirs, _ in os.walk(directory):\n                        for sub_dir in dirs:\n                            os.chown(os.path.join(root, sub_dir), uid, gid)\n            else:\n                recursive_str = '-R' if recursive is True else ''\n                self.run('chown {0} {1}:{2} {3}'.format(recursive_str, user, group, directory))\n\n    def file_create(self, filenames):\n        if isinstance(filenames, basestring):\n            filenames = [filenames]\n        for filename in filenames:\n            if not filename.startswith('/'):\n                raise ValueError('Absolute path required for filename {0}'.format(filename))\n\n            filename = self._shell_safe(filename)\n            if self.is_local is True:\n                if not os.path.exists(filename):\n                    open(filename, 'a').close()\n            else:\n                directory = os.path.dirname(filename)\n                self.dir_create(directory)\n                self.run('touch {0}'.format(filename))\n\n    def file_delete(self, filenames):\n        \"\"\"\n        Remove a file (or multiple files) from the remote filesystem\n        \"\"\"\n        if isinstance(filenames, basestring):\n            filenames = [filenames]\n        for filename in filenames:\n            filename = self._shell_safe(filename)\n            if self.is_local is True:\n                if '*' in filename:\n                    for fn in glob.glob(filename):\n                        os.remove(fn)\n                else:\n                    if os.path.isfile(filename):\n                        os.remove(filename)\n            else:\n                if '*' in filename:\n                    command = \"\"\"import glob, json\nprint json.dumps(glob.glob('{0}'))\"\"\".format(filename)\n                    for fn in json.loads(self.run('python -c \"\"\"{0}\"\"\"'.format(command))):\n                        self.run('rm -f \"{0}\"'.format(fn))\n                else:\n                    if self.file_exists(filename):\n                        self.run('rm -f \"{0}\"'.format(filename))\n\n    def file_unlink(self, path):\n        if self.file_exists(path):\n            self.run(\"unlink {0}\".format(self._shell_safe(path)))\n\n    def file_read(self, filename):\n        \"\"\"\n        Load a file from the remote end\n        \"\"\"\n        if self.is_local is True:\n            with open(filename, 'r') as the_file:\n                return the_file.read()\n        else:\n            return self.run('cat \"{0}\"'.format(filename))\n\n    @connected()\n    def file_write(self, filename, contents, mode='w'):\n        \"\"\"\n        Writes into a file to the remote end\n        \"\"\"\n        if self.is_local is True:\n            with open(filename, mode) as the_file:\n                the_file.write(contents)\n        else:\n            handle, temp_filename = tempfile.mkstemp()\n            with open(temp_filename, mode) as the_file:\n                the_file.write(contents)\n            os.close(handle)\n            try:\n                sftp = self.client.open_sftp()\n                sftp.put(temp_filename, filename)\n                sftp.close()\n            finally:\n                os.remove(temp_filename)\n\n    @connected()\n    def file_upload(self, remote_filename, local_filename):\n        \"\"\"\n        Uploads a file to a remote end\n        \"\"\"\n        if self.is_local is True:\n            check_output('cp -f \"{0}\" \"{1}\"'.format(local_filename, remote_filename), shell=True)\n        else:\n            sftp = self.client.open_sftp()\n            sftp.put(local_filename, remote_filename)\n\n    def file_exists(self, filename):\n        \"\"\"\n        Checks if a file exists on a remote host\n        \"\"\"\n        if self.is_local is True:\n            return os.path.isfile(self._shell_safe(filename))\n        else:\n            command = \"\"\"import os, json\nprint json.dumps(os.path.isfile('{0}'))\"\"\".format(self._shell_safe(filename))\n            return json.loads(self.run('python -c \"\"\"{0}\"\"\"'.format(command)))\n\n    def file_attribs(self, filename, mode):\n        \"\"\"\n        Sets the mode of a remote file\n        \"\"\"\n        command = 'chmod {0} \"{1}\"'.format(mode, filename)\n        if self.is_local is True:\n            check_output(command, shell=True)\n        else:\n            self.run(command)\n\n    @connected()\n    def config_read(self, key):\n        if self.is_local is True:\n            from ovs.extensions.generic.configuration import Configuration\n            return Configuration.get(key)\n        else:\n            read = \"\"\"\nimport sys, json\nsys.path.append('/opt/OpenvStorage')\nfrom ovs.extensions.generic.configuration import Configuration\nprint json.dumps(Configuration.get('{0}'))\n\"\"\".format(key)\n            return json.loads(self.run('python -c \"\"\"{0}\"\"\"'.format(read)))\n\n    @connected()\n    def config_set(self, key, value):\n        if self.is_local is True:\n            from ovs.extensions.generic.configuration import Configuration\n            Configuration.set(key, value)\n        else:\n            write = \"\"\"\nimport sys, json\nsys.path.append('/opt/OpenvStorage')\nfrom ovs.extensions.generic.configuration import Configuration\nConfiguration.set('{0}', json.loads('{1}'))\n\"\"\".format(key, json.dumps(value).replace('\"', '\\\\\"'))\n            self.run('python -c \"\"\"{0}\"\"\"'.format(write))\n\n    def rawconfig_read(self, filename):\n        contents = self.file_read(filename)\n        handle, temp_filename = tempfile.mkstemp()\n        with open(temp_filename, 'w') as configfile:\n            configfile.write(contents)\n        os.close(handle)\n        rawconfig = RawConfigParser()\n        rawconfig.read(temp_filename)\n        os.remove(temp_filename)\n        return rawconfig\n\n    def rawconfig_write(self, filename, rawconfig):\n        handle, temp_filename = tempfile.mkstemp()\n        with open(temp_filename, 'w') as configfile:\n            rawconfig.write(configfile)\n        with open(temp_filename, 'r') as configfile:\n            contents = configfile.read()\n            self.file_write(filename, contents)\n        os.close(handle)\n        os.remove(temp_filename)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "StorageDriverConfiguration"
+    ],
+    "edit_constraints": [
+      {
+        "target_kind": "method",
+        "target_hint": "vpool = VPool(vpool_guid)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# @TODO: Must be boolean value once implemented correctly) while staying consistent with `VPool`.",
+        "must_do": "Use `VPool` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not replace a local value/flag fix with an object-level rewrite.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "VPool",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "class VPool(DataObject):\n...\n    __properties = [Property('name', str, doc='Name of the vPool'),\n                    Property('description', str, mandatory=False, doc='Description of the vPool'),\n                    Property('size', int, mandatory=False, doc='Size of the vPool expressed in Bytes. Set to zero if not applicable.'),\n                    Property('login', str, mandatory=False, doc='Login/Username for the Storage BackendType.'),\n                    Property('password', str, mandatory=False, doc='Password for the Storage BackendType.'),",
+        "confidence": 0.99
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "client = SSHClient(vpool.storagedrivers[0].storagerouter)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# @TODO: Must be boolean value once implemented correctly) while staying consistent with `SSHClient`.",
+        "must_do": "Use `SSHClient` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not replace a local value/flag fix with an object-level rewrite.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "SSHClient",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "class SSHClient(object):\n...\n\n    def __init__(self, endpoint, username='ovs', password=None):\n        \"\"\"\n...\n        \"\"\"",
+        "confidence": 0.99
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "storagedriver_config = StorageDriverConfiguration('storagedriver', vpool.name)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# @TODO: Must be boolean value once implemented correctly) while staying consistent with `StorageDriverConfiguration`.",
+        "must_do": "Use `StorageDriverConfiguration` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not replace a local value/flag fix with an object-level rewrite.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "StorageDriverConfiguration",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "19:     client = SSHClient(vpool.storagedrivers[0].storagerouter)\n20:     storagedriver_config = StorageDriverConfiguration('storagedriver', vpool.name)\n21:     storagedriver_config.load(client)",
+        "confidence": 0.45
+      }
+    ]
+  },
+  "review_context": {}
+}

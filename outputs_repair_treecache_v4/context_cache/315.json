@@ -1,0 +1,248 @@
+{
+  "task_id": "315",
+  "repo_owner": "google",
+  "repo_name": "jax",
+  "file_path": "jax/_src/interpreters/mlir.py",
+  "commit": "cc8d7fae3290ec75891fda01b1c685b21d835f1d",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-16T20:58:41+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "cc8d7fae3290ec75891fda01b1c685b21d835f1d",
+    "symbol_name": "reshape",
+    "satd_line": 677,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-16T21:11:24+00:00",
+    "identified_method_count": 8,
+    "retrieved_method_count": 2,
+    "missing_method_count": 6,
+    "edit_constraint_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "jax/_src/interpreters/mlir.py",
+    "original_signature": "def reshape(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue) -> ir.Value:",
+    "target_file": {
+      "ok": true,
+      "path": "jax/_src/interpreters/mlir.py",
+      "sha": "c64c42f04fa00b9b379e13af1c2265ad0346ea9e",
+      "download_url": "https://raw.githubusercontent.com/jax-ml/jax/cc8d7fae3290ec75891fda01b1c685b21d835f1d/jax/_src/interpreters/mlir.py",
+      "content_excerpt": "# Copyright 2021 The JAX Authors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     https://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n# Lowering and execution path that converts jaxprs into MLIR.\nfrom __future__ import annotations\n\nimport collections\nimport dataclasses\nimport functools\nfrom functools import partial\nimport io\nimport itertools\nimport operator\nimport re\nimport typing\nfrom typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,\n                    Protocol, Sequence, Set, Tuple, Type, Union, FrozenSet)\nimport warnings\n\nimport numpy as np\n\nfrom jax._src import linear_util as lu\nfrom jax.config import config\nfrom jax._src.interpreters import ad\nfrom jax.interpreters import partial_eval as pe\nfrom jax._src.interpreters import xla\nfrom jax._src import ad_util\nfrom jax._src import core\nfrom jax._src import device_array\nfrom jax._src import dtypes\nfrom jax._src import source_info_util\nfrom jax._src import util\nfrom jax._src.lib import xla_bridge as xb\nfrom jax._src.lib import xla_client as xc\nfrom jax._src.lib.mlir import ir\nfrom jax._src.lib.mlir.dialects import hlo\nfrom jax._src.lib.mlir.dialects import func as func_dialect\n\n\nmap, unsafe_map = util.safe_map, map\nzip, unsafe_zip = util.safe_zip, zip\n\nT = typing.TypeVar(\"T\")\n\nValue = Any  # = ir.Value\n\n# mypy implicitly sets this variable to true when type checking.\nMYPY = False\n\nlowerable_effects: Set[core.Effect] = set()\n\n\n# IR Helpers\n\ndef dense_int_elements(xs) -> ir.DenseIntElementsAttr:\n  return ir.DenseIntElementsAttr.get(np.asarray(xs, np.int64))\n\ndef dense_bool_elements(xs: Sequence[bool]) -> ir.DenseElementsAttr:\n  a = np.packbits(np.array(xs, np.bool_), bitorder='little')\n  # TODO(b/209005197): Work around for MLIR crash for non-splat single element\n  # buffers.\n  if len(xs) == 1:\n    a = np.array(0 if a.item() == 0 else 0xff, np.uint8)\n  return ir.DenseElementsAttr.get(\n      a, type=ir.IntegerType.get_signless(1), shape=[len(xs)])\n\ndef i32_attr(i): return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), i)\ndef i64_attr(i): return ir.IntegerAttr.get(ir.IntegerType.get_signless(64), i)\n\ndef shape_tensor(sizes: Sequence[Union[int, ir.RankedTensorType]]\n                 ) -> ir.RankedTensorType:\n  int1d = aval_to_ir_type(core.ShapedArray((1,), np.int32))\n  def lower_dim(d):\n    if type(d) is int:\n      return ir_constant(np.array([d], np.int32))\n    else:\n      return hlo.ReshapeOp(int1d, hlo.ConvertOp(aval_to_ir_type(core.ShapedArray((), np.int32)), d))\n  d, *ds = map(lower_dim, sizes)\n  if not ds:\n    return d\n  else:\n    return hlo.ConcatenateOp([d, *ds], i64_attr(0)).result\n\n\ndef delegate_lowering(ctx, lowering_fun, *args, **ctx_override_kwargs):\n  \"\"\"Side-effects on `ctx`\"\"\"\n  ctx_new = ctx.replace(**ctx_override_kwargs)\n  out = lowering_fun(ctx_new, *args)\n  ctx.set_tokens_out(ctx_new.tokens_out)\n  return out\n\n\n# IR Types\n\n# Non-canonicalized dtype to IR type mapping.\n_dtype_to_ir_type : Dict[np.dtype, Callable[[], ir.Type]] = {\n  np.dtype(dtypes.float0): partial(ir.IntegerType.get_signless, 1),\n  np.dtype(np.bool_): partial(ir.IntegerType.get_signless, 1),\n  np.dtype(np.int8): partial(ir.IntegerType.get_signless, 8),\n  np.dtype(np.int16): partial(ir.IntegerType.get_signless, 16),\n  np.dtype(np.int32): partial(ir.IntegerType.get_signless, 32),\n  np.dtype(np.int64): partial(ir.IntegerType.get_signless, 64),\n  np.dtype(np.uint8): partial(ir.IntegerType.get_unsigned, 8),\n  np.dtype(np.uint16): partial(ir.IntegerType.get_unsigned, 16),\n  np.dtype(np.uint32): partial(ir.IntegerType.get_unsigned, 32),\n  np.dtype(np.uint64): partial(ir.IntegerType.get_unsigned, 64),\n  np.dtype(dtypes.bfloat16): ir.BF16Type.get,\n  np.dtype(np.float16): ir.F16Type.get,\n  np.dtype(np.float32): ir.F32Type.get,\n  np.dtype(np.float64): ir.F64Type.get,\n  np.dtype(np.complex64): lambda: ir.ComplexType.get(ir.F32Type.get()),\n  np.dtype(np.complex128): lambda: ir.ComplexType.get(ir.F64Type.get()),\n}\n\n_dtype_to_ir_type.update({\n    np.dtype(dtypes.float8_e4m3fn): ir.Float8E4M3FNType.get,\n    np.dtype(dtypes.float8_e5m2): ir.Float8E5M2Type.get,\n})\n\ndef dtype_to_ir_type(dtype: Union[np.dtype, np.generic]) -> ir.Type:\n  assert isinstance(dtype, (np.dtype, np.generic)), type(dtype)\n  dtype = np.dtype(dtype)\n  try:\n    ir_type_factory = _dtype_to_ir_type[dtype]\n  except KeyError as err:\n    raise TypeError(\n        f\"No dtype_to_ir_type handler for dtype: {dtype}\") from err\n  return ir_type_factory()\n\ndef _array_ir_types(aval: Union[core.ShapedArray, core.DShapedArray]\n                    ) -> Sequence[ir.Type]:\n  if core.is_opaque_dtype(aval.dtype):\n    phys_avals = aval.dtype._rules.physical_avals(aval)\n    return tuple(itertools.chain(*map(_array_ir_types, phys_avals)))\n  if not core.is_constant_shape(aval.shape):\n    return _dynamic_array_ir_types(aval)  # type: ignore\n  return (ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype)),)\n\ndef _dynamic_array_ir_types(aval: core.ShapedArray) -> Sequence[ir.Type]:\n  dyn_size = ir.ShapedType.get_dynamic_size()\n  shape = [d if type(d) is int else dyn_size for d in aval.shape]\n  return (ir.RankedTensorType.get(shape, dtype_to_ir_type(aval.dtype)),)\n\nir_type_handlers: Dict[Type[core.AbstractValue],\n                        Callable[[Any], Sequence[ir.Type]]] = {}\n\ndef aval_to_ir_types(aval: core.AbstractValue) -> Sequence[ir.Type]:\n  \"\"\"Converts a JAX aval to zero or more MLIR IR types.\n\n  In general, a JAX value may be represented by multiple IR values, so this\n  function returns multiple types.\"\"\"\n  try:\n    return ir_type_handlers[type(aval)](aval)\n  except KeyError as err:\n    raise TypeError(f\"No ir_type_handler for aval type: {type(aval)}\") from err\n\nir_type_handlers[core.ShapedArray] = _array_ir_types\nir_type_handlers[core.ConcreteArray] = _array_ir_types\nir_type_handlers[core.AbstractToken] = lambda _: [hlo.TokenType.get()]\nir_type_handlers[core.DShapedArray] = _dynamic_array_ir_types\n\ndef aval_to_ir_type(aval: core.AbstractValue) -> ir.Type:\n  \"\"\"Convenience wrapper around aval_to_ir_types for single types.\n\n  For some common cases, e.g. dense arrays, we know JAX values are represented\n  by a single IR value.\"\"\"\n  types = aval_to_ir_types(aval)\n  if len(types) != 1:\n    raise TypeError(f\"aval_to_ir_type called on {aval} which corresponds to \"\n                    f\"multiple IR types {types}\")\n  return types[0]\n\n\n# Constants\n\nclass ConstantHandler(Protocol):\n  def __call__(self, val: Any, canonicalize_types: bool) -> Sequence[ir.Value]:\n    \"\"\"Builds an IR representation for a constant `val`.\n\n    A JAX value is represented by zero or more IR values.\"\"\"\n\n_constant_handlers : Dict[type, ConstantHandler] = {}\n\ndef register_constant_handler(type_: type, handler_fun: ConstantHandler):\n  _constant_handlers[type_] = handler_fun\n\ndef get_constant_handler(type_: type) -> ConstantHandler:\n  return _constant_handlers[type_]\n\ndef ir_constants(val: Any,\n                 canonicalize_types: bool = True) -> Sequence[ir.Value]:\n  \"\"\"Translate a Python `val` to an IR constant, canonicalizing its dtype.\n\n  Args:\n    val: a Python value to be translated to a constant.\n\n  Returns:\n    A representation of the constant as a list of IR values.\n  \"\"\"\n  for t in type(val).__mro__:\n    handler = _constant_handlers.get(t)\n    if handler:\n      out = handler(val, canonicalize_types)\n      assert all(isinstance(v, ir.Value) for v in out), (type(val), out)\n      return out\n  if hasattr(val, '__jax_array__'):\n    return ir_constants(val.__jax_array__(), canonicalize_types)\n  raise TypeError(f\"No constant handler for type: {type(val)}\")\n\ndef ir_constant(val: Any, canonicalize_types: bool = True) -> ir.Value:\n  \"\"\"Convenience wrapper around ir_constants for singleton values.\"\"\"\n  values = ir_constants(val, canonicalize_types=canonicalize_types)\n  if len(values) != 1:\n    raise TypeError(f\"ir_constant called on {val} which corresponds to \"\n                    f\"multiple IR values {values}\")\n  return values[0]\n\n\ndef _numpy_array_constant(x: np.ndarray, canonicalize_types\n                         ) -> Sequence[ir.Value]:\n  if canonicalize_types:\n    x = np.asarray(x, dtypes.canonicalize_dtype(x.dtype))\n  element_type = dtype_to_ir_type(x.dtype)\n  shape = x.shape\n  if x.dtype == np.bool_:\n    nelems = x.size\n    x = np.packbits(x, bitorder='little')\n    # TODO(b/209005197): Work around for MLIR crash for non-splat single element\n    # buffers.\n    if nelems == 1:\n      x = np.array(0 if x.item() == 0 else 0xff, np.uint8)\n  elif x.dtype == dtypes.bfloat16:\n    x = x.view(np.uint16)\n  x = np.ascontiguousarray(x)\n  attr = ir.DenseElementsAttr.get(x, type=element_type, shape=shape)\n  return (hlo.ConstantOp(attr).result,)\n\n\ndef _masked_array_constant_handler(*args, **kwargs):\n  raise ValueError(\"numpy masked arrays are not supported as direct inputs to JAX functions. \"\n                   \"Use arr.filled() to convert the value to a standard numpy array.\")\n\nregister_constant_handler(np.ma.MaskedArray, _masked_array_constant_handler)\n\ndef _ndarray_constant_handler(val: np.ndarray, canonicalize_types\n                             ) -> Sequence[ir.Value]:\n  \"\"\"Constant handler for ndarray literals, handling zero-size strides.\n\n  In most cases this function calls _numpy_array_constant(val) except it has\n  special handling of arrays with any strides of size zero: for those, it\n  generates appropriate calls to NumpyArrayConstant, Broadcast, and Transpose\n  to avoid staging in large literals that might arise from np.zeros or np.ones\n  or the output of lax.broadcast (which uses np.broadcast_to which in turn\n  uses size-zero strides).\n\n  Args:\n    val: an ndarray.\n\n  Returns:\n    An XLA ComputationDataHandle / XlaOp representing the constant ndarray\n    staged into the XLA Computation.\n  \"\"\"\n  if dtypes.result_type(val) == dtypes.float0:\n    return _numpy_array_constant(np.zeros(val.shape, dtype=np.bool_),\n                                 canonicalize_types=False)\n  elif np.any(np.equal(0, val.strides)) and val.size > 0:\n    zero_stride_axes, = np.where(np.equal(0, val.strides))\n    other_axes, = np.where(np.not_equal(0, val.strides))\n    collapsed_val = val[tuple(0 if ax in zero_stride_axes else slice(None) # type: ignore\n                              for ax in range(val.ndim))]  # type: ignore\n    if canonicalize_types:\n      collapsed_val = np.asarray(\n          collapsed_val, dtypes.canonicalize_dtype(collapsed_val.dtype))\n    out = hlo.BroadcastInDimOp(\n        ir.RankedTensorType.get(\n            val.shape, dtype_to_ir_type(collapsed_val.dtype)),\n        _numpy_array_constant(collapsed_val, canonicalize_types=False)[0],\n        dense_int_elements(other_axes)).result\n    return (out,)\n  else:\n    return _numpy_array_constant(val, canonicalize_types)\n\nregister_constant_handler(np.ndarray, _ndarray_constant_handler)\n\nfor _scalar_type in [np.int8, np.int16, np.int32, np.int64,\n                     np.uint8, np.uint16, np.uint32, np.uint64,\n                     np.float16, np.float32, np.float64,\n                     np.complex64, np.complex128,\n                     np.bool_, np.longlong, dtypes.bfloat16]:\n  register_constant_handler(_scalar_type, _ndarray_constant_handler)\n\ndef _python_scalar_handler(dtype, val, canonicalize_dtypes):\n  return _numpy_array_constant(np.array(val, dtype), canonicalize_dtypes)\n\nfor ptype, dtype in dtypes.python_scalar_dtypes.items():\n  register_constant_handler(ptype, partial(_python_scalar_handler, dtype))\n\ndef _device_array_constant_handler(val, canonicalize_types):\n  return _ndarray_constant_handler(np.asarray(val.device_buffer),\n    ",
+      "total_lines": 1891,
+      "ref": "cc8d7fae3290ec75891fda01b1c685b21d835f1d"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "reshape",
+      "class_name": null,
+      "start_line": 1309,
+      "end_line": 1321,
+      "satd_line": 677,
+      "matched_by": "signature_or_comment",
+      "source": "def reshape(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue) -> ir.Value:\n  if core.is_opaque_dtype(aval_out.dtype):  # type: ignore\n    # TODO(frostig,mattjj,necula): asserts a single physical aval, and a\n    # particular reshape rule (reshape to the output physical aval's shape)\n    aval_out, = aval_out.dtype._rules.physical_avals(aval_out)  # type: ignore\n  if not core.is_constant_shape(aval_out.shape):  # type: ignore\n    shape = eval_dynamic_shape(ctx, aval_out.shape)  # type: ignore\n    return hlo.DynamicReshapeOp(\n        aval_to_ir_type(aval_out), op,\n        shape_tensor(shape),\n    ).result\n  else:\n    return hlo.ReshapeOp(aval_to_ir_type(aval_out), op).result",
+      "calls": [
+        "aval_to_ir_type",
+        "eval_dynamic_shape",
+        "shape_tensor"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "LoweringRuleContext",
+        "aval_to_ir_type",
+        "core",
+        "eval_dynamic_shape",
+        "hlo",
+        "ir",
+        "shape_tensor"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "dtypes.is_opaque_dtype",
+        "aval_out.dtype._rules.physical_avals",
+        "core.is_constant_shape",
+        "eval_dynamic_shape",
+        "hlo.DynamicReshapeOp",
+        "aval_to_ir_type",
+        "shape_tensor",
+        "hlo.ReshapeOp"
+      ],
+      "reason": "These methods are critical for determining the behavior of the reshape operation based on the output's abstract value and shape, which directly affects the local edit.",
+      "uncertainty_items": [
+        {
+          "kind": "method",
+          "raw_name": "dtypes.is_opaque_dtype",
+          "normalized_name": "dtypes.is_opaque_dtype",
+          "line": 2,
+          "source_excerpt": "if dtypes.is_opaque_dtype(aval_out.dtype):  # type: ignore",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "aval_out.dtype._rules.physical_avals",
+          "normalized_name": "aval_out.dtype._rules.physical_avals",
+          "line": 5,
+          "source_excerpt": "aval_out, = aval_out.dtype._rules.physical_avals(aval_out)  # type: ignore",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "core.is_constant_shape",
+          "normalized_name": "core.is_constant_shape",
+          "line": 6,
+          "source_excerpt": "if not core.is_constant_shape(aval_out.shape):  # type: ignore",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "eval_dynamic_shape",
+          "normalized_name": "eval_dynamic_shape",
+          "line": 7,
+          "source_excerpt": "shape = eval_dynamic_shape(ctx, aval_out.shape)  # type: ignore",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "hlo.DynamicReshapeOp",
+          "normalized_name": "hlo.DynamicReshapeOp",
+          "line": 8,
+          "source_excerpt": "return hlo.DynamicReshapeOp(",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "aval_to_ir_type",
+          "normalized_name": "aval_to_ir_type",
+          "line": 9,
+          "source_excerpt": "aval_to_ir_type(aval_out), op,",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "shape_tensor",
+          "normalized_name": "shape_tensor",
+          "line": 10,
+          "source_excerpt": "shape_tensor(shape),",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "hlo.ReshapeOp",
+          "normalized_name": "hlo.ReshapeOp",
+          "line": 13,
+          "source_excerpt": "return hlo.ReshapeOp(aval_to_ir_type(aval_out), op).result",
+          "retrieval_eligible": true
+        }
+      ]
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "is_opaque_dtype",
+        "path": "jax/_src/core.py",
+        "class_name": null,
+        "start_line": 1319,
+        "end_line": 1320,
+        "source": "def is_opaque_dtype(dtype: Any) -> bool:\n  return type(dtype) in opaque_dtypes",
+        "found": true
+      },
+      {
+        "method_name": "physical_avals",
+        "path": "jax/_src/lax/lax.py",
+        "class_name": "BIntRules",
+        "start_line": 4811,
+        "end_line": 4813,
+        "source": "def physical_avals(aval) -> Sequence[core.AbstractValue]:\n    dtype = dtypes._scalar_type_to_dtype(int)\n    return [core.ShapedArray(aval.shape, dtype)]",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "hlo.DynamicReshapeOp",
+      "hlo.ReshapeOp",
+      "is_constant_shape",
+      "eval_dynamic_shape",
+      "aval_to_ir_type",
+      "shape_tensor"
+    ],
+    "edit_constraints": [
+      {
+        "target_kind": "method",
+        "target_hint": "if dtypes.is_opaque_dtype(aval_out.dtype):  # type: ignore",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO(frostig,mattjj,necula): asserts a single physical aval, and a\r\n# particular reshape rule (reshape to the output physical aval's shape)) while staying consistent with `is_opaque_dtype`.",
+        "must_do": "Use `is_opaque_dtype` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "is_opaque_dtype",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "def is_opaque_dtype(dtype: Any) -> bool:\n  return type(dtype) in opaque_dtypes",
+        "confidence": 0.99
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "aval_out, = aval_out.dtype._rules.physical_avals(aval_out)  # type: ignore",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO(frostig,mattjj,necula): asserts a single physical aval, and a\r\n# particular reshape rule (reshape to the output physical aval's shape)) while staying consistent with `physical_avals`.",
+        "must_do": "Use `physical_avals` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "physical_avals",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "def physical_avals(aval) -> Sequence[core.AbstractValue]:\n    dtype = dtypes._scalar_type_to_dtype(int)\n    return [core.ShapedArray(aval.shape, dtype)]",
+        "confidence": 0.99
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "if not core.is_constant_shape(aval_out.shape):  # type: ignore",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO(frostig,mattjj,necula): asserts a single physical aval, and a\r\n# particular reshape rule (reshape to the output physical aval's shape)) while staying consistent with `core.is_constant_shape`.",
+        "must_do": "Use `core.is_constant_shape` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "core.is_constant_shape",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "5:     aval_out, = aval_out.dtype._rules.physical_avals(aval_out)  # type: ignore\n6:   if not core.is_constant_shape(aval_out.shape):  # type: ignore\n7:     shape = eval_dynamic_shape(ctx, aval_out.shape)  # type: ignore",
+        "confidence": 0.45
+      }
+    ]
+  },
+  "review_context": {}
+}

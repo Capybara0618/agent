@@ -1,0 +1,121 @@
+{
+  "task_id": "77",
+  "repo_owner": "containerbuildsystem",
+  "repo_name": "atomic-reactor",
+  "file_path": "atomic_reactor/plugins/build_orchestrate_build.py",
+  "commit": "afee7c0f865923d3948033533d832a063955772f",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-16T04:37:50+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "afee7c0f865923d3948033533d832a063955772f",
+    "symbol_name": "validate_arrangement_version",
+    "satd_line": 434,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-16T04:40:53+00:00",
+    "identified_method_count": 1,
+    "retrieved_method_count": 0,
+    "missing_method_count": 1,
+    "edit_constraint_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "atomic_reactor/plugins/build_orchestrate_build.py",
+    "original_signature": "def validate_arrangement_version(self):",
+    "target_file": {
+      "ok": true,
+      "path": "atomic_reactor/plugins/build_orchestrate_build.py",
+      "sha": "5fb114670a913ffea038bf754057842bca054ff5",
+      "download_url": "https://raw.githubusercontent.com/containerbuildsystem/atomic-reactor/afee7c0f865923d3948033533d832a063955772f/atomic_reactor/plugins/build_orchestrate_build.py",
+      "content_excerpt": "\"\"\"\nCopyright (c) 2017 Red Hat, Inc\nAll rights reserved.\n\nThis software may be modified and distributed under the terms\nof the BSD license. See the LICENSE file for details.\n\"\"\"\nfrom __future__ import unicode_literals, division\n\nfrom collections import namedtuple\nfrom copy import deepcopy\nfrom multiprocessing.pool import ThreadPool\nimport warnings\n\nimport json\nimport os\nfrom operator import attrgetter\nimport random\nfrom string import ascii_letters\nimport time\nimport logging\nfrom datetime import timedelta\nimport datetime as dt\nimport copy\nimport platform\n\nfrom atomic_reactor.build import BuildResult\nfrom atomic_reactor.plugin import BuildStepPlugin\nfrom atomic_reactor.plugins.pre_reactor_config import (get_config,\n                                                       get_arrangement_version, get_koji,\n                                                       get_odcs, get_pulp,\n                                                       get_prefer_schema1_digest, get_smtp,\n                                                       get_source_registry, get_sources_command,\n                                                       get_artifacts_allowed_domains,\n                                                       get_yum_proxy, get_image_equal_labels,\n                                                       get_content_versions, get_openshift_session,\n                                                       get_platform_descriptors,\n                                                       get_clusters_client_config_path,\n                                                       get_build_image_override,\n                                                       get_goarch_to_platform_mapping)\nfrom atomic_reactor.plugins.pre_check_and_set_rebuild import is_rebuild\nfrom atomic_reactor.util import (df_parser, get_build_json, get_manifest_list, get_platforms,\n                                 ImageName)\nfrom atomic_reactor.constants import (PLUGIN_ADD_FILESYSTEM_KEY, PLUGIN_BUILD_ORCHESTRATE_KEY)\nfrom osbs.api import OSBS\nfrom osbs.exceptions import OsbsException\nfrom osbs.conf import Configuration\nfrom osbs.constants import BUILD_FINISHED_STATES\nfrom osbs.utils import Labels, RegistryURI\n\n\nClusterInfo = namedtuple('ClusterInfo', ('cluster', 'platform', 'osbs', 'load'))\nWORKSPACE_KEY_BUILD_INFO = 'build_info'\nWORKSPACE_KEY_UPLOAD_DIR = 'koji_upload_dir'\nWORKSPACE_KEY_OVERRIDE_KWARGS = 'override_kwargs'\nFIND_CLUSTER_RETRY_DELAY = 15.0\nFAILURE_RETRY_DELAY = 10.0\nMAX_CLUSTER_FAILS = 20\n\n\ndef get_worker_build_info(workflow, platform):\n    \"\"\"\n    Obtain worker build information for a given platform\n    \"\"\"\n    workspace = workflow.plugin_workspace[OrchestrateBuildPlugin.key]\n    return workspace[WORKSPACE_KEY_BUILD_INFO][platform]\n\n\ndef get_koji_upload_dir(workflow):\n    \"\"\"\n    Obtain koji_upload_dir value used for worker builds\n    \"\"\"\n    workspace = workflow.plugin_workspace[OrchestrateBuildPlugin.key]\n    return workspace[WORKSPACE_KEY_UPLOAD_DIR]\n\n\ndef override_build_kwarg(workflow, k, v, platform=None):\n    \"\"\"\n    Override a build-kwarg for all worker builds\n    \"\"\"\n    key = OrchestrateBuildPlugin.key\n    # Use None to indicate an override for all platforms\n\n    workspace = workflow.plugin_workspace.setdefault(key, {})\n    override_kwargs = workspace.setdefault(WORKSPACE_KEY_OVERRIDE_KWARGS, {})\n    override_kwargs.setdefault(platform, {})\n    override_kwargs[platform][k] = v\n\n\nclass UnknownPlatformException(Exception):\n    \"\"\" No clusters could be found for a platform \"\"\"\n\n\nclass AllClustersFailedException(Exception):\n    \"\"\" Each cluster has reached max_cluster_fails \"\"\"\n\n\nclass UnknownKindException(Exception):\n    \"\"\" Build image from contains unknown kind \"\"\"\n\n\nclass ClusterRetryContext(object):\n    def __init__(self, max_cluster_fails):\n        # how many times this cluster has failed\n        self.fails = 0\n\n        # datetime at which attempts can resume\n        self.retry_at = dt.datetime.utcfromtimestamp(0)\n\n        # the number of fail counts before this cluster is considered dead\n        self.max_cluster_fails = max_cluster_fails\n\n    @property\n    def failed(self):\n        \"\"\"Is this cluster considered dead?\"\"\"\n        return self.fails >= self.max_cluster_fails\n\n    @property\n    def in_retry_wait(self):\n        \"\"\"Should we wait before trying this cluster again?\"\"\"\n        return dt.datetime.now() < self.retry_at\n\n    def try_again_later(self, seconds):\n        \"\"\"Put this cluster in retry-wait (or consider it dead)\"\"\"\n        if not self.failed:\n            self.fails += 1\n            self.retry_at = (dt.datetime.now() + timedelta(seconds=seconds))\n\n\ndef wait_for_any_cluster(contexts):\n    \"\"\"\n    Wait until any of the clusters are out of retry-wait\n\n    :param contexts: List[ClusterRetryContext]\n    :raises: AllClustersFailedException if no more retry attempts allowed\n    \"\"\"\n    try:\n        earliest_retry_at = min(ctx.retry_at for ctx in contexts.values()\n                                if not ctx.failed)\n    except ValueError:  # can't take min() of empty sequence\n        raise AllClustersFailedException(\n            \"Could not find appropriate cluster for worker build.\"\n        )\n\n    time_until_next = earliest_retry_at - dt.datetime.now()\n    time.sleep(max(timedelta(seconds=0), time_until_next).seconds)\n\n\nclass WorkerBuildInfo(object):\n\n    def __init__(self, build, cluster_info, logger):\n        self.build = build\n        self.cluster = cluster_info.cluster\n        self.osbs = cluster_info.osbs\n        self.platform = cluster_info.platform\n        self.log = logging.LoggerAdapter(logger, {'arch': self.platform})\n\n        self.monitor_exception = None\n\n    @property\n    def name(self):\n        return self.build.get_build_name() if self.build else 'N/A'\n\n    def wait_to_finish(self):\n        self.build = self.osbs.wait_for_build_to_finish(self.name)\n        return self.build\n\n    def watch_logs(self):\n        for line in self.osbs.get_build_logs(self.name, follow=True):\n            self.log.info(line)\n\n    def get_annotations(self):\n        build_annotations = self.build.get_annotations() or {}\n        annotations = {\n            'build': {\n                'cluster-url': self.osbs.os_conf.get_openshift_base_uri(),\n                'namespace': self.osbs.os_conf.get_namespace(),\n                'build-name': self.name,\n            },\n            'digests': json.loads(\n                build_annotations.get('digests', '[]')),\n            'plugins-metadata': json.loads(\n                build_annotations.get('plugins-metadata', '{}')),\n        }\n\n        if 'metadata_fragment' in build_annotations and \\\n           'metadata_fragment_key' in build_annotations:\n            annotations['metadata_fragment'] = build_annotations['metadata_fragment']\n            annotations['metadata_fragment_key'] = build_annotations['metadata_fragment_key']\n\n        return annotations\n\n    def get_fail_reason(self):\n        fail_reason = {}\n        if self.monitor_exception:\n            fail_reason['general'] = repr(self.monitor_exception)\n        elif not self.build:\n            fail_reason['general'] = 'build not started'\n\n        if not self.build:\n            return fail_reason\n\n        build_annotations = self.build.get_annotations() or {}\n        metadata = json.loads(build_annotations.get('plugins-metadata', '{}'))\n        if self.monitor_exception:\n            fail_reason['general'] = repr(self.monitor_exception)\n\n        try:\n            fail_reason.update(metadata['errors'])\n        except KeyError:\n            try:\n                build_name = self.build.get_build_name()\n                pod = self.osbs.get_pod_for_build(build_name)\n                fail_reason['pod'] = pod.get_failure_reason()\n            except (OsbsException, AttributeError):\n                # Catch AttributeError here because osbs-client < 0.41\n                # doesn't have this method\n                pass\n\n        return fail_reason\n\n    def cancel_build(self):\n        if self.build and not self.build.is_finished():\n            self.osbs.cancel_build(self.name)\n\n\nclass OrchestrateBuildPlugin(BuildStepPlugin):\n    \"\"\"\n    Start and monitor worker builds for each platform\n\n    This plugin will find the best suited worker cluster to\n    be used for each platform. It does so by calculating the\n    current load of active builds on each cluster and choosing\n    the one with smallest load.\n\n    The list of available worker clusters is retrieved by fetching\n    the result provided by reactor_config plugin.\n\n    If any of the worker builds fail, this plugin will return a\n    failed BuildResult. Although, it does wait for all worker builds\n    to complete in any case.\n\n    If all worker builds succeed, then this plugin returns a\n    successful BuildResult, but with a remote image result. The\n    image is built in the worker builds which is likely a different\n    host than the one running this build. This means that the local\n    docker daemon has no knowledge of the built image.\n\n    If build_image is defined it is passed to the worker build,\n    but there is still possibility to have build_imagestream inside\n    osbs.conf in the secret, and that would take precendence over\n    build_image from kwargs\n    \"\"\"\n\n    UNREACHABLE_CLUSTER_LOAD = object()\n\n    key = PLUGIN_BUILD_ORCHESTRATE_KEY\n\n    def __init__(self, tasker, workflow, build_kwargs, platforms=None,\n                 osbs_client_config=None, worker_build_image=None,\n                 config_kwargs=None,\n                 find_cluster_retry_delay=FIND_CLUSTER_RETRY_DELAY,\n                 failure_retry_delay=FAILURE_RETRY_DELAY,\n                 max_cluster_fails=MAX_CLUSTER_FAILS,\n                 url=None, verify_ssl=True, use_auth=True,\n                 goarch=None):\n        \"\"\"\n        constructor\n\n        :param tasker: DockerTasker instance\n        :param workflow: DockerBuildWorkflow instance\n        :param build_kwargs: dict, keyword arguments for starting worker builds\n        :param platforms: list<str>, platforms to build\n                          (used via utils.get_orchestrator_platforms())\n        :param osbs_client_config: str, path to directory containing osbs.conf\n        :param worker_build_image: str, the builder image to use for worker builds\n                                  (not used, image is inherited from the orchestrator)\n        :param config_kwargs: dict, keyword arguments to override worker configuration\n        :param find_cluster_retry_delay: the delay in seconds to try again reaching a cluster\n        :param failure_retry_delay: the delay in seconds to try again starting a build\n        :param max_cluster_fails: the maximum number of times a cluster can fail before being\n                                  ignored\n        :param goarch: dict, keys are platform, values are go language platform names\n        \"\"\"\n        super(OrchestrateBuildPlugin, self).__init__(tasker, workflow)\n        self.platforms = get_platforms(self.workflow)\n\n        self.build_kwargs = build_kwargs\n        self.osbs_client_config_fallback = osbs_client_config\n        self.config_kwargs = config_kwargs or {}\n\n        self.adjust_build_kwargs()\n        self.validate_arrangement_version()\n        self.adjust_config_kwargs()\n        self.reactor_config = get_config(self.workflow)\n\n        self.find_cluster_retry_delay = find_cluster_retry_delay\n        self.failure_retry_delay = failure_retry_delay\n        self.max_cluster_fails = max_cluster_fails\n        self.koji_upload_dir = self.get_koji_upload_dir()\n        self.fs_task_id = self.get_fs_task_id()\n        self.release = self.get_release()\n\n        self.plat_des_fallback = []\n        for plat, architecture in (goarch or {}).items():\n            plat_dic = {'platform': plat,\n                        'architecture': architecture}\n            self.plat_des_fallback.append(plat_dic)\n\n        self.openshift_fallback = {\n            'url': url,\n            'insecure': not verify_ssl,\n            'auth': {'enable': use_auth}\n     ",
+      "total_lines": 924,
+      "ref": "afee7c0f865923d3948033533d832a063955772f"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "validate_arrangement_version",
+      "class_name": "OrchestrateBuildPlugin",
+      "start_line": 417,
+      "end_line": 436,
+      "satd_line": 434,
+      "matched_by": "signature_or_comment",
+      "source": "    def validate_arrangement_version(self):\n        \"\"\"Validate if the arrangement_version is supported\n\n        This is for autorebuilds to fail early otherwise they may failed\n        on workers because of osbs-client validation checks.\n\n        Method should be called after self.adjust_build_kwargs\n\n        Shows a warning when version is deprecated\n\n        :raises ValueError: when version is not supported\n        \"\"\"\n        arrangement_version = self.build_kwargs['arrangement_version']\n        if arrangement_version is None:\n            return\n\n        if arrangement_version <= 5:\n            # TODO: raise as ValueError in release 1.6.38+\n            warnings.warn(\"arrangement_version <= 5 is deprecated and will be removed\"\n                          \" in release 1.6.38\", DeprecationWarning)",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [
+        "build_kwargs"
+      ],
+      "global_uses": [
+        "warnings"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "ValueError"
+      ],
+      "reason": "The ValueError symbol is critical for understanding the intended exception to be raised, which directly impacts the semantics of the method.",
+      "uncertainty_items": [
+        {
+          "kind": "symbol",
+          "raw_name": "ValueError",
+          "normalized_name": "ValueError",
+          "line": null,
+          "source_excerpt": "# TODO: raise as ValueError in release 1.6.38+",
+          "retrieval_eligible": false
+        }
+      ]
+    },
+    "retrieved_methods": [],
+    "missing_method_names": [
+      "ValueError"
+    ],
+    "edit_constraints": [
+      {
+        "target_kind": "symbol",
+        "target_hint": "# TODO: raise as ValueError in release 1.6.38+",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The repair should follow the exact symbol/API semantics of `ValueError` referenced by the SATD or local code.",
+        "must_do": "Keep the repair aligned to the exact nearby symbol/API `ValueError`.",
+        "must_not_do": "Do not swap in a different API/helper than `ValueError` without direct local evidence.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "ValueError",
+        "supporting_point_kind": "symbol",
+        "supporting_evidence": "10: \n11:     :raises ValueError: when version is not supported\n12:     \"\"\"",
+        "confidence": 0.55
+      }
+    ]
+  },
+  "review_context": {}
+}

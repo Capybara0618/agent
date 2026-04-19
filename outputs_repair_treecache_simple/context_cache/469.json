@@ -1,0 +1,95 @@
+{
+  "task_id": "469",
+  "repo_owner": "learningequality",
+  "repo_name": "kolibri",
+  "file_path": "kolibri/core/tasks/storage.py",
+  "commit": "e9e2fd0e535a882da670a4990f64e17b187fb5b7",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-18T21:14:47+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "e9e2fd0e535a882da670a4990f64e17b187fb5b7",
+    "symbol_name": "_update_job",
+    "satd_line": 243,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-18T21:14:50+00:00",
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "kolibri/core/tasks/storage.py",
+    "original_signature": "def _update_job(self, job_id, state=None, **kwargs):",
+    "target_file": {
+      "ok": true,
+      "path": "kolibri/core/tasks/storage.py",
+      "sha": "cd61c9f52d900ca132d90d2ba66de2959e19d99c",
+      "download_url": "https://raw.githubusercontent.com/learningequality/kolibri/e9e2fd0e535a882da670a4990f64e17b187fb5b7/kolibri/core/tasks/storage.py",
+      "content_excerpt": "import logging\nfrom contextlib import contextmanager\nfrom copy import copy\n\nfrom sqlalchemy import Column\nfrom sqlalchemy import DateTime\nfrom sqlalchemy import func\nfrom sqlalchemy import Integer\nfrom sqlalchemy import or_\nfrom sqlalchemy import PickleType\nfrom sqlalchemy import String\nfrom sqlalchemy.exc import OperationalError\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.orm import sessionmaker\n\nfrom kolibri.core.tasks.exceptions import JobNotFound\nfrom kolibri.core.tasks.job import State\n\nBase = declarative_base()\n\n\nclass ORMJob(Base):\n    \"\"\"\n    The DB representation of a common.classes.Job object,\n    storing the relevant details needed by the job storage\n    backend.\n    \"\"\"\n\n    __tablename__ = \"jobs\"\n\n    # The hex UUID given to the job upon first creation\n    id = Column(String, primary_key=True, autoincrement=False)\n\n    # The job's state. Inflated here for easier querying to the job's state.\n    state = Column(String, index=True)\n\n    # The job's order in the entire global queue of jobs.\n    queue_order = Column(Integer, autoincrement=True)\n\n    # The queue name passed to the client when the job is scheduled.\n    queue = Column(String, index=True)\n\n    # The original Job object, pickled here for so we can easily access it.\n    obj = Column(PickleType)\n\n    time_created = Column(DateTime(timezone=True), server_default=func.now())\n    time_updated = Column(DateTime(timezone=True), server_onupdate=func.now())\n\n\nclass StorageMixin(object):\n    def __init__(self, connection, Base=Base):\n        self.engine = connection\n        if self.engine.name == \"sqlite\":\n            self.set_sqlite_pragmas()\n        self.Base = Base\n        self.Base.metadata.create_all(self.engine)\n        self.sessionmaker = sessionmaker(bind=self.engine)\n\n    @contextmanager\n    def session_scope(self):\n        session = self.sessionmaker()\n        try:\n            yield session\n            session.commit()\n        except Exception:\n            session.rollback()\n            raise\n        finally:\n            session.close()\n\n    def recreate_tables(self):\n        self.Base.metadata.drop_all(self.engine)\n        self.Base.metadata.create_all(self.engine)\n\n    def set_sqlite_pragmas(self):\n        \"\"\"\n        Sets the connection PRAGMAs for the sqlalchemy engine stored in self.engine.\n\n        It currently sets:\n        - journal_mode to WAL\n\n        :return: None\n        \"\"\"\n        try:\n            self.engine.execute(\"PRAGMA journal_mode = WAL;\")\n        except OperationalError:\n            pass\n\n\nclass Storage(StorageMixin):\n    def enqueue_job(self, j, queue):\n        \"\"\"\n        Add the job given by j to the job queue.\n\n        Note: Does not actually run the job.\n        \"\"\"\n        with self.session_scope() as session:\n            orm_job = session.query(ORMJob).get(j.job_id)\n            if orm_job and orm_job.state not in [\n                State.COMPLETED,\n                State.FAILED,\n                State.CANCELED,\n            ]:\n                # If this job is already queued or running, don't try to replace it.\n                return j.job_id\n            orm_job = ORMJob(id=j.job_id, state=j.state, queue=queue, obj=j)\n            session.merge(orm_job)\n            try:\n                session.commit()\n            except Exception as e:\n                logging.error(\"Got an error running session.commit(): {}\".format(e))\n\n            return j.job_id\n\n    def mark_job_as_canceled(self, job_id):\n        \"\"\"\n\n        Mark the job as canceled. Does not actually try to cancel a running job.\n\n        \"\"\"\n        self._update_job(job_id, State.CANCELED)\n\n    def mark_job_as_canceling(self, job_id):\n        \"\"\"\n        Mark the job as requested for canceling. Does not actually try to cancel a running job.\n\n        :param job_id: the job to be marked as canceling.\n        :return: None\n        \"\"\"\n        self._update_job(job_id, State.CANCELING)\n\n    def get_next_queued_job(self, queues):\n        with self.session_scope() as s:\n            orm_job = (\n                s.query(ORMJob)\n                .filter(ORMJob.queue.in_(queues))\n                .filter_by(state=State.QUEUED)\n                .order_by(ORMJob.queue_order)\n                .first()\n            )\n            if orm_job:\n                job = orm_job.obj\n            else:\n                job = None\n            return job\n\n    def get_canceling_jobs(self, queues):\n        with self.session_scope() as s:\n            jobs = (\n                s.query(ORMJob)\n                .filter(ORMJob.queue.in_(queues))\n                .filter_by(state=State.CANCELING)\n                .order_by(ORMJob.queue_order)\n            )\n            return [job.obj for job in jobs]\n\n    def get_all_jobs(self, queue):\n        with self.session_scope() as s:\n            orm_jobs = s.query(ORMJob).filter(ORMJob.queue == queue).all()\n            return [o.obj for o in orm_jobs]\n\n    def count_all_jobs(self, queue):\n        with self.session_scope() as s:\n            return s.query(ORMJob).filter(ORMJob.queue == queue).count()\n\n    def get_job(self, job_id):\n        with self.session_scope() as session:\n            job, _ = self._get_job_and_orm_job(job_id, session)\n            return job\n\n    def clear(self, queue=None, job_id=None, force=False):\n        \"\"\"\n        Clear the queue and the job data.\n        If force is True, clear all jobs, otherwise only delete jobs that are in a finished state,\n        COMPLETED, FAILED, or CANCELED.\n        :type job_id: NoneType or str\n        :param job_id: the job_id to clear. If None, clear all jobs.\n        :type force: bool\n        :param force: If True, clear the job (or jobs), even if it hasn't completed, failed or been cancelled.\n        \"\"\"\n        with self.session_scope() as s:\n            q = s.query(ORMJob)\n            if queue:\n                q = q.filter_by(queue=queue)\n            if job_id:\n                q = q.filter_by(id=job_id)\n\n            # filter only by the finished jobs, if we are not specified to force\n            if not force:\n                q = q.filter(\n                    or_(\n                        ORMJob.state == State.COMPLETED,\n                        ORMJob.state == State.FAILED,\n                        ORMJob.state == State.CANCELED,\n                    )\n                )\n\n            q.delete(synchronize_session=False)\n\n    def update_job_progress(self, job_id, progress, total_progress):\n        \"\"\"\n        Update the job given by job_id's progress info.\n        :type total_progress: int\n        :type progress: int\n        :type job_id: str\n        :param job_id: The id of the job to update\n        :param progress: The current progress achieved by the job\n        :param total_progress: The total progress achievable by the job.\n        :return: None\n        \"\"\"\n        self._update_job(job_id, progress=progress, total_progress=total_progress)\n\n    def mark_job_as_failed(self, job_id, exception, traceback):\n        \"\"\"\n        Mark the job as failed, and record the traceback and exception.\n        Args:\n            job_id: The job_id of the job that failed.\n            exception: The exception object thrown by the job.\n            traceback: The traceback, if any. Note (aron): Not implemented yet. We need to find a way\n            for the conncurrent.futures workers to throw back the error to us.\n\n        Returns: None\n\n        \"\"\"\n        self._update_job(job_id, State.FAILED, exception=exception, traceback=traceback)\n\n    def mark_job_as_running(self, job_id):\n        self._update_job(job_id, State.RUNNING)\n\n    def complete_job(self, job_id):\n        self._update_job(job_id, State.COMPLETED)\n\n    def _update_job(self, job_id, state=None, **kwargs):\n        with self.session_scope() as session:\n\n            job, orm_job = self._get_job_and_orm_job(job_id, session)\n\n            # Note (aron): looks like SQLAlchemy doesn't automatically\n            # save any pickletype fields even if we re-set (orm_job.obj = job) that\n            # field. My hunch is that it's tracking the id of the object,\n            # and if that doesn't change, then SQLAlchemy doesn't repickle the object\n            # and save to the DB.\n            # Our hack here is to just copy the job object, and then set thespecific\n            # field we want to edit, in this case the job.state. That forces\n            # SQLAlchemy to re-pickle the object, thus setting it to the correct state.\n            job = copy(job)\n            if state is not None:\n                orm_job.state = job.state = state\n            for kwarg in kwargs:\n                setattr(job, kwarg, kwargs[kwarg])\n            orm_job.obj = job\n            session.add(orm_job)\n            return job, orm_job\n\n    def _get_job_and_orm_job(self, job_id, session):\n        orm_job = session.query(ORMJob).filter_by(id=job_id).one_or_none()\n        if orm_job is None:\n            raise JobNotFound()\n        job = orm_job.obj\n        return job, orm_job\n",
+      "total_lines": 260,
+      "ref": "e9e2fd0e535a882da670a4990f64e17b187fb5b7"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_update_job",
+      "class_name": "Storage",
+      "start_line": 233,
+      "end_line": 253,
+      "satd_line": 243,
+      "matched_by": "signature_or_comment",
+      "source": "    def _update_job(self, job_id, state=None, **kwargs):\n        with self.session_scope() as session:\n\n            job, orm_job = self._get_job_and_orm_job(job_id, session)\n\n            # Note (aron): looks like SQLAlchemy doesn't automatically\n            # save any pickletype fields even if we re-set (orm_job.obj = job) that\n            # field. My hunch is that it's tracking the id of the object,\n            # and if that doesn't change, then SQLAlchemy doesn't repickle the object\n            # and save to the DB.\n            # Our hack here is to just copy the job object, and then set thespecific\n            # field we want to edit, in this case the job.state. That forces\n            # SQLAlchemy to re-pickle the object, thus setting it to the correct state.\n            job = copy(job)\n            if state is not None:\n                orm_job.state = job.state = state\n            for kwarg in kwargs:\n                setattr(job, kwarg, kwargs[kwarg])\n            orm_job.obj = job\n            session.add(orm_job)\n            return job, orm_job",
+      "calls": [
+        "copy",
+        "setattr"
+      ],
+      "self_calls": [
+        "_get_job_and_orm_job",
+        "session_scope"
+      ],
+      "self_attrs": [
+        "_get_job_and_orm_job",
+        "session_scope"
+      ],
+      "global_uses": [
+        "copy"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "rule_without_method_context:remove_temporary"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

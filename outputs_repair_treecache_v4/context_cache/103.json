@@ -1,0 +1,215 @@
+{
+  "task_id": "103",
+  "repo_owner": "firedrakeproject",
+  "repo_name": "firedrake",
+  "file_path": "firedrake/functionspacedata.py",
+  "commit": "794adbf05f1be9300fc8e898e01fc102d433a456",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-16T05:28:56+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "794adbf05f1be9300fc8e898e01fc102d433a456",
+    "symbol_name": "get_node_set",
+    "satd_line": 88,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-16T05:29:16+00:00",
+    "identified_method_count": 5,
+    "retrieved_method_count": 2,
+    "missing_method_count": 3,
+    "edit_constraint_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "firedrake/functionspacedata.py",
+    "original_signature": "def get_node_set(mesh, nodes_per_entity):",
+    "target_file": {
+      "ok": true,
+      "path": "firedrake/functionspacedata.py",
+      "sha": "325dac0bcccbe233b7e1d35d5d7befc996520db3",
+      "download_url": "https://raw.githubusercontent.com/firedrakeproject/firedrake/794adbf05f1be9300fc8e898e01fc102d433a456/firedrake/functionspacedata.py",
+      "content_excerpt": "\"\"\"This module provides an object that encapsulates data that can be\nshared between different :class:`~.FunctionSpace` objects.\n\nThe sharing is based on the idea of compatibility of function space\nnode layout.  The shared data is stored on the :func:`~.Mesh` the\nfunction space is created on, since the created objects are\nmesh-specific.  The sharing is done on an individual key basis.  So,\nfor example, Sets can be shared between all function spaces with the\nsame number of nodes per topological entity.  However, maps are\nspecific to the node *ordering*.\n\nThis means, for example, that function spaces with the same *node*\nordering, but different numbers of dofs per node (e.g. FiniteElement\nvs VectorElement) can share the PyOP2 Set and Map data.\n\"\"\"\n\nimport numpy\nimport finat\nfrom decorator import decorator\nfrom functools import reduce, partial\n\nfrom pyop2 import op2\nfrom pyop2.datatypes import IntType\nfrom pyop2.utils import as_tuple\n\nimport firedrake.extrusion_numbering as extnum\nfrom firedrake import dmplex\nfrom firedrake import halo as halo_mod\nfrom firedrake import mesh as mesh_mod\nfrom firedrake import extrusion_utils as eutils\nfrom firedrake.petsc import PETSc\n\n\n__all__ = (\"get_shared_data\", )\n\n\n@decorator\ndef cached(f, mesh, key, *args, **kwargs):\n    \"\"\"Sui generis caching for a function whose data is\n    associated with a mesh.\n\n    :arg f: The function to cache.\n    :arg mesh: The mesh to cache on (should have a\n        ``_shared_data_cache`` object).\n    :arg key: The key to the cache.\n    :args args: Additional arguments to ``f``.\n    :kwargs kwargs:  Additional keyword arguments to ``f``.\"\"\"\n    assert hasattr(mesh, \"_shared_data_cache\")\n    cache = mesh._shared_data_cache[f.__name__]\n    try:\n        return cache[key]\n    except KeyError:\n        result = f(mesh, key, *args, **kwargs)\n        cache[key] = result\n        return result\n\n\n@cached\ndef get_global_numbering(mesh, nodes_per_entity):\n    \"\"\"Get a PETSc Section describing the global numbering.\n\n    This numbering associates function space nodes with topological\n    entities.\n\n    :arg mesh: The mesh to use.\n    :arg nodes_per_entity: a tuple of the number of nodes per\n        topological entity.\n    :returns: A new PETSc Section.\n    \"\"\"\n    return mesh.create_section(nodes_per_entity)\n\n\n@cached\ndef get_node_set(mesh, nodes_per_entity):\n    \"\"\"Get the :class:`node set <pyop2.Set>`.\n\n    :arg mesh: The mesh to use.\n    :arg nodes_per_entity: The number of function space nodes per\n        topological entity.\n    :returns: A :class:`pyop2.Set` for the function space nodes.\n    \"\"\"\n    global_numbering = get_global_numbering(mesh, nodes_per_entity)\n    node_classes = mesh.node_classes(nodes_per_entity)\n    halo = halo_mod.Halo(mesh._plex, global_numbering)\n    node_set = op2.Set(node_classes, halo=halo, comm=mesh.comm)\n    extruded = mesh.cell_set._extruded\n    if extruded:\n        # FIXME! This is a LIE! But these sets should not be extruded\n        # anyway, only the code gen in PyOP2 is busted.\n        node_set = op2.ExtrudedSet(node_set, layers=2)\n\n    assert global_numbering.getStorageSize() == node_set.total_size\n    if not extruded and node_set.total_size >= (1 << (IntType.itemsize * 8 - 4)):\n        raise RuntimeError(\"Problems with more than %d nodes per process unsupported\", (1 << (IntType.itemsize * 8 - 4)))\n    return node_set\n\n\ndef get_cell_node_list(mesh, entity_dofs, global_numbering, offsets):\n    \"\"\"Get the cell->node list for specified dof layout.\n\n    :arg mesh: The mesh to use.\n    :arg entity_dofs: The FInAT entity_dofs dict.\n    :arg global_numbering: The PETSc Section describing node layout\n        (see :func:`get_global_numbering`).\n    :arg offsets: layer offsets for each entity (maybe ignored).\n    :returns: A numpy array mapping mesh cells to function space\n        nodes.\n    \"\"\"\n    return mesh.make_cell_node_list(global_numbering, entity_dofs, offsets)\n\n\ndef get_facet_node_list(mesh, kind, cell_node_list, offsets):\n    \"\"\"Get the facet->node list for specified dof layout.\n\n    :arg mesh: The mesh to use.\n    :arg kind: The facet kind (one of ``\"interior_facets\"`` or\n        ``\"exterior_facets\"``).\n    :arg cell_node_list: The map from mesh cells to function space\n        nodes, see :func:`get_cell_node_list`.\n    :arg offsets: layer offsets for each entity (maybe ignored).\n    :returns: A numpy array mapping mesh facets to function space\n        nodes.\n    \"\"\"\n    assert kind in [\"interior_facets\", \"exterior_facets\"]\n    if mesh._plex.getStratumSize(kind, 1) > 0:\n        return dmplex.get_facet_nodes(mesh, cell_node_list, kind, offsets)\n    else:\n        return numpy.array([], dtype=IntType)\n\n\n@cached\ndef get_entity_node_lists(mesh, key, entity_dofs, global_numbering, offsets):\n    \"\"\"Get the map from mesh entity sets to function space nodes.\n\n    :arg mesh: The mesh to use.\n    :arg key: Canonicalised entity_dofs (see :func:`entity_dofs_key`).\n    :arg entity_dofs: FInAT entity dofs.\n    :arg global_numbering: The PETSc Section describing node layout\n        (see :func:`get_global_numbering`).\n    :arg offsets: layer offsets for each entity (maybe ignored).\n    :returns: A dict mapping mesh entity sets to numpy arrays of\n        function space nodes.\n    \"\"\"\n    # set->node lists are specific to the sorted entity_dofs.\n    cell_node_list = get_cell_node_list(mesh, entity_dofs, global_numbering, offsets)\n    interior_facet_node_list = partial(get_facet_node_list, mesh, \"interior_facets\", cell_node_list, offsets)\n    exterior_facet_node_list = partial(get_facet_node_list, mesh, \"exterior_facets\", cell_node_list, offsets)\n\n    class magic(dict):\n        def __missing__(self, key):\n            return self.setdefault(key,\n                                   {mesh.cell_set: lambda: cell_node_list,\n                                    mesh.interior_facets.set: interior_facet_node_list,\n                                    mesh.exterior_facets.set: exterior_facet_node_list}[key]())\n\n    return magic()\n\n\n@cached\ndef get_map_caches(mesh, entity_dofs):\n    \"\"\"Get the map caches for this mesh.\n\n    :arg mesh: The mesh to use.\n    :arg entity_dofs: Canonicalised entity_dofs (see\n        :func:`entity_dofs_key`).\n    \"\"\"\n    return {mesh.cell_set: {},\n            mesh.interior_facets.set: {},\n            mesh.exterior_facets.set: {},\n            \"boundary_node\": {}}\n\n\n@cached\ndef get_dof_offset(mesh, key, entity_dofs, ndof):\n    \"\"\"Get the dof offsets.\n\n    :arg mesh: The mesh to use.\n    :arg key: Canonicalised entity_dofs (see :func:`entity_dofs_key`).\n    :arg entity_dofs: The FInAT entity_dofs dict.\n    :arg ndof: The number of dofs (the FInAT space_dimension).\n    :returns: A numpy array of dof offsets (extruded) or ``None``.\n    \"\"\"\n    return mesh.make_offset(entity_dofs, ndof)\n\n\n@cached\ndef get_boundary_masks(mesh, key, finat_element):\n    \"\"\"Get masks for facet dofs.\n\n    :arg mesh: The mesh to use.\n    :arg key: Canonicalised entity_dofs (see :func:`entity_dofs_key`).\n    :arg finat_element: The FInAT element.\n    :returns: A dict mapping ``\"topological\"`` and ``\"geometric\"``\n        keys to boundary nodes or ``None``.  If not None, the entry in\n        the mask dict 3-tuple of a Section, an array of indices, and\n        an array indicating which points in the Section correspond to\n        the facets of the cell.  If section.getDof(p) is non-zero,\n        then there are ndof basis functions topologically associated\n        with points in the closure of\n        point p (for \"topological\", ndof basis functions with non-zero\n        support on points in the closure of p for \"geometric\").  The\n        basis function indices are in the index array, starting at\n        section.getOffset(p).\n    \"\"\"\n    if not mesh.cell_set._extruded:\n        return None\n    masks = {}\n    _, kind = key\n    assert kind in {\"cell\", \"interior_facet\"}\n    dim = finat_element.cell.get_spatial_dimension()\n    ecd = finat_element.entity_closure_dofs()\n    try:\n        esd = finat_element.entity_support_dofs()\n    except NotImplementedError:\n        # 4-D cells\n        esd = None\n    # Number of entities on cell excepting the cell itself.\n    chart = sum(map(len, ecd.values())) - 1\n    closure_section = PETSc.Section().create(comm=PETSc.COMM_SELF)\n    support_section = PETSc.Section().create(comm=PETSc.COMM_SELF)\n    # Double up for interior facets.\n    if kind == \"cell\":\n        ncell = 1\n    else:\n        ncell = 2\n    closure_section.setChart(0, ncell*chart)\n    support_section.setChart(0, ncell*chart)\n    closure_indices = []\n    support_indices = []\n    facet_points = []\n    p = 0\n\n    offset = finat_element.space_dimension()\n    for cell in range(ncell):\n        for ent in sorted(ecd.keys()):\n            # Never need closure of cell\n            if sum(ent) == dim:\n                continue\n            for key in sorted(ecd[ent].keys()):\n                closure_section.setDof(p, len(ecd[ent][key]))\n                vals = numpy.asarray(sorted(ecd[ent][key]), dtype=IntType)\n                closure_indices.extend(vals + cell*offset)\n                if esd is not None:\n                    support_section.setDof(p, ncell*len(esd[ent][key]))\n                    vals = numpy.asarray(sorted(esd[ent][key]), dtype=IntType)\n                    support_indices.extend(vals + cell*offset)\n                if sum(ent) == dim - 1:\n                    facet_points.append(p)\n                p += 1\n    closure_section.setUp()\n    support_section.setUp()\n    closure_indices = numpy.asarray(closure_indices, dtype=IntType)\n    support_indices = numpy.asarray(support_indices, dtype=IntType)\n    facet_points = numpy.asarray(facet_points, dtype=IntType)\n    masks[\"topological\"] = op2.Map.MapMask(closure_section, closure_indices, facet_points)\n    masks[\"geometric\"] = op2.Map.MapMask(support_section, support_indices, facet_points)\n    return masks\n\n\n@cached\ndef get_work_function_cache(mesh, ufl_element):\n    \"\"\"Get the cache for work functions.\n\n    :arg mesh: The mesh to use.\n    :arg ufl_element: The ufl element, used as a key.\n    :returns: A dict.\n\n    :class:`.FunctionSpace` objects sharing the same UFL element (and\n    therefore comparing equal) share a work function cache.\n    \"\"\"\n    return {}\n\n\n@cached\ndef get_top_bottom_boundary_nodes(mesh, key, V):\n    \"\"\"Get top or bottom boundary nodes of an extruded function space.\n\n    :arg mesh: The mesh to cache on.\n    :arg key: The key a 3-tuple of ``(entity_dofs_key, sub_domain, method)``.\n        Where sub_domain indicates top or bottom and method is whether\n        we should identify dofs on facets topologically or geometrically.\n    :arg V: The FunctionSpace to select from.\n    :arg entity_dofs: The flattened entity dofs.\n    :returnsL: A numpy array of the (unique) boundary nodes.\n    \"\"\"\n    _, sub_domain, method = key\n    cell_node_list = V.cell_node_list\n    offset = V.offset\n    if mesh.variable_layers:\n        return extnum.top_bottom_boundary_nodes(mesh, cell_node_list,\n                                                V.cell_boundary_masks[method],\n                                                offset,\n                                                sub_domain)\n    else:\n        idx = {\"bottom\": -2, \"top\": -1}[sub_domain]\n        section, indices, facet_points = V.cell_boundary_masks[method]\n        facet = facet_points[idx]\n        dof = section.getDof(facet)\n        off = section.getOffset(facet)\n        mask = indices[off:off+dof]\n        nodes = cell_node_list[..., mask]\n        if sub_domain == \"top\":\n            nodes = nodes + offset[mask]*(mesh.cell_set.layers - 2)\n        return numpy.unique(nodes)\n\n\n@cached\ndef get_boundary_nodes(mesh, key, V):\n    _, sub_domain, method = key\n    indices = dmplex.boundary_nodes(V, sub_domain, method)\n    # We need a halo exchange to determine all bc nodes.\n    # Should be improved by doing this on the DM topology once.\n    d = op2.Dat(V.dof_dset.set, dtype=IntType)\n    d.data_with_halos[indices] = 1\n    d.global_to_local_begin(op2",
+      "total_lines": 596,
+      "ref": "794adbf05f1be9300fc8e898e01fc102d433a456"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "get_node_set",
+      "class_name": null,
+      "start_line": 74,
+      "end_line": 95,
+      "satd_line": 88,
+      "matched_by": "normalized_source",
+      "source": "def get_node_set(mesh, nodes_per_entity):\n    \"\"\"Get the :class:`node set <pyop2.Set>`.\n\n    :arg mesh: The mesh to use.\n    :arg nodes_per_entity: The number of function space nodes per\n        topological entity.\n    :returns: A :class:`pyop2.Set` for the function space nodes.\n    \"\"\"\n    global_numbering = get_global_numbering(mesh, nodes_per_entity)\n    node_classes = mesh.node_classes(nodes_per_entity)\n    halo = halo_mod.Halo(mesh._plex, global_numbering)\n    node_set = op2.Set(node_classes, halo=halo, comm=mesh.comm)\n    extruded = mesh.cell_set._extruded\n    if extruded:\n        # FIXME! This is a LIE! But these sets should not be extruded\n        # anyway, only the code gen in PyOP2 is busted.\n        node_set = op2.ExtrudedSet(node_set, layers=2)\n\n    assert global_numbering.getStorageSize() == node_set.total_size\n    if not extruded and node_set.total_size >= (1 << (IntType.itemsize * 8 - 4)):\n        raise RuntimeError(\"Problems with more than %d nodes per process unsupported\", (1 << (IntType.itemsize * 8 - 4)))\n    return node_set",
+      "calls": [
+        "RuntimeError",
+        "get_global_numbering"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "IntType",
+        "cached",
+        "get_global_numbering",
+        "halo_mod",
+        "op2"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "get_global_numbering",
+        "mesh.node_classes",
+        "halo_mod.Halo",
+        "op2.ExtrudedSet",
+        "global_numbering.getStorageSize"
+      ],
+      "reason": "These methods are critical for understanding the structure and behavior of the node set and its dependencies, which directly impact the SATD repair.",
+      "uncertainty_items": [
+        {
+          "kind": "method",
+          "raw_name": "get_global_numbering",
+          "normalized_name": "get_global_numbering",
+          "line": 9,
+          "source_excerpt": "global_numbering = get_global_numbering(mesh, nodes_per_entity)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "mesh.node_classes",
+          "normalized_name": "mesh.node_classes",
+          "line": 10,
+          "source_excerpt": "node_classes = mesh.node_classes(nodes_per_entity)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "halo_mod.Halo",
+          "normalized_name": "halo_mod.Halo",
+          "line": 11,
+          "source_excerpt": "halo = halo_mod.Halo(mesh._plex, global_numbering)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "op2.ExtrudedSet",
+          "normalized_name": "op2.ExtrudedSet",
+          "line": 17,
+          "source_excerpt": "node_set = op2.ExtrudedSet(node_set, layers=2)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "global_numbering.getStorageSize",
+          "normalized_name": "global_numbering.getStorageSize",
+          "line": 19,
+          "source_excerpt": "assert global_numbering.getStorageSize() == node_set.total_size",
+          "retrieval_eligible": true
+        }
+      ]
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "MeshTopology.node_classes",
+        "path": "firedrake/mesh.py",
+        "class_name": "MeshTopology",
+        "start_line": 574,
+        "end_line": 580,
+        "source": "def node_classes(self, nodes_per_entity):\n        \"\"\"Compute node classes given nodes per entity.\n\n        :arg nodes_per_entity: number of function space nodes per topological entity.\n        :returns: the number of nodes in each of core, owned, and ghost classes.\n        \"\"\"\n        return tuple(np.dot(nodes_per_entity, self._entity_classes))",
+        "found": true
+      },
+      {
+        "method_name": "Halo",
+        "path": "firedrake/halo.py",
+        "class_name": null,
+        "start_line": 38,
+        "end_line": 108,
+        "source": "class Halo(op2.Halo):\n    \"\"\"Build a Halo for a function space.\n\n    :arg dm:  The DMPlex describing the topology.\n    :arg section: The data layout.\n\n    The halo is implemented using a PETSc SF (star forest) object and\n    is usable as a PyOP2 :class:`pyop2.Halo`.\"\"\"\n\n    def __init__(self, dm, section):\n        super(Halo, self).__init__()\n        # Use a DM to create the halo SFs\n        self.dm = PETSc.DMShell().create(dm.comm)\n        self.dm.setPointSF(dm.getPointSF())\n        self.dm.setDefaultSection(section)\n\n    @utils.cached_property\n    def sf(self):\n        lsec = self.dm.getDefaultSection()\n        gsec = self.dm.getDefaultGlobalSection()\n        self.dm.createDefaultSF(lsec, gsec)\n        # The full SF is designed for GlobalToLocal or LocalToGlobal\n        # where the input and output buffers are different.  So on the\n        # local rank, it copies data from input to output.  However,\n        # our halo exchanges use the same buffer for input and output\n        # (so we don't need to do the local copy).  To facilitate\n        # this, prune the SF to remove all the roots that reference\n        # the local rank.\n        sf = dmplex.prune_sf(self.dm.getDefaultSF())\n        sf.setFromOptions()\n        if sf.getType() != sf.Type.BASIC:\n            raise RuntimeError(\"Windowed SFs expose bugs in OpenMPI (use -sf_type basic)\")\n        return sf\n\n    @utils.cached_property\n    def comm(self):\n        return self.dm.comm.tompi4py()\n\n    @utils.cached_property\n    def local_to_global_numbering(self):\n        lsec = self.dm.getDefaultSection()\n        gsec = self.dm.getDefaultGlobalSection()\n        return dmplex.make_global_numbering(lsec, gsec)\n\n    def global_to_local_begin(self, dat, insert_mode):\n        assert insert_mode is op2.WRITE, \"Only WRITE GtoL supported\"\n        if self.comm.size == 1:\n            return\n        mtype = _get_mtype(dat)\n        dmplex.halo_begin(self.sf, dat, mtype, False)\n\n    def global_to_local_end(self, dat, insert_mode):\n        assert insert_mode is op2.WRITE, \"Only WRITE GtoL supported\"\n        if self.comm.size == 1:\n            return\n        mtype = _get_mtype(dat)\n        dmplex.halo_end(self.sf, dat, mtype, False)\n\n    def local_to_global_begin(self, dat, insert_mode):\n        assert insert_mode is op2.INC, \"Only INC LtoG supported\"\n        if self.comm.size == 1:\n            return\n        mtype = _get_mtype(dat)\n        dmplex.halo_begin(self.sf, dat, mtype, True)\n\n    def local_to_global_end(self, dat, insert_mode):\n        assert insert_mode is op2.INC, \"Only INC LtoG supported\"\n        if self.comm.size == 1:\n            return\n        mtype = _get_mtype(dat)\n        dmplex.halo_end(self.sf, dat, mtype, True)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "op2.ExtrudedSet",
+      "global_numbering.getStorageSize",
+      "get_global_numbering"
+    ],
+    "edit_constraints": [
+      {
+        "target_kind": "method",
+        "target_hint": "global_numbering = get_global_numbering(mesh, nodes_per_entity)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# FIXME! This is a LIE! But these sets should not be extruded\r\n# anyway, only the code gen in PyOP2 is busted.) while staying consistent with `get_global_numbering`.",
+        "must_do": "Use `get_global_numbering` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "get_global_numbering",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "8:     \"\"\"\n9:     global_numbering = get_global_numbering(mesh, nodes_per_entity)\n10:     node_classes = mesh.node_classes(nodes_per_entity)",
+        "confidence": 0.45
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "node_classes = mesh.node_classes(nodes_per_entity)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# FIXME! This is a LIE! But these sets should not be extruded\r\n# anyway, only the code gen in PyOP2 is busted.) while staying consistent with `MeshTopology.node_classes`.",
+        "must_do": "Use `MeshTopology.node_classes` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "MeshTopology.node_classes",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "def node_classes(self, nodes_per_entity):\n        \"\"\"Compute node classes given nodes per entity.\n\n        :arg nodes_per_entity: number of function space nodes per topological entity.\n        :returns: the number of nodes in each of core, owned, and ghost classes.\n        \"\"\"\n        return tuple(np.dot(nodes_per_entity, self._entity_classes))",
+        "confidence": 0.99
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "halo = halo_mod.Halo(mesh._plex, global_numbering)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# FIXME! This is a LIE! But these sets should not be extruded\r\n# anyway, only the code gen in PyOP2 is busted.) while staying consistent with `Halo`.",
+        "must_do": "Use `Halo` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "Halo",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "class Halo(op2.Halo):\n...\n        # Use a DM to create the halo SFs\n        self.dm = PETSc.DMShell().create(dm.comm)\n        self.dm.setPointSF(dm.getPointSF())\n        self.dm.setDefaultSection(section)",
+        "confidence": 0.99
+      }
+    ]
+  },
+  "review_context": {}
+}

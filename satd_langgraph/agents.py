@@ -17,12 +17,14 @@ from .local_settings import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
 from .local_settings import OPENAI_BASE_URL as LOCAL_OPENAI_BASE_URL
 from .schema import (
     AnalysisResult,
+    EditConstraint,
     GraphState,
     MethodInquiryResult,
     RepairAttempt,
     RetrievedMethodContext,
     ReviewResult,
     SelectorDecision,
+    UncertaintyItem,
     preprocess_python_code,
 )
 
@@ -1636,14 +1638,12 @@ class OpenAIFixer:
     def __init__(
         self,
         client: OpenAICompatClient,
-        prompt_mode: str = "lightweight",
         repair_context_mode: str = "clone_treesitter",
         max_method_contexts: int = 2,
         logger: Any | None = None,
         checkpoint_callback: Any | None = None,
     ) -> None:
         self.client = client
-        self.prompt_mode = prompt_mode
         self.repair_context_mode = repair_context_mode
         self.max_method_contexts = max(1, int(max_method_contexts))
         self.logger = logger
@@ -1653,9 +1653,8 @@ class OpenAIFixer:
         self,
         state: GraphState,
         candidate_mode: str = "baseline_context",
-    ) -> tuple[RepairAttempt, MethodInquiryResult, list[RetrievedMethodContext], list[str]]:
+    ) -> tuple[RepairAttempt, MethodInquiryResult, list[RetrievedMethodContext], list[str], list[UncertaintyItem], list[EditConstraint]]:
         round_id = state["round_id"] + 1
-        contextual_repair_hint = self._contextual_repair_hint(state["original_code"], state["satd_comment"])
         use_method_context = self._candidate_uses_method_context(candidate_mode)
         self._checkpoint(
             state,
@@ -1673,6 +1672,7 @@ class OpenAIFixer:
             method_inquiry = MethodInquiryResult(reason="candidate_mode_without_method_context")
             self._log(state, f"context questions=skipped mode={candidate_mode}")
         effective_use_method_context = use_method_context and bool(method_inquiry.required_methods)
+        uncertainty_items = list(method_inquiry.uncertainty_items or [])
         self._checkpoint(
             state,
             stage="question_done",
@@ -1681,6 +1681,8 @@ class OpenAIFixer:
                 "candidate_mode": candidate_mode,
                 "required_methods": list(method_inquiry.required_methods),
                 "reason": method_inquiry.reason,
+                "method_notes": self._serialize_method_notes(method_inquiry.method_notes),
+                "uncertainty_items": self._serialize_uncertainty_items(uncertainty_items),
             },
         )
         self._checkpoint(
@@ -1709,8 +1711,18 @@ class OpenAIFixer:
                 method_inquiry.required_methods,
                 method_location_hints=method_location_hints,
             )
+            retrieved_method_contexts = self._enrich_retrieved_method_contexts(
+                state=state,
+                method_inquiry=method_inquiry,
+                retrieved_method_contexts=retrieved_method_contexts,
+            )
             missing_method_names = [item.method_name for item in retrieved_method_contexts if not item.found]
             found_method_contexts = [item for item in retrieved_method_contexts if item.found]
+            found_method_contexts = self._apply_method_context_gate(
+                state=state,
+                method_inquiry=method_inquiry,
+                retrieved_method_contexts=found_method_contexts,
+            )
             self._log(
                 state,
                 "context results "
@@ -1736,6 +1748,12 @@ class OpenAIFixer:
                     "method_location_hints": {},
                 },
             )
+        edit_constraints = self._synthesize_edit_constraints(
+            state=state,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=found_method_contexts,
+        )
+        effective_candidate_mode = self._effective_candidate_mode(candidate_mode, found_method_contexts)
         self._checkpoint(
             state,
             stage="retrieval_done",
@@ -1743,20 +1761,12 @@ class OpenAIFixer:
                 "round_id": round_id,
                 "candidate_mode": candidate_mode,
                 "required_methods": list(method_inquiry.required_methods),
+                "method_notes": self._serialize_method_notes(method_inquiry.method_notes),
+                "uncertainty_items": self._serialize_uncertainty_items(uncertainty_items),
                 "method_location_hints": method_location_hints,
-                "retrieved_method_contexts": [
-                    {
-                        "method_name": item.method_name,
-                        "path": item.path,
-                        "class_name": item.class_name,
-                        "start_line": item.start_line,
-                        "end_line": item.end_line,
-                        "source": item.source,
-                        "found": item.found,
-                    }
-                    for item in retrieved_method_contexts
-                ],
+                "retrieved_method_contexts": self._serialize_retrieved_method_contexts(retrieved_method_contexts),
                 "missing_method_names": list(missing_method_names),
+                "edit_constraints": self._serialize_edit_constraints(edit_constraints),
             },
         )
         self._checkpoint(
@@ -1766,44 +1776,31 @@ class OpenAIFixer:
                 "round_id": round_id,
                 "candidate_mode": candidate_mode,
                 "required_methods": list(method_inquiry.required_methods),
-                "retrieved_method_contexts": [
-                    {
-                        "method_name": item.method_name,
-                        "path": item.path,
-                        "class_name": item.class_name,
-                        "start_line": item.start_line,
-                        "end_line": item.end_line,
-                        "source": item.source,
-                        "found": item.found,
-                    }
-                    for item in retrieved_method_contexts
-                ],
+                "method_notes": self._serialize_method_notes(method_inquiry.method_notes),
+                "uncertainty_items": self._serialize_uncertainty_items(uncertainty_items),
+                "retrieved_method_contexts": self._serialize_retrieved_method_contexts(retrieved_method_contexts),
                 "missing_method_names": list(missing_method_names),
+                "edit_constraints": self._serialize_edit_constraints(edit_constraints),
             },
         )
         system_prompt, user_prompt = self._build_repair_prompts(
             state=state,
             round_id=round_id,
-            contextual_repair_hint=contextual_repair_hint,
             method_inquiry=method_inquiry,
             retrieved_method_contexts=found_method_contexts,
             missing_method_names=missing_method_names,
+            edit_constraints=edit_constraints,
         )
         payload = self.client.generate_json(
             system_prompt,
             user_prompt,
-            request_label=f"repair:task_{state['task_id']}:round_{round_id}:candidate_{candidate_mode}",
+            request_label=f"repair:task_{state['task_id']}:round_{round_id}:candidate_{effective_candidate_mode}",
         )
-        repair_plan = str(payload.get("repair_plan") or "Resolve the SATD with the smallest plausible local edit.")
         repaired_code = str(payload.get("repaired_code") or state["original_code"])
-        changed_scope = str(payload.get("changed_scope") or "function")
-        if changed_scope not in {"line", "function", "class", "file", "multi_file"}:
-            changed_scope = "function"
-        try:
-            confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.45))))
-        except (TypeError, ValueError):
-            confidence = 0.45
-        notes = str(payload.get("notes") or "model response normalized with fixer fallback")
+        repair_plan = self._default_repair_plan(state)
+        changed_scope = self._infer_changed_scope(state["original_code"], repaired_code)
+        confidence = self._default_repair_confidence(state, repaired_code, found_method_contexts)
+        notes = "repair metadata generated locally"
         if method_inquiry.required_methods and not found_method_contexts:
             notes = f"{notes} | no_method_context_found"
         elif found_method_contexts:
@@ -1817,14 +1814,14 @@ class OpenAIFixer:
             notes = f"{notes} | em_risk={','.join(em_risk_notes)}"
         self._log(
             state,
-            f"repair output scope={changed_scope} confidence={confidence:.2f} mode={candidate_mode}"
+            f"repair output scope={changed_scope} confidence={confidence:.2f} mode={effective_candidate_mode}"
         )
         self._checkpoint(
             state,
             stage="generation_done",
             payload={
                 "round_id": round_id,
-                "candidate_mode": candidate_mode,
+                "candidate_mode": effective_candidate_mode,
                 "repair_plan": repair_plan,
                 "repaired_code": repaired_code,
                 "changed_scope": changed_scope,
@@ -1841,79 +1838,118 @@ class OpenAIFixer:
                 changed_scope=changed_scope,
                 confidence=confidence,
                 notes=notes,
-                candidate_mode=candidate_mode,
+                candidate_mode=effective_candidate_mode,
             ),
             method_inquiry,
             found_method_contexts,
             missing_method_names,
+            uncertainty_items,
+            edit_constraints,
         )
 
     def identify_required_methods(self, state: GraphState) -> MethodInquiryResult:
         if self.repair_context_mode not in {"method_query", "clone_treesitter"}:
             return MethodInquiryResult()
+
         satd_route_type = str(state.get("satd_route_type") or "generic").strip().lower()
-        if satd_route_type == "remove_temporary":
-            return MethodInquiryResult(required_methods=[], reason="route_remove_temporary_comment_code_only")
-        candidates = self._extract_method_candidates_from_satd_code(state["original_code"])
+        satd_comment = state.get("satd_comment") or ""
+        uncertainty_items = self._extract_uncertainty_candidates_from_satd_code(
+            satd_comment=satd_comment,
+            original_code=state["original_code"],
+        )
+
+        if self._skip_method_context_by_rule(satd_route_type, satd_comment):
+            return MethodInquiryResult(
+                required_methods=[],
+                reason=f"rule_without_method_context:{satd_route_type or 'generic'}",
+                uncertainty_items=uncertainty_items,
+            )
+
+        retrieval_candidates = [
+            item
+            for item in uncertainty_items
+            if item.retrieval_eligible and item.kind in {"method", "symbol"}
+        ]
+        candidates = [
+            {
+                "raw_call": item.raw_name or item.name,
+                "normalized_name": item.normalized_name or self._normalize_method_name(item.name),
+                "line": item.line,
+                "kind": item.kind,
+            }
+            for item in retrieval_candidates
+            if item.normalized_name or self._normalize_method_name(item.name)
+        ]
         if not candidates:
-            return MethodInquiryResult(required_methods=[], reason="llm_no_static_candidates")
+            return MethodInquiryResult(
+                required_methods=[],
+                reason="no_retrieval_eligible_method_symbol",
+                uncertainty_items=uncertainty_items,
+            )
+
+        method_line = "、".join(
+            str(item.get("normalized_name") or "").strip()
+            for item in candidates
+            if str(item.get("normalized_name") or "").strip()
+        ) or "[none]"
 
         system_prompt = textwrap.dedent(
             """
-            You are the engineer who must repair this SATD in the next step.
-            Before you repair it, decide which methods are truly indispensable to understand first.
-
-            Only keep methods that are so important that, without understanding their implementation or semantics,
-            you would likely repair the SATD incorrectly.
+            You will repair this SATD in the next step.
+            Before that, select only the methods that are strongly relevant to exact-match repair.
 
             Rules:
-            - There is NO quota. Return every indispensable method, and return none if nothing is truly indispensable.
-            - Favor false negatives over false positives. When unsure, leave the method out.
-            - Be conservative. Do not include methods that are merely nearby, obvious, builtin-like, or easy to infer locally.
-            - Prefer methods whose definitions materially affect behavior, compatibility, protocol, data shape, or side effects.
-            - Do not include a method just because it appears in the code. Include it only if understanding it is required before repair.
-            - You must only choose from the provided candidate methods.
+            - Return only methods that you must understand before repairing.
+            - Favor false negatives over false positives.
+            - You must only choose from the provided methods.
+            - For every selected method, explain why it is strongly related to the repair.
 
             Return JSON with:
             {
-              "required_methods": ["..."],
+              "required_methods": [
+                {"method_name": "...", "selection_reason": "..."}
+              ],
               "reason": "short explanation"
             }
             """
         ).strip()
         user_prompt = textwrap.dedent(
             f"""
-            You are about to repair this SATD yourself.
+            You will repair this SATD next.
+            Before that, you may ask for method context.
 
-            SATD comment:
-            {state["satd_comment"]}
+            Methods:
+            {method_line}
 
-            Original code:
+            Comment:
+            {satd_comment}
+
+            Code:
             {state["original_code"]}
 
-            Candidate methods extracted from the code:
-            {self._format_method_candidates_for_prompt(candidates)}
-
-            Question:
-            Which of these candidate methods must you understand before you can safely repair this SATD?
-
-            Apply a "better to miss than over-include" standard.
-            If none of them are truly indispensable, return an empty list.
+            Output the strongly relevant methods and their selection reasons.
             """
         ).strip()
         payload = self.client.generate_json(
             system_prompt,
             user_prompt,
             temperature=0.0,
-            request_label=f"method_inquiry:task_{state['task_id']}",
+            request_label=f"method_inquiry:task_{state.get('task_id', '?')}",
         )
         inquiry = self._coerce_method_inquiry(
             payload,
             allowed_methods=[str(item.get("normalized_name") or "") for item in candidates],
         )
         if not inquiry.reason:
-            inquiry.reason = "llm_filtered_static_candidates"
+            inquiry.reason = "llm_required_method_selection"
+        inquiry.uncertainty_items = uncertainty_items
         return inquiry
+
+    def _skip_method_context_by_rule(self, satd_route_type: str, satd_comment: str) -> bool:
+        route = str(satd_route_type or "").strip().lower()
+        if route in {"remove_temporary", "type_annotation", "replace_symbol", "document"}:
+            return True
+        return False
 
     def _coerce_method_inquiry(
         self,
@@ -1922,25 +1958,245 @@ class OpenAIFixer:
     ) -> MethodInquiryResult:
         raw_methods = payload.get("required_methods")
         required_methods: list[str] = []
+        method_notes: list[dict[str, str]] = []
         seen: set[str] = set()
         allowed = set(allowed_methods or [])
         if isinstance(raw_methods, list):
             for item in raw_methods:
-                normalized = self._normalize_method_name(item)
+                selection_reason = ""
+                raw_name = item
+                if isinstance(item, dict):
+                    raw_name = item.get("method_name") or item.get("name") or item.get("method") or ""
+                    selection_reason = str(
+                        item.get("selection_reason")
+                        or item.get("reason")
+                        or item.get("relation")
+                        or item.get("why")
+                        or ""
+                    ).strip()
+                normalized = self._normalize_method_name(raw_name)
                 if not normalized or normalized in seen:
                     continue
                 if allowed and normalized not in allowed:
                     continue
                 seen.add(normalized)
                 required_methods.append(normalized)
+                method_notes.append(
+                    {
+                        "method_name": normalized,
+                        "why_blocking": selection_reason or f"`{normalized}` may change the exact repair behavior.",
+                        "what_to_learn": selection_reason or f"Understand how `{normalized}` affects the local SATD fix.",
+                    }
+                )
         reason = str(payload.get("reason") or "").strip()
-        return MethodInquiryResult(required_methods=required_methods, reason=reason)
+        return MethodInquiryResult(required_methods=required_methods, reason=reason, method_notes=method_notes)
+
+    def _extract_uncertainty_candidates_from_satd_code(self, satd_comment: str, original_code: str) -> list[UncertaintyItem]:
+        items: list[UncertaintyItem] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(
+            kind: str,
+            name: str,
+            line: int | None = None,
+            retrieval_eligible: bool = False,
+            why: str = "",
+            *,
+            raw_name: str = "",
+            normalized_name: str = "",
+            source_excerpt: str = "",
+        ) -> None:
+            normalized_name = (normalized_name or name or "").strip()
+            if not normalized_name:
+                return
+            key = (kind, normalized_name)
+            if key in seen:
+                return
+            seen.add(key)
+            items.append(
+                UncertaintyItem(
+                    kind=kind,
+                    name=normalized_name,
+                    line=line,
+                    retrieval_eligible=retrieval_eligible,
+                    why_this_matters=why,
+                    raw_name=(raw_name or name or "").strip(),
+                    normalized_name=normalized_name,
+                    source_excerpt=(source_excerpt or "").strip(),
+                )
+            )
+
+        for candidate in self._extract_method_candidates_from_satd_code(original_code):
+            name = str(candidate.get("normalized_name") or "")
+            add(
+                "method",
+                name,
+                candidate.get("line"),
+                True,
+                "Method call appears in the edit region.",
+                raw_name=str(candidate.get("raw_call") or name),
+                normalized_name=name,
+                source_excerpt=str(candidate.get("source_excerpt") or ""),
+            )
+
+        comment = satd_comment or ""
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_\.]+", comment):
+            token = token.strip(".")
+            if not token:
+                continue
+            lower = token.lower()
+            if lower in {"todo", "fixme", "none", "true", "false"}:
+                continue
+            normalized_token = self._normalize_method_name(token) or token
+            if self._looks_like_retrieval_symbol(token):
+                add(
+                    "symbol",
+                    normalized_token,
+                    None,
+                    True,
+                    "Comment explicitly names an API-like symbol.",
+                    raw_name=token,
+                    normalized_name=normalized_token,
+                    source_excerpt=comment.strip(),
+                )
+            elif "." in token:
+                add(
+                    "value",
+                    token,
+                    None,
+                    False,
+                    "Comment references a value-like qualified name.",
+                    raw_name=token,
+                    normalized_name=token,
+                    source_excerpt=comment.strip(),
+                )
+
+        try:
+            tree = ast.parse(textwrap.dedent((original_code or "").strip("\n")))
+        except (SyntaxError, ValueError):
+            return items
+
+        class LocalSignalCollector(ast.NodeVisitor):
+            def visit_If(self, node: ast.If) -> Any:
+                snippet = ast.get_source_segment(original_code, node.test) or ""
+                cleaned = snippet.strip()
+                add(
+                    "condition",
+                    cleaned,
+                    getattr(node, "lineno", None),
+                    False,
+                    "Condition may determine the patch shape.",
+                    raw_name=cleaned,
+                    normalized_name=cleaned,
+                    source_excerpt=cleaned,
+                )
+                self.generic_visit(node)
+
+            def visit_Return(self, node: ast.Return) -> Any:
+                snippet = ast.get_source_segment(original_code, node.value) or "return"
+                cleaned = snippet.strip()
+                add(
+                    "return",
+                    cleaned,
+                    getattr(node, "lineno", None),
+                    False,
+                    "Return semantics may matter.",
+                    raw_name=cleaned,
+                    normalized_name=cleaned,
+                    source_excerpt=cleaned,
+                )
+                self.generic_visit(node)
+
+            def visit_Assign(self, node: ast.Assign) -> Any:
+                for target in node.targets:
+                    if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
+                        name = f"self.{target.attr}"
+                        add(
+                            "state_write",
+                            name,
+                            getattr(node, "lineno", None),
+                            False,
+                            "State mutation may matter.",
+                            raw_name=name,
+                            normalized_name=name,
+                            source_excerpt=(ast.get_source_segment(original_code, node) or name).strip(),
+                        )
+                self.generic_visit(node)
+
+        LocalSignalCollector().visit(tree)
+        return items
+
+    def _looks_like_retrieval_symbol(self, token: str) -> bool:
+        cleaned = str(token or "").strip()
+        if not cleaned:
+            return False
+        normalized = self._normalize_method_name(cleaned)
+        if not normalized:
+            return False
+        tail = normalized.split(".")[-1]
+        tail_segments = self._method_name_segments(tail)
+        if len(tail) < 3:
+            return False
+        if tail.lower() in {"default", "backend", "config", "true", "false", "none"}:
+            return False
+        callable_markers = {
+            "send",
+            "close",
+            "open",
+            "load",
+            "save",
+            "reset",
+            "resolve",
+            "create",
+            "build",
+            "update",
+            "remove",
+            "delete",
+            "write",
+            "read",
+        }
+        if any(marker in tail.lower() for marker in {"default", "backend", "config"}) and not any(
+            word in tail_segments for word in callable_markers
+        ):
+            return False
+        return (
+            "." in normalized
+            or "_" in tail
+            or any(ch.isupper() for ch in tail)
+            or any(word in tail_segments for word in callable_markers)
+        )
+
+    def _method_name_segments(self, value: str) -> set[str]:
+        text = str(value or "").strip()
+        if not text:
+            return set()
+        tokens: set[str] = set()
+        for chunk in text.replace(".", "_").split("_"):
+            for part in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", chunk):
+                tokens.add(part.lower())
+        return tokens
 
     def _candidate_uses_method_context(self, candidate_mode: str) -> bool:
         mode = str(candidate_mode or "").strip().lower()
         if not mode:
             return True
         return not mode.endswith("no_context")
+
+    def _effective_candidate_mode(
+        self,
+        candidate_mode: str,
+        found_method_contexts: list[RetrievedMethodContext],
+    ) -> str:
+        mode = str(candidate_mode or "").strip()
+        if not mode:
+            return mode
+        if not self._candidate_uses_method_context(mode):
+            return mode
+        if found_method_contexts:
+            return mode
+        if mode.endswith("_context"):
+            return mode[: -len("_context")] + "_no_context"
+        return mode
 
     def _extract_method_candidates_from_satd_code(self, code: str) -> list[dict[str, Any]]:
         snippet = textwrap.dedent((code or "").strip("\n"))
@@ -1973,6 +2229,7 @@ class OpenAIFixer:
                             "raw_call": raw_call,
                             "normalized_name": normalized,
                             "line": getattr(node, "lineno", None),
+                            "source_excerpt": (ast.get_source_segment(snippet, node) or "").strip(),
                         }
                     )
                 self.generic_visit(node)
@@ -1996,15 +2253,83 @@ class OpenAIFixer:
             return self._call_chain_from_node(node.func)
         return ""
 
-    def _format_method_candidates_for_prompt(self, candidates: list[dict[str, Any]]) -> str:
-        lines = []
-        for item in candidates:
-            raw_call = str(item.get("raw_call") or "")
-            normalized_name = str(item.get("normalized_name") or "")
-            line_no = item.get("line")
-            line_part = f" line={line_no}" if isinstance(line_no, int) else ""
-            lines.append(f"- normalized_name={normalized_name} raw_call={raw_call}{line_part}")
-        return "\n".join(lines)
+    def _serialize_method_notes(self, method_notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for item in method_notes or []:
+            if not isinstance(item, dict):
+                continue
+            serialized.append(
+                {
+                    "method_name": str(item.get("method_name") or "").strip(),
+                    "why_blocking": str(item.get("why_blocking") or "").strip(),
+                    "what_to_learn": str(item.get("what_to_learn") or "").strip(),
+                }
+            )
+        return serialized
+
+    def _serialize_uncertainty_items(self, items: list[UncertaintyItem]) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for item in items or []:
+            normalized = item.normalized_name or self._normalize_method_name(item.name) or item.name
+            serialized.append(
+                {
+                    "kind": item.kind,
+                    "name": item.name,
+                    "raw_name": item.raw_name or item.name,
+                    "normalized_name": normalized,
+                    "line": item.line,
+                    "source_excerpt": item.source_excerpt,
+                    "retrieval_eligible": item.retrieval_eligible,
+                    "why_this_matters": item.why_this_matters,
+                }
+            )
+        return serialized
+
+    def _serialize_edit_constraints(self, items: list[EditConstraint]) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for item in items or []:
+            serialized.append(
+                {
+                    "focus_point": item.focus_point,
+                    "required_fact": item.required_fact,
+                    "must_do": item.must_do,
+                    "must_not_do": item.must_not_do,
+                    "supporting_point_kind": item.supporting_point_kind,
+                    "target_kind": item.target_kind,
+                    "target_hint": item.target_hint,
+                    "allowed_edit_radius": item.allowed_edit_radius,
+                    "must_preserve_signature": item.must_preserve_signature,
+                    "must_not_add_helper": item.must_not_add_helper,
+                    "must_not_expand_control_flow": item.must_not_expand_control_flow,
+                    "must_not_rewrite_unrelated_lines": item.must_not_rewrite_unrelated_lines,
+                    "supporting_symbol": item.supporting_symbol,
+                    "supporting_evidence": item.supporting_evidence,
+                    "confidence": item.confidence,
+                }
+            )
+        return serialized
+
+    def _serialize_retrieved_method_contexts(self, items: list[RetrievedMethodContext]) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for item in items or []:
+            serialized.append(
+                {
+                    "method_name": item.method_name,
+                    "path": item.path,
+                    "class_name": item.class_name,
+                    "start_line": item.start_line,
+                    "end_line": item.end_line,
+                    "source": item.source,
+                    "found": item.found,
+                    "signature": item.signature,
+                    "callsite_slice": item.callsite_slice,
+                    "evidence_slice": item.evidence_slice,
+                    "match_score": item.match_score,
+                    "confidence": item.confidence,
+                    "confidence_label": item.confidence_label,
+                }
+            )
+        return serialized
 
     def _normalize_method_name(self, value: Any) -> str:
         text = str(value or "").strip().strip("`").strip()
@@ -2064,9 +2389,404 @@ class OpenAIFixer:
                     end_line=item.get("end_line"),
                     source=str(item.get("source") or ""),
                     found=bool(item.get("found")),
+                    signature=str(item.get("signature") or ""),
+                    callsite_slice=str(item.get("callsite_slice") or ""),
+                    evidence_slice=str(item.get("evidence_slice") or ""),
+                    match_score=int(item.get("match_score") or 0),
+                    confidence=float(item.get("confidence") or 0.0),
+                    confidence_label=str(item.get("confidence_label") or ""),
                 )
             )
         return contexts
+
+    def _enrich_retrieved_method_contexts(
+        self,
+        *,
+        state: GraphState,
+        method_inquiry: MethodInquiryResult,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+    ) -> list[RetrievedMethodContext]:
+        if not retrieved_method_contexts:
+            return []
+        comment_refs = self._extract_comment_reference_names(state.get("satd_comment") or "")
+        required_refs = {
+            self._normalize_method_name(name)
+            for name in (method_inquiry.required_methods or [])
+            if self._normalize_method_name(name)
+        }
+        enriched: list[RetrievedMethodContext] = []
+        for item in retrieved_method_contexts:
+            signature = item.signature or self._extract_signature_line(item.source)
+            callsite_slice = item.callsite_slice or self._extract_callsite_slice(state["original_code"], item.method_name)
+            evidence_slice = item.evidence_slice or self._extract_relevant_definition_slice(item.source)
+            match_score = item.match_score or self._score_retrieved_method_context(
+                item=item,
+                comment_refs=comment_refs,
+                required_refs=required_refs,
+                callsite_slice=callsite_slice,
+                evidence_slice=evidence_slice,
+            )
+            confidence = item.confidence or self._confidence_from_match_score(match_score)
+            confidence_label = item.confidence_label or self._confidence_label(confidence)
+            enriched.append(
+                RetrievedMethodContext(
+                    method_name=item.method_name,
+                    path=item.path,
+                    class_name=item.class_name,
+                    start_line=item.start_line,
+                    end_line=item.end_line,
+                    source=item.source,
+                    found=item.found,
+                    signature=signature,
+                    callsite_slice=callsite_slice,
+                    evidence_slice=evidence_slice,
+                    match_score=match_score,
+                    confidence=confidence,
+                    confidence_label=confidence_label,
+                )
+            )
+        return enriched
+
+    def _score_retrieved_method_context(
+        self,
+        *,
+        item: RetrievedMethodContext,
+        comment_refs: set[str],
+        required_refs: set[str],
+        callsite_slice: str,
+        evidence_slice: str,
+    ) -> int:
+        method_name = self._normalize_method_name(item.method_name)
+        tail = method_name.split(".")[-1] if method_name else ""
+        comment_tail_refs = {name.split(".")[-1] for name in comment_refs if name}
+        required_tail_refs = {name.split(".")[-1] for name in required_refs if name}
+        score = 0
+        if method_name in comment_refs:
+            score += 1200
+        elif tail in comment_tail_refs:
+            score += 350
+        if method_name in required_refs:
+            score += 800
+        elif tail in required_tail_refs:
+            score += 220
+        if callsite_slice:
+            score += 900
+        if evidence_slice:
+            score += 300
+        if item.path:
+            score += 80
+        if item.class_name:
+            score += 30
+        if self._is_low_signal_evidence_method(tail):
+            score -= 850
+        return max(0, score)
+
+    def _confidence_from_match_score(self, match_score: int) -> float:
+        if match_score >= 1800:
+            return 0.99
+        if match_score >= 1200:
+            return 0.82
+        if match_score >= 800:
+            return 0.62
+        return 0.35
+
+    def _confidence_label(self, confidence: float) -> str:
+        if confidence >= 0.8:
+            return "high"
+        if confidence >= 0.6:
+            return "medium"
+        return "low"
+
+    def _is_low_signal_evidence_method(self, tail: str) -> bool:
+        lowered = str(tail or "").lower()
+        return lowered in {"gradcheck", "gradgradcheck", "assertequal", "sum", "backward", "product", "run_test"}
+
+    def _apply_method_context_gate(
+        self,
+        *,
+        state: GraphState,
+        method_inquiry: MethodInquiryResult,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+    ) -> list[RetrievedMethodContext]:
+        if not retrieved_method_contexts:
+            return []
+        retrieved_method_contexts = self._enrich_retrieved_method_contexts(
+            state=state,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=retrieved_method_contexts,
+        )
+
+        comment_refs = self._extract_comment_reference_names(state.get("satd_comment") or "")
+        required_refs = {
+            self._normalize_method_name(name)
+            for name in (method_inquiry.required_methods or [])
+            if self._normalize_method_name(name)
+        }
+        required_tail_refs = {name.split(".")[-1] for name in required_refs if name}
+        ranked: list[tuple[tuple[int, int, int, int], RetrievedMethodContext]] = []
+        for item, pack in zip(retrieved_method_contexts, self._build_method_evidence_packs(state, retrieved_method_contexts), strict=False):
+            method_name = self._normalize_method_name(item.method_name)
+            tail = method_name.split(".")[-1] if method_name else ""
+            if item.confidence_label == "low" or item.confidence < 0.6:
+                continue
+            exact_comment_hit = int(bool(method_name and (method_name in comment_refs or tail in comment_refs)))
+            has_callsite = int(bool(pack.get("callsite_slice")))
+            has_evidence = int(bool(pack.get("evidence_slice")))
+            required_match = int(bool(method_name and (method_name in required_refs or tail in required_tail_refs)))
+            match_score = int(item.match_score or 0)
+            if not (exact_comment_hit or has_callsite or required_match):
+                continue
+            ranked.append(((exact_comment_hit, has_callsite, has_evidence, match_score + required_match), item))
+
+        if not ranked:
+            return []
+        ranked.sort(key=lambda entry: entry[0], reverse=True)
+        return [item for _, item in ranked[: min(2, self.max_method_contexts)]]
+
+    def _build_method_evidence_packs(
+        self,
+        state: GraphState,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+    ) -> list[dict[str, Any]]:
+        packs: list[dict[str, Any]] = []
+        for item in retrieved_method_contexts:
+            local_call = self._extract_local_call_line(
+                state["original_code"],
+                item.method_name,
+                existing_slice=item.callsite_slice,
+            )
+            packs.append(
+                {
+                    "method_name": item.method_name,
+                    "path": item.path,
+                    "start_line": item.start_line,
+                    "end_line": item.end_line,
+                    "local_call": local_call,
+                    "callsite_slice": item.callsite_slice or self._extract_callsite_slice(state["original_code"], item.method_name),
+                    "method_behavior": self._build_method_behavior(
+                        source=item.source,
+                        method_name=item.method_name,
+                        local_call=local_call,
+                    ),
+                    "evidence_slice": item.evidence_slice or self._extract_relevant_definition_slice(item.source),
+                    "match_score": item.match_score,
+                    "confidence": item.confidence,
+                    "confidence_label": item.confidence_label,
+                }
+            )
+        return packs
+
+    def _extract_signature_line(self, source: str) -> str:
+        for line in (source or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("def ") or stripped.startswith("async def ") or stripped.startswith("class "):
+                return stripped
+        return ""
+
+    def _extract_callsite_slice(self, original_code: str, method_name: str) -> str:
+        lines = (original_code or "").splitlines()
+        if not lines:
+            return ""
+        token = (method_name or "").split(".")[-1]
+        token_pattern = re.compile(rf"\b{re.escape(token)}\b") if token else None
+        hit_indexes = [
+            idx
+            for idx, line in enumerate(lines)
+            if token_pattern and token_pattern.search(line)
+        ]
+        if not hit_indexes:
+            return ""
+        center = hit_indexes[0]
+        start = max(0, center - 2)
+        end = min(len(lines), center + 3)
+        return "\n".join(lines[start:end]).strip()
+
+    def _extract_local_call_line(self, original_code: str, method_name: str, existing_slice: str = "") -> str:
+        lines = (original_code or "").splitlines()
+        token = (method_name or "").split(".")[-1]
+        token_pattern = re.compile(rf"\b{re.escape(token)}\b") if token else None
+        for line in lines:
+            stripped = line.rstrip()
+            if token_pattern and token_pattern.search(stripped):
+                return stripped.strip()
+        for line in (existing_slice or "").splitlines():
+            stripped = line.strip()
+            if token_pattern and token_pattern.search(stripped):
+                return stripped
+        return ""
+
+    def _build_method_behavior(self, source: str, method_name: str, local_call: str = "") -> str:
+        lines = (source or "").splitlines()
+        if not lines:
+            return ""
+        if len(lines) <= 8:
+            return "\n".join(lines).strip()
+
+        signature_index = 0
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(("def ", "async def ", "class ")):
+                signature_index = index
+                break
+
+        anchor_tokens = {
+            token.lower()
+            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", local_call or "")
+            if token.lower() not in {"self", "cls", "super", "true", "false", "none"}
+        }
+        method_tail = (method_name or "").split(".")[-1].lower()
+        if method_tail:
+            anchor_tokens.add(method_tail)
+
+        best_index = min(signature_index + 1, len(lines) - 1)
+        best_score = -1
+        keyword_tokens = ("return", "raise", "yield", "await", "if ", "elif ", "else:", "except", "finally:")
+        for index in range(signature_index + 1, len(lines)):
+            stripped = lines[index].strip()
+            lowered = stripped.lower()
+            score = 0
+            if any(token in lowered for token in anchor_tokens):
+                score += 4
+            if any(token in lowered for token in keyword_tokens):
+                score += 3
+            if "self." in stripped and "=" in stripped:
+                score += 2
+            if "=" in stripped:
+                score += 1
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        body_window = 8
+        body_start = max(signature_index + 1, best_index - 2)
+        for index in range(best_index, signature_index, -1):
+            stripped = lines[index].strip().lower()
+            if stripped.startswith(("if ", "elif ", "else:", "except", "finally:")):
+                body_start = index
+                break
+        max_body_start = max(signature_index + 1, len(lines) - body_window)
+        body_start = min(body_start, max_body_start)
+        body_end = min(len(lines), body_start + body_window)
+        if body_end - body_start < 4 and len(lines) - (signature_index + 1) >= 4:
+            body_end = min(len(lines), signature_index + 1 + 4)
+            body_start = signature_index + 1
+
+        snippet_lines = [lines[signature_index]]
+        snippet_lines.extend(lines[body_start:body_end])
+        return "\n".join(snippet_lines).strip()
+
+    def _extract_relevant_definition_slice(self, source: str) -> str:
+        lines = (source or "").splitlines()
+        if not lines:
+            return ""
+        if len(lines) <= 12:
+            return "\n".join(lines[:10]).strip()
+        selected: list[str] = []
+        keywords = ("return", "raise", "yield", "await", "if ", "elif ", "else:", "except", "finally:", "config", "default", "none", "true", "false")
+        for line in lines:
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if stripped.startswith(("def ", "async def ", "class ")):
+                selected.append(line)
+                continue
+            if "self." in stripped and "=" in stripped:
+                selected.append(line)
+                continue
+            if any(token in lowered for token in keywords):
+                selected.append(line)
+            if len(selected) >= 6:
+                break
+        if not selected:
+            selected = lines[:10]
+        return "\n".join(selected[:6]).strip()
+
+    def _synthesize_edit_constraints(
+        self,
+        *,
+        state: GraphState,
+        method_inquiry: MethodInquiryResult,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+    ) -> list[EditConstraint]:
+        constraints: list[EditConstraint] = []
+        seen: set[str] = set()
+        satd_comment = str(state.get("satd_comment") or "").strip()
+        inquiry_lookup = {
+            (item.normalized_name or self._normalize_method_name(item.name)): item
+            for item in (method_inquiry.uncertainty_items or [])
+            if (item.normalized_name or self._normalize_method_name(item.name))
+        }
+        for method_name in method_inquiry.required_methods[:2]:
+            normalized = self._normalize_method_name(method_name)
+            item = inquiry_lookup.get(normalized)
+            focus = normalized or method_name
+            if not focus or focus in seen:
+                continue
+            seen.add(focus)
+            target_hint = (
+                item.source_excerpt
+                if item and item.source_excerpt
+                else focus
+            )
+            constraints.append(
+                EditConstraint(
+                    focus_point=focus,
+                    required_fact=(
+                        f"The current edit point must satisfy the SATD intent ({satd_comment}) while staying consistent with `{focus}`."
+                    ),
+                    must_do=f"Use `{focus}` only as local supporting evidence for the current edit point.",
+                    must_not_do="Do not treat retrieved evidence as permission to redesign the surrounding function.",
+                    supporting_point_kind="method",
+                    target_kind="method",
+                    target_hint=target_hint,
+                    supporting_symbol=focus,
+                    supporting_evidence=(item.source_excerpt if item else ""),
+                    confidence=0.45,
+                )
+            )
+        for context in retrieved_method_contexts[:1]:
+            focus = self._normalize_method_name(context.method_name) or context.method_name
+            if not focus or focus in seen:
+                continue
+            seen.add(focus)
+            constraints.append(
+                EditConstraint(
+                    focus_point=focus,
+                    required_fact=(
+                        f"The current edit point must satisfy the SATD intent ({satd_comment}) while staying consistent with `{focus}`."
+                    ),
+                    must_do=f"Use `{focus}` only as local supporting evidence for the current edit point.",
+                    must_not_do="Do not treat retrieved evidence as permission to redesign the surrounding function.",
+                    supporting_point_kind="method",
+                    target_kind="method",
+                    target_hint=context.callsite_slice.splitlines()[2].strip() if context.callsite_slice and len(context.callsite_slice.splitlines()) >= 3 else focus,
+                    supporting_symbol=focus,
+                    supporting_evidence=context.evidence_slice or context.callsite_slice,
+                    confidence=context.confidence or 0.45,
+                )
+            )
+        if not constraints:
+            for item in method_inquiry.uncertainty_items or []:
+                focus = item.name
+                if not focus or focus in seen or item.kind not in {"condition", "return", "state_write", "value"}:
+                    continue
+                seen.add(focus)
+                constraints.append(
+                    EditConstraint(
+                        focus_point=focus,
+                        required_fact=item.why_this_matters or f"Preserve the local semantics around {focus}.",
+                        must_do="Stay with the smallest local edit near the SATD comment.",
+                        must_not_do="Do not introduce unrelated structural rewrites.",
+                        supporting_point_kind=item.kind,
+                        target_kind=item.kind,
+                        target_hint=item.source_excerpt or focus,
+                        supporting_symbol=item.normalized_name or focus,
+                        supporting_evidence=item.source_excerpt,
+                        confidence=0.45,
+                    )
+                )
+                if len(constraints) >= 2:
+                    break
+        return constraints[:3]
 
     def resolve_method_locations(self, state: GraphState, method_names: list[str]) -> dict[str, list[str]]:
         if not method_names:
@@ -2095,63 +2815,6 @@ class OpenAIFixer:
             repo_paths=repo_paths,
         )
         return hints
-
-    def _coerce_method_location_hints(
-        self,
-        payload: dict[str, Any],
-        current_path: str,
-        method_names: list[str],
-    ) -> dict[str, list[str]]:
-        resolutions = payload.get("resolutions")
-        valid_methods = {self._normalize_method_name(name) for name in method_names}
-        hints: dict[str, list[str]] = {}
-        if not isinstance(resolutions, list):
-            return hints
-        for item in resolutions:
-            if not isinstance(item, dict):
-                continue
-            method_name = self._normalize_method_name(item.get("method_name"))
-            if not method_name or method_name not in valid_methods:
-                continue
-            file_path = self._normalize_file_path_hint(str(item.get("file_path") or ""), current_path)
-            if not file_path:
-                continue
-            hints.setdefault(method_name, [])
-            if file_path not in hints[method_name]:
-                hints[method_name].append(file_path)
-        return hints
-
-    def _normalize_file_path_hint(self, value: str, current_path: str) -> str:
-        text = (value or "").strip().strip("`").strip()
-        if not text:
-            return ""
-        text = text.replace("\\", "/").strip("/")
-        if text.endswith(".py") or text.endswith("/__init__.py"):
-            return self._prepend_repo_prefix_if_needed(text, current_path)
-        dotted = text.replace("/", ".")
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\.]*", dotted):
-            module_path = dotted.replace(".", "/")
-            return self._prepend_repo_prefix_if_needed(f"{module_path}.py", current_path)
-        return ""
-
-    def _prepend_repo_prefix_if_needed(self, path: str, current_path: str) -> str:
-        normalized = path.replace("\\", "/").strip("/")
-        top_level = normalized.split("/", 1)[0] if normalized else ""
-        current_parts = [part for part in current_path.replace("\\", "/").split("/") if part]
-        if top_level and top_level in current_parts:
-            index = current_parts.index(top_level)
-            prefix = "/".join(current_parts[:index])
-            if prefix:
-                return f"{prefix}/{normalized}"
-        return normalized
-
-    def _extract_import_block(self, file_content: str) -> str:
-        lines = []
-        for raw_line in (file_content or "").splitlines():
-            stripped = raw_line.strip()
-            if stripped.startswith("import ") or stripped.startswith("from "):
-                lines.append(raw_line)
-        return "\n".join(lines[:40])
 
     def _log(self, state: GraphState, message: str) -> None:
         if not self.logger:
@@ -2184,158 +2847,173 @@ class OpenAIFixer:
         *,
         state: GraphState,
         round_id: int,
-        contextual_repair_hint: str,
         method_inquiry: MethodInquiryResult,
         retrieved_method_contexts: list[RetrievedMethodContext],
         missing_method_names: list[str],
+        edit_constraints: list[EditConstraint],
     ) -> tuple[str, str]:
         repair_feedback = state.get("repair_feedback") or {}
         reviewer_feedback_block = self._format_reviewer_feedback_block(repair_feedback)
-        satd_route_type = str(state.get("satd_route_type") or "generic")
         candidate_mode = str(state.get("candidate_mode") or "single")
-        type_hint = self._type_hint_for_route(satd_route_type, state.get("satd_comment") or "") if candidate_mode.startswith("typed_") else ""
-        method_context_block = ""
+        method_context_block = "[none]"
         if self._candidate_uses_method_context(candidate_mode):
             method_context_block = self._format_method_context_block(
+                state=state,
                 method_inquiry=method_inquiry,
                 retrieved_method_contexts=retrieved_method_contexts,
                 missing_method_names=missing_method_names,
             )
-        if satd_route_type == "remove_temporary":
-            return self._build_remove_temporary_repair_prompts(
-                state=state,
-                round_id=round_id,
-                contextual_repair_hint=contextual_repair_hint,
-                reviewer_feedback_block=reviewer_feedback_block,
-            )
-        if self.prompt_mode == "analysis_heavy":
-            system_prompt = (
-                "You are the fixer agent in a SATD repair workflow. "
-                "Produce repaired code, not a patch description. "
-                "Optimize for the most conservative plausible human repair and preserve the original code skeleton whenever possible. "
-                "Prefer comment-driven, minimal textual repairs over broader rewrites. "
-                "Unless the evidence clearly requires it, do not add parameters, helper functions, return statements, exception paths, renames, or control-flow rewrites. "
-                "Treat retrieved method context as optional evidence, not a mandate. If it is weak or absent, stay with the smallest comment-driven local edit. "
-                "If a previous review warns about API shape drift, overwritten repair, or no-op output, fix that issue first with a smaller in-place edit. "
-                "A pure comment removal is acceptable only when the SATD itself explicitly says the obsolete comment or TODO should be removed. "
-                "Use only the provided method context to localize the smallest valid repair. Return JSON only."
-            )
-            user_prompt = (
-                "Return a JSON object with keys: "
-                "repair_plan (string), repaired_code (string), changed_scope (string), "
-                "confidence (float 0-1), notes (string).\n"
-                "repaired_code must be the complete repaired version of the provided original code block.\n"
-                "If retrieved method context is weak or absent, prefer tiny local edits inside the existing structure.\n"
-                "Do not invent APIs, helper methods, parameters, or control-flow changes without direct evidence from the provided context.\n"
-                "If the previous review asked for a smaller change, follow that advice before trying anything broader.\n"
-                "When a SATD comment sits directly above an existing workaround, guard, or commented-out behavior, prefer deleting that obsolete workaround and restoring the nearby intended lines before inventing new logic.\n"
-                "Keep the original signature unchanged unless the SATD explicitly asks for a signature-local annotation fix or the retrieved evidence clearly supports a signature edit.\n\n"
-                f"Round: {round_id}\n"
-                f"Repository owner: {state['user']}\n"
-                f"Repository name: {state['project']}\n"
-                f"File path: {state['file_path']}\n"
-                f"SATD comment: {state['satd_comment']}\n"
-                f"SATD route type: {satd_route_type}\n"
-                f"Contextual repair hint: {contextual_repair_hint}\n"
-                f"Original code block:\n{state['original_code']}\n\n"
-                f"{method_context_block}"
-                f"{type_hint}"
-                f"{reviewer_feedback_block}"
-            )
-            return system_prompt, user_prompt
+        if method_context_block == "[none]":
+            return self._build_no_context_repair_prompts(state=state)
+        return self._build_generic_repair_prompts(
+            state=state,
+            method_context_block=method_context_block,
+            edit_constraints=edit_constraints,
+            reviewer_feedback_block=reviewer_feedback_block,
+        )
+
+    def _build_no_context_repair_prompts(
+        self,
+        *,
+        state: GraphState,
+    ) -> tuple[str, str]:
         system_prompt = (
             "You are the fixer agent in a SATD repair workflow. "
-            "Return valid JSON only with keys: "
-            "repair_plan (string), repaired_code (string), changed_scope (string), "
-            "confidence (float 0-1), notes (string). "
-            "Your goal is to resolve the SATD with the smallest plausible local edit. "
-            "Use the SATD comment and original code as primary evidence. "
-            "Use retrieved method context only as supporting evidence, not as a reason to rewrite more code. "
-            "Do not invent new APIs, helper functions, parameters, or broad control-flow rewrites unless the SATD clearly requires them. "
-            "repaired_code must be the complete repaired version of the provided code block, not a patch or partial snippet."
         )
         user_prompt = (
-            "Resolve the SATD in the following code.\n\n"
-            f"### Original code:\n{state['original_code']}\n\n"
+            "Repair the code according to the SATD comment. Respond in JSON with key repaired_code.\n\n"
             f"### SATD comment:\n{state['satd_comment']}\n\n"
-            "Requirements:\n"
-            "- Prefer the smallest in-place edit that directly addresses the SATD.\n"
-            "- Keep unchanged lines unchanged whenever possible.\n"
-            "- Keep the original signature unless the SATD explicitly asks for a signature-local fix.\n"
-            "- If method context is helpful, use it only to validate a local repair.\n"
-            "- Do not output partial code; repaired_code must contain the full updated code block.\n\n"
-            f"### Method context (supporting evidence only):\n{method_context_block}\n"
+            f"Code:\n{state['original_code']}\n\n"
+            "- When the SATD requests deleting or removing something, delete the corresponding executable code or statement, not only the SATD comment.\n"
+        )
+        return system_prompt, user_prompt
+
+    def _build_generic_repair_prompts(
+        self,
+        *,
+        state: GraphState,
+        method_context_block: str,
+        edit_constraints: list[EditConstraint],
+        reviewer_feedback_block: str,
+    ) -> tuple[str, str]:
+        system_prompt = (
+            "You are the fixer agent in a SATD repair workflow. "
+            "Return valid JSON only with key: repaired_code. "
+        )
+        hard_rules = self._format_generic_constraint_block(edit_constraints)
+        user_prompt = (
+            "Repair the code according to the SATD comment. Respond in JSON with key repaired_code.\n\n"
+            f"### SATD comment:\n{state['satd_comment']}\n\n"
+            f"### Code:\n{state['original_code']}\n\n"
+            f"### Supporting evidence:\n{method_context_block}\n\n"
+            f"### Hard rules:\n{hard_rules}\n"
+            "- Use supporting evidence only to validate the smallest local repair.\n"
+            "- When the SATD requests deleting or removing something, delete the corresponding executable code or statement, not only the SATD comment.\n"
+            "- Edit only the smallest local block nearest to the SATD comment.\n"
             f"{reviewer_feedback_block}"
         )
         return system_prompt, user_prompt
 
-    def _build_remove_temporary_repair_prompts(
+    def _default_repair_confidence(
         self,
-        *,
         state: GraphState,
-        round_id: int,
-        contextual_repair_hint: str,
-        reviewer_feedback_block: str,
-    ) -> tuple[str, str]:
-        system_prompt = (
-            "You are the fixer agent for a remove_temporary SATD. "
-            "These tasks are usually solved by deleting an obsolete workaround, temporary log, compatibility hack, or dead branch. "
-            "Default to the smallest deletion or restoration that makes the temporary code disappear. "
-            "Do not preserve a temporary workaround just because it currently executes. "
-            "Do not add new logic, helper functions, parameters, or broader rewrites unless the SATD comment explicitly demands that behavior. "
-            "Return valid JSON only with keys: "
-            "repair_plan (string), repaired_code (string), changed_scope (string), confidence (float 0-1), notes (string)."
-        )
-        user_prompt = (
-            "Resolve this remove_temporary SATD.\n\n"
-            "Primary goal:\n"
-            "- Remove the temporary workaround, temporary log, obsolete compatibility branch, or dead comment-driven code.\n"
-            "- Prefer deleting or restoring nearby intended lines over inventing replacement logic.\n"
-            "- If a one-line or few-line deletion solves the SATD, do that.\n"
-            "- Keep unchanged lines unchanged whenever possible.\n"
-            "- Keep the original signature unchanged.\n"
-            "- Use only the SATD comment and the provided code block as the main evidence.\n"
-            "- If the SATD clearly says the code is temporary, obsolete, hacky, or for short-term compatibility, bias strongly toward removal.\n"
-            "- Only keep the temporary code if the comment explicitly says it must stay for correctness today.\n"
-            "- repaired_code must contain the complete updated code block.\n\n"
-            f"Round: {round_id}\n"
-            f"Repository owner: {state['user']}\n"
-            f"Repository name: {state['project']}\n"
-            f"File path: {state['file_path']}\n"
-            f"SATD comment: {state['satd_comment']}\n"
-            f"SATD route type: remove_temporary\n"
-            f"Contextual repair hint: {contextual_repair_hint}\n\n"
-            f"### Original code:\n{state['original_code']}\n\n"
-            f"{reviewer_feedback_block}"
-        )
-        return system_prompt, user_prompt
+        repaired_code: str,
+        found_method_contexts: list[RetrievedMethodContext],
+    ) -> float:
+        if preprocess_python_code(state["original_code"]) == preprocess_python_code(repaired_code):
+            return 0.35
+        if found_method_contexts:
+            return 0.60
+        return 0.50
+
+    def _default_repair_plan(self, state: GraphState) -> str:
+        comment = " ".join(str(state.get("satd_comment") or "").split())
+        if not comment:
+            return "Apply the smallest local repair required by the SATD."
+        if len(comment) > 160:
+            comment = comment[:157] + "..."
+        return f"Apply the smallest local repair required by the SATD comment: {comment}"
+
+    def _infer_changed_scope(self, original_code: str, repaired_code: str) -> str:
+        if (original_code or "") == (repaired_code or ""):
+            return "line"
+        original_lines = (original_code or "").splitlines()
+        repaired_lines = (repaired_code or "").splitlines()
+        changed_line_count = abs(len(original_lines) - len(repaired_lines))
+        for before, after in zip(original_lines, repaired_lines):
+            if before != after:
+                changed_line_count += 1
+        if changed_line_count <= 2:
+            return "line"
+        if changed_line_count <= 12:
+            return "function"
+        if changed_line_count <= 40:
+            return "class"
+        return "file"
 
     def _format_method_context_block(
         self,
         *,
+        state: GraphState,
         method_inquiry: MethodInquiryResult,
         retrieved_method_contexts: list[RetrievedMethodContext],
         missing_method_names: list[str],
     ) -> str:
-        lines = ["### Method inquiry:"]
-        lines.append(
-            "Required methods: "
-            + (", ".join(method_inquiry.required_methods) if method_inquiry.required_methods else "[none identified]")
-        )
-        if method_inquiry.reason:
-            lines.append(f"Reason: {method_inquiry.reason}")
-        if missing_method_names:
-            lines.append("Missing methods: " + ", ".join(missing_method_names))
         if not retrieved_method_contexts:
-            lines.append("Retrieved method context: [none found]")
-            return "\n".join(lines) + "\n\n"
-        lines.append("Retrieved method context:")
-        for item in retrieved_method_contexts:
-            location = f"{item.path}:{item.start_line}-{item.end_line}" if item.path else "[unknown]"
-            class_part = f" class={item.class_name}" if item.class_name else ""
-            lines.append(f"- {item.method_name} @ {location}{class_part}")
-            lines.append(item.source)
-        return "\n".join(lines) + "\n\n"
+            return "[none]"
+        lines: list[str] = []
+        note_lookup: dict[str, str] = {}
+        for item in method_inquiry.method_notes or []:
+            if not isinstance(item, dict):
+                continue
+            method_name = self._normalize_method_name(item.get("method_name"))
+            if not method_name:
+                continue
+            selection_reason = str(item.get("why_blocking") or item.get("what_to_learn") or "").strip()
+            if selection_reason:
+                note_lookup[method_name] = selection_reason
+        for pack in self._build_method_evidence_packs(state, retrieved_method_contexts[:2]):
+            method_name = str(pack["method_name"])
+            lines.append(f"- method: {method_name}")
+            if pack.get("local_call"):
+                lines.append("  local call:")
+                lines.append(f"    {pack['local_call']}")
+            if pack.get("method_behavior"):
+                lines.append("  method behavior:")
+                for line in str(pack["method_behavior"]).splitlines():
+                    lines.append(f"    {line}")
+            selection_reason = note_lookup.get(self._normalize_method_name(method_name))
+            if selection_reason:
+                lines.append("  selection reason:")
+                lines.append(f"    {selection_reason}")
+        return "\n".join(lines)
+
+    def _format_generic_constraint_block(self, edit_constraints: list[EditConstraint]) -> str:
+        lines = [
+            "- Make the smallest plausible local edit.",
+            "- Preserve the existing function/class signature unless the SATD explicitly asks for a signature-local fix.",
+            "- Do not add new helpers, new control flow, or unrelated rewrites.",
+            "- Keep unchanged lines unchanged whenever possible.",
+        ]
+        for item in edit_constraints[:3]:
+            focus = str(item.focus_point or "").strip()
+            if focus:
+                lines.append(f"- Focus on: {focus}")
+            must_do = str(item.must_do or "").strip()
+            if must_do:
+                lines.append(f"- Must do: {must_do}")
+            must_not_do = str(item.must_not_do or "").strip()
+            if must_not_do:
+                lines.append(f"- Must not do: {must_not_do}")
+        return "\n".join(lines)
+
+    def _extract_comment_reference_names(self, comment: str) -> set[str]:
+        refs: set[str] = set()
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_\.]+", comment or ""):
+            normalized = self._normalize_method_name(token)
+            if normalized:
+                refs.add(normalized)
+        return refs
 
     def _format_reviewer_feedback_block(self, repair_feedback: dict[str, Any]) -> str:
         if not repair_feedback:
@@ -2364,58 +3042,6 @@ class OpenAIFixer:
         if flags:
             lines.append(f"Reviewer flags: {', '.join(flags)}")
         return "\n".join(lines) + "\n\n"
-
-    def _repair_style_guidance(self, satd_type: str) -> str:
-        satd = (satd_type or "").strip().lower()
-        if satd in {"type_annotation", "pyre-fixme", "pyre_fixme"}:
-            return "Prefer the narrowest annotation or signature-local fix. Annotation-only signature edits are acceptable; do not refactor surrounding logic."
-        if satd in {"exception_handling"}:
-            return "Prefer a single guard, raise, or local branch inside the existing function instead of broader control-flow rewrites."
-        if satd in {"todo", "fixme", "bug"}:
-            return "Prefer a local expression, condition, constant, message, or single-branch fix before any structural change."
-        return "Preserve the existing structure and only replace the minimal lines needed to satisfy the comment."
-
-    def _contextual_repair_hint(self, original_code: str, satd_comment: str) -> str:
-        comment = (satd_comment or "").strip().lower()
-        if not comment:
-            return "Prefer the smallest in-place repair that matches the SATD comment."
-        if "temporary use only" in comment or "uncomment" in comment:
-            return "Prefer removing the temporary SATD marker and restoring the nearby intended executable line(s) exactly."
-        if "does not work correctly yet" in comment or "remove when" in comment:
-            return "Prefer deleting the obsolete workaround or guard that follows this SATD and restoring the nearby intended code instead of inventing a new workaround."
-        if "return type must be annotated" in comment:
-            return "Prefer the smallest signature-local annotation fix and avoid changing parameter shape or surrounding logic."
-        return "Prefer the smallest in-place repair that matches the SATD comment."
-
-    def _type_hint_for_route(self, satd_route_type: str, satd_comment: str = "") -> str:
-        route = (satd_route_type or "").strip().lower()
-        if route == "type_annotation":
-            comment = (satd_comment or "").strip().lower()
-            if "return type" in comment:
-                return (
-                    "### Type hint:\n"
-                    "Prefer a return-annotation-only fix. Keep parameters, control flow, and the function body unchanged unless the comment explicitly requires otherwise.\n\n"
-                )
-            if "parameter must be annotated" in comment or ("parameter" in comment and "annotat" in comment):
-                return (
-                    "### Type hint:\n"
-                    "Prefer annotating only the specific parameter(s) mentioned by the comment. Do not change the return annotation or executable logic unless required.\n\n"
-                )
-            if "pyre-fixme" in comment or "type" in comment or "annotat" in comment:
-                return (
-                    "### Type hint:\n"
-                    "Prefer the smallest local type-only fix, such as adding a missing annotation or a narrow type adjustment. Avoid changing executable logic.\n\n"
-                )
-            return "### Type hint:\nPrefer the smallest annotation-only fix and avoid changing surrounding logic.\n\n"
-        if route == "remove_temporary":
-            return "### Type hint:\nPrefer deleting the temporary workaround or obsolete branch instead of introducing new logic.\n\n"
-        if route == "replace_symbol":
-            return "### Type hint:\nPrefer the narrowest in-place symbol or field replacement.\n\n"
-        if route == "restore_uncomment":
-            return "### Type hint:\nPrefer restoring the nearby commented or disabled line(s) with the smallest possible edit.\n\n"
-        if route == "small_local_value_fix":
-            return "### Type hint:\nPrefer the smallest local value or literal change inside the existing structure.\n\n"
-        return ""
 
     def _em_risk_notes(self, original_code: str, repaired_code: str) -> list[str]:
         risks = []
@@ -2960,13 +3586,6 @@ class OpenAISelector:
                 "baseline_context": 0.35,
                 "typed_context": 0.25,
             }
-        if satd_route_type == "generic":
-            return {
-                "baseline_no_context": 1.00,
-                "baseline_context": 0.72,
-                "typed_no_context": 0.58,
-                "typed_context": 0.40,
-            }
         if satd_route_type == "type_annotation":
             return {
                 "typed_no_context": 1.00,
@@ -2974,38 +3593,36 @@ class OpenAISelector:
                 "typed_context": 0.70,
                 "baseline_context": 0.52,
             }
-        if satd_route_type == "restore_uncomment":
-            return {
-                "typed_no_context": 1.00,
-                "baseline_no_context": 0.95,
-                "baseline_context": 0.45,
-                "typed_context": 0.35,
-            }
         if satd_route_type == "replace_symbol":
             return {
-                "baseline_context": 1.00,
-                "typed_context": 0.92,
-                "baseline_no_context": 0.82,
-                "typed_no_context": 0.55,
+                "baseline_no_context": 1.00,
+                "typed_no_context": 0.88,
+                "baseline_context": 0.45,
+                "typed_context": 0.30,
             }
-        if satd_route_type == "small_local_value_fix":
+        if satd_route_type == "document":
+            return {
+                "baseline_no_context": 1.00,
+                "typed_no_context": 0.90,
+                "baseline_context": 0.40,
+                "typed_context": 0.28,
+            }
+        if satd_route_type == "generic":
             return {
                 "baseline_context": 1.00,
-                "baseline_no_context": 0.90,
-                "typed_no_context": 0.55,
-                "typed_context": 0.45,
+                "typed_context": 0.82,
+                "baseline_no_context": 0.55,
+                "typed_no_context": 0.40,
             }
         return {
-            "baseline_no_context": 1.00,
-            "baseline_context": 0.70,
-            "typed_no_context": 0.55,
-            "typed_context": 0.40,
+            "baseline_context": 1.00,
+            "typed_context": 0.80,
+            "baseline_no_context": 0.58,
+            "typed_no_context": 0.42,
         }
 
     def _route_bias_margin(self, satd_route_type: str) -> float:
-        if satd_route_type in {"generic", "remove_temporary"}:
-            return 0.14
-        if satd_route_type in {"type_annotation", "restore_uncomment"}:
+        if satd_route_type in {"remove_temporary", "type_annotation", "replace_symbol", "document"}:
             return 0.12
         return 0.10
 

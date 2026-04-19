@@ -1,0 +1,319 @@
+{
+  "task_id": "252",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+  "commit": "75419d339ff315dda771f0150158c708fe7a9b1a",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-16T12:06:51+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "75419d339ff315dda771f0150158c708fe7a9b1a",
+    "symbol_name": "sample_boundaries",
+    "satd_line": 48,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-16T12:08:02+00:00",
+    "identified_method_count": 14,
+    "retrieved_method_count": 2,
+    "missing_method_count": 12,
+    "edit_constraint_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+    "original_signature": "def sample_boundaries(",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "sha": "4ba8b0e8e43050860c5bcf12083c11221d238d16",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/75419d339ff315dda771f0150158c708fe7a9b1a/python/ray/data/_internal/planner/exchange/sort_task_spec.py",
+      "content_excerpt": "from typing import Any, Callable, List, Tuple, TypeVar, Union\n\nimport numpy as np\n\nfrom ray.data._internal.progress_bar import ProgressBar\nfrom ray.data._internal.remote_fn import cached_remote_fn\nfrom ray.data._internal.delegating_block_builder import DelegatingBlockBuilder\nfrom ray.data._internal.planner.exchange.interfaces import ExchangeTaskSpec\nfrom ray.data.block import Block, BlockAccessor, BlockExecStats, BlockMetadata\nfrom ray.types import ObjectRef\n\n\nT = TypeVar(\"T\")\n\n# Data can be sorted by value (None), a list of columns and\n# ascending/descending orders (List), or a custom transform function\n# (Callable).\nSortKeyT = Union[None, List[Tuple[str, str]], Callable[[T], Any]]\n\n\nclass SortTaskSpec(ExchangeTaskSpec):\n    \"\"\"\n    The implementation for distributed sort tasks.\n\n    The algorithm is similar to [External Merge Sort]\n    (https://en.wikipedia.org/wiki/External_sorting).\n    Sorting is done in 3 steps: sampling, sorting individual blocks, and\n    merging sorted blocks.\n\n    Sampling (`sample_boundaries`): we get a number of sample items from each block,\n    sort them, and use them to compute boundaries that would partition all items into\n    approximately equal ranges.\n\n    Sorting (`map`): each block is sorted locally, then partitioned into smaller\n    blocks according to the boundaries. Each partitioned block is passed to a merge\n    task.\n\n    Merging (`reduce`): a merge task would receive a block from every worker that\n    consists of items in a certain range. It then merges the sorted blocks into one\n    sorted block and becomes part of the new, sorted block.\n    \"\"\"\n\n    def __init__(\n        self,\n        boundaries: List[T],\n        key: SortKeyT,\n        descending: bool,\n    ):\n        super().__init__(\n            map_args=[boundaries, key, descending],\n            reduce_args=[key, descending],\n        )\n\n    @staticmethod\n    def map(\n        idx: int,\n        block: Block,\n        output_num_blocks: int,\n        boundaries: List[T],\n        key: SortKeyT,\n        descending: bool,\n    ) -> List[Union[BlockMetadata, Block]]:\n        stats = BlockExecStats.builder()\n        out = BlockAccessor.for_block(block).sort_and_partition(\n            boundaries, key, descending\n        )\n        meta = BlockAccessor.for_block(block).get_metadata(\n            input_files=None, exec_stats=stats.build()\n        )\n        return out + [meta]\n\n    @staticmethod\n    def reduce(\n        key: SortKeyT,\n        descending: bool,\n        *mapper_outputs: List[Block],\n        partial_reduce: bool = False,\n    ) -> Tuple[Block, BlockMetadata]:\n        return BlockAccessor.for_block(mapper_outputs[0]).merge_sorted_blocks(\n            mapper_outputs, key, descending\n        )\n\n    @staticmethod\n    def sample_boundaries(\n        blocks: List[ObjectRef[Block]], key: SortKeyT, num_reducers: int\n    ) -> List[T]:\n        \"\"\"\n        Return (num_reducers - 1) items in ascending order from the blocks that\n        partition the domain into ranges with approximately equally many elements.\n        \"\"\"\n        # TODO(Clark): Support multiple boundary sampling keys.\n        if isinstance(key, list) and len(key) > 1:\n            raise ValueError(\"Multiple boundary sampling keys not supported.\")\n\n        n_samples = int(num_reducers * 10 / len(blocks))\n\n        sample_block = cached_remote_fn(_sample_block)\n\n        sample_results = [\n            sample_block.remote(block, n_samples, key) for block in blocks\n        ]\n        sample_bar = ProgressBar(\"Sort Sample\", len(sample_results))\n        samples = sample_bar.fetch_until_complete(sample_results)\n        sample_bar.close()\n        del sample_results\n        samples = [s for s in samples if len(s) > 0]\n        # The dataset is empty\n        if len(samples) == 0:\n            return [None] * (num_reducers - 1)\n        builder = DelegatingBlockBuilder()\n        for sample in samples:\n            builder.add_block(sample)\n        samples = builder.build()\n        column = key[0][0] if isinstance(key, list) else None\n        sample_items = BlockAccessor.for_block(samples).to_numpy(column)\n        sample_items = np.sort(sample_items)\n        ret = [\n            np.quantile(sample_items, q, interpolation=\"nearest\")\n            for q in np.linspace(0, 1, num_reducers)\n        ]\n        return ret[1:]\n\n\ndef _sample_block(block: Block[T], n_samples: int, key: SortKeyT) -> Block[T]:\n    return BlockAccessor.for_block(block).sample(n_samples, key)\n",
+      "total_lines": 125,
+      "ref": "75419d339ff315dda771f0150158c708fe7a9b1a"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "sample_boundaries",
+      "class_name": "SortTaskSpec",
+      "start_line": 84,
+      "end_line": 121,
+      "satd_line": 48,
+      "matched_by": "signature_or_comment",
+      "source": "    def sample_boundaries(\n        blocks: List[ObjectRef[Block]], key: SortKeyT, num_reducers: int\n    ) -> List[T]:\n        \"\"\"\n        Return (num_reducers - 1) items in ascending order from the blocks that\n        partition the domain into ranges with approximately equally many elements.\n        \"\"\"\n        # TODO(Clark): Support multiple boundary sampling keys.\n        if isinstance(key, list) and len(key) > 1:\n            raise ValueError(\"Multiple boundary sampling keys not supported.\")\n\n        n_samples = int(num_reducers * 10 / len(blocks))\n\n        sample_block = cached_remote_fn(_sample_block)\n\n        sample_results = [\n            sample_block.remote(block, n_samples, key) for block in blocks\n        ]\n        sample_bar = ProgressBar(\"Sort Sample\", len(sample_results))\n        samples = sample_bar.fetch_until_complete(sample_results)\n        sample_bar.close()\n        del sample_results\n        samples = [s for s in samples if len(s) > 0]\n        # The dataset is empty\n        if len(samples) == 0:\n            return [None] * (num_reducers - 1)\n        builder = DelegatingBlockBuilder()\n        for sample in samples:\n            builder.add_block(sample)\n        samples = builder.build()\n        column = key[0][0] if isinstance(key, list) else None\n        sample_items = BlockAccessor.for_block(samples).to_numpy(column)\n        sample_items = np.sort(sample_items)\n        ret = [\n            np.quantile(sample_items, q, interpolation=\"nearest\")\n            for q in np.linspace(0, 1, num_reducers)\n        ]\n        return ret[1:]",
+      "calls": [
+        "DelegatingBlockBuilder",
+        "ProgressBar",
+        "ValueError",
+        "cached_remote_fn",
+        "int",
+        "isinstance",
+        "len"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "Block",
+        "BlockAccessor",
+        "DelegatingBlockBuilder",
+        "List",
+        "ObjectRef",
+        "ProgressBar",
+        "SortKeyT",
+        "T",
+        "_sample_block",
+        "block",
+        "cached_remote_fn",
+        "np",
+        "q",
+        "s"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "sort_key.get_columns",
+        "cached_remote_fn",
+        "sample_block.remote",
+        "ProgressBar",
+        "sample_bar.fetch_until_complete",
+        "sample_bar.close",
+        "DelegatingBlockBuilder",
+        "builder.add_block",
+        "builder.build",
+        "BlockAccessor.for_block",
+        "BlockAccessor.for_block.to_numpy",
+        "np.sort",
+        "np.quantile",
+        "np.linspace"
+      ],
+      "reason": "These methods are critical for the functionality of the sampling process and directly relate to the SATD comment about supporting multiple boundary sampling keys.",
+      "uncertainty_items": [
+        {
+          "kind": "method",
+          "raw_name": "sort_key.get_columns",
+          "normalized_name": "sort_key.get_columns",
+          "line": 8,
+          "source_excerpt": "columns = sort_key.get_columns()",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "cached_remote_fn",
+          "normalized_name": "cached_remote_fn",
+          "line": 15,
+          "source_excerpt": "sample_block = cached_remote_fn(_sample_block)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "sample_block.remote",
+          "normalized_name": "sample_block.remote",
+          "line": 18,
+          "source_excerpt": "sample_block.remote(block, n_samples, sort_key) for block in blocks",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "ProgressBar",
+          "normalized_name": "ProgressBar",
+          "line": 20,
+          "source_excerpt": "sample_bar = ProgressBar(",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "sample_bar.fetch_until_complete",
+          "normalized_name": "sample_bar.fetch_until_complete",
+          "line": 23,
+          "source_excerpt": "samples = sample_bar.fetch_until_complete(sample_results)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "sample_bar.close",
+          "normalized_name": "sample_bar.close",
+          "line": 24,
+          "source_excerpt": "sample_bar.close()",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "DelegatingBlockBuilder",
+          "normalized_name": "DelegatingBlockBuilder",
+          "line": 30,
+          "source_excerpt": "builder = DelegatingBlockBuilder()",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "builder.add_block",
+          "normalized_name": "builder.add_block",
+          "line": 32,
+          "source_excerpt": "builder.add_block(sample)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "builder.build",
+          "normalized_name": "builder.build",
+          "line": 33,
+          "source_excerpt": "samples = builder.build()",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "BlockAccessor.for_block",
+          "normalized_name": "BlockAccessor.for_block",
+          "line": 35,
+          "source_excerpt": "sample_items = BlockAccessor.for_block(samples).to_numpy(column)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "BlockAccessor.for_block.to_numpy",
+          "normalized_name": "BlockAccessor.for_block.to_numpy",
+          "line": 35,
+          "source_excerpt": "sample_items = BlockAccessor.for_block(samples).to_numpy(column)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "np.sort",
+          "normalized_name": "np.sort",
+          "line": 36,
+          "source_excerpt": "sample_items = np.sort(sample_items)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "np.quantile",
+          "normalized_name": "np.quantile",
+          "line": 38,
+          "source_excerpt": "np.quantile(sample_items, q, interpolation=\"nearest\")",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "np.linspace",
+          "normalized_name": "np.linspace",
+          "line": 39,
+          "source_excerpt": "for q in np.linspace(0, 1, num_reducers)",
+          "retrieval_eligible": true
+        }
+      ]
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "to_numpy",
+        "path": "python/ray/data/block.py",
+        "class_name": "BlockAccessor",
+        "start_line": 292,
+        "end_line": 300,
+        "source": "def to_numpy(\n        self, columns: Optional[Union[str, List[str]]] = None\n    ) -> Union[np.ndarray, Dict[str, np.ndarray]]:\n        \"\"\"Convert this block (or columns of block) into a NumPy ndarray.\n\n        Args:\n            columns: Name of columns to convert, or None if converting all columns.\n        \"\"\"\n        raise NotImplementedError",
+        "found": true
+      },
+      {
+        "method_name": "BlockAccessor.for_block",
+        "path": "python/ray/data/block.py",
+        "class_name": "BlockAccessor",
+        "start_line": 376,
+        "end_line": 399,
+        "source": "def for_block(block: Block) -> \"BlockAccessor[T]\":\n        \"\"\"Create a block accessor for the given block.\"\"\"\n        _check_pyarrow_version()\n        import pandas\n        import pyarrow\n\n        if isinstance(block, pyarrow.Table):\n            from ray.data._internal.arrow_block import ArrowBlockAccessor\n\n            return ArrowBlockAccessor(block)\n        elif isinstance(block, pandas.DataFrame):\n            from ray.data._internal.pandas_block import PandasBlockAccessor\n\n            return PandasBlockAccessor(block)\n        elif isinstance(block, bytes):\n            from ray.data._internal.arrow_block import ArrowBlockAccessor\n\n            return ArrowBlockAccessor.from_bytes(block)\n        elif isinstance(block, list):\n            from ray.data._internal.simple_block import SimpleBlockAccessor\n\n            return SimpleBlockAccessor(block)\n        else:\n            raise TypeError(\"Not a block type: {} ({})\".format(block, type(block)))",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "get_columns",
+      "sample_block.remote",
+      "ProgressBar.fetch_until_complete",
+      "ProgressBar.close",
+      "DelegatingBlockBuilder.add_block",
+      "DelegatingBlockBuilder.build",
+      "np.sort",
+      "np.quantile",
+      "np.linspace",
+      "cached_remote_fn",
+      "ProgressBar",
+      "DelegatingBlockBuilder"
+    ],
+    "edit_constraints": [
+      {
+        "target_kind": "method",
+        "target_hint": "columns = sort_key.get_columns()",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO(Clark): Support multiple boundary sampling keys.) while staying consistent with `sort_key.get_columns`.",
+        "must_do": "Use `sort_key.get_columns` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "sort_key.get_columns",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "7:     \"\"\"\n8:     columns = sort_key.get_columns()\n9:     # TODO(Clark): Support multiple boundary sampling keys.",
+        "confidence": 0.45
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "sample_block = cached_remote_fn(_sample_block)",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO(Clark): Support multiple boundary sampling keys.) while staying consistent with `cached_remote_fn`.",
+        "must_do": "Use `cached_remote_fn` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "cached_remote_fn",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "14: \n15:     sample_block = cached_remote_fn(_sample_block)\n16:",
+        "confidence": 0.45
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "sample_block.remote(block, n_samples, sort_key) for block in blocks",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO(Clark): Support multiple boundary sampling keys.) while staying consistent with `sample_block.remote`.",
+        "must_do": "Use `sample_block.remote` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "sample_block.remote",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "17:     sample_results = [\n18:         sample_block.remote(block, n_samples, sort_key) for block in blocks\n19:     ]",
+        "confidence": 0.45
+      }
+    ]
+  },
+  "review_context": {}
+}

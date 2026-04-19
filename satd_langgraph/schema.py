@@ -65,6 +65,39 @@ class RepairAttempt:
 class MethodInquiryResult:
     required_methods: list[str] = field(default_factory=list)
     reason: str = ""
+    method_notes: list[dict[str, Any]] = field(default_factory=list)
+    uncertainty_items: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class UncertaintyItem:
+    kind: str
+    name: str
+    line: int | None = None
+    retrieval_eligible: bool = False
+    why_this_matters: str = ""
+    raw_name: str = ""
+    normalized_name: str = ""
+    source_excerpt: str = ""
+
+
+@dataclass
+class EditConstraint:
+    focus_point: str
+    required_fact: str = ""
+    must_do: str = ""
+    must_not_do: str = ""
+    supporting_point_kind: str = ""
+    target_kind: str = ""
+    target_hint: str = ""
+    allowed_edit_radius: str = "local_block"
+    must_preserve_signature: bool = True
+    must_not_add_helper: bool = True
+    must_not_expand_control_flow: bool = True
+    must_not_rewrite_unrelated_lines: bool = True
+    supporting_symbol: str = ""
+    supporting_evidence: str = ""
+    confidence: float = 0.45
 
 
 @dataclass
@@ -76,6 +109,12 @@ class RetrievedMethodContext:
     end_line: int | None
     source: str
     found: bool
+    signature: str = ""
+    callsite_slice: str = ""
+    evidence_slice: str = ""
+    match_score: int = 0
+    confidence: float = 0.0
+    confidence_label: str = ""
 
 
 @dataclass
@@ -124,6 +163,8 @@ class WorkflowTrace:
     analysis: dict[str, Any] | None
     satd_route_type: str | None = None
     method_inquiry: dict[str, Any] | None = None
+    uncertainty_items: list[dict[str, Any]] = field(default_factory=list)
+    edit_constraints: list[dict[str, Any]] = field(default_factory=list)
     retrieved_method_contexts: list[dict[str, Any]] = field(default_factory=list)
     missing_method_names: list[str] = field(default_factory=list)
     repairs: list[dict[str, Any]] = field(default_factory=list)
@@ -161,6 +202,8 @@ class GraphState(TypedDict):
     analysis: AnalysisResult | None
     satd_route_type: str | None
     method_inquiry: MethodInquiryResult | None
+    uncertainty_items: list[UncertaintyItem]
+    edit_constraints: list[EditConstraint]
     retrieved_method_contexts: list[RetrievedMethodContext]
     missing_method_names: list[str]
     repair_candidates: list[RepairAttempt]
@@ -225,6 +268,8 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         analysis=None,
         satd_route_type=None,
         method_inquiry=None,
+        uncertainty_items=[],
+        edit_constraints=[],
         retrieved_method_contexts=[],
         missing_method_names=[],
         repair_candidates=[],
@@ -314,6 +359,8 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         analysis=asdict(state["analysis"]) if state["analysis"] else None,
         satd_route_type=state.get("satd_route_type"),
         method_inquiry=asdict(state["method_inquiry"]) if state.get("method_inquiry") else None,
+        uncertainty_items=[asdict(item) for item in state.get("uncertainty_items", [])],
+        edit_constraints=[asdict(item) for item in state.get("edit_constraints", [])],
         retrieved_method_contexts=[asdict(item) for item in state["retrieved_method_contexts"]],
         missing_method_names=list(state["missing_method_names"]),
         repair_candidates=[asdict(item) for item in state["repair_candidates"]],

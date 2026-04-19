@@ -1,0 +1,246 @@
+{
+  "task_id": "256",
+  "repo_owner": "spesmilo",
+  "repo_name": "electrum",
+  "file_path": "electrum/lnpeer.py",
+  "commit": "2cc76fbbbda3b49262dda7f00a9d7ea6a1c39761",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-16T12:11:02+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "2cc76fbbbda3b49262dda7f00a9d7ea6a1c39761",
+    "symbol_name": "htlc_switch",
+    "satd_line": 1459,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-16T12:17:52+00:00",
+    "identified_method_count": 5,
+    "retrieved_method_count": 2,
+    "missing_method_count": 3,
+    "edit_constraint_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "electrum/lnpeer.py",
+    "original_signature": "async def htlc_switch(self):",
+    "target_file": {
+      "ok": true,
+      "path": "electrum/lnpeer.py",
+      "sha": "647db5d2f452cd4e86bbadfb58a97d7dcddd5199",
+      "download_url": "https://raw.githubusercontent.com/spesmilo/electrum/2cc76fbbbda3b49262dda7f00a9d7ea6a1c39761/electrum/lnpeer.py",
+      "content_excerpt": "#!/usr/bin/env python3\n#\n# Copyright (C) 2018 The Electrum developers\n# Distributed under the MIT software license, see the accompanying\n# file LICENCE or http://www.opensource.org/licenses/mit-license.php\n\nimport zlib\nfrom collections import OrderedDict, defaultdict\nimport json\nimport asyncio\nimport os\nimport time\nfrom functools import partial\nfrom typing import List, Tuple, Dict, TYPE_CHECKING, Optional, Callable, Union\nimport traceback\nimport sys\nfrom datetime import datetime\n\nimport aiorpcx\n\nfrom .crypto import sha256, sha256d\nfrom . import bitcoin\nfrom .bip32 import BIP32Node\nfrom . import ecc\nfrom .ecc import sig_string_from_r_and_s, get_r_and_s_from_sig_string, der_sig_from_sig_string\nfrom . import constants\nfrom .util import bh2u, bfh, log_exceptions, ignore_exceptions, chunks, SilentTaskGroup\nfrom . import transaction\nfrom .transaction import Transaction, TxOutput, PartialTxOutput, match_script_against_template\nfrom .logging import Logger\nfrom .lnonion import (new_onion_packet, decode_onion_error, OnionFailureCode, calc_hops_data_for_payment,\n                      process_onion_packet, OnionPacket, construct_onion_error, OnionRoutingFailureMessage,\n                      ProcessedOnionPacket, UnsupportedOnionPacketVersion, InvalidOnionMac, InvalidOnionPubkey,\n                      OnionFailureCodeMetaFlag)\nfrom .lnchannel import Channel, RevokeAndAck, htlcsum, RemoteCtnTooFarInFuture, channel_states, peer_states\nfrom . import lnutil\nfrom .lnutil import (Outpoint, LocalConfig, RECEIVED, UpdateAddHtlc,\n                     RemoteConfig, OnlyPubkeyKeypair, ChannelConstraints, RevocationStore,\n                     funding_output_script, get_per_commitment_secret_from_seed,\n                     secret_to_pubkey, PaymentFailure, LnLocalFeatures,\n                     LOCAL, REMOTE, HTLCOwner, generate_keypair, LnKeyFamily,\n                     ln_compare_features, privkey_to_pubkey, UnknownPaymentHash, MIN_FINAL_CLTV_EXPIRY_ACCEPTED,\n                     LightningPeerConnectionClosed, HandshakeFailed, NotFoundChanAnnouncementForUpdate,\n                     MINIMUM_MAX_HTLC_VALUE_IN_FLIGHT_ACCEPTED, MAXIMUM_HTLC_MINIMUM_MSAT_ACCEPTED,\n                     MAXIMUM_REMOTE_TO_SELF_DELAY_ACCEPTED, RemoteMisbehaving, DEFAULT_TO_SELF_DELAY,\n                     NBLOCK_OUR_CLTV_EXPIRY_DELTA, format_short_channel_id, ShortChannelID,\n                     IncompatibleLightningFeatures)\nfrom .lnutil import FeeUpdate\nfrom .lntransport import LNTransport, LNTransportBase\nfrom .lnmsg import encode_msg, decode_msg\nfrom .interface import GracefulDisconnect, NetworkException\nfrom .lnrouter import fee_for_edge_msat\nfrom .lnutil import ln_dummy_address\nfrom .json_db import StoredDict\n\nif TYPE_CHECKING:\n    from .lnworker import LNWorker, LNGossip, LNWallet\n    from .lnrouter import RouteEdge, LNPaymentRoute\n    from .transaction import PartialTransaction\n\n\nLN_P2P_NETWORK_TIMEOUT = 20\n\ndef channel_id_from_funding_tx(funding_txid: str, funding_index: int) -> Tuple[bytes, bytes]:\n    funding_txid_bytes = bytes.fromhex(funding_txid)[::-1]\n    i = int.from_bytes(funding_txid_bytes, 'big') ^ funding_index\n    return i.to_bytes(32, 'big'), funding_txid_bytes\n\nclass Peer(Logger):\n\n    def __init__(self, lnworker: Union['LNGossip', 'LNWallet'], pubkey:bytes, transport: LNTransportBase):\n        self._sent_init = False  # type: bool\n        self._received_init = False  # type: bool\n        self.initialized = asyncio.Future()\n        self.querying = asyncio.Event()\n        self.transport = transport\n        self.pubkey = pubkey  # remote pubkey\n        self.lnworker = lnworker\n        self.privkey = lnworker.node_keypair.privkey  # local privkey\n        self.localfeatures = self.lnworker.localfeatures\n        self.node_ids = [self.pubkey, privkey_to_pubkey(self.privkey)]\n        self.network = lnworker.network\n        self.channel_db = lnworker.network.channel_db\n        self.ping_time = 0\n        self.reply_channel_range = asyncio.Queue()\n        # gossip uses a single queue to preserve message order\n        self.gossip_queue = asyncio.Queue()\n        self.ordered_messages = ['accept_channel', 'funding_signed', 'funding_created', 'accept_channel', 'channel_reestablish', 'closing_signed']\n        self.ordered_message_queues = defaultdict(asyncio.Queue) # for messsage that are ordered\n        self.temp_id_to_id = {}   # to forward error messages\n        self.funding_created_sent = set() # for channels in PREOPENING\n        self.funding_signed_sent = set()  # for channels in PREOPENING\n        self.shutdown_received = {}\n        self.announcement_signatures = defaultdict(asyncio.Queue)\n        self.orphan_channel_updates = OrderedDict()\n        Logger.__init__(self)\n        self.taskgroup = SilentTaskGroup()\n\n    def send_message(self, message_name: str, **kwargs):\n        assert type(message_name) is str\n        self.logger.debug(f\"Sending {message_name.upper()}\")\n        if message_name.upper() != \"INIT\" and not self.is_initialized():\n            raise Exception(\"tried to send message before we are initialized\")\n        raw_msg = encode_msg(message_name, **kwargs)\n        self._store_raw_msg_if_local_update(raw_msg, message_name=message_name, channel_id=kwargs.get(\"channel_id\"))\n        self.transport.send_bytes(raw_msg)\n\n    def _store_raw_msg_if_local_update(self, raw_msg: bytes, *, message_name: str, channel_id: Optional[bytes]):\n        is_commitment_signed = message_name == \"commitment_signed\"\n        if not (message_name.startswith(\"update_\") or is_commitment_signed):\n            return\n        assert channel_id\n        chan = self.lnworker.channels[channel_id]  # type: Channel\n        chan.hm.store_local_update_raw_msg(raw_msg, is_commitment_signed=is_commitment_signed)\n        if is_commitment_signed:\n            # saving now, to ensure replaying updates works (in case of channel reestablishment)\n            self.lnworker.save_channel(chan)\n\n    def maybe_set_initialized(self):\n        if self.initialized.done():\n            return\n        if self._sent_init and self._received_init:\n            self.initialized.set_result(True)\n\n    def is_initialized(self) -> bool:\n        return (self.initialized.done()\n                and not self.initialized.cancelled()\n                and self.initialized.exception() is None\n                and self.initialized.result() is True)\n\n    async def initialize(self):\n        if isinstance(self.transport, LNTransport):\n            await self.transport.handshake()\n        self.send_message(\"init\", gflen=0, lflen=2, localfeatures=self.localfeatures)\n        self._sent_init = True\n        self.maybe_set_initialized()\n\n    @property\n    def channels(self) -> Dict[bytes, Channel]:\n        return self.lnworker.channels_for_peer(self.pubkey)\n\n    def diagnostic_name(self):\n        return self.lnworker.__class__.__name__ + ', ' + self.transport.name()\n\n    def ping_if_required(self):\n        if time.time() - self.ping_time > 120:\n            self.send_message('ping', num_pong_bytes=4, byteslen=4)\n            self.ping_time = time.time()\n\n    def process_message(self, message):\n        message_type, payload = decode_msg(message)\n        if message_type in self.ordered_messages:\n            chan_id = payload.get('channel_id') or payload[\"temporary_channel_id\"]\n            self.ordered_message_queues[chan_id].put_nowait((message_type, payload))\n        else:\n            if message_type != 'error' and 'channel_id' in payload:\n                chan = self.channels.get(payload['channel_id'])\n                if chan is None:\n                    raise Exception('Got unknown '+ message_type)\n                args = (chan, payload)\n            else:\n                args = (payload,)\n            try:\n                f = getattr(self, 'on_' + message_type)\n            except AttributeError:\n                #self.logger.info(\"Received '%s'\" % message_type.upper(), payload)\n                return\n            # raw message is needed to check signature\n            if message_type in ['node_announcement', 'channel_announcement', 'channel_update']:\n                payload['raw'] = message\n            execution_result = f(*args)\n            if asyncio.iscoroutinefunction(f):\n                asyncio.ensure_future(execution_result)\n\n    def on_error(self, payload):\n        self.logger.info(f\"remote peer sent error [DO NOT TRUST THIS MESSAGE]: {payload['data'].decode('ascii')}\")\n        chan_id = payload.get(\"channel_id\")\n        if chan_id in self.temp_id_to_id:\n            chan_id = self.temp_id_to_id[chan_id]\n        self.ordered_message_queues[chan_id].put_nowait((None, {'error':payload['data']}))\n\n    def on_ping(self, payload):\n        l = int.from_bytes(payload['num_pong_bytes'], 'big')\n        self.send_message('pong', byteslen=l)\n\n    def on_pong(self, payload):\n        pass\n\n    async def wait_for_message(self, expected_name, channel_id):\n        q = self.ordered_message_queues[channel_id]\n        name, payload = await asyncio.wait_for(q.get(), LN_P2P_NETWORK_TIMEOUT)\n        if payload.get('error'):\n            raise Exception('Remote peer reported error [DO NOT TRUST THIS MESSAGE]: ' + repr(payload.get('error')))\n        if name != expected_name:\n            raise Exception(f\"Received unexpected '{name}'\")\n        return payload\n\n    def on_init(self, payload):\n        if self._received_init:\n            self.logger.info(\"ALREADY INITIALIZED BUT RECEIVED INIT\")\n            return\n        # if they required some even flag we don't have, they will close themselves\n        # but if we require an even flag they don't have, we close\n        their_localfeatures = int.from_bytes(payload['localfeatures'], byteorder=\"big\")\n        try:\n            self.localfeatures = ln_compare_features(self.localfeatures, their_localfeatures)\n        except IncompatibleLightningFeatures as e:\n            self.initialized.set_exception(e)\n            raise GracefulDisconnect(f\"{str(e)}\")\n        if isinstance(self.transport, LNTransport):\n            self.channel_db.add_recent_peer(self.transport.peer_addr)\n            for chan in self.channels.values():\n                chan.add_or_update_peer_addr(self.transport.peer_addr)\n        self._received_init = True\n        self.maybe_set_initialized()\n\n    def on_node_announcement(self, payload):\n        self.gossip_queue.put_nowait(('node_announcement', payload))\n\n    def on_channel_announcement(self, payload):\n        self.gossip_queue.put_nowait(('channel_announcement', payload))\n\n    def on_channel_update(self, payload):\n        self.maybe_save_remote_update(payload)\n        self.gossip_queue.put_nowait(('channel_update', payload))\n\n    def maybe_save_remote_update(self, payload):\n        for chan in self.channels.values():\n            if chan.short_channel_id == payload['short_channel_id']:\n                chan.set_remote_update(payload['raw'])\n                self.logger.info(\"saved remote_update\")\n\n    def on_announcement_signatures(self, chan: Channel, payload):\n        if chan.config[LOCAL].was_announced:\n            h, local_node_sig, local_bitcoin_sig = self.send_announcement_signatures(chan)\n        else:\n            self.announcement_signatures[chan.channel_id].put_nowait(payload)\n\n    def handle_disconnect(func):\n        async def wrapper_func(self, *args, **kwargs):\n            try:\n                return await func(self, *args, **kwargs)\n            except GracefulDisconnect as e:\n                self.logger.log(e.log_level, f\"Disconnecting: {repr(e)}\")\n            except (LightningPeerConnectionClosed, IncompatibleLightningFeatures) as e:\n                self.logger.info(f\"Disconnecting: {repr(e)}\")\n            finally:\n                self.close_and_cleanup()\n        return wrapper_func\n\n    @ignore_exceptions  # do not kill outer taskgroup\n    @log_exceptions\n    @handle_disconnect\n    async def main_loop(self):\n        async with self.taskgroup as group:\n            await group.spawn(self._message_loop())\n            await group.spawn(self.h",
+      "total_lines": 1480,
+      "ref": "2cc76fbbbda3b49262dda7f00a9d7ea6a1c39761"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "htlc_switch",
+      "class_name": "Peer",
+      "start_line": 1412,
+      "end_line": 1480,
+      "satd_line": 1459,
+      "matched_by": "signature_or_comment",
+      "source": "    async def htlc_switch(self):\n        while True:\n            await asyncio.sleep(0.1)\n            for chan_id, chan in self.channels.items():\n                if not chan.can_send_ctx_updates():\n                    continue\n                self.maybe_send_commitment(chan)\n                done = set()\n                unfulfilled = chan.hm.log.get('unfulfilled_htlcs', {})\n                for htlc_id, (local_ctn, remote_ctn, onion_packet_hex, forwarded) in unfulfilled.items():\n                    if chan.get_oldest_unrevoked_ctn(LOCAL) <= local_ctn:\n                        continue\n                    if chan.get_oldest_unrevoked_ctn(REMOTE) <= remote_ctn:\n                        continue\n                    chan.logger.info(f'found unfulfilled htlc: {htlc_id}')\n                    htlc = chan.hm.log[REMOTE]['adds'][htlc_id]\n                    payment_hash = htlc.payment_hash\n                    error_reason = None  # type: Optional[OnionRoutingFailureMessage]\n                    error_bytes = None  # type: Optional[bytes]\n                    preimage = None\n                    onion_packet_bytes = bytes.fromhex(onion_packet_hex)\n                    onion_packet = None\n                    try:\n                        onion_packet = OnionPacket.from_bytes(onion_packet_bytes)\n                        processed_onion = process_onion_packet(onion_packet, associated_data=payment_hash, our_onion_private_key=self.privkey)\n                    except UnsupportedOnionPacketVersion:\n                        error_reason = OnionRoutingFailureMessage(code=OnionFailureCode.INVALID_ONION_VERSION, data=sha256(onion_packet_bytes))\n                    except InvalidOnionPubkey:\n                        error_reason = OnionRoutingFailureMessage(code=OnionFailureCode.INVALID_ONION_KEY, data=sha256(onion_packet_bytes))\n                    except InvalidOnionMac:\n                        error_reason = OnionRoutingFailureMessage(code=OnionFailureCode.INVALID_ONION_HMAC, data=sha256(onion_packet_bytes))\n                    else:\n                        if processed_onion.are_we_final:\n                            preimage, error_reason = self.maybe_fulfill_htlc(\n                                chan=chan,\n                                htlc=htlc,\n                                onion_packet=onion_packet,\n                                processed_onion=processed_onion)\n                        elif not forwarded:\n                            error_reason = self.maybe_forward_htlc(\n                                chan=chan,\n                                htlc=htlc,\n                                onion_packet=onion_packet,\n                                processed_onion=processed_onion)\n                            if not error_reason:\n                                unfulfilled[htlc_id] = local_ctn, remote_ctn, onion_packet_hex, True\n                        else:\n                            # TODO self.lnworker.pending_payments is not persisted,\n                            #      so what happens if we restart the process?...\n                            f = self.lnworker.pending_payments[payment_hash]\n                            if f.done():\n                                payment_attempt = f.result()\n                                preimage = payment_attempt.preimage\n                                error_bytes = payment_attempt.error_bytes\n                                error_reason = payment_attempt.error_reason\n                        if preimage:\n                            await self.lnworker.enable_htlc_settle.wait()\n                            self.fulfill_htlc(chan, htlc.htlc_id, preimage)\n                            done.add(htlc_id)\n                    if error_reason or error_bytes:\n                        self.fail_htlc(chan=chan,\n                                       htlc_id=htlc.htlc_id,\n                                       onion_packet=onion_packet,\n                                       reason=error_reason,\n                                       error_bytes=error_bytes)\n                        done.add(htlc_id)\n                # cleanup\n                for htlc_id in done:\n                    unfulfilled.pop(htlc_id)",
+      "calls": [
+        "OnionRoutingFailureMessage",
+        "process_onion_packet",
+        "set",
+        "sha256"
+      ],
+      "self_calls": [
+        "fail_htlc",
+        "fulfill_htlc",
+        "maybe_forward_htlc",
+        "maybe_fulfill_htlc",
+        "maybe_send_commitment"
+      ],
+      "self_attrs": [
+        "channels",
+        "fail_htlc",
+        "fulfill_htlc",
+        "lnworker",
+        "maybe_forward_htlc",
+        "maybe_fulfill_htlc",
+        "maybe_send_commitment",
+        "privkey"
+      ],
+      "global_uses": [
+        "InvalidOnionMac",
+        "InvalidOnionPubkey",
+        "LOCAL",
+        "OnionFailureCode",
+        "OnionPacket",
+        "OnionRoutingFailureMessage",
+        "REMOTE",
+        "UnsupportedOnionPacketVersion",
+        "asyncio",
+        "process_onion_packet",
+        "sha256"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "f.done",
+        "f.result",
+        "fulfill_htlc",
+        "fail_htlc",
+        "unfulfilled.pop"
+      ],
+      "reason": "The methods related to 'self.lnworker.pending_payments' and its associated calls are critical for understanding the state of pending payments and how they are handled, which directly relates to the SATD about persistence and process restarts.",
+      "uncertainty_items": [
+        {
+          "kind": "symbol",
+          "raw_name": "self.lnworker.pending_payments",
+          "normalized_name": "self.lnworker.pending_payments",
+          "line": null,
+          "source_excerpt": "# TODO self.lnworker.pending_payments is not persisted,\r\n#      so what happens if we restart the process?...",
+          "retrieval_eligible": false
+        },
+        {
+          "kind": "method",
+          "raw_name": "f.done",
+          "normalized_name": "f.done",
+          "line": 57,
+          "source_excerpt": "if f.done():",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "f.result",
+          "normalized_name": "f.result",
+          "line": 58,
+          "source_excerpt": "payment_attempt = f.result()",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "self.fulfill_htlc",
+          "normalized_name": "fulfill_htlc",
+          "line": 64,
+          "source_excerpt": "self.fulfill_htlc(chan, htlc.htlc_id, preimage)",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "self.fail_htlc",
+          "normalized_name": "fail_htlc",
+          "line": 67,
+          "source_excerpt": "self.fail_htlc(chan=chan,",
+          "retrieval_eligible": true
+        },
+        {
+          "kind": "method",
+          "raw_name": "unfulfilled.pop",
+          "normalized_name": "unfulfilled.pop",
+          "line": 75,
+          "source_excerpt": "unfulfilled.pop(htlc_id)",
+          "retrieval_eligible": true
+        }
+      ]
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "done",
+        "path": "electrum/gui/qt/util.py",
+        "class_name": "ThreadedButton",
+        "start_line": 87,
+        "end_line": 89,
+        "source": "def done(self):\n        self.setEnabled(True)\n        self.thread.stop()",
+        "found": true
+      },
+      {
+        "method_name": "Contacts.pop",
+        "path": "electrum/contacts.py",
+        "class_name": "Contacts",
+        "start_line": 68,
+        "end_line": 72,
+        "source": "def pop(self, key):\n        if key in self.keys():\n            res = dict.pop(self, key)\n            self.save()\n            return res",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "result",
+      "Peer.fulfill_htlc",
+      "fail_htlc"
+    ],
+    "edit_constraints": [
+      {
+        "target_kind": "symbol",
+        "target_hint": "# TODO self.lnworker.pending_payments is not persisted,\r\n#      so what happens if we restart the process?...",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The repair should follow the exact symbol/API semantics of `self.lnworker.pending_payments` referenced by the SATD or local code.",
+        "must_do": "Keep the repair aligned to the exact nearby symbol/API `self.lnworker.pending_payments`.",
+        "must_not_do": "Do not swap in a different API/helper than `self.lnworker.pending_payments` without direct local evidence.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "self.lnworker.pending_payments",
+        "supporting_point_kind": "symbol",
+        "supporting_evidence": "53:                     else:\n54:                         # TODO self.lnworker.pending_payments is not persisted,\n55:                         #      so what happens if we restart the process?...",
+        "confidence": 0.55
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "if f.done():",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO self.lnworker.pending_payments is not persisted,\r\n#      so what happens if we restart the process?...) while staying consistent with `done`.",
+        "must_do": "Use `done` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "done",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "def done(self):\n        self.setEnabled(True)\n        self.thread.stop()",
+        "confidence": 0.99
+      },
+      {
+        "target_kind": "method",
+        "target_hint": "payment_attempt = f.result()",
+        "allowed_edit_radius": "local_block",
+        "required_fact": "The current edit point must satisfy the SATD intent (# TODO self.lnworker.pending_payments is not persisted,\r\n#      so what happens if we restart the process?...) while staying consistent with `f.result`.",
+        "must_do": "Use `f.result` only as local supporting evidence for the current edit point.",
+        "must_not_do": "Do not treat retrieved evidence as permission to redesign the surrounding function.",
+        "must_preserve_signature": true,
+        "must_not_add_helper": true,
+        "must_not_expand_control_flow": true,
+        "must_not_rewrite_unrelated_lines": true,
+        "supporting_symbol": "f.result",
+        "supporting_point_kind": "method",
+        "supporting_evidence": "57:                         if f.done():\n58:                             payment_attempt = f.result()\n59:                             preimage = payment_attempt.preimage",
+        "confidence": 0.45
+      }
+    ]
+  },
+  "review_context": {}
+}

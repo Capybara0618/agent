@@ -39,7 +39,6 @@ class LangGraphSATDWorkflow:
         use_analyzer: bool = False,
         use_reviewer: bool = False,
         use_selector: bool = False,
-        repair_prompt_mode: str = "lightweight",
         dual_repair_candidates: bool = False,
         repair_context_mode: str = "clone_treesitter",
         max_method_contexts: int = 2,
@@ -51,7 +50,6 @@ class LangGraphSATDWorkflow:
         self.use_analyzer = use_analyzer
         self.use_reviewer = use_reviewer
         self.use_selector = use_selector
-        self.repair_prompt_mode = repair_prompt_mode
         self.dual_repair_candidates = dual_repair_candidates
         self.repair_context_mode = repair_context_mode
         self.max_method_contexts = max(1, int(max_method_contexts))
@@ -61,7 +59,6 @@ class LangGraphSATDWorkflow:
         self.analyzer = OpenAIAnalyzer(client)
         self.fixer = OpenAIFixer(
             client,
-            prompt_mode=repair_prompt_mode,
             repair_context_mode=repair_context_mode,
             max_method_contexts=self.max_method_contexts,
             logger=self._log,
@@ -116,7 +113,7 @@ class LangGraphSATDWorkflow:
         self._log(f"{self._task_label(state)} repair start round={next_round}")
         context_bundle = state.get("github_context") or self._load_or_build_base_context(state)
         satd_route_type = self._infer_satd_route_type(state)
-        candidates, method_inquiry, retrieved_method_contexts, missing_method_names = self._run_repair_candidates(
+        candidates, method_inquiry, retrieved_method_contexts, missing_method_names, uncertainty_items, edit_constraints = self._run_repair_candidates(
             state,
             context_bundle,
             next_round,
@@ -137,11 +134,17 @@ class LangGraphSATDWorkflow:
             "github_context": context_bundle,
             "satd_route_type": satd_route_type,
             "method_inquiry": method_inquiry,
+            "uncertainty_items": uncertainty_items,
+            "edit_constraints": edit_constraints,
             "retrieved_method_contexts": retrieved_method_contexts,
             "missing_method_names": missing_method_names,
             "repair_candidates": candidates,
             "candidate_repairs": [*state["candidate_repairs"], *candidates],
-            "repair_context_used": bool(retrieved_method_contexts),
+            "repair_context_used": self._repair_attempt_uses_method_evidence(
+                satd_route_type,
+                provisional,
+                retrieved_method_contexts,
+            ),
             "repair_feedback": state.get("repair_feedback"),
             "status": "repairing",
             "round_id": provisional.round_id,
@@ -158,7 +161,11 @@ class LangGraphSATDWorkflow:
             f"route={decision.satd_route_type} candidate={selected_repair.candidate_mode} conf={decision.confidence:.2f}"
         )
         return {
-            "repair_context_used": bool(state.get("retrieved_method_contexts")),
+            "repair_context_used": self._repair_attempt_uses_method_evidence(
+                state.get("satd_route_type"),
+                selected_repair,
+                state.get("retrieved_method_contexts") or [],
+            ),
             "latest_repair": selected_repair,
             "selector_decisions": [*state["selector_decisions"], decision],
             "status": "selected",
@@ -193,7 +200,11 @@ class LangGraphSATDWorkflow:
             "repair_feedback": repair_feedback,
             "review_strict_gate_result": "approved" if review.approved else "rejected",
             "status": "accepted" if review.approved else "review_failed",
-            "repair_context_used": bool(state.get("retrieved_method_contexts")),
+            "repair_context_used": self._repair_attempt_uses_method_evidence(
+                state.get("satd_route_type"),
+                state.get("latest_repair"),
+                state.get("retrieved_method_contexts") or [],
+            ),
             "latest_review": review,
             "repairs": [*state["repairs"], state["latest_repair"]],
             "reviews": [*state["reviews"], review],
@@ -281,12 +292,14 @@ class LangGraphSATDWorkflow:
         context_bundle: dict,
         round_id: int,
         satd_route_type: str,
-    ) -> tuple[list[RepairAttempt], MethodInquiryResult, list[RetrievedMethodContext], list[str]]:
+    ) -> tuple[list[RepairAttempt], MethodInquiryResult, list[RetrievedMethodContext], list[str], list, list]:
         candidates: list[RepairAttempt] = []
         candidate_modes = self._candidate_modes_for_route(satd_route_type)
         method_inquiry = MethodInquiryResult()
         retrieved_method_contexts: list[RetrievedMethodContext] = []
         missing_method_names: list[str] = []
+        uncertainty_items = []
+        edit_constraints = []
         for candidate_mode in candidate_modes:
             candidate_state = {
                 **state,
@@ -295,11 +308,22 @@ class LangGraphSATDWorkflow:
                 "github_context": context_bundle,
             }
             try:
-                repair, inquiry, contexts, missing = self.fixer.run(candidate_state, candidate_mode=candidate_mode)
+                repair, inquiry, contexts, missing, uncertainty_items, edit_constraints = self.fixer.run(candidate_state, candidate_mode=candidate_mode)
                 method_inquiry = inquiry
                 retrieved_method_contexts = contexts
                 missing_method_names = missing
             except Exception as exc:
+                error_message = " ".join(str(exc).split())
+                self.fixer._checkpoint(
+                    candidate_state,
+                    stage="generation_error",
+                    payload={
+                        "round_id": int(candidate_state.get("round_id", 0)) + 1,
+                        "candidate_mode": candidate_mode,
+                        "error_type": type(exc).__name__,
+                        "error_message": error_message[:500],
+                    },
+                )
                 if self.context_client._is_content_filter_error(exc):
                     self._log(
                         f"{self._task_label(state)} repair candidate={candidate_mode} "
@@ -309,12 +333,12 @@ class LangGraphSATDWorkflow:
                 else:
                     self._log(
                         f"{self._task_label(state)} repair candidate={candidate_mode} "
-                        f"exception type={type(exc).__name__}; using fallback no-op repair"
+                        f"exception type={type(exc).__name__} message={error_message[:200]}; using fallback no-op repair"
                     )
                     repair = self._fallback_repair(state, round_id, reason=f"fixer_exception:{candidate_mode}:{type(exc).__name__}")
                 repair.candidate_mode = candidate_mode
             candidates.append(repair)
-        return candidates, method_inquiry, retrieved_method_contexts, missing_method_names
+        return candidates, method_inquiry, retrieved_method_contexts, missing_method_names, uncertainty_items, edit_constraints
 
     def _run_selector(self, state: GraphState, candidates: list[RepairAttempt]) -> SelectorDecision:
         if not candidates:
@@ -377,23 +401,31 @@ class LangGraphSATDWorkflow:
             ),
         )
 
+    def _repair_attempt_uses_method_evidence(
+        self,
+        satd_route_type: str | None,
+        repair: RepairAttempt | None,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+    ) -> bool:
+        if repair is None or not retrieved_method_contexts:
+            return False
+        return not str(repair.candidate_mode or "").strip().lower().endswith("no_context")
+
     def _infer_satd_route_type(self, state: GraphState) -> str:
         comment = (state.get("satd_comment") or "").strip().lower()
         if not comment:
             return "generic"
         if any(token in comment for token in ("pyre-fixme", "return type", "parameter must be annotated", "annotation", "annotated")):
             return "type_annotation"
-        if any(token in comment for token in ("uncomment", "re-enable", "reenable", "restore", "commented out")):
-            return "restore_uncomment"
         if any(token in comment for token in ("replace by", "switch to", "deprecated", "rename", "full_path")):
             return "replace_symbol"
         if any(token in comment for token in ("temporary", "hack", "workaround", "obsolete", "remove this", "drop this")):
             return "remove_temporary"
-        if (
-            any(token in comment for token in ("default value", "set this to", "change it to", "negative", "this line is quite clearly wrong", "wrong", "chmod"))
-            and not any(token in comment for token in ("document", "docstring", "doc ", "example"))
+        if any(
+            token in comment
+            for token in ("document", "documentation", "docstring", "docs", "comment this", "commented explanation")
         ):
-            return "small_local_value_fix"
+            return "document"
         return "generic"
 
     def _candidate_modes_for_route(self, satd_route_type: str) -> list[str]:
@@ -460,7 +492,7 @@ class LangGraphSATDWorkflow:
                 summary["use_analyzer"] = self.use_analyzer
                 summary["use_reviewer"] = self.use_reviewer
                 summary["use_selector"] = self.use_selector
-                summary["repair_prompt_mode"] = self.repair_prompt_mode
+                summary["repair_prompt_mode"] = "lightweight"
                 summary["dual_repair_candidates"] = self.dual_repair_candidates
                 summary["repair_context_mode"] = self.repair_context_mode
                 summary["max_method_contexts"] = self.max_method_contexts
@@ -485,7 +517,7 @@ class LangGraphSATDWorkflow:
             summary["use_analyzer"] = self.use_analyzer
             summary["use_reviewer"] = self.use_reviewer
             summary["use_selector"] = self.use_selector
-            summary["repair_prompt_mode"] = self.repair_prompt_mode
+            summary["repair_prompt_mode"] = "lightweight"
             summary["dual_repair_candidates"] = self.dual_repair_candidates
             summary["repair_context_mode"] = self.repair_context_mode
             summary["max_method_contexts"] = self.max_method_contexts
@@ -561,7 +593,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -634,6 +666,8 @@ class LangGraphSATDWorkflow:
             "missing_method_names": " | ".join(trace.missing_method_names),
             "retrieved_method_count": len(trace.retrieved_method_contexts),
             "method_context_json": json.dumps(trace.retrieved_method_contexts, ensure_ascii=False),
+            "uncertainty_items_json": json.dumps(trace.uncertainty_items, ensure_ascii=False),
+            "edit_constraints_json": json.dumps(trace.edit_constraints, ensure_ascii=False),
             "repair_context_used": trace.repair_context_used,
             "review_strict_gate_result": trace.review_strict_gate_result,
             "selector_selected_candidate_mode": latest_selector.get("selected_candidate_mode"),
@@ -710,7 +744,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -990,7 +1024,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
@@ -1006,7 +1040,7 @@ class LangGraphSATDWorkflow:
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
             "analysis_repair_strategy", "analysis_drop_reason", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
-            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json",
+            "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence",
             "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",

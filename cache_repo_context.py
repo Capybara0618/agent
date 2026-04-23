@@ -10,16 +10,22 @@ from satd_langgraph.csv_loader import load_satd_csv
 from satd_langgraph.github_tools import GitHubToolbox
 
 
+def _default_repo_cache_dir(input_path: Path) -> Path | None:
+    if input_path.stem == "random_code":
+        return input_path.resolve().parent / ".repo_cache_random_code"
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Warm the shared SATD repo cache in code.csv task order without running repair."
     )
-    parser.add_argument("--input", type=Path, default=Path("code.csv"), help="Path to the SATD CSV file.")
+    parser.add_argument("--input", type=Path, default=Path("random_code.csv"), help="Path to the SATD CSV file.")
     parser.add_argument("--limit", type=int, default=None, help="Optional row limit.")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs_repo_cache_only"),
+        default=Path("outputs_repo_cache_random1000"),
         help="Directory for cache-only progress files.",
     )
     parser.add_argument(
@@ -42,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--git-remote-template",
         default=None,
         help="Optional git remote template with {owner} and {repo}; overrides --git-remote-base.",
+    )
+    parser.add_argument(
+        "--repo-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional repo cache directory. By default, random_code.csv uses .repo_cache_random_code.",
     )
     return parser
 
@@ -184,6 +196,13 @@ def main() -> None:
         os.environ["SATD_GIT_REMOTE_BASE"] = args.git_remote_base
     if args.git_remote_template:
         os.environ["SATD_GIT_REMOTE_TEMPLATE"] = args.git_remote_template
+    repo_cache_dir = args.repo_cache_dir
+    if repo_cache_dir is None:
+        repo_cache_dir = _default_repo_cache_dir(args.input)
+    if repo_cache_dir is not None:
+        resolved_repo_cache_dir = repo_cache_dir if repo_cache_dir.is_absolute() else (Path.cwd() / repo_cache_dir)
+        resolved_repo_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["SATD_REPO_CACHE_DIR"] = str(resolved_repo_cache_dir)
 
     records = load_satd_csv(args.input, limit=args.limit)
     total = len(records)

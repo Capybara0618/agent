@@ -10,13 +10,19 @@ from satd_langgraph import LangGraphSATDWorkflow
 # python run_langgraph_workflow.py --input code.csv --output-dir outputs_langgraph_smoke5 --limit 5 --model gpt-4o-mini --verbose --write-batch-size 10 --resume
 
 
+def _default_repo_cache_dir(input_path: Path) -> Path | None:
+    if input_path.stem == "random_code":
+        return input_path.resolve().parent / ".repo_cache_random_code"
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the LangGraph SATD workflow on code.csv.")
-    parser.add_argument("--input", type=Path, default=Path("code.csv"), help="Path to the SATD CSV file.")
+    parser.add_argument("--input", type=Path, default=Path("random_code.csv"), help="Path to the SATD CSV file.")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs_langgraph"),
+        default=Path("outputs_langgraph_random1000"),
         help="Directory for workflow outputs.",  
     )
     parser.add_argument("--max-rounds", type=int, default=2, help="Maximum repair-review iterations.")
@@ -80,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional git remote template with {owner} and {repo}; overrides --git-remote-base.",
     )
+    parser.add_argument(
+        "--repo-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional repo cache directory. By default, random_code.csv uses .repo_cache_random_code.",
+    )
     return parser
 
 
@@ -89,6 +101,13 @@ def main() -> None:
         os.environ["SATD_GIT_REMOTE_BASE"] = args.git_remote_base
     if args.git_remote_template:
         os.environ["SATD_GIT_REMOTE_TEMPLATE"] = args.git_remote_template
+    repo_cache_dir = args.repo_cache_dir
+    if repo_cache_dir is None:
+        repo_cache_dir = _default_repo_cache_dir(args.input)
+    if repo_cache_dir is not None:
+        resolved_repo_cache_dir = repo_cache_dir if repo_cache_dir.is_absolute() else (Path.cwd() / repo_cache_dir)
+        resolved_repo_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["SATD_REPO_CACHE_DIR"] = str(resolved_repo_cache_dir)
     workflow = LangGraphSATDWorkflow(
         max_rounds=args.max_rounds,
         model=args.model,
@@ -123,6 +142,7 @@ def main() -> None:
     print(f"Dual repair candidates: {summary.get('dual_repair_candidates')}")
     print(f"Git remote base: {os.environ.get('SATD_GIT_REMOTE_BASE') or 'https://mirrors.tuna.tsinghua.edu.cn/git/github.com'}")
     print(f"Git remote template: {os.environ.get('SATD_GIT_REMOTE_TEMPLATE') or 'none'}")
+    print(f"Repo cache dir: {os.environ.get('SATD_REPO_CACHE_DIR') or (Path.cwd() / '.repo_cache')}")
     print(f"Resume mode: {args.resume}")
     print(f"Main trajectory file: {args.output_dir / 'trajectory_overview.csv'}")
     print(f"Task progress file: {args.output_dir / 'task_progress.csv'}")

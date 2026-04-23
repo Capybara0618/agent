@@ -1,0 +1,102 @@
+{
+  "task_id": "56",
+  "repo_owner": "ethereum",
+  "repo_name": "trinity",
+  "file_path": "p2p/chain.py",
+  "commit": "ca1e05707694ce23c801c76aa469771eb6d50c56",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-23T07:43:34+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ca1e05707694ce23c801c76aa469771eb6d50c56",
+    "symbol_name": "_handle_get_block_headers",
+    "satd_line": 155,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-23T07:43:41+00:00",
+    "identified_method_count": 1,
+    "retrieved_method_count": 1,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "p2p/chain.py",
+    "original_signature": "async def _handle_get_block_headers(self,",
+    "target_file": {
+      "ok": true,
+      "path": "p2p/chain.py",
+      "sha": "bd655b70f6451efb65d6e15c86e54db76d0d8a68",
+      "download_url": "https://raw.githubusercontent.com/ethereum/trinity/ca1e05707694ce23c801c76aa469771eb6d50c56/p2p/chain.py",
+      "content_excerpt": "import asyncio\nfrom concurrent.futures import ProcessPoolExecutor\nimport logging\nimport math\nimport operator\nimport os\nimport time\nfrom typing import (\n    Any,\n    Callable,\n    Dict,\n    List,\n    NamedTuple,\n    Set,\n    Tuple,\n    Union,\n    cast,\n)\n\nfrom cytoolz import (\n    partition_all,\n    unique,\n)\n\nfrom eth_typing import BlockNumber, Hash32\nfrom eth_utils import (\n    encode_hex,\n)\n\nfrom evm.constants import BLANK_ROOT_HASH, EMPTY_UNCLE_HASH, GENESIS_PARENT_HASH\nfrom evm.chains import AsyncChain\nfrom evm.db.chain import AsyncChainDB\nfrom evm.db.trie import make_trie_root_and_nodes\nfrom evm.exceptions import HeaderNotFound\nfrom evm.rlp.headers import BlockHeader\nfrom evm.rlp.receipts import Receipt\nfrom evm.rlp.transactions import BaseTransaction\n\nfrom p2p import protocol\nfrom p2p import eth\nfrom p2p.cancel_token import CancelToken, wait_with_token\nfrom p2p.exceptions import NoEligiblePeers, OperationCancelled\nfrom p2p.peer import BasePeer, ETHPeer, PeerPool, PeerPoolSubscriber\nfrom p2p.rlp import BlockBody, P2PTransaction\nfrom p2p.service import BaseService\nfrom p2p.utils import unclean_close_exceptions\n\n\nclass FastChainSyncer(BaseService, PeerPoolSubscriber):\n    \"\"\"\n    Sync with the Ethereum network by fetching/storing block headers, bodies and receipts.\n\n    Here, the run() method will execute the sync loop until our local head is the same as the one\n    with the highest TD announced by any of our peers.\n    \"\"\"\n    logger = logging.getLogger(\"p2p.chain.ChainSyncer\")\n    # We'll only sync if we are connected to at least min_peers_to_sync.\n    min_peers_to_sync = 1\n    # TODO: Instead of a fixed timeout, we should use a variable one that gets adjusted based on\n    # the round-trip times from our download requests.\n    _reply_timeout = 60\n\n    def __init__(self,\n                 chaindb: AsyncChainDB,\n                 peer_pool: PeerPool,\n                 token: CancelToken = None) -> None:\n        super().__init__(token)\n        self.chaindb = chaindb\n        self.peer_pool = peer_pool\n        self._running_peers: Set[ETHPeer] = set()\n        self._syncing = False\n        self._sync_complete = asyncio.Event()\n        self._sync_requests: asyncio.Queue[ETHPeer] = asyncio.Queue()\n        self._new_headers: asyncio.Queue[List[BlockHeader]] = asyncio.Queue()\n        # Those are used by our msg handlers and _download_block_parts() in order to track missing\n        # bodies/receipts for a given chain segment.\n        self._downloaded_receipts: asyncio.Queue[Tuple[ETHPeer, List[DownloadedBlockPart]]] = asyncio.Queue()  # noqa: E501\n        self._downloaded_bodies: asyncio.Queue[Tuple[ETHPeer, List[DownloadedBlockPart]]] = asyncio.Queue()  # noqa: E501\n        # Use CPU_COUNT - 1 processes to make sure we always leave one CPU idle so that it can run\n        # asyncio's event loop.\n        if os.cpu_count() is None:\n            # Need this because os.cpu_count() returns None when the # of CPUs is indeterminable.\n            cpu_count = 1\n        else:\n            cpu_count = os.cpu_count() - 1\n        self._executor = ProcessPoolExecutor(cpu_count)\n\n    def register_peer(self, peer: BasePeer) -> None:\n        asyncio.ensure_future(self.handle_peer(cast(ETHPeer, peer)))\n        highest_td_peer = max(\n            [cast(ETHPeer, peer) for peer in self.peer_pool.peers],\n            key=operator.attrgetter('head_td'))\n        self._sync_requests.put_nowait(highest_td_peer)\n\n    async def handle_peer(self, peer: ETHPeer) -> None:\n        \"\"\"Handle the lifecycle of the given peer.\"\"\"\n        self._running_peers.add(peer)\n        # Use a local token that we'll trigger to cleanly cancel the _handle_peer() sub-tasks when\n        # self.finished is set.\n        peer_token = self.cancel_token.chain(CancelToken(\"HandlePeer\"))\n        try:\n            await asyncio.wait(\n                [self._handle_peer(peer, peer_token), self.finished.wait()],\n                return_when=asyncio.FIRST_COMPLETED)\n        finally:\n            peer_token.trigger()\n            self._running_peers.remove(peer)\n\n    async def _handle_peer(self, peer: ETHPeer, token: CancelToken) -> None:\n        while not self.is_finished:\n            try:\n                cmd, msg = await peer.read_sub_proto_msg(token)\n            except OperationCancelled:\n                # Either our cancel token or the peer's has been triggered, so break out of the\n                # loop.\n                break\n\n            pending_msgs = peer.sub_proto_msg_queue.qsize()\n            if pending_msgs:\n                self.logger.debug(\n                    \"Read %s msg from %s's queue; %d msgs pending\", cmd, peer, pending_msgs)\n\n            # Our handle_msg() method runs cpu-intensive tasks in sub-processes so that the main\n            # loop can keep processing msgs, and that's why we use ensure_future() instead of\n            # awaiting for it to finish here.\n            asyncio.ensure_future(self.handle_msg(peer, cmd, msg))\n\n    async def handle_msg(self, peer: ETHPeer, cmd: protocol.Command,\n                         msg: protocol._DecodedMsgType) -> None:\n        try:\n            await self._handle_msg(peer, cmd, msg)\n        except OperationCancelled:\n            # Silently swallow OperationCancelled exceptions because we run unsupervised (i.e.\n            # with ensure_future()). Our caller will also get an OperationCancelled anyway, and\n            # there it will be handled.\n            pass\n        except unclean_close_exceptions:\n            # FIXME: These exceptions come from AsyncChain[DB] methods; instead of catching them\n            # here we should do so in our coro_* wrappers, and have them re-raise something\n            # meaningful. Or something like that.\n            self.logger.exception(\"Unclean exit while handling message from %s\", peer)\n        except Exception:\n            self.logger.exception(\"Unexpected error when processing msg from %s\", peer)\n\n    async def _run(self) -> None:\n        with self.subscribe(self.peer_pool):\n            while True:\n                peer_or_finished = await wait_with_token(\n                    self._sync_requests.get(), self._sync_complete.wait(),\n                    token=self.cancel_token)\n\n                # In the case of a fast sync, we return once the sync is completed, and our caller\n                # must then run the StateDownloader.\n                if self._sync_complete.is_set():\n                    return\n\n                # Since self._sync_complete is not set, peer_or_finished can only be a ETHPeer\n                # instance.\n                asyncio.ensure_future(self.sync(peer_or_finished))\n\n    async def sync(self, peer: ETHPeer) -> None:\n        if self._syncing:\n            self.logger.debug(\n                \"Got a NewBlock or a new peer, but already syncing so doing nothing\")\n            return\n        elif len(self._running_peers) < self.min_peers_to_sync:\n            self.logger.info(\n                \"Connected to less peers (%d) than the minimum (%d) required to sync, \"\n                \"doing nothing\", len(self._running_peers), self.min_peers_to_sync)\n            return\n\n        self._syncing = True\n        try:\n            await self._sync(peer)\n        except OperationCancelled:\n            pass\n        except unclean_close_exceptions:\n            self.logger.exception(\"Unclean exit while syncing\")\n        finally:\n            self._syncing = False\n\n    async def _sync(self, peer: ETHPeer) -> None:\n        head = await self.chaindb.coro_get_canonical_head()\n        head_td = await self.chaindb.coro_get_score(head.hash)\n        if peer.head_td <= head_td:\n            self.logger.info(\n                \"Head TD (%d) announced by %s not higher than ours (%d), not syncing\",\n                peer.head_td, peer, head_td)\n            return\n\n        self.logger.info(\"Starting sync with %s\", peer)\n        # FIXME: Fetch a batch of headers, in reverse order, starting from our current head, and\n        # find the common ancestor between our chain and the peer's.\n        start_at = max(0, head.block_number - eth.MAX_HEADERS_FETCH)\n        while not self._sync_complete.is_set():\n            if peer.is_finished:\n                self.logger.info(\"%s disconnected, aborting sync\", peer)\n                break\n\n            self.logger.debug(\"Fetching chain segment starting at #%d\", start_at)\n            peer.sub_proto.send_get_block_headers(start_at, eth.MAX_HEADERS_FETCH, reverse=False)\n            try:\n                headers = await wait_with_token(\n                    self._new_headers.get(), peer.finished.wait(),\n                    token=self.cancel_token,\n                    timeout=self._reply_timeout)\n            except TimeoutError:\n                self.logger.warn(\"Timeout waiting for header batch from %s, aborting sync\", peer)\n                await peer.cancel()\n                break\n\n            if peer.is_finished:\n                self.logger.info(\"%s disconnected, aborting sync\", peer)\n                break\n\n            self.logger.debug(\"Got headers segment starting at #%d\", start_at)\n\n            # TODO: Process headers for consistency.\n            try:\n                head_number = await self._process_headers(peer, headers)\n            except NoEligiblePeers:\n                self.logger.info(\"No peers have the blocks we want, aborting sync\")\n                break\n            start_at = head_number + 1\n\n    async def _calculate_td(self, headers: List[BlockHeader]) -> int:\n        \"\"\"Return the score (total difficulty) of the last header in the given list.\n\n        Assumes the first header's parent is already present in our DB.\n\n        Used when we have a batch of headers that has not been persisted to the DB yet, and we\n        need to know the score for the last one of them.\n        \"\"\"\n        if headers[0].parent_hash == GENESIS_PARENT_HASH:\n            td = 0\n        else:\n            td = await self.chaindb.coro_get_score(headers[0].parent_hash)\n        for header in headers:\n            td += header.difficulty\n        return td\n\n    async def _process_headers(self, peer: ETHPeer, headers: List[BlockHeader]) -> int:\n        start = time.time()\n        target_td = await self._calculate_td(headers)\n        await self._download_block_parts(\n            target_td,\n            [header for header in headers if not _is_body_empty(header)],\n            self.request_bodies,\n            self._downloaded_bodies,\n            _body_key,\n            'body')\n        self.logger.debug(\"Got block bodies for chain segment\")\n\n        missing_receipts = [header for header in headers if not _is_receipts_empty(header)]\n        # Post-Byzantium blocks may have identical receipt roots (e.g. when they have the same\n        # number of transactions and all succeed/failed: ropsten blocks 2503212 and 2503284),\n        # so we do this to avoid requesting the same receipts multiple times.\n        missing_receipts = list(unique(missing_receipts, key=_receipts_key))\n        await self._download_block_parts(\n            target_td,\n            missing_receipts,\n            self.request_receipts,\n            self._downloaded_receipts,\n            _receipts_key,\n            'receipt')\n        self.logger.debug(\"Got block receipts for chain segment\")\n\n        # FIXME: Get the bodies returned by self._download_block_parts above and use persit_block\n        # here.\n        for header in headers:\n            await self.chaindb.coro_persist_header(header)\n\n        head = await self.chaindb.coro_get_canonical_head()\n        self.logger.info(\n            \"Imported %d headers in %0.2f seconds, new head: #%d (%s)\",\n            len(headers),\n            time.time() - start,\n            head.block_number,\n            encode_hex(head.hash)[2:8],\n        )\n        # Quite often the header batch we receive here includes headers past the peer's reported\n        # head (via the NewBlock msg), so we can't compare our head's hash to the peer's in\n        # order to see if the sync is completed. Instead we",
+      "total_lines": 725,
+      "ref": "ca1e05707694ce23c801c76aa469771eb6d50c56"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_handle_get_block_headers",
+      "class_name": "FastChainSyncer",
+      "start_line": 472,
+      "end_line": 478,
+      "satd_line": 155,
+      "matched_by": "normalized_source",
+      "source": "    async def _handle_get_block_headers(self,\n                                        peer: ETHPeer,\n                                        header_request: Dict[str, Any]) -> None:\n        self.logger.debug(\"Peer %s made header request: %s\", peer, header_request)\n        # TODO: We should *try* to return the requested headers as they *may*\n        # have already been synced into our chain database.\n        peer.sub_proto.send_block_headers([])",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [
+        "logger"
+      ],
+      "global_uses": [
+        "Any",
+        "Dict",
+        "ETHPeer"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "peer.sub_proto.send_block_headers"
+      ],
+      "reason": "The selected method is essential for addressing the TODO comment, as it directly relates to the functionality that needs to be repaired."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "ETHProtocol.send_block_headers",
+        "path": "p2p/eth.py",
+        "class_name": "ETHProtocol",
+        "start_line": 156,
+        "end_line": 159,
+        "source": "def send_block_headers(self, headers: List[BlockHeader]) -> None:\n        cmd = BlockHeaders(self.cmd_id_offset)\n        header, body = cmd.encode(headers)\n        self.send(header, body)",
+        "found": true
+      }
+    ],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

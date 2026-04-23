@@ -1,0 +1,138 @@
+{
+  "task_id": "255",
+  "repo_owner": "seagate",
+  "repo_name": "cortx-hare",
+  "file_path": "hax/hax/server.py",
+  "commit": "ea6d5416234bf17ce73148ae1158a9d467b99f53",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-20T09:53:10+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ea6d5416234bf17ce73148ae1158a9d467b99f53",
+    "symbol_name": "run_server",
+    "satd_line": 66,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-20T09:54:36+00:00",
+    "identified_method_count": 3,
+    "retrieved_method_count": 2,
+    "missing_method_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "hax/hax/server.py",
+    "original_signature": "def run_server(",
+    "target_file": {
+      "ok": true,
+      "path": "hax/hax/server.py",
+      "sha": "2eabe0f8fc67f87d411bc7ec8708825b47b0bf32",
+      "download_url": "https://raw.githubusercontent.com/Seagate/cortx-hare/ea6d5416234bf17ce73148ae1158a9d467b99f53/hax/hax/server.py",
+      "content_excerpt": "# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#    http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n# For any questions about this software or licensing,\n# please email opensource@seagate.com or cortx-questions@seagate.com.\n#\n\nimport asyncio\nimport logging\nfrom json.decoder import JSONDecodeError\nfrom queue import Queue\nfrom typing import Any, Callable, Dict, List, Type, Union\n\nfrom aiohttp import web\nfrom aiohttp.web import HTTPError, HTTPNotFound\nfrom aiohttp.web_response import json_response\n\nfrom hax.message import (BaseMessage, BroadcastHAStates, SnsDiskAttach,\n                         SnsDiskDetach, SnsRebalancePause, SnsRebalanceResume,\n                         SnsRebalanceStart, SnsRebalanceStatus,\n                         SnsRebalanceStop, SnsRepairPause, SnsRepairResume,\n                         SnsRepairStart, SnsRepairStatus, SnsRepairStop)\nfrom hax.motr.delivery import DeliveryHerald\nfrom hax.motr.planner import WorkPlanner\nfrom hax.queue import BQProcessor\nfrom hax.queue.confobjutil import ConfObjUtil\nfrom hax.queue.offset import InboxFilter, OffsetStorage\nfrom hax.types import Fid, HAState, ServiceHealth, StoppableThread\nfrom hax.util import ConsulUtil, create_process_fid, dump_json\n\nLOG = logging.getLogger('hax')\n\n\nasync def hello_reply(request):\n    return json_response(text=\"I'm alive! Sincerely, HaX\")\n\n\ndef to_ha_states(data: Any, consul_util: ConsulUtil) -> List[HAState]:\n    \"\"\"Converts a dictionary, obtained from JSON data, into a list of\n    HA states.\n\n    Format of an HA state: HAState(fid= <service fid>, status= <state>),\n    where <state> is either 'online' or 'offline'.\n    \"\"\"\n    if not data:\n        return []\n\n    def get_status(checks: List[Dict[str, Any]]) -> ServiceHealth:\n        ok = all(x.get('Status') == 'passing' for x in checks)\n        return ServiceHealth.OK if ok else ServiceHealth.FAILED\n\n    return [\n        HAState(fid=create_process_fid(int(t['Service']['ID'])),\n                status=get_status(t['Checks'])) for t in data\n    ]\n\n\ndef process_ha_states(planner: WorkPlanner, consul_util: ConsulUtil):\n    async def _process(request):\n        data = await request.json()\n\n        loop = asyncio.get_event_loop()\n        # Note that planner.add_command is potentially a blocking call\n        await loop.run_in_executor(\n            None, lambda: planner.add_command(\n                BroadcastHAStates(states=to_ha_states(data, consul_util),\n                                  reply_to=None)))\n        return web.Response()\n\n    return _process\n\n\ndef process_sns_operation(planner: WorkPlanner):\n    async def _process(request):\n        op_name = request.match_info.get('operation')\n\n        def create_handler(\n            a_type: Callable[[Fid], BaseMessage]\n        ) -> Callable[[Dict[str, Any]], BaseMessage]:\n            def fn(data: Dict[str, Any]):\n                fid = Fid.parse(data['fid'])\n                return a_type(fid)\n\n            return fn\n\n        msg_factory = {\n            'rebalance-start': create_handler(SnsRebalanceStart),\n            'rebalance-stop': create_handler(SnsRebalanceStop),\n            'rebalance-pause': create_handler(SnsRebalancePause),\n            'rebalance-resume': create_handler(SnsRebalanceResume),\n            'repair-start': create_handler(SnsRepairStart),\n            'repair-stop': create_handler(SnsRepairStop),\n            'repair-pause': create_handler(SnsRepairPause),\n            'repair-resume': create_handler(SnsRepairResume),\n            'disk-attach': create_handler(SnsDiskAttach),\n            'disk-detach': create_handler(SnsDiskDetach),\n        }\n\n        LOG.debug(f'process_sns_operation: {op_name}')\n        if op_name not in msg_factory:\n            raise HTTPNotFound()\n        data = await request.json()\n        message = msg_factory[op_name](data)\n\n        loop = asyncio.get_event_loop()\n        await loop.run_in_executor(None, lambda: planner.add_command(message))\n        return web.Response()\n\n    return _process\n\n\ndef get_sns_status(planner: WorkPlanner,\n                   status_type: Union[Type[SnsRepairStatus],\n                                      Type[SnsRebalanceStatus]]):\n    def fn(request):\n        queue: Queue = Queue(1)\n        planner.add_command(\n            status_type(reply_to=queue,\n                        fid=Fid.parse(request.query['pool_fid'])))\n        return queue.get(timeout=10)\n\n    async def _process(request):\n        LOG.debug('%s with params: %s', request, request.query)\n        loop = asyncio.get_event_loop()\n        payload = await loop.run_in_executor(None, fn, request)\n        return json_response(data=payload, dumps=dump_json)\n\n    return _process\n\n\ndef process_bq_update(inbox_filter: InboxFilter, processor: BQProcessor):\n    async def _process(request):\n        data = await request.json()\n\n        def fn():\n            messages = inbox_filter.prepare(data)\n            if not messages:\n                return\n            for i, msg in messages:\n                processor.process((i, msg))\n                # Mark the message as read ASAP since the process can\n                # potentially die any time\n                inbox_filter.offset_mgr.mark_last_read(i)\n\n        loop = asyncio.get_event_loop()\n        await loop.run_in_executor(None, fn)\n\n        return web.Response()\n\n    return _process\n\n\n@web.middleware\nasync def encode_exception(request, handler):\n    def error_response(e: Exception, code=500, reason=\"\"):\n        payload = {\n            \"status_code\": code,\n            \"error_message\": str(e),\n            \"error_type\": e.__class__.__name__,\n            \"reason\": reason\n        }\n        return json_response(data=payload, status=code)\n\n    try:\n        response = await handler(request)\n        return response\n    except HTTPError:\n        raise\n    except (JSONDecodeError, KeyError) as e:\n        return error_response(e, code=400, reason=\"Bad JSON provided\")\n    except Exception as e:\n        return error_response(e,\n                              code=500,\n                              reason=\"Unexpected error has happened\")\n\n\ndef run_server(\n    planner: WorkPlanner,\n    herald: DeliveryHerald,\n    consul_util: ConsulUtil,\n    threads_to_wait: List[StoppableThread] = [],\n    port=8008,\n):\n    node_address = consul_util.get_hax_ip_address()\n\n    # We can't use broad 0.0.0.0 IP address to make it possible to run\n    # multiple hax instances at the same machine (i.e. in failover situation).\n    # Instead, every hax will use a private IP only.\n    web_address = node_address\n\n    # Note that bq-delivered mechanism must use a unique node name rather than\n    # broad '0.0.0.0' that doesn't identify the node from outside.\n    inbox_filter = InboxFilter(\n        OffsetStorage(node_address, key_prefix='bq-delivered'))\n\n    conf_obj = ConfObjUtil(consul_util)\n\n    app = web.Application(middlewares=[encode_exception])\n    app.add_routes([\n        web.get('/', hello_reply),\n        web.post('/', process_ha_states(planner, consul_util)),\n        web.post(\n            '/watcher/bq',\n            process_bq_update(inbox_filter,\n                              BQProcessor(planner, herald, conf_obj))),\n        web.post('/api/v1/sns/{operation}', process_sns_operation(planner)),\n        web.get('/api/v1/sns/repair-status',\n                get_sns_status(planner, SnsRepairStatus)),\n        web.get('/api/v1/sns/rebalance-status',\n                get_sns_status(planner, SnsRebalanceStatus)),\n    ])\n    LOG.info(f'Starting HTTP server at {web_address}:{port} ...')\n    try:\n        web.run_app(app, host=web_address, port=port)\n        LOG.debug('Server stopped normally')\n    finally:\n        LOG.debug('Stopping the threads')\n        # [KN] FIXME Implement shutdown in WorkPlanner\n        for thread in threads_to_wait:\n            thread.stop()\n        for thread in threads_to_wait:\n            thread.join()\n\n        LOG.info('The http server has stopped')\n",
+      "total_lines": 235,
+      "ref": "ea6d5416234bf17ce73148ae1158a9d467b99f53"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "run_server",
+      "class_name": null,
+      "start_line": 188,
+      "end_line": 235,
+      "satd_line": 66,
+      "matched_by": "normalized_source",
+      "source": "def run_server(\n    planner: WorkPlanner,\n    herald: DeliveryHerald,\n    consul_util: ConsulUtil,\n    threads_to_wait: List[StoppableThread] = [],\n    port=8008,\n):\n    node_address = consul_util.get_hax_ip_address()\n\n    # We can't use broad 0.0.0.0 IP address to make it possible to run\n    # multiple hax instances at the same machine (i.e. in failover situation).\n    # Instead, every hax will use a private IP only.\n    web_address = node_address\n\n    # Note that bq-delivered mechanism must use a unique node name rather than\n    # broad '0.0.0.0' that doesn't identify the node from outside.\n    inbox_filter = InboxFilter(\n        OffsetStorage(node_address, key_prefix='bq-delivered'))\n\n    conf_obj = ConfObjUtil(consul_util)\n\n    app = web.Application(middlewares=[encode_exception])\n    app.add_routes([\n        web.get('/', hello_reply),\n        web.post('/', process_ha_states(planner, consul_util)),\n        web.post(\n            '/watcher/bq',\n            process_bq_update(inbox_filter,\n                              BQProcessor(planner, herald, conf_obj))),\n        web.post('/api/v1/sns/{operation}', process_sns_operation(planner)),\n        web.get('/api/v1/sns/repair-status',\n                get_sns_status(planner, SnsRepairStatus)),\n        web.get('/api/v1/sns/rebalance-status',\n                get_sns_status(planner, SnsRebalanceStatus)),\n    ])\n    LOG.info(f'Starting HTTP server at {web_address}:{port} ...')\n    try:\n        web.run_app(app, host=web_address, port=port)\n        LOG.debug('Server stopped normally')\n    finally:\n        LOG.debug('Stopping the threads')\n        # [KN] FIXME Implement shutdown in WorkPlanner\n        for thread in threads_to_wait:\n            thread.stop()\n        for thread in threads_to_wait:\n            thread.join()\n\n        LOG.info('The http server has stopped')",
+      "calls": [
+        "BQProcessor",
+        "ConfObjUtil",
+        "InboxFilter",
+        "OffsetStorage",
+        "get_sns_status",
+        "process_bq_update",
+        "process_ha_states",
+        "process_sns_operation"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "BQProcessor",
+        "ConfObjUtil",
+        "ConsulUtil",
+        "DeliveryHerald",
+        "InboxFilter",
+        "LOG",
+        "List",
+        "OffsetStorage",
+        "SnsRebalanceStatus",
+        "SnsRepairStatus",
+        "StoppableThread",
+        "WorkPlanner",
+        "encode_exception",
+        "get_sns_status",
+        "hello_reply",
+        "process_bq_update",
+        "process_ha_states",
+        "process_sns_operation",
+        "web"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "WorkPlanner",
+        "thread.stop",
+        "thread.join"
+      ],
+      "reason": "These methods are essential for understanding how to implement the shutdown functionality in WorkPlanner, as they directly relate to managing threads during the server's shutdown process."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "WorkPlanner",
+        "path": "hax/hax/motr/planner.py",
+        "class_name": null,
+        "start_line": 50,
+        "end_line": 190,
+        "source": "class WorkPlanner:\n    \"\"\"\n    Thread synchronizing block that is used as a work planner for Motr-aware\n    threads (see ConsumerThread). This synchronizing primitive guarantees that\n\n    1. The messages can be processed by an arbitrary number of ConsumerThread\n       threads.\n\n    2. The parallelism doesn't break semantics (some messages can be processed\n       in parallel to others, while some other not; the ConsumerThread's don't\n       need to worry about that).\n    \"\"\"\n    def __init__(self):\n        self.state = State(next_group_id=0,\n                           active_commands=LinkedSet(),\n                           taken_commands=LinkedSet(),\n                           current_group_id=0,\n                           next_group_commands=LinkedSet())\n        self.backlog: Deque[BaseMessage] = deque()\n        self.b_lock = Condition()\n\n    def is_empty(self) -> bool:\n        with self.b_lock:\n            return not self.backlog\n\n    def add_command(self, command: BaseMessage) -> None:\n        LOG.log(TRACE, '[WP]Before add_command: %s', command)\n        with self.b_lock:\n            cmd = self._assign_group(command)\n            LOG.log(TRACE, '[WP]Cmd %s is added. Current state: %s', cmd,\n                    self.state)\n            self.backlog.append(cmd)\n            # Some threads may be waiting because of an empty backlog - let's\n            # notify them\n            self.b_lock.notifyAll()\n\n    def get_next_command(self) -> BaseMessage:\n        # TODO think of is_stopped and shutdown procedure\n        while True:\n            LOG.log(TRACE, '[WP]Trying to get new command')\n            with self.b_lock:\n                if self.backlog:\n                    cmd = self.backlog.popleft()\n                    LOG.log(TRACE, '[WP]Cmd %s taken!', cmd)\n                    self.state.taken_commands.add(cmd)\n                    return cmd\n                LOG.log(TRACE, '[WP]Blocking thread: no commands in backlog')\n                self.b_lock.wait()\n\n    def ensure_allowed(self, command: BaseMessage) -> None:\n        def is_current(cmd: BaseMessage, st: State) -> bool:\n            return cmd.group == st.current_group_id\n\n        while True:\n            with self.b_lock:\n                state = self.state\n                if is_current(command, state):\n                    state.taken_commands.remove(command)\n                    state.active_commands.add(command)\n                    return\n                LOG.log(TRACE, '[WP]Cmd %s not allowed for now.'\n                        ' Current state: %s', command, self.state)\n                self.b_lock.wait()\n\n    def _inc_group(self):\n        state = self.state\n        state.current_group_id += 1\n        if state.next_group_id < state.current_group_id:\n            state.next_group_id = state.current_group_id\n            state.next_group_commands = LinkedSet()\n\n    def notify_finished(self, command: BaseMessage) -> None:\n        with self.b_lock:\n            state = self.state\n            state.active_commands.remove(command)\n            LOG.log(TRACE, '[WP]Cmd %s removed. Current state: %s', command,\n                    state)\n\n            if state.active_commands:\n                return\n            for c in self.backlog:\n                if c.group == state.current_group_id:\n                    return\n            for c in state.taken_commands:\n                if c.group == state.current_group_id:\n                    return\n            # if we're here, command was the only one belonging to group\n            self._inc_group()\n            LOG.log(TRACE, '[WP]Active group changed to %s',\n                    state.current_group_id)\n            # The group changed, let's unblock those who are waiting for\n            # this group\n            self.b_lock.notifyAll()\n\n    def _should_increase_group(self, cmd: BaseMessage) -> bool:\n        def has(cmd_type: Type[BaseMessage]) -> bool:\n            ''' Checks if the group being currently formed (i.e. next_group)\n                contains a message of the given type.\n            '''\n            return cmd_type in self.state.next_group_commands\n\n        if not self.state.next_group_commands:\n            # current group is empty -> join it freely\n            return False\n        if isinstance(cmd, HaNvecGetEvent):\n            # HaNvecGetEvent can be done in parallel to any other commands.\n            # No need to form the new group for it.\n            return False\n        if isinstance(cmd, AnyEntrypointRequest):\n            # if the current group has a BroadcastHAStates request,\n            # then this entrypoint request should be placed to a next group.\n            return has(BroadcastHAStates)\n        if isinstance(cmd, BroadcastHAStates):\n            return True\n\n        if isinstance(cmd, SnsOperation):\n            # Start new group if there is another SNS operation within the\n            # current group.\n            return has(SnsOperation)\n        return False\n\n    def _assign_group(self, cmd: BaseMessage) -> BaseMessage:\n        ''' Sets the correct group_id to the command.\n            Must be invoked with b_lock acquired.\n        '''\n        def join_group(cmd: BaseMessage) -> BaseMessage:\n            cmd.group = self.state.next_group_id\n            self.state.next_group_commands.add(type(cmd))\n            return cmd\n\n        def inc_group() -> None:\n            self.state.next_group_commands = LinkedSet()\n            self.state.next_group_id += 1\n\n        if isinstance(cmd, Die):\n            return join_group(cmd)\n\n        if self._should_increase_group(cmd):\n            inc_group()\n\n        return join_group(cmd)",
+        "found": true
+      },
+      {
+        "method_name": "FsStatsUpdater.stop",
+        "path": "hax/hax/filestats.py",
+        "class_name": "FsStatsUpdater",
+        "start_line": 41,
+        "end_line": 44,
+        "source": "def stop(self) -> None:\n        LOG.debug('Stop signal received')\n        self.stopped = True\n        self.event.set()",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "thread.join"
+    ]
+  },
+  "review_context": {}
+}

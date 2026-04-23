@@ -29,7 +29,7 @@ from .schema import (
 )
 
 
-VALID_DECISIONS = {"repairable", "drop", "needs_more_context"}
+VALID_DECISIONS = {"repairable", "drop", "needs_more_context"}  
 FINAL_DECISIONS = {"repairable", "drop"}
 VALID_SCOPE_RADII = {"line", "function", "class", "file", "multi_file"}
 VALID_DROP_REASONS = {
@@ -80,8 +80,8 @@ class OpenAICompatClient:
     ) -> dict[str, Any]:
         last_error: Exception | None = None
         sanitized = False
-        active_system_prompt = system_prompt
-        active_user_prompt = user_prompt
+        active_system_prompt = self._coerce_prompt_text(system_prompt)
+        active_user_prompt = self._coerce_prompt_text(user_prompt)
         active_model = self.model
         label = request_label or "llm_request"
         for attempt in range(self.max_attempts):
@@ -157,8 +157,8 @@ class OpenAICompatClient:
         return "content_filter" in message or "content management policy" in message
 
     def _sanitize_prompts(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
-        compact_system = system_prompt + " Prefer concise evidence use and avoid unnecessary raw excerpts."
-        compact_user = user_prompt
+        compact_system = self._coerce_prompt_text(system_prompt) + " Prefer concise evidence use and avoid unnecessary raw excerpts."
+        compact_user = self._coerce_prompt_text(user_prompt)
         compact_user = re.sub(
             r"(Base \+ repair \+ review context:\n)[\s\S]*",
             r"\1[context compacted for safety; rely on metadata and direct task evidence]",
@@ -196,6 +196,15 @@ class OpenAICompatClient:
         )
         compact_user = re.sub(r"\n{3,}", "\n\n", compact_user)
         return compact_system, compact_user
+
+    def _coerce_prompt_text(self, prompt: Any) -> str:
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, (list, tuple)):
+            return "".join(self._coerce_prompt_text(item) for item in prompt)
+        if prompt is None:
+            return ""
+        return str(prompt)
     def build_base_context(self, state: GraphState, existing_bundle: dict[str, Any] | None = None) -> dict[str, Any]:
         bundle = self._ensure_bundle(existing_bundle, state)
         metadata = bundle.setdefault("metadata", {})

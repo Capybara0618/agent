@@ -1,0 +1,116 @@
+{
+  "task_id": "693",
+  "repo_owner": "openstack",
+  "repo_name": "senlin",
+  "file_path": "senlin/engine/service.py",
+  "commit": "87203d63c781604bf73c136a8ce0f2082506992d",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-22T02:14:37+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "87203d63c781604bf73c136a8ce0f2082506992d",
+    "symbol_name": "profile_find",
+    "satd_line": 187,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-22T02:17:35+00:00",
+    "identified_method_count": 4,
+    "retrieved_method_count": 2,
+    "missing_method_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "senlin/engine/service.py",
+    "original_signature": "def profile_find(self, context, identity):",
+    "target_file": {
+      "ok": true,
+      "path": "senlin/engine/service.py",
+      "sha": "63bf25e269f5b4c88841e9cb5d2fd0a702b27e26",
+      "download_url": "https://raw.githubusercontent.com/openstack-archive/senlin/87203d63c781604bf73c136a8ce0f2082506992d/senlin/engine/service.py",
+      "content_excerpt": "# Licensed under the Apache License, Version 2.0 (the \"License\"); you may\n# not use this file except in compliance with the License. You may obtain\n# a copy of the License at\n#\n#         http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS, WITHOUT\n# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the\n# License for the specific language governing permissions and limitations\n# under the License.\n\nimport functools\nimport random\n\nfrom oslo import messaging\nfrom oslo_config import cfg\nfrom oslo_utils import uuidutils\nfrom osprofiler import profiler\n\nfrom senlin.common import consts\nfrom senlin.common import context\nfrom senlin.common import exception\nfrom senlin.common.i18n import _\nfrom senlin.common.i18n import _LI\nfrom senlin.common import messaging as rpc_messaging\nfrom senlin.db import api as db_api\nfrom senlin.engine.actions import base as action_mod\nfrom senlin.engine import cluster as cluster_mod\nfrom senlin.engine import dispatcher\nfrom senlin.engine import environment\nfrom senlin.engine import node as node_mod\nfrom senlin.engine import scheduler\nfrom senlin.engine import senlin_lock\nfrom senlin.openstack.common import log as logging\nfrom senlin.openstack.common import service\nfrom senlin.policies import base as policy_base\nfrom senlin.profiles import base as profile_base\n\nLOG = logging.getLogger(__name__)\n\nservice_opts = [\n    cfg.IntOpt('periodic_interval_max',\n               default=60,\n               help='Seconds between periodic tasks to be called'),\n    cfg.BoolOpt('periodic_enable',\n                default=True,\n                help='Enable periodic tasks'),\n    cfg.IntOpt('periodic_fuzzy_delay',\n               default=60,\n               help='Range of seconds to randomly delay when starting the'\n                    ' periodic task scheduler to reduce stampeding.'\n                    ' (Disable by setting to 0)'),\n]\n\nCONF = cfg.CONF\nCONF.register_opts(service_opts)\n\n\ndef request_context(func):\n    @functools.wraps(func)\n    def wrapped(self, ctx, *args, **kwargs):\n        if ctx is not None and not isinstance(ctx, context.RequestContext):\n            ctx = context.RequestContext.from_dict(ctx.to_dict())\n        try:\n            return func(self, ctx, *args, **kwargs)\n        except exception.SenlinException:\n            raise messaging.rpc.dispatcher.ExpectedException()\n    return wrapped\n\n\n@profiler.trace_cls(\"rpc\")\nclass EngineService(service.Service):\n    '''Manages the running instances from creation to destruction.\n\n    All the methods in here are called from the RPC backend.  This is\n    all done dynamically so if a call is made via RPC that does not\n    have a corresponding method here, an exception will be thrown when\n    it attempts to call into this class.  Arguments to these methods\n    are also dynamically added and will be named as keyword arguments\n    by the RPC caller.\n    '''\n\n    def __init__(self, host, topic, manager=None,\n                 periodic_enable=None, periodic_fuzzy_delay=None,\n                 periodic_interval_max=None):\n\n        super(EngineService, self).__init__()\n        # TODO(Qiming): call environment.initialize() when environment\n        # is ready\n        self.host = host\n        self.topic = topic\n        self.dispatcher_topic = consts.ENGINE_DISPATCHER_TOPIC\n\n        #params for periodic running task\n        if periodic_interval_max is None:\n            periodic_interval_max = CONF.periodic_interval_max\n        if periodic_enable is None:\n            periodic_enable = CONF.periodic_enable\n        if periodic_fuzzy_delay is None:\n            periodic_fuzzy_delay = CONF.periodic_fuzzy_delay\n\n        self.periodic_interval_max = periodic_interval_max\n        self.periodic_enable = periodic_enable\n        self.periodic_fuzzy_delay = periodic_fuzzy_delay\n\n        # The following are initialized here, but assigned in start() which\n        # happens after the fork when spawning multiple worker processes\n        self.engine_id = None\n        self.TG = None\n        self.target = None\n\n    def start(self):\n        self.engine_id = senlin_lock.BaseLock.generate_engine_id()\n        self.TG = scheduler.ThreadGroupManager()\n\n        # TODO(Yanyan): create a dispatcher for this engine thread.\n        # This dispatcher will run in a greenthread and it will not\n        # stop until being notified or the engine is stopped.\n        self.dispatcher = dispatcher.Dispatcher(self,\n                                                self.dispatcher_topic,\n                                                consts.RPC_API_VERSION,\n                                                self.TG)\n        LOG.debug(\"Starting dispatcher for engine %s\" % self.engine_id)\n\n        if self.periodic_enable:\n            if self.periodic_fuzzy_delay:\n                initial_delay = random.randint(0, self.periodic_fuzzy_delay)\n            else:\n                initial_delay = None\n\n            self.tg.add_dynamic_timer(self.periodic_tasks,\n                                      initial_delay=initial_delay,\n                                      periodic_interval_max=\n                                      self.periodic_interval_max)\n\n        self.dispatcher.start()\n\n        target = messaging.Target(version=consts.RPC_API_VERSION,\n                                  server=self.host,\n                                  topic=self.topic)\n        self.target = target\n        server = rpc_messaging.get_rpc_server(target, self)\n        server.start()\n        environment.initialize()\n        super(EngineService, self).start()\n\n    def stop(self):\n        # Stop rpc connection at first for preventing new requests\n        LOG.info(_LI(\"Attempting to stop engine service...\"))\n        try:\n            self.conn.close()\n        except Exception:\n            pass\n\n        # Notify dispatcher to stop all action threads it started.\n        self.dispatcher.stop()\n\n        # Terminate the engine process\n        LOG.info(_LI(\"All threads were gone, terminating engine\"))\n        super(EngineService, self).stop()\n\n    def periodic_tasks(self, raise_on_error=False):\n        \"\"\"Tasks to be run at a periodic interval.\"\"\"\n        #TODO(anyone): iterate clusters and call their periodic_tasks\n        return self.periodic_interval_max\n\n    @request_context\n    def get_revision(self, context):\n        return cfg.CONF.revision['senlin_engine_revision']\n\n    @request_context\n    def profile_type_list(self, context):\n        return environment.global_env().get_profile_types()\n\n    @request_context\n    def profile_type_spec(self, context, type_name):\n        return {}\n\n    @request_context\n    def profile_type_template(self, context, type_name):\n        return {}\n\n    @request_context\n    def profile_find(self, context, identity):\n        '''Find a profile with the given identity (could be name or ID).'''\n        # TODO(anyone): add support to show_deleted\n        if uuidutils.is_uuid_like(identity):\n            profile = db_api.profile_get(context, identity)\n            if not profile:\n                profile = db_api.profile_get_by_name(context, identity)\n        else:\n            profile = db_api.profile_get_by_name(context, identity)\n            if not profile:\n                profile = db_api.profile_get_by_short_id(context, identity)\n\n        if not profile:\n            raise exception.ProfileNotFound(profile=identity)\n\n        return profile\n\n    @request_context\n    def profile_list(self, context, limit=None, marker=None, sort_keys=None,\n                     sort_dir=None, filters=None, show_deleted=False):\n        profiles = profile_base.Profile.load_all(context, limit=limit,\n                                                 marker=marker,\n                                                 sort_keys=sort_keys,\n                                                 sort_dir=sort_dir,\n                                                 filters=filters,\n                                                 show_deleted=show_deleted)\n\n        return [p.to_dict() for p in profiles]\n\n    @request_context\n    def profile_create(self, context, name, type, spec, perm, tags):\n        LOG.info(_LI('Creating profile %s:%s'), type, name)\n        # validate type\n        plugin = environment.global_env().get_profile(type)\n\n        kwargs = {\n            'spec': spec,\n            'permission': perm,\n            'tags': tags,\n        }\n        profile = plugin(type, name, **kwargs)\n        profile.store(context)\n        return profile.to_dict()\n\n    @request_context\n    def profile_get(self, context, identity):\n        db_profile = self.profile_find(context, identity)\n        profile = profile_base.Profile.load(context, profile=db_profile)\n        return profile.to_dict()\n\n    @request_context\n    def profile_update(self, context, profile_id, name, spec, perm, tags):\n        return {}\n\n    @request_context\n    def profile_delete(self, context, identity):\n        db_profile = self.profile_find(context, identity)\n        LOG.info(_LI('Delete profile: %s'), identity)\n        profile_base.Profile.delete(context, db_profile.id)\n        return None\n\n    @request_context\n    def policy_type_list(self, context):\n        return environment.global_env().get_policy_types()\n\n    @request_context\n    def policy_type_spec(self, context, type_name):\n        return {}\n\n    @request_context\n    def policy_type_template(self, context, type_name):\n        return {}\n\n    @request_context\n    def policy_find(self, context, identity, show_deleted=False):\n        '''Find a policy with the given identity (could be name or ID).'''\n\n        if uuidutils.is_uuid_like(identity):\n            policy = db_api.policy_get(context, identity,\n                                       show_deleted=show_deleted)\n            if not policy:\n                policy = db_api.policy_get_by_name(context, identity)\n        else:\n            policy = db_api.policy_get_by_name(context, identity)\n            if not policy:\n                policy = db_api.policy_get_by_short_id(context, identity)\n\n        if not policy:\n            raise exception.PolicyNotFound(policy=identity)\n\n        return policy\n\n    @request_context\n    def policy_list(self, context, limit=None, marker=None, sort_keys=None,\n                    sort_dir=None, filters=None, show_deleted=False):\n        policies = policy_base.Policy.load_all(context, limit=limit,\n                                               marker=marker,\n                                               sort_keys=sort_keys,\n                                               sort_dir=sort_dir,\n                                               filters=filters,\n                                               show_deleted=show_deleted)\n\n        return [p.to_dict() for p in policies]\n\n    @request_context\n    def policy_create(self, context, name, type, spec, level=None,\n                      cooldown=None):\n        LOG.info(_LI('Creating policy %s:%s'), type, name)\n        plugin = environment.global_env().get_policy(type)\n\n        kwargs = {\n            'spec': spec,\n            'level': level,\n            'cooldown': cooldown,\n        }\n        policy = plugin(type, name, **kwargs)\n        policy.store(context)\n        return policy.to_dict()\n\n    @request_context\n    def policy_get(self, context, identity):\n        db_policy = self.policy_find(context, identity)\n        policy = policy_base.Policy.load(context, policy=db_policy)\n        return policy.to_dict()\n\n    @request_context\n    def policy_update(self, context, identity, name, spec, level, cooldown):\n        return {}\n\n    @request_context\n    def policy_delete(self, context, identity):\n        db_policy = self.policy_find(context, identity)\n        LOG.info(_LI('Delete policy: %s'), identity)\n        policy_base.Policy.delete(context, db_policy.id)\n        return None\n\n    @request_context\n    def cluster_list(self, context, limit=None, marker=No",
+      "total_lines": 692,
+      "ref": "87203d63c781604bf73c136a8ce0f2082506992d"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "profile_find",
+      "class_name": "EngineService",
+      "start_line": 185,
+      "end_line": 200,
+      "satd_line": 187,
+      "matched_by": "normalized_source",
+      "source": "    def profile_find(self, context, identity):\n        '''Find a profile with the given identity (could be name or ID).'''\n        # TODO(anyone): add support to show_deleted\n        if uuidutils.is_uuid_like(identity):\n            profile = db_api.profile_get(context, identity)\n            if not profile:\n                profile = db_api.profile_get_by_name(context, identity)\n        else:\n            profile = db_api.profile_get_by_name(context, identity)\n            if not profile:\n                profile = db_api.profile_get_by_short_id(context, identity)\n\n        if not profile:\n            raise exception.ProfileNotFound(profile=identity)\n\n        return profile",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "db_api",
+        "exception",
+        "profile",
+        "request_context",
+        "uuidutils"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "show_deleted",
+        "db_api.profile_get",
+        "db_api.profile_get_by_name",
+        "db_api.profile_get_by_short_id"
+      ],
+      "reason": "These methods are directly involved in the profile retrieval process, which is where the 'show_deleted' support needs to be integrated."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "profile_get",
+        "path": "senlin/db/api.py",
+        "class_name": null,
+        "start_line": 227,
+        "end_line": 228,
+        "source": "def profile_get(context, profile_id):\n    return IMPL.profile_get(context, profile_id)",
+        "found": true
+      },
+      {
+        "method_name": "profile_get_by_name",
+        "path": "senlin/db/api.py",
+        "class_name": null,
+        "start_line": 231,
+        "end_line": 232,
+        "source": "def profile_get_by_name(context, name, show_deleted=False):\n    return IMPL.profile_get_by_name(context, name, show_deleted=show_deleted)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "show_deleted"
+    ]
+  },
+  "review_context": {}
+}

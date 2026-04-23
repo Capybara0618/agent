@@ -1,0 +1,118 @@
+{
+  "task_id": "968",
+  "repo_owner": "apache",
+  "repo_name": "airflow",
+  "file_path": "airflow/providers/elasticsearch/log/es_task_handler.py",
+  "commit": "f9e9d23457cba5d3e18b5bdb7b65ecc63735b65b",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-23T01:42:04+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "f9e9d23457cba5d3e18b5bdb7b65ecc63735b65b",
+    "symbol_name": "close",
+    "satd_line": 367,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-23T02:24:04+00:00",
+    "identified_method_count": 4,
+    "retrieved_method_count": 1,
+    "missing_method_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "airflow/providers/elasticsearch/log/es_task_handler.py",
+    "original_signature": "def close(self) -> None:",
+    "target_file": {
+      "ok": true,
+      "path": "airflow/providers/elasticsearch/log/es_task_handler.py",
+      "sha": "0c521e2c50bb95c5303fc5142838488d1cafce6a",
+      "download_url": "https://raw.githubusercontent.com/apache/airflow/f9e9d23457cba5d3e18b5bdb7b65ecc63735b65b/airflow/providers/elasticsearch/log/es_task_handler.py",
+      "content_excerpt": "#\n# Licensed to the Apache Software Foundation (ASF) under one\n# or more contributor license agreements.  See the NOTICE file\n# distributed with this work for additional information\n# regarding copyright ownership.  The ASF licenses this file\n# to you under the Apache License, Version 2.0 (the\n# \"License\"); you may not use this file except in compliance\n# with the License.  You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing,\n# software distributed under the License is distributed on an\n# \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n# KIND, either express or implied.  See the License for the\n# specific language governing permissions and limitations\n# under the License.\nfrom __future__ import annotations\n\nimport logging\nimport sys\nimport warnings\nfrom collections import defaultdict\nfrom datetime import datetime\nfrom operator import attrgetter\nfrom time import time\nfrom typing import TYPE_CHECKING, List, Tuple\nfrom urllib.parse import quote\n\n# Using `from elasticsearch import *` would break elasticsearch mocking used in unit test.\nimport elasticsearch\nimport pendulum\nfrom elasticsearch_dsl import Search\n\nfrom airflow.configuration import conf\nfrom airflow.models.dagrun import DagRun\nfrom airflow.models.taskinstance import TaskInstance\nfrom airflow.providers.elasticsearch.log.es_json_formatter import ElasticsearchJSONFormatter\nfrom airflow.utils import timezone\nfrom airflow.utils.log.file_task_handler import FileTaskHandler\nfrom airflow.utils.log.logging_mixin import ExternalLoggingMixin, LoggingMixin\nfrom airflow.utils.session import create_session\n\nLOG_LINE_DEFAULTS = {\"exc_text\": \"\", \"stack_info\": \"\"}\n# Elasticsearch hosted log type\nEsLogMsgType = List[Tuple[str, str]]\n\n# Compatibility: Airflow 2.3.3 and up uses this method, which accesses the\n# LogTemplate model to record the log ID template used. If this function does\n# not exist, the task handler should use the log_id_template attribute instead.\nUSE_PER_RUN_LOG_ID = hasattr(DagRun, \"get_log_template\")\n\n\nclass ElasticsearchTaskHandler(FileTaskHandler, ExternalLoggingMixin, LoggingMixin):\n    \"\"\"\n    ElasticsearchTaskHandler is a python log handler that\n    reads logs from Elasticsearch. Note that Airflow does not handle the indexing\n    of logs into Elasticsearch. Instead, Airflow flushes logs\n    into local files. Additional software setup is required\n    to index the logs into Elasticsearch, such as using\n    Filebeat and Logstash.\n    To efficiently query and sort Elasticsearch results, this handler assumes each\n    log message has a field `log_id` consists of ti primary keys:\n    `log_id = {dag_id}-{task_id}-{execution_date}-{try_number}`\n    Log messages with specific log_id are sorted based on `offset`,\n    which is a unique integer indicates log message's order.\n    Timestamps here are unreliable because multiple log messages\n    might have the same timestamp.\n    \"\"\"\n\n    PAGE = 0\n    MAX_LINE_PER_PAGE = 1000\n    LOG_NAME = \"Elasticsearch\"\n\n    trigger_should_wrap = True\n\n    def __init__(\n        self,\n        base_log_folder: str,\n        end_of_log_mark: str,\n        write_stdout: bool,\n        json_format: bool,\n        json_fields: str,\n        host_field: str = \"host\",\n        offset_field: str = \"offset\",\n        host: str = \"localhost:9200\",\n        frontend: str = \"localhost:5601\",\n        index_patterns: str | None = conf.get(\"elasticsearch\", \"index_patterns\", fallback=\"_all\"),\n        es_kwargs: dict | None = conf.getsection(\"elasticsearch_configs\"),\n        *,\n        filename_template: str | None = None,\n        log_id_template: str | None = None,\n    ):\n        \"\"\"\n        :param base_log_folder: base folder to store logs locally\n        :param log_id_template: log id template\n        :param host: Elasticsearch host name\n        \"\"\"\n        es_kwargs = es_kwargs or {}\n        super().__init__(base_log_folder, filename_template)\n        self.closed = False\n\n        self.client = elasticsearch.Elasticsearch(host.split(\";\"), **es_kwargs)  # type: ignore[attr-defined]\n\n        if USE_PER_RUN_LOG_ID and log_id_template is not None:\n            warnings.warn(\n                \"Passing log_id_template to ElasticsearchTaskHandler is deprecated and has no effect\",\n                DeprecationWarning,\n            )\n\n        self.log_id_template = log_id_template  # Only used on Airflow < 2.3.2.\n        self.frontend = frontend\n        self.mark_end_on_close = True\n        self.end_of_log_mark = end_of_log_mark.strip()\n        self.write_stdout = write_stdout\n        self.json_format = json_format\n        self.json_fields = [label.strip() for label in json_fields.split(\",\")]\n        self.host_field = host_field\n        self.offset_field = offset_field\n        self.index_patterns = index_patterns\n        self.context_set = False\n\n        self.formatter: logging.Formatter\n        self.handler: logging.FileHandler | logging.StreamHandler  # type: ignore[assignment]\n\n    def _render_log_id(self, ti: TaskInstance, try_number: int) -> str:\n        with create_session() as session:\n            dag_run = ti.get_dagrun(session=session)\n            if USE_PER_RUN_LOG_ID:\n                log_id_template = dag_run.get_log_template(session=session).elasticsearch_id\n            else:\n                log_id_template = self.log_id_template\n\n        try:\n            dag = ti.task.dag\n        except AttributeError:  # ti.task is not always set.\n            data_interval = (dag_run.data_interval_start, dag_run.data_interval_end)\n        else:\n            if TYPE_CHECKING:\n                assert dag is not None\n            data_interval = dag.get_run_data_interval(dag_run)\n\n        if self.json_format:\n            data_interval_start = self._clean_date(data_interval[0])\n            data_interval_end = self._clean_date(data_interval[1])\n            execution_date = self._clean_date(dag_run.execution_date)\n        else:\n            if data_interval[0]:\n                data_interval_start = data_interval[0].isoformat()\n            else:\n                data_interval_start = \"\"\n            if data_interval[1]:\n                data_interval_end = data_interval[1].isoformat()\n            else:\n                data_interval_end = \"\"\n            execution_date = dag_run.execution_date.isoformat()\n\n        return log_id_template.format(\n            dag_id=ti.dag_id,\n            task_id=ti.task_id,\n            run_id=getattr(ti, \"run_id\", \"\"),\n            data_interval_start=data_interval_start,\n            data_interval_end=data_interval_end,\n            execution_date=execution_date,\n            try_number=try_number,\n            map_index=getattr(ti, \"map_index\", \"\"),\n        )\n\n    @staticmethod\n    def _clean_date(value: datetime | None) -> str:\n        \"\"\"\n        Clean up a date value so that it is safe to query in elasticsearch\n        by removing reserved characters.\n\n        https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-query-string-query.html#_reserved_characters\n        \"\"\"\n        if value is None:\n            return \"\"\n        return value.strftime(\"%Y_%m_%dT%H_%M_%S_%f\")\n\n    def _group_logs_by_host(self, logs):\n        grouped_logs = defaultdict(list)\n        for log in logs:\n            key = getattr_nested(log, self.host_field, None) or \"default_host\"\n            grouped_logs[key].append(log)\n\n        return grouped_logs\n\n    def _read_grouped_logs(self):\n        return True\n\n    def _read(\n        self, ti: TaskInstance, try_number: int, metadata: dict | None = None\n    ) -> tuple[EsLogMsgType, dict]:\n        \"\"\"\n        Endpoint for streaming log.\n\n        :param ti: task instance object\n        :param try_number: try_number of the task instance\n        :param metadata: log metadata,\n                         can be used for steaming log reading and auto-tailing.\n        :return: a list of tuple with host and log documents, metadata.\n        \"\"\"\n        if not metadata:\n            metadata = {\"offset\": 0}\n        if \"offset\" not in metadata:\n            metadata[\"offset\"] = 0\n\n        offset = metadata[\"offset\"]\n        log_id = self._render_log_id(ti, try_number)\n\n        logs = self.es_read(log_id, offset, metadata)\n        logs_by_host = self._group_logs_by_host(logs)\n\n        next_offset = offset if not logs else attrgetter(self.offset_field)(logs[-1])\n\n        # Ensure a string here. Large offset numbers will get JSON.parsed incorrectly\n        # on the client. Sending as a string prevents this issue.\n        # https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER\n        metadata[\"offset\"] = str(next_offset)\n\n        # end_of_log_mark may contain characters like '\\n' which is needed to\n        # have the log uploaded but will not be stored in elasticsearch.\n        metadata[\"end_of_log\"] = False\n        for logs in logs_by_host.values():\n            if logs[-1].message == self.end_of_log_mark:\n                metadata[\"end_of_log\"] = True\n\n        cur_ts = pendulum.now()\n        if \"last_log_timestamp\" in metadata:\n            last_log_ts = timezone.parse(metadata[\"last_log_timestamp\"])\n\n            # if we are not getting any logs at all after more than N seconds of trying,\n            # assume logs do not exist\n            if int(next_offset) == 0 and cur_ts.diff(last_log_ts).in_seconds() > 5:\n                metadata[\"end_of_log\"] = True\n                missing_log_message = (\n                    f\"*** Log {log_id} not found in Elasticsearch. \"\n                    \"If your task started recently, please wait a moment and reload this page. \"\n                    \"Otherwise, the logs for this task instance may have been removed.\"\n                )\n                return [(\"\", missing_log_message)], metadata\n            if (\n                # Assume end of log after not receiving new log for N min,\n                cur_ts.diff(last_log_ts).in_minutes() >= 5\n                # if max_offset specified, respect it\n                or (\"max_offset\" in metadata and int(offset) >= int(metadata[\"max_offset\"]))\n            ):\n                metadata[\"end_of_log\"] = True\n\n        if int(offset) != int(next_offset) or \"last_log_timestamp\" not in metadata:\n            metadata[\"last_log_timestamp\"] = str(cur_ts)\n\n        # If we hit the end of the log, remove the actual end_of_log message\n        # to prevent it from showing in the UI.\n        def concat_logs(lines):\n            log_range = (len(lines) - 1) if lines[-1].message == self.end_of_log_mark else len(lines)\n            return \"\\n\".join(self._format_msg(lines[i]) for i in range(log_range))\n\n        message = [(host, concat_logs(hosted_log)) for host, hosted_log in logs_by_host.items()]\n\n        return message, metadata\n\n    def _format_msg(self, log_line):\n        \"\"\"Format ES Record to match settings.LOG_FORMAT when used with json_format\"\"\"\n        # Using formatter._style.format makes it future proof i.e.\n        # if we change the formatter style from '%' to '{' or '$', this will still work\n        if self.json_format:\n            try:\n                return self.formatter._style.format(\n                    logging.makeLogRecord({**LOG_LINE_DEFAULTS, **log_line.to_dict()})\n                )\n            except Exception:\n                pass\n\n        # Just a safe-guard to preserve backwards-compatibility\n        return log_line.message\n\n    def es_read(self, log_id: str, offset: str, metadata: dict) -> list:\n        \"\"\"\n        Returns the logs matching log_id in Elasticsearch and next offset.\n        Returns '' if no log is found or there was an error.\n\n        :param log_id: the log_id of the log to read.\n        :param offset: the offset start to read log from.\n        :param metadata: log metadata, used for steaming log download.\n        \"\"\"\n        # Offset is the unique key for sorting logs given log_id.\n        search = (\n            Search(index=self.index_patterns, using=s",
+      "total_lines": 430,
+      "ref": "f9e9d23457cba5d3e18b5bdb7b65ecc63735b65b"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "close",
+      "class_name": "ElasticsearchTaskHandler",
+      "start_line": 359,
+      "end_line": 393,
+      "satd_line": 367,
+      "matched_by": "normalized_source",
+      "source": "    def close(self) -> None:\n        # When application exit, system shuts down all handlers by\n        # calling close method. Here we check if logger is already\n        # closed to prevent uploading the log to remote storage multiple\n        # times when `logging.shutdown` is called.\n        if self.closed:\n            return\n\n        # todo: remove `getattr` when min airflow version >= 2.6\n        if not self.mark_end_on_close or getattr(self, \"ctx_task_deferred\", None):\n            # when we're closing due to task deferral, don't mark end of log\n            self.closed = True\n            return\n\n        # Case which context of the handler was not set.\n        if self.handler is None:\n            self.closed = True\n            return\n\n        # Reopen the file stream, because FileHandler.close() would be called\n        # first in logging.shutdown() and the stream in it would be set to None.\n        if self.handler.stream is None or self.handler.stream.closed:  # type: ignore[attr-defined]\n            self.handler.stream = self.handler._open()  # type: ignore[union-attr]\n\n        # Mark the end of file using end of log mark,\n        # so we know where to stop while auto-tailing.\n        self.emit(logging.makeLogRecord({\"msg\": self.end_of_log_mark}))\n\n        if self.write_stdout:\n            self.handler.close()\n            sys.stdout = sys.__stdout__\n\n        super().close()\n\n        self.closed = True",
+      "calls": [
+        "getattr",
+        "super"
+      ],
+      "self_calls": [
+        "emit"
+      ],
+      "self_attrs": [
+        "closed",
+        "emit",
+        "end_of_log_mark",
+        "handler",
+        "mark_end_on_close",
+        "write_stdout"
+      ],
+      "global_uses": [
+        "logging",
+        "sys"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "handler._open",
+        "logging.makeLogRecord",
+        "emit",
+        "handler.close"
+      ],
+      "reason": "These methods are directly involved in the functionality of the close method, which is the focus of the repair. Understanding them is essential to ensure that the repair is effective and does not introduce new issues."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "emit",
+        "path": "airflow/providers/elasticsearch/log/es_task_handler.py",
+        "class_name": "ElasticsearchTaskHandler",
+        "start_line": 318,
+        "end_line": 321,
+        "source": "def emit(self, record):\n        if self.handler:\n            setattr(record, self.offset_field, int(time() * (10**9)))\n            self.handler.emit(record)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "StreamHandler._open",
+      "logging.makeLogRecord",
+      "StreamHandler.close"
+    ]
+  },
+  "review_context": {}
+}

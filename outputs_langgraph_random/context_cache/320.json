@@ -1,0 +1,120 @@
+{
+  "task_id": "320",
+  "repo_owner": "tensorflow",
+  "repo_name": "federated",
+  "file_path": "tensorflow_federated/python/program/file_release_manager.py",
+  "commit": "bbea0a2db620e9bd7d9c2ca96b7b0ba8875cc298",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-20T16:59:35+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "bbea0a2db620e9bd7d9c2ca96b7b0ba8875cc298",
+    "symbol_name": "release",
+    "satd_line": 278,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-20T17:16:36+00:00",
+    "identified_method_count": 5,
+    "retrieved_method_count": 2,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "tensorflow_federated/python/program/file_release_manager.py",
+    "original_signature": "async def release(",
+    "target_file": {
+      "ok": true,
+      "path": "tensorflow_federated/python/program/file_release_manager.py",
+      "sha": "9600d36880d948d3284aa678ab8fd6331447a11e",
+      "download_url": "https://raw.githubusercontent.com/google-parfait/tensorflow-federated/bbea0a2db620e9bd7d9c2ca96b7b0ba8875cc298/tensorflow_federated/python/program/file_release_manager.py",
+      "content_excerpt": "# Copyright 2021, The TensorFlow Federated Authors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#      http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Utilities for releasing values from a federated program to a file system.\n\nNote: This library uses `tf.io.gfile` to perform file system operations, this\nmeans that this library:\n\n  * supports all the file systems supported by `tf.io.gfile`\n  * encodes files in the same way as `tf.io.gfile`\n\"\"\"\n\nimport asyncio\nimport collections\nfrom collections.abc import Iterable, Mapping, Sequence\nimport csv\nimport enum\nimport os\nimport os.path\nimport random\nfrom typing import Optional, Union\n\nimport numpy as np\nimport tensorflow as tf\n\nfrom tensorflow_federated.python.common_libs import py_typecheck\nfrom tensorflow_federated.python.core.impl.types import computation_types\nfrom tensorflow_federated.python.program import file_utils\nfrom tensorflow_federated.python.program import release_manager\nfrom tensorflow_federated.python.program import structure_utils\nfrom tensorflow_federated.python.program import value_reference\n\n\nclass CSVKeyFieldnameNotFoundError(Exception):\n  \"\"\"Raised when a file does not contain the key fieldname.\"\"\"\n\n  def __init__(\n      self,\n      file_path: Union[bytes, str, os.PathLike[Union[bytes, str]]],\n      key_fieldname: str,\n  ):\n    super().__init__(\n        f'Expected the file {file_path} to contain the key fieldname of '\n        f'{key_fieldname}. It is possible that the file was not created by '\n        'a `tff.program.CSVFileReleaseManager` or was created with a different '\n        '`key_fieldname`.'\n    )\n\n\n@enum.unique\nclass CSVSaveMode(enum.Enum):\n  APPEND = 'append'\n  WRITE = 'write'\n\n\nclass CSVFileReleaseManager(\n    release_manager.ReleaseManager[release_manager.ReleasableStructure, int]\n):\n  \"\"\"A `tff.program.ReleaseManager` that releases values to a CSV file.\n\n  A `tff.program.CSVFileReleaseManager` is a utility for releasing values\n  from a federated program to a CSV file and is used to release values from\n  platform storage to customer storage in a federated program.\n\n  Values are released to the file system as a CSV file and are quoted as\n  strings. When the value is released, if the value is a value reference or a\n  structure containing value references, each value reference is materialized.\n  The value is then flattened, converted to a `numpy.ndarray`, and then\n  converted to a nested list of Python scalars, and released as a CSV file.\n  For example, `1` will be written as `'1'` and `tf.constant([[1, 1], [1, 1]])`\n  will be written as `'[[1, 1], [1, 1]]'`.\n\n  This manager can be configured to release values using a `save_mode` of either\n  `CSVSaveMode.APPEND` or `CSVSaveMode.WRITE`.\n\n  * In append mode, when a value is released, this manager will try and append\n    the value to the CSV file instead of overwriting the existing file. While\n    potentially more efficient, append mode is incompatible with compressed\n    files (e.g. `.bz2` formats) and encoded directories. This mode is equivalent\n    to write mode when releasing a value with a different structure than the\n    currently released values, so it may not be useful when values with\n    different structures are being released frequently.\n\n  * In write mode (or in append mode when releasing new structures), when a\n    value is realeased, this manager reads the entire CSV file and overwrites\n    the existing file with the additional values. This can be slower than append\n    mode, but is compatible with compressed files (e.g. `.bz2` formats) and\n    encoded directories.\n  \"\"\"\n\n  def __init__(\n      self,\n      file_path: Union[bytes, str, os.PathLike[Union[bytes, str]]],\n      save_mode: CSVSaveMode = CSVSaveMode.APPEND,\n      key_fieldname: str = 'key',\n  ):\n    \"\"\"Returns an initialized `tff.program.CSVFileReleaseManager`.\n\n    Args:\n      file_path: A path on the file system to save releases values. If this file\n        does not exist it will be created.\n      save_mode: A `tff.program.CSVSaveMode` specifying how to save released\n        values.\n      key_fieldname: A `str` specifying the fieldname used for the key when\n        saving released value.\n\n    Raises:\n      ValueError: If `file_path` or `key_fieldname` is an empty string.\n      CSVKeyFieldnameNotFoundError: If the file exists but does not contain a\n        fieldname of `key_fieldname`.\n    \"\"\"\n    py_typecheck.check_type(file_path, (bytes, str, os.PathLike))\n    if not file_path:\n      raise ValueError('Expected `file_path` to not be an empty string.')\n    py_typecheck.check_type(save_mode, CSVSaveMode)\n    py_typecheck.check_type(key_fieldname, str)\n    if not key_fieldname:\n      raise ValueError('Expected `key_fieldname` to not be an empty string.')\n\n    file_dir = os.path.dirname(file_path)\n    if not tf.io.gfile.exists(file_dir):\n      tf.io.gfile.makedirs(file_dir)\n    self._file_path = file_path\n    self._save_mode = save_mode\n    self._key_fieldname = key_fieldname\n\n    if tf.io.gfile.exists(self._file_path):\n      fieldnames, values = self._read_values()\n      if self._key_fieldname not in fieldnames:\n        raise CSVKeyFieldnameNotFoundError(self._file_path, self._key_fieldname)\n      if values:\n        self._latest_key = int(values[-1][self._key_fieldname])\n      else:\n        self._latest_key = None\n    else:\n      self._write_values([self._key_fieldname], [])\n      self._latest_key = None\n\n  def _read_values(self) -> tuple[list[str], list[dict[str, str]]]:\n    \"\"\"Returns a tuple of fieldnames and values from the managed CSV.\"\"\"\n    with tf.io.gfile.GFile(self._file_path, 'r') as file:\n      reader = csv.DictReader(file)\n      if reader.fieldnames is not None:\n        fieldnames = list(reader.fieldnames)\n      else:\n        fieldnames = []\n      values = list(reader)\n    return fieldnames, values\n\n  def _write_values(\n      self,\n      fieldnames: Sequence[str],\n      values: Iterable[Mapping[str, release_manager.ReleasableStructure]],\n  ) -> None:\n    \"\"\"Writes `fieldnames` and `values` to the managed CSV.\"\"\"\n    py_typecheck.check_type(fieldnames, Sequence)\n    if isinstance(fieldnames, str):\n      raise TypeError(\n          'Expected `fieldnames` to be a `Sequence` of `str`, found `str`.'\n      )\n    for fieldname in fieldnames:\n      py_typecheck.check_type(fieldname, str)\n    py_typecheck.check_type(values, Iterable)\n    for value in values:\n      py_typecheck.check_type(value, Mapping)\n      for key in value.keys():\n        py_typecheck.check_type(key, str)\n\n    path = os.fspath(self._file_path)\n\n    # Create a temporary file.\n    temp_path = f'{path}_temp{random.randint(1000, 9999)}'\n    if tf.io.gfile.exists(temp_path):\n      tf.io.gfile.remove(temp_path)\n\n    # Write to the temporary file.\n    with tf.io.gfile.GFile(temp_path, 'w') as file:\n      writer = csv.DictWriter(file, fieldnames=fieldnames)\n      writer.writeheader()\n      writer.writerows(values)\n\n    # Rename the temporary file to the final location atomically.\n    tf.io.gfile.rename(temp_path, self._file_path, overwrite=True)\n\n  async def _write_value(\n      self, value: Mapping[str, release_manager.ReleasableStructure]\n  ) -> None:\n    \"\"\"Writes `value` to the managed CSV.\"\"\"\n    py_typecheck.check_type(value, Mapping)\n    for key in value.keys():\n      py_typecheck.check_type(key, str)\n\n    loop = asyncio.get_running_loop()\n    fieldnames, values = await loop.run_in_executor(None, self._read_values)\n    fieldnames.extend([x for x in value.keys() if x not in fieldnames])\n    values.append(value)\n    await loop.run_in_executor(None, self._write_values, fieldnames, values)\n\n  async def _append_value(\n      self, value: Mapping[str, release_manager.ReleasableStructure]\n  ) -> None:\n    \"\"\"Appends `value` to the managed CSV.\"\"\"\n    py_typecheck.check_type(value, Mapping)\n    for key in value.keys():\n      py_typecheck.check_type(key, str)\n\n    def _read_fieldnames_only() -> list[str]:\n      with tf.io.gfile.GFile(self._file_path, 'r') as file:\n        reader = csv.DictReader(file)\n        if reader.fieldnames is not None:\n          fieldnames = list(reader.fieldnames)\n        else:\n          fieldnames = []\n      return fieldnames\n\n    def _append_value(\n        fieldnames: Sequence[str],\n        value: Mapping[str, release_manager.ReleasableStructure],\n    ) -> None:\n      try:\n        with tf.io.gfile.GFile(self._file_path, 'a') as file:\n          writer = csv.DictWriter(file, fieldnames=fieldnames)\n          writer.writerow(value)\n      except (tf.errors.PermissionDeniedError, csv.Error) as e:\n        raise PermissionError(\n            f'Could not append a value to the file {self._file_path}. It is '\n            'possible that this file is compressed or encoded. Please use '\n            'write mode instead of append mode to release values to this '\n            'file using a `tff.program.CSVFileReleaseManager`.'\n        ) from e\n\n    loop = asyncio.get_running_loop()\n    fieldnames = await loop.run_in_executor(None, _read_fieldnames_only)\n    if all(key in fieldnames for key in value.keys()):\n      await loop.run_in_executor(None, _append_value, fieldnames, value)\n    else:\n      await self._write_value(value)\n\n  async def _remove_values_greater_than_key(self, key: int) -> None:\n    \"\"\"Removes all values greater than `key` from the managed CSV.\"\"\"\n    py_typecheck.check_type(key, (int, np.integer))\n\n    if self._latest_key is None or key > self._latest_key:\n      return\n\n    loop = asyncio.get_running_loop()\n    if key < 0:\n      await loop.run_in_executor(\n          None, self._write_values, [self._key_fieldname], []\n      )\n      self._latest_key = None\n    else:\n      loop = asyncio.get_running_loop()\n      filtered_fieldnames = [self._key_fieldname]\n      filtered_values = []\n      _, values = await loop.run_in_executor(None, self._read_values)\n      for value in values:\n        current_key = int(value[self._key_fieldname])\n        if current_key <= key:\n          fieldnames = [x for x in value.keys() if x not in filtered_fieldnames]\n          filtered_fieldnames.extend(fieldnames)\n          filtered_values.append(value)\n      await loop.run_in_executor(\n          None, self._write_values, filtered_fieldnames, filtered_values\n      )\n      self._latest_key = key\n\n  # TODO: b/305743962 - Deprecate `type_signature` and temporarily give `key` a\n  # default value.\n  async def release(\n      self,\n      value: release_manager.ReleasableStructure,\n      type_signature: Optional[computation_types.Type] = None,\n      key: int = 0,\n  ) -> None:\n    \"\"\"Releases `value` from a federated program.\n\n    This method will atomically update the managed CSV file by removing all\n    values previously released with a key greater than or equal to `key` before\n    writing `value`.\n\n    Args:\n      value: A `tff.program.ReleasableStructure` to release.\n      type_signature: The `tff.Type` of `value`.\n      key: An integer used to reference the released `value`; `key` represents a\n        step in a federated program.\n    \"\"\"\n    del type_signature  # Unused.\n    py_typecheck.check_type(key, (int, np.integer))\n\n    _, materialized_value = await asyncio.gather(\n        self._remove_values_greater_than_key(key - 1),\n        value_reference.materialize_value(value),\n    )\n\n    flattened_value = structure_utils.flatten_with_name(materialized_value)\n\n    def _normalize(\n        value: value_reference.MaterializedValue,\n    ) -> value_reference.MaterializedValue:\n      if isinstance(value, tf.data.Dataset):\n        value = list(value)\n      return np.array(value).tolist()\n\n    no",
+      "total_lines": 451,
+      "ref": "bbea0a2db620e9bd7d9c2ca96b7b0ba8875cc298"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "release",
+      "class_name": "SavedModelFileReleaseManager",
+      "start_line": 387,
+      "end_line": 404,
+      "satd_line": 278,
+      "matched_by": "normalized_source",
+      "source": "  async def release(\n      self,\n      value: release_manager.ReleasableStructure,\n      type_signature: Optional[computation_types.Type] = None,\n      key: release_manager.Key = None,\n  ) -> None:\n    \"\"\"Releases `value` from a federated program.\n\n    Args:\n      value: A `tff.program.ReleasableStructure` to release.\n      type_signature: The `tff.Type` of `value`.\n      key: Used to reference (in the file system) the released `value`.\n    \"\"\"\n    del type_signature  # Unused.\n    path = self._get_path_for_key(key)\n    materialized_value = await value_reference.materialize_value(value)\n    flattened_value = structure_utils.flatten(materialized_value)\n    await file_utils.write_saved_model(flattened_value, path, overwrite=True)",
+      "calls": [],
+      "self_calls": [
+        "_get_path_for_key"
+      ],
+      "self_attrs": [
+        "_get_path_for_key"
+      ],
+      "global_uses": [
+        "Optional",
+        "computation_types",
+        "file_utils",
+        "release_manager",
+        "structure_utils",
+        "value_reference"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "_get_path_for_key",
+        "value_reference.materialize_value",
+        "structure_utils.flatten",
+        "file_utils.write_saved_model",
+        "type_signature"
+      ],
+      "reason": "These methods are directly involved in the functionality of the `release` method and are essential for understanding how to implement the changes related to the TODO comment."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "type_signature",
+        "path": "tensorflow_federated/python/program/native_platform.py",
+        "class_name": "AwaitableValueReference",
+        "start_line": 75,
+        "end_line": 77,
+        "source": "def type_signature(self) -> value_reference.MaterializableTypeSignature:\n    \"\"\"The `tff.TensorType` of this object.\"\"\"\n    return self._type_signature",
+        "found": true
+      },
+      {
+        "method_name": "SavedModelFileReleaseManager._get_path_for_key",
+        "path": "tensorflow_federated/python/program/file_release_manager.py",
+        "class_name": "SavedModelFileReleaseManager",
+        "start_line": 373,
+        "end_line": 383,
+        "source": "def _get_path_for_key(self, key: release_manager.Key) -> str:\n    \"\"\"Returns the path for the given `key`.\n\n    This method does not assert that the given `key` or the returned path\n    represent released values.\n\n    Args:\n      key: The key used to construct the path.\n    \"\"\"\n    basename = f'{self._prefix}{str(key)}'\n    return os.path.join(self._root_dir, basename)",
+        "found": true
+      }
+    ],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

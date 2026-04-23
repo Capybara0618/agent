@@ -1,6 +1,6 @@
 ﻿# SATD Multi-Agent Workflow
 
-This workspace contains a LangGraph-based SATD workflow for `code.csv`.
+This workspace contains a LangGraph-based SATD workflow for SATD CSV datasets such as `code.csv` and `random_code.csv`.
 
 The workflow now defaults to a repair-only method-context pipeline with a lightweight compatibility shell around the old graph:
 
@@ -95,7 +95,8 @@ Display rules are now:
 - `satd_langgraph/agents.py`: analyzer, fixer, reviewer, and layered context manager
 - `satd_langgraph/workflow.py`: LangGraph state graph, cache persistence, and CSV writers
 - `run_langgraph_workflow.py`: command-line entry point for the CSV experiment
-- `code.csv`: your SATD dataset
+- `code.csv`: original SATD dataset
+- `random_code.csv`: 1000-row SATD dataset with `manual_clean` / `created_in_*` columns
 - `.vendor/`: local dependencies installed into the workspace
 
 ## Quick Start
@@ -111,29 +112,40 @@ $env:GITHUB_TOKEN="your-github-token"
 Then run:
 
 ```powershell
-python run_langgraph_workflow.py --input code.csv --output-dir outputs_langgraph --model gpt-4o-mini --verbose
+python run_langgraph_workflow.py --input random_code.csv --output-dir outputs_langgraph_random1000 --model gpt-4o-mini --verbose
 ```
 
 If you want a small smoke test first:
 
 ```powershell
-python run_langgraph_workflow.py --input code.csv --output-dir outputs_langgraph_smoke --limit 20 --model gpt-4o-mini --verbose --write-batch-size 10
+python run_langgraph_workflow.py --input random_code.csv --output-dir outputs_langgraph_random_smoke --limit 20 --model gpt-4o-mini --verbose --write-batch-size 10
+```
+
+For `random_code.csv`, the CLI now defaults to a dedicated repo cache directory:
+
+- `.repo_cache_random_code`
+
+You can override it in either workflow or cache-warming runs with:
+
+```powershell
+--repo-cache-dir .repo_cache_any_name
 ```
 
 ## Dataset Assumptions
 
-The current CSV loader expects these columns:
+The current CSV loader supports these dataset shapes:
 
 - `index`
 - `SATD_comment`
 - `original_code`
-- `manual_code`
+- `manual_code` or `manual_clean`
 - `user`
 - `project`
-- `file_path`
-- `EM`
+- `file_path` or `created_in_file`
+- `commit` or `created_in_commit`
+- optional `EM`
 
-Unnamed empty columns in `code.csv` are ignored.
+Unnamed empty columns in the CSV are ignored.
 
 ## Main Outputs
 

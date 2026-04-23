@@ -1,0 +1,86 @@
+{
+  "task_id": "589",
+  "repo_owner": "dmwm",
+  "repo_name": "wmcore",
+  "file_path": "src/python/WMComponent/RucioInjector/RucioInjectorPoller.py",
+  "commit": "bb36e59a1d83395a34654db3a1f1bd822d041341",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-19T09:07:45+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "bb36e59a1d83395a34654db3a1f1bd822d041341",
+    "symbol_name": "deleteBlocks",
+    "satd_line": 337,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-19T09:07:48+00:00",
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/python/WMComponent/RucioInjector/RucioInjectorPoller.py",
+    "original_signature": "def deleteBlocks(self):",
+    "target_file": {
+      "ok": true,
+      "path": "src/python/WMComponent/RucioInjector/RucioInjectorPoller.py",
+      "sha": "92a7affb625411e096bd8a0a75ad399306284da2",
+      "download_url": "https://raw.githubusercontent.com/dmwm/WMCore/bb36e59a1d83395a34654db3a1f1bd822d041341/src/python/WMComponent/RucioInjector/RucioInjectorPoller.py",
+      "content_excerpt": "#!/usr/bin/env python\n\"\"\"\n_RucioInjectorPoller_\n\nGeneral reminder about PhEDEx and Rucio definitions:\n* CMS dataset is equivalent to a Rucio container\n* CMS block is equivalent to a Rucio dataset\n* CMS file is equivalent to a Rucio file\n* A Rucio replica is a file, under a given scope, at a given RSE\n\"\"\"\nfrom __future__ import division\n\nimport json\nimport logging\nimport threading\nimport time\n\nfrom Utils.MemoryCache import MemoryCache\nfrom Utils.Timers import timeFunction\nfrom WMCore.DAOFactory import DAOFactory\nfrom WMCore.Services.Rucio.Rucio import Rucio\nfrom WMCore.WMException import WMException\nfrom WMCore.WorkerThreads.BaseWorkerThread import BaseWorkerThread\n\n\nclass RucioInjectorException(WMException):\n    \"\"\"\n    _RucioInjectorException_\n\n    Specific RucioInjectorPoller exception handling.\n    \"\"\"\n\n\nclass RucioInjectorPoller(BaseWorkerThread):\n    \"\"\"\n    _RucioInjectorPoller_\n\n    Poll the DBSBuffer database and inject files as they are created.\n\n    The logic of this component is:\n      * create a rucio container (or reuse a pre-existent one)\n      * create a CMS block (or reuse a pre-existent one), block gets automatically attached\n      * create file/replicas, which get automatically attached to its block as well\n      * now create a CMS block rule to protect this data\n      * if the block has been inserted into DBS, close the block in Rucio\n\n    In addition to that, it has logic for rucio container subscription (rule creation),\n    and block rule removal. Those follow a different polling cycle though.\n    \"\"\"\n\n    def __init__(self, config):\n        \"\"\"\n        ___init___\n\n        Initialise class members\n        \"\"\"\n        BaseWorkerThread.__init__(self)\n\n        self.enabled = config.RucioInjector.enabled\n        # dataset rule creation has a larger polling cycle\n        self.pollRules = config.RucioInjector.pollIntervalRules\n        self.lastRulesExecTime = 0\n        self.createBlockRules = config.RucioInjector.createBlockRules\n        self.skipRulesForTiers = config.RucioInjector.skipRulesForTiers\n\n        # setup cache for container and blocks (containers can be much longer, make 6 days now)\n        self.containersCache = MemoryCache(config.RucioInjector.cacheExpiration * 3, set())\n        self.blocksCache = MemoryCache(config.RucioInjector.cacheExpiration, set())\n\n        self.scope = getattr(config.RucioInjector, \"scope\", \"cms\")\n        self.rucioAcct = config.RucioInjector.rucioAccount\n        self.rucio = Rucio(acct=self.rucioAcct,\n                           hostUrl=config.RucioInjector.rucioUrl,\n                           authUrl=config.RucioInjector.rucioAuthUrl,\n                           configDict={'logger': self.logger})\n\n        # metadata dictionary information to be added to block/container rules\n        # cannot be a python dictionary, but a JSON string instead\n        self.metaData = json.dumps(dict(agentHost=config.Agent.hostName,\n                                        userAgent=config.Agent.agentName))\n\n        self.testRSEs = config.RucioInjector.RSEPostfix\n        self.filesToRecover = []\n\n        logging.info(\"Component configured to skip container rule creation for data tiers: %s\",\n                     self.skipRulesForTiers)\n        logging.info(\"Component configured to create block rules: %s\", self.createBlockRules)\n\n    def setup(self, parameters):\n        \"\"\"\n        _setup_\n\n        Create DAO Factory and setup some DAO.\n        \"\"\"\n        myThread = threading.currentThread()\n        daofactory = DAOFactory(package=\"WMComponent.RucioInjector.Database\",\n                                logger=self.logger, dbinterface=myThread.dbi)\n\n        self.getUninjected = daofactory(classname=\"GetUninjectedFiles\")\n        self.getMigrated = daofactory(classname=\"GetMigratedBlocks\")\n\n        self.findDeletableBlocks = daofactory(classname=\"GetDeletableBlocks\")\n        self.markBlocksDeleted = daofactory(classname=\"MarkBlocksDeleted\")\n        self.getUnsubscribed = daofactory(classname=\"GetUnsubscribedDatasets\")\n        self.markSubscribed = daofactory(classname=\"MarkDatasetSubscribed\")\n\n        daofactory = DAOFactory(package=\"WMComponent.DBS3Buffer\",\n                                logger=self.logger, dbinterface=myThread.dbi)\n        self.setStatus = daofactory(classname=\"DBSBufferFiles.SetPhEDExStatus\")\n        self.setBlockClosed = daofactory(classname=\"SetBlockClosed\")\n\n    @timeFunction\n    def algorithm(self, parameters):\n        \"\"\"\n        _algorithm_\n\n        Poll the database for uninjected files and inject them into Rucio.\n        \"\"\"\n        if not self.enabled:\n            logging.info(\"RucioInjector component is disabled in the configuration, exiting.\")\n            return\n\n        logging.info(\"Running Rucio injector poller algorithm...\")\n\n        try:\n            # files that failed to get their status updated in dbsbuffer\n            self._updateLFNState(self.filesToRecover, recovery=True)\n\n            # get dbsbuffer_file.in_phedex = 0\n            uninjectedFiles = self.getUninjected.execute()\n\n            # create containers in rucio  (and update local cache)\n            containersAdded = self.insertContainers(uninjectedFiles)\n            if self.containersCache.isCacheExpired():\n                self.containersCache.setCache(containersAdded)\n            else:\n                self.containersCache.addItemToCache(containersAdded)\n\n            # create blocks. Only update the cache once a rule gets created...\n            blocksAdded = self.insertBlocks(uninjectedFiles)\n\n            # create file replicas\n            self.insertReplicas(uninjectedFiles)\n\n            # now create a Rucio rule for every single block (and update local cache)\n            blocksAdded = self.insertBlockRules(blocksAdded)\n            if self.blocksCache.isCacheExpired():\n                self.blocksCache.setCache(blocksAdded)\n            else:\n                self.blocksCache.addItemToCache(blocksAdded)\n\n            # now close blocks already uploaded to DBS\n            self.closeBlocks()\n\n            if self.lastRulesExecTime + self.pollRules <= int(time.time()):\n                self.deleteBlocks()\n                self.insertContainerRules()\n        except Exception as ex:\n            msg = \"Caught unexpected exception in RucioInjector. Details:\\n%s\" % str(ex)\n            logging.exception(msg)\n            raise RucioInjectorException(msg)\n\n        return\n\n    def insertContainers(self, uninjectedData):\n        \"\"\"\n        This method will insert containers into Rucio, provided they cannot be found in\n        the local cache.\n        :param uninjectedData: same data as it's returned from the uninjectedFiles\n        :return: set of containers successfully inserted into Rucio\n        \"\"\"\n        logging.info(\"Preparing to insert containers into Rucio...\")\n        newContainers = set()\n        for location in uninjectedData:\n            for container in uninjectedData[location]:\n                if container not in self.containersCache:\n                    if self.rucio.createContainer(container):\n                        logging.info(\"Container %s inserted into Rucio\", container)\n                        newContainers.add(container)\n                    else:\n                        logging.error(\"Failed to create container: %s\", container)\n        logging.info(\"Successfully inserted %d containers into Rucio\", newContainers)\n        return newContainers\n\n    def insertBlocks(self, uninjectedData):\n        \"\"\"\n        This method will insert blocks into Rucio and attach them to their correspondent\n        containers, when attaching this block, we also need to provide the RSE that it\n        will be available.\n        :param uninjectedData: same data as it's returned from the uninjectedFiles\n        :return: a dictionary of successfully inserted blocks and their correspondent location\n        \"\"\"\n        logging.info(\"Preparing to insert blocks into Rucio...\")\n        newBlocks = {}\n        for location in uninjectedData:\n            if self.testRSEs:\n                rseName = \"%s_Test\" % location\n            for container in uninjectedData[location]:\n                for block in uninjectedData[location][container]:\n                    if block not in self.blocksCache:\n                        if self.rucio.createBlock(block, rse=rseName):\n                            logging.info(\"Block %s inserted into Rucio\", block)\n                            newBlocks[block] = location\n                        else:\n                            logging.error(\"Failed to create block: %s\", block)\n        logging.info(\"Successfully inserted %d blocks into Rucio\", newBlocks)\n        return newBlocks\n\n    # TODO: this will likely go away once the phedex to rucio migration is over\n    def _isBlockTierAllowed(self, blockName):\n        \"\"\"\n        Check the block datatier against the list of data tiers that we want\n        to get pinned in Rucio through a block rule\n        :return: boolean whether we can or not insert a rule\n        \"\"\"\n        endBlock = blockName.rsplit('/', 1)[1]\n        endTier = endBlock.split('#')[0]\n        if endTier in self.skipRulesForTiers:\n            return False\n        return True\n\n    def insertBlockRules(self, blocksAndRSEs):\n        \"\"\"\n        Creates a simple replication rule for every single block that\n        has been previously inserted into Rucio.\n        Right now, we make standard rules against a given site.\n        :param blocksAndRSEs: dictionary with blocks as key, and RSEs as value\n        :return: a set of blocks with successfully created rules\n        \"\"\"\n        newBlocks = set()\n        if not self.createBlockRules:\n            return newBlocks\n\n        # FIXME: this could have been done in bulk, by RSE\n        logging.info(\"Preparing to create block rules into Rucio...\")\n        for block, rse in blocksAndRSEs.items():\n            if not self._isBlockTierAllowed(block):\n                logging.info(\"Component configured to skip block rule for: %s\", block)\n                continue\n            if self.testRSEs:\n                rseName = \"%s_Test\" % rse\n            # DATASET = replicates all files in the same block to the same RSE\n            resp = self.rucio.createReplicationRule(block, rseExpression=\"rse=%s\" % rseName,\n                                                    account=self.rucioAcct, grouping=\"DATASET\",\n                                                    comment=\"WMAgent production site\",\n                                                    meta=self.metaData)\n            if resp:\n                logging.info(\"Block rule created for %s under rule id: %s\", block, resp)\n                newBlocks.add(block)\n            else:\n                logging.error(\"Failed to create rule for block: %s\", block)\n        logging.info(\"Successfully inserted %d rules for blocks into Rucio\", newBlocks)\n        return newBlocks\n\n    def insertReplicas(self, uninjectedData):\n        \"\"\"\n        Inserts replicas into Rucio and attach them to its specific block.\n        If the insertion succeeds, also switch their database state to injected.\n\n        :param uninjectedData: dictionary with blocks as key, and RSEs as value\n        \"\"\"\n        # FIXME: I think we need a different data struct from the database\n        # this method is very expensive O(n^4)\n        logging.info(\"Preparing to insert replicas into Rucio...\")\n\n        for location in uninjectedData.keys():\n            if self.testRSEs:\n                rseName = \"%s_Test\" % location\n            for container in uninjectedData[location]:\n                for block in uninjectedData[location][container]:\n                    injectData = []\n                    listLfns = []\n                    for fileInfo in uninjectedData[location][container][block]['files']:\n                        listLfns.append(fileInfo['lfn'])\n                        injectData.append(dict(name=fileInfo['lfn'], scope=self.scope,\n                                               bytes=fileInfo['size'], state=\"A\",\n     ",
+      "total_lines": 395,
+      "ref": "bb36e59a1d83395a34654db3a1f1bd822d041341"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "deleteBlocks",
+      "class_name": "RucioInjectorPoller",
+      "start_line": 326,
+      "end_line": 338,
+      "satd_line": 337,
+      "matched_by": "normalized_source",
+      "source": "    def deleteBlocks(self):\n        \"\"\"\n        _deleteBlocks_\n        Find deletable blocks, then decide if to delete based on:\n        Is there an active subscription for dataset or block ?\n          If yes => set deleted=2\n          If no => next check\n        Has transfer to all destinations finished ?\n          If yes => request block deletion, approve request, set deleted=1\n          If no => do nothing (check again next cycle)\n        \"\"\"\n        # FIXME: figure out the proper logic for rule block deletion\n        logging.info(\"Starting deleteBlocks methods --> IMPLEMENT-ME!!!\")",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "logging"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "no_retrieval_eligible_method_symbol"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

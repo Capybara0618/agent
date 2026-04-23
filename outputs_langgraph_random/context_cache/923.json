@@ -1,0 +1,99 @@
+{
+  "task_id": "923",
+  "repo_owner": "jepegit",
+  "repo_name": "cellpy",
+  "file_path": "cellpy/readers/cellreader.py",
+  "commit": "8e9daf75b99f923ab253378d47def9e7e3dc0a2d",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-22T19:47:09+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "8e9daf75b99f923ab253378d47def9e7e3dc0a2d",
+    "symbol_name": "get_summary",
+    "satd_line": 3709,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-22T19:48:31+00:00",
+    "identified_method_count": 1,
+    "retrieved_method_count": 0,
+    "missing_method_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "cellpy/readers/cellreader.py",
+    "original_signature": "def get_summary(self, use_summary_made=False):",
+    "target_file": {
+      "ok": true,
+      "path": "cellpy/readers/cellreader.py",
+      "sha": "174677d023511e7ac262c909baaf1da0c4424372",
+      "download_url": "https://raw.githubusercontent.com/jepegit/cellpy/8e9daf75b99f923ab253378d47def9e7e3dc0a2d/cellpy/readers/cellreader.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n\"\"\"Datareader for cell testers and potentiostats.\n\nThis module is used for loading data and databases created by different cell\ntesters. Currently it only accepts arbin-type res-files (access) data as\nraw data files, but we intend to implement more types soon. It also creates\nprocessed files in the hdf5-format.\n\nExample:\n    >>> d = CellpyData()\n    >>> d.loadcell(names = [file1.res, file2.res]) # loads and merges the runs\n    >>> voltage_curves = d.get_cap()\n    >>> d.save(\"mytest.hdf\")\n\n\"\"\"\n\nimport os\nfrom pathlib import Path\nimport logging\nimport sys\nimport collections\nimport warnings\nimport csv\nimport itertools\nimport time\n\nimport numpy as np\nimport pandas as pd\nfrom pandas.errors import PerformanceWarning\nfrom cellpy.parameters import prms\nfrom cellpy.exceptions import WrongFileVersion, DeprecatedFeature, NullData\nfrom cellpy.parameters.internal_settings import (\n    get_headers_summary,\n    get_cellpy_units,\n    get_headers_normal,\n    get_headers_step_table,\n    ATTRS_CELLPYFILE,\n    ATTRS_DATASET,\n    ATTRS_CELLPYDATA,\n)\nfrom cellpy.readers.core import (\n    FileID,\n    Cell,\n    CELLPY_FILE_VERSION,\n    MINIMUM_CELLPY_FILE_VERSION,\n    xldate_as_datetime,\n    interpolate_y_on_x,\n)\n\nHEADERS_NORMAL = get_headers_normal()\nHEADERS_SUMMARY = get_headers_summary()\nHEADERS_STEP_TABLE = get_headers_step_table()\n\n# TODO: @jepe - performance warnings - mixed types within cols (pytables)\nperformance_warning_level = \"ignore\"  # \"ignore\", \"error\"\nwarnings.filterwarnings(\n    performance_warning_level, category=pd.io.pytables.PerformanceWarning\n)\npd.set_option(\"mode.chained_assignment\", None)  # \"raise\", \"warn\", None\n\nmodule_logger = logging.getLogger(__name__)\n\n\nclass CellpyData(object):\n    \"\"\"Main class for working and storing data.\n\n    This class is the main work-horse for cellpy where all the functions for\n    reading, selecting, and tweaking your data is located. It also contains the\n    header definitions, both for the cellpy hdf5 format, and for the various\n    cell-tester file-formats that can be read. The class can contain\n    several cell-tests and each test is stored in a list. If you see what I mean...\n\n    Attributes:\n        cells (list): list of DataSet objects.\n    \"\"\"\n\n    def __str__(self):\n        txt = \"<CellpyData>\\n\"\n        if self.name:\n            txt += f\"name: {self.name}\\n\"\n        if self.table_names:\n            txt += f\"table_names: {self.table_names}\\n\"\n        if self.tester:\n            txt += f\"tester: {self.tester}\\n\"\n        if self.cells:\n            txt += \"datasets: [ ->\\n\"\n            for i, d in enumerate(self.cells):\n                txt += f\"   ({i})\\n\"\n                for t in str(d).split(\"\\n\"):\n                    txt += \"     \"\n                    txt += t\n                    txt += \"\\n\"\n                txt += \"\\n\"\n            txt += \"]\"\n        else:\n            txt += \"datasets: []\"\n        txt += \"\\n\"\n        return txt\n\n    def __bool__(self):\n        if self.cells:\n            return True\n        else:\n            return False\n\n    def __init__(\n        self,\n        filenames=None,\n        selected_scans=None,\n        profile=False,\n        filestatuschecker=None,  # \"modified\"\n        fetch_one_liners=False,\n        tester=None,\n        initialize=False,\n    ):\n        \"\"\"CellpyData object\n\n        Args:\n            filenames: list of files to load.\n            selected_scans:\n            profile: experimental feature.\n            filestatuschecker: property to compare cellpy and raw-files;\n               default read from prms-file.\n            fetch_one_liners: experimental feature.\n            tester: instrument used (e.g. \"arbin\") (checks prms-file as\n               default).\n            initialize: create a dummy (empty) dataset; defaults to False.\n        \"\"\"\n\n        if tester is None:\n            self.tester = prms.Instruments.tester\n        else:\n            self.tester = tester\n        self.loader = None  # this will be set in the function set_instrument\n        self.logger = logging.getLogger(__name__)\n        self.logger.debug(\"created CellpyData instance\")\n        self.name = None\n        self.profile = profile\n        self.minimum_selection = {}\n        if filestatuschecker is None:\n            self.filestatuschecker = prms.Reader.filestatuschecker\n        else:\n            self.filestatuschecker = filestatuschecker\n        self.forced_errors = 0\n        self.summary_exists = False\n\n        if not filenames:\n            self.file_names = []\n        else:\n            self.file_names = filenames\n            if not self._is_listtype(self.file_names):\n                self.file_names = [self.file_names]\n        if not selected_scans:\n            self.selected_scans = []\n        else:\n            self.selected_scans = selected_scans\n            if not self._is_listtype(self.selected_scans):\n                self.selected_scans = [self.selected_scans]\n\n        self.cells = []\n        self.status_datasets = []\n        self.selected_cell_number = 0\n        self.number_of_datasets = 0\n\n        self.capacity_modifiers = [\"reset\"]\n\n        self.list_of_step_types = [\n            \"charge\",\n            \"discharge\",\n            \"cv_charge\",\n            \"cv_discharge\",\n            \"taper_charge\",\n            \"taper_discharge\",\n            \"charge_cv\",\n            \"discharge_cv\",\n            \"ocvrlx_up\",\n            \"ocvrlx_down\",\n            \"ir\",\n            \"rest\",\n            \"not_known\",\n        ]\n        # - options\n        self.force_step_table_creation = prms.Reader.force_step_table_creation\n        self.force_all = prms.Reader.force_all\n        self.sep = prms.Reader.sep\n        self._cycle_mode = prms.Reader.cycle_mode\n        # self.max_res_filesize = prms.Reader.max_res_filesize\n        self.load_only_summary = prms.Reader.load_only_summary\n        self.select_minimal = prms.Reader.select_minimal\n        # self.chunk_size = prms.Reader.chunk_size  # 100000\n        # self.max_chunks = prms.Reader.max_chunks\n        # self.last_chunk = prms.Reader.last_chunk\n        self.limit_loaded_cycles = prms.Reader.limit_loaded_cycles\n        # self.load_until_error = prms.Reader.load_until_error\n        self.ensure_step_table = prms.Reader.ensure_step_table\n        self.daniel_number = prms.Reader.daniel_number\n        # self.raw_datadir = prms.Reader.raw_datadir\n        self.raw_datadir = prms.Paths.rawdatadir\n        # self.cellpy_datadir = prms.Reader.cellpy_datadir\n        self.cellpy_datadir = prms.Paths.cellpydatadir\n        # search in prm-file for res and hdf5 dirs in loadcell:\n        self.auto_dirs = prms.Reader.auto_dirs\n\n        # - headers and instruments\n        self.headers_normal = get_headers_normal()\n        self.headers_summary = get_headers_summary()\n        self.headers_step_table = get_headers_step_table()\n\n        self.table_names = None  # dictionary defined in set_instruments\n        self.set_instrument()\n\n        # - units used by cellpy\n        self.cellpy_units = get_cellpy_units()\n\n        if initialize:\n            self.initialize()\n\n    def initialize(self):\n        self.logger.debug(\"Initializing...\")\n        self.cells.append(Cell())\n\n    @property\n    def cell(self):\n        \"\"\"returns the DataSet instance\"\"\"\n        # could insert a try-except thingy here...\n        cell = self.cells[self.selected_cell_number]\n        return cell\n\n    @property\n    def dataset(self):\n        \"\"\"returns the DataSet instance\"\"\"\n        # could insert a try-except thingy here...\n        warnings.warn(\n            \"The .dataset property is deprecated, please use .cell instead.\",\n            DeprecationWarning,\n        )\n        cell = self.cells[self.selected_cell_number]\n        return cell\n\n    @property\n    def empty(self):\n        \"\"\"gives False if the CellpyData object is empty (or un-functional)\"\"\"\n        return not self.check()\n\n    @classmethod\n    def vacant(cls, cell=None):\n        \"\"\"Create a CellpyData instance.\n        Args:\n            cell (CellpyData instance): the attributes from the cell will be copied\n                to the new Cellpydata instance.\n\n         Returns:\n            CellpyData instance.\n        \"\"\"\n\n        new_cell = cls(initialize=True)\n        if cell is not None:\n            for attr in ATTRS_DATASET:\n                value = getattr(cell.cell, attr)\n                setattr(new_cell.cell, attr, value)\n\n            for attr in ATTRS_CELLPYDATA:\n                value = getattr(cell, attr)\n                setattr(new_cell, attr, value)\n\n        return new_cell\n\n    def split(self, cycle=None):\n        \"\"\"Split experiment (CellpyData object) into two sub-experiments. if cycle\n        is not give, it will split on the median cycle number\"\"\"\n\n        if isinstance(cycle, int) or cycle is None:\n            return self.split_many(base_cycles=cycle)\n\n    def drop_from(self, cycle=None):\n        \"\"\"Select first part of experiment (CellpyData object) up to cycle number\n         'cycle'\"\"\"\n        if isinstance(cycle, int):\n            c1, c2 = self.split_many(base_cycles=cycle)\n            return c1\n\n    def drop_to(self, cycle=None):\n        \"\"\"Select last part of experiment (CellpyData object) from cycle number\n        'cycle'\"\"\"\n        if isinstance(cycle, int):\n            c1, c2 = self.split_many(base_cycles=cycle)\n            return c2\n\n    def drop_edges(self, start, end):\n        \"\"\"Select middle part of experiment (CellpyData object) from cycle\n        number 'start' to 'end\"\"\"\n\n        if end < start:\n            raise ValueError(\"end cannot be larger than start\")\n        if end == start:\n            raise ValueError(\"end cannot be the same as start\")\n        return self.split_many([start, end])[1]\n\n    def split_many(self, base_cycles=None):\n        \"\"\"Split experiment (CellpyData object) into several sub-experiments.\n\n        Args:\n            base_cycles (int or list of ints): cycle(s) to do the split on.\n\n        Returns:\n            List of CellpyData objects\n        \"\"\"\n        h_summary_index = HEADERS_SUMMARY.cycle_index\n        h_raw_index = HEADERS_NORMAL.cycle_index_txt\n        h_step_cycle = HEADERS_STEP_TABLE.cycle\n\n        if base_cycles is None:\n            all_cycles = self.get_cycle_numbers()\n            base_cycles = int(np.median(all_cycles))\n\n        cells = list()\n        if not isinstance(base_cycles, (list, tuple)):\n            base_cycles = [base_cycles]\n\n        dataset = self.cell\n        steptable = dataset.steps\n        data = dataset.raw\n        summary = dataset.summary\n\n        # In case Cycle_Index has been promoted to index [#index]\n        if h_summary_index not in summary.columns:\n            summary = summary.reset_index(drop=False)\n\n        for b_cycle in base_cycles:\n            steptable0, steptable = [\n                steptable[steptable[h_step_cycle] < b_cycle],\n                steptable[steptable[h_step_cycle] >= b_cycle],\n            ]\n            data0, data = [\n                data[data[h_raw_index] < b_cycle],\n                data[data[h_raw_index] >= b_cycle],\n            ]\n            summary0, summary = [\n                summary[summary[h_summary_index] < b_cycle],\n                summary[summary[h_summary_index] >= b_cycle],\n            ]\n\n            new_cell = CellpyData.vacant(cell=self)\n            old_cell = CellpyData.vacant(cell=self)\n\n            new_cell.cell.steps = steptable0\n            new_cell.cell.raw = data0\n            new_cell.cell.summary = summary0\n\n            old_cell.cell.steps = steptable\n            old_cell.cell.raw = data\n            old_cell.cell.summary = summary\n\n            cells.append(new_cell)\n\n        cells.append(old_cell)\n        return cells\n\n    # TODO: @jepe - merge the _set_xxinstrument methods into one method\n    def set_instrument(self, instrument=None):\n        \"\"\"Set the instrument (i.e. tell cellpy the file-type you use).\n\n        Args:\n            instrument: (str) in [\"arbin\", \"bio-logic-csv\", \"bio-logic-bin\",...]\n\n        Sets the instrument used for obt",
+      "total_lines": 4627,
+      "ref": "8e9daf75b99f923ab253378d47def9e7e3dc0a2d"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "get_summary",
+      "class_name": "CellpyData",
+      "start_line": 3710,
+      "end_line": 3734,
+      "satd_line": 3709,
+      "matched_by": "signature_or_comment",
+      "source": "    def get_summary(self, dataset_number=None, use_summary_made=False):\n        \"\"\"Retrieve summary returned as a pandas DataFrame.\"\"\"\n        dataset_number = self._validate_dataset_number(dataset_number)\n        if dataset_number is None:\n            self._report_empty_dataset()\n            return None\n\n        test = self.get_cell(dataset_number)\n\n        # This is a bit convoluted; in the old days, we used an attribute\n        # called summary_made,\n        # that was set to True when the summary was made successfully.\n        # It is most likely never\n        # used anymore. And will most probably be deleted.\n        if use_summary_made:\n            summary_made = test.summary_made\n        else:\n            summary_made = True\n\n        if not summary_made:\n            warnings.warn(\"Summary is not made yet\")\n            return None\n        else:\n            self.logger.info(\"Returning datasets[test_no].summary\")\n            return test.summary",
+      "calls": [],
+      "self_calls": [
+        "_report_empty_dataset",
+        "_validate_dataset_number",
+        "get_cell"
+      ],
+      "self_attrs": [
+        "_report_empty_dataset",
+        "_validate_dataset_number",
+        "get_cell",
+        "logger"
+      ],
+      "global_uses": [
+        "warnings"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "warnings.warn"
+      ],
+      "reason": "The selected method is essential for understanding the warning mechanism in the code, which is directly tied to the TODO comment about deprecating it."
+    },
+    "retrieved_methods": [],
+    "missing_method_names": [
+      "warnings.warn"
+    ]
+  },
+  "review_context": {}
+}

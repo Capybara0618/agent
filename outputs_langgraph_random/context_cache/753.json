@@ -1,0 +1,117 @@
+{
+  "task_id": "753",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "python/ray/tests/test_reference_counting.py",
+  "commit": "e904711e74e3e75fb2b50cf2454b7dc47209dd1c",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-22T08:23:50+00:00",
+    "base_cache_source": "disk_cache",
+    "context_commit": "e904711e74e3e75fb2b50cf2454b7dc47209dd1c",
+    "symbol_name": "test_basic_serialized_reference",
+    "satd_line": 275,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-22T08:55:26+00:00",
+    "identified_method_count": 3,
+    "retrieved_method_count": 2,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "python/ray/tests/test_reference_counting.py",
+    "original_signature": "def test_basic_serialized_reference(one_worker_100MiB):",
+    "target_file": {
+      "ok": true,
+      "path": "python/ray/tests/test_reference_counting.py",
+      "sha": "c815a945890034441e32e5405063c71a9bc33004",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/e904711e74e3e75fb2b50cf2454b7dc47209dd1c/python/ray/tests/test_reference_counting.py",
+      "content_excerpt": "# coding: utf-8\nimport os\nimport json\nimport copy\nimport tempfile\nimport numpy as np\nimport time\nimport pytest\nimport logging\nimport uuid\n\nimport ray\nimport ray.cluster_utils\nimport ray.test_utils\n\nlogger = logging.getLogger(__name__)\n\n\n@pytest.fixture\ndef one_worker_100MiB(request):\n    yield ray.init(num_cpus=1, object_store_memory=100 * 1024 * 1024)\n    ray.shutdown()\n\n\ndef _fill_object_store_and_get(oid, succeed=True, object_MiB=40,\n                               num_objects=5):\n    for _ in range(num_objects):\n        ray.put(np.zeros(object_MiB * 1024 * 1024, dtype=np.uint8))\n\n    if type(oid) is bytes:\n        oid = ray.ObjectID(oid)\n\n    if succeed:\n        ray.get(oid)\n    else:\n        if oid.is_direct_call_type():\n            with pytest.raises(ray.exceptions.RayTimeoutError):\n                ray.get(oid, timeout=0.1)\n        else:\n            with pytest.raises(ray.exceptions.UnreconstructableError):\n                ray.get(oid)\n\n\ndef _check_refcounts(expected):\n    actual = ray.worker.global_worker.core_worker.get_all_reference_counts()\n    assert len(expected) == len(actual)\n    for object_id, (local, submitted) in expected.items():\n        hex_id = object_id.hex().encode(\"ascii\")\n        assert hex_id in actual\n        assert local == actual[hex_id][\"local\"]\n        assert submitted == actual[hex_id][\"submitted\"]\n\n\ndef check_refcounts(expected, timeout=10):\n    start = time.time()\n    while True:\n        try:\n            _check_refcounts(expected)\n            break\n        except AssertionError as e:\n            if time.time() - start > timeout:\n                raise e\n            else:\n                time.sleep(0.1)\n\n\ndef test_local_refcounts(ray_start_regular):\n    oid1 = ray.put(None)\n    check_refcounts({oid1: (1, 0)})\n    oid1_copy = copy.copy(oid1)\n    check_refcounts({oid1: (2, 0)})\n    del oid1\n    check_refcounts({oid1_copy: (1, 0)})\n    del oid1_copy\n    check_refcounts({})\n\n\ndef test_dependency_refcounts(ray_start_regular):\n    # Return a large object that will be spilled to plasma.\n    def large_object():\n        return np.zeros(10 * 1024 * 1024, dtype=np.uint8)\n\n    # TODO: Clean up tmpfiles?\n    def random_path():\n        return os.path.join(tempfile.gettempdir(), uuid.uuid4().hex)\n\n    def touch(path):\n        with open(path, \"w\"):\n            pass\n\n    def wait_for_file(path):\n        while True:\n            if os.path.exists(path):\n                break\n            time.sleep(0.1)\n\n    @ray.remote\n    def one_dep(dep, path=None, fail=False):\n        if path is not None:\n            wait_for_file(path)\n        if fail:\n            raise Exception(\"failed on purpose\")\n\n    @ray.remote\n    def one_dep_large(dep, path=None):\n        if path is not None:\n            wait_for_file(path)\n        # This should be spilled to plasma.\n        return large_object()\n\n    # Test that regular plasma dependency refcounts are decremented once the\n    # task finishes.\n    f = random_path()\n    large_dep = ray.put(large_object())\n    result = one_dep.remote(large_dep, path=f)\n    check_refcounts({large_dep: (1, 1), result: (1, 0)})\n    touch(f)\n    # Reference count should be removed once the task finishes.\n    check_refcounts({large_dep: (1, 0), result: (1, 0)})\n    del large_dep, result\n    check_refcounts({})\n\n    # Test that inlined dependency refcounts are decremented once they are\n    # inlined.\n    f = random_path()\n    dep = one_dep.remote(None, path=f)\n    check_refcounts({dep: (1, 0)})\n    result = one_dep.remote(dep)\n    check_refcounts({dep: (1, 1), result: (1, 0)})\n    touch(f)\n    # Reference count should be removed as soon as the dependency is inlined.\n    check_refcounts({dep: (1, 0), result: (1, 0)}, timeout=1)\n    del dep, result\n    check_refcounts({})\n\n    # Test that spilled plasma dependency refcounts are decremented once\n    # the task finishes.\n    f1, f2 = random_path(), random_path()\n    dep = one_dep_large.remote(None, path=f1)\n    check_refcounts({dep: (1, 0)})\n    result = one_dep.remote(dep, path=f2)\n    check_refcounts({dep: (1, 1), result: (1, 0)})\n    touch(f1)\n    ray.get(dep, timeout=5.0)\n    # Reference count should remain because the dependency is in plasma.\n    check_refcounts({dep: (1, 1), result: (1, 0)})\n    touch(f2)\n    # Reference count should be removed because the task finished.\n    check_refcounts({dep: (1, 0), result: (1, 0)})\n    del dep, result\n    check_refcounts({})\n\n    # Test that regular plasma dependency refcounts are decremented if a task\n    # fails.\n    f = random_path()\n    large_dep = ray.put(large_object())\n    result = one_dep.remote(large_dep, path=f, fail=True)\n    check_refcounts({large_dep: (1, 1), result: (1, 0)})\n    touch(f)\n    # Reference count should be removed once the task finishes.\n    check_refcounts({large_dep: (1, 0), result: (1, 0)})\n    del large_dep, result\n    check_refcounts({})\n\n    # Test that spilled plasma dependency refcounts are decremented if a task\n    # fails.\n    f1, f2 = random_path(), random_path()\n    dep = one_dep_large.remote(None, path=f1)\n    check_refcounts({dep: (1, 0)})\n    result = one_dep.remote(dep, path=f2, fail=True)\n    check_refcounts({dep: (1, 1), result: (1, 0)})\n    touch(f1)\n    ray.get(dep, timeout=5.0)\n    # Reference count should remain because the dependency is in plasma.\n    check_refcounts({dep: (1, 1), result: (1, 0)})\n    touch(f2)\n    # Reference count should be removed because the task finished.\n    check_refcounts({dep: (1, 0), result: (1, 0)})\n    del dep, result\n    check_refcounts({})\n\n\ndef test_basic_pinning(one_worker_100MiB):\n    @ray.remote\n    def f(array):\n        return np.sum(array)\n\n    @ray.remote\n    class Actor(object):\n        def __init__(self):\n            # Hold a long-lived reference to a ray.put object's ID. The object\n            # should not be garbage collected while the actor is alive because\n            # the object is pinned by the raylet.\n            self.large_object = ray.put(\n                np.zeros(25 * 1024 * 1024, dtype=np.uint8))\n\n        def get_large_object(self):\n            return ray.get(self.large_object)\n\n    actor = Actor.remote()\n\n    # Fill up the object store with short-lived objects. These should be\n    # evicted before the long-lived object whose reference is held by\n    # the actor.\n    for batch in range(10):\n        intermediate_result = f.remote(\n            np.zeros(10 * 1024 * 1024, dtype=np.uint8))\n        ray.get(intermediate_result)\n\n    # The ray.get below would fail with only LRU eviction, as the object\n    # that was ray.put by the actor would have been evicted.\n    ray.get(actor.get_large_object.remote())\n\n\ndef test_pending_task_dependency_pinning(one_worker_100MiB):\n    @ray.remote\n    def pending(input1, input2):\n        return\n\n    # The object that is ray.put here will go out of scope immediately, so if\n    # pending task dependencies aren't considered, it will be evicted before\n    # the ray.get below due to the subsequent ray.puts that fill up the object\n    # store.\n    np_array = np.zeros(40 * 1024 * 1024, dtype=np.uint8)\n    random_oid = ray.ObjectID.from_random()\n    oid = pending.remote(np_array, random_oid)\n\n    for _ in range(2):\n        ray.put(np.zeros(40 * 1024 * 1024, dtype=np.uint8))\n\n    ray.worker.global_worker.put_object(None, object_id=random_oid)\n    ray.get(oid)\n\n\ndef test_feature_flag(shutdown_only):\n    ray.init(\n        object_store_memory=100 * 1024 * 1024,\n        _internal_config=json.dumps({\n            \"object_pinning_enabled\": 0\n        }))\n\n    @ray.remote\n    def f(array):\n        return np.sum(array)\n\n    @ray.remote\n    class Actor(object):\n        def __init__(self):\n            self.large_object = ray.put(\n                np.zeros(25 * 1024 * 1024, dtype=np.uint8))\n\n        def wait_for_actor_to_start(self):\n            pass\n\n        def get_large_object(self):\n            return ray.get(self.large_object)\n\n    actor = Actor.remote()\n    ray.get(actor.wait_for_actor_to_start.remote())\n\n    # The ray.get below fails with only LRU eviction, as the object\n    # that was ray.put by the actor should have been evicted.\n    _fill_object_store_and_get(actor.get_large_object.remote(), succeed=False)\n\n\n# Remote function takes serialized reference and doesn't hold onto it after\n# finishing. Referenced object shouldn't be evicted while the task is pending\n# and should be evicted after it returns.\n@pytest.mark.skip(\"Serialized ObjectID reference counting not implemented.\")\ndef test_basic_serialized_reference(one_worker_100MiB):\n    @ray.remote\n    def pending(ref, dep):\n        ray.get(ref[0])\n\n    # TODO(edoakes): currently these tests don't work with ray.put() so we need\n    # to return from a task like this instead. Once that is fixed, should have\n    # tests run with both codepaths.\n    @ray.remote\n    def put():\n        return np.zeros(40 * 1024 * 1024, dtype=np.uint8)\n\n    array_oid = put.remote()\n    random_oid = ray.ObjectID.from_random()\n    oid = pending.remote([array_oid], random_oid)\n\n    # Remove the local reference.\n    array_oid_bytes = array_oid.binary()\n    del array_oid\n\n    # Check that the remote reference pins the object.\n    _fill_object_store_and_get(array_oid_bytes)\n\n    # Fulfill the dependency, causing the task to finish.\n    ray.worker.global_worker.put_object(None, object_id=random_oid)\n    ray.get(oid)\n\n    # Reference should be gone, check that array gets evicted.\n    _fill_object_store_and_get(array_oid_bytes, succeed=False)\n\n\n# Call a recursive chain of tasks that pass a serialized reference to the end\n# of the chain. The reference should still exist while the final task in the\n# chain is running and should be removed once it finishes.\n@pytest.mark.skip(\"Serialized ObjectID reference counting not implemented.\")\ndef test_recursive_serialized_reference(one_worker_100MiB):\n    @ray.remote\n    def recursive(ref, dep, max_depth, depth=0):\n        ray.get(ref[0])\n        if depth == max_depth:\n            return ray.get(dep[0])\n        else:\n            return recursive.remote(ref, dep, max_depth, depth + 1)\n\n    @ray.remote\n    def put():\n        return np.zeros(40 * 1024 * 1024, dtype=np.uint8)\n\n    max_depth = 5\n    array_oid = put.remote()\n    random_oid = ray.ObjectID.from_random()\n    head_oid = recursive.remote([array_oid], [random_oid], max_depth)\n\n    # Remove the local reference.\n    array_oid_bytes = array_oid.binary()\n    del array_oid\n\n    tail_oid = head_oid\n    for _ in range(max_depth - 1):\n        tail_oid = ray.get(tail_oid)\n\n    # Check that the remote reference pins the object.\n    _fill_object_store_and_get(array_oid_bytes)\n\n    # Fulfill the dependency, causing the tail task to finish.\n    ray.worker.global_worker.put_object(None, object_id=random_oid)\n    ray.get(tail_oid)\n\n    # Reference should be gone, check that array gets evicted.\n    _fill_object_store_and_get(array_oid_bytes, succeed=False)\n\n\n# Test that a passed reference held by an actor after the method finishes\n# is kept until the reference is removed from the actor. Also tests giving\n# the actor a duplicate reference to the same object ID.\n@pytest.mark.skip(\"Serialized ObjectID reference counting not implemented.\")\ndef test_actor_holding_serialized_reference(one_worker_100MiB):\n    @ray.remote\n    class GreedyActor(object):\n        def __init__(self):\n            pass\n\n        def set_ref1(self, ref):\n            self.ref1 = ref\n\n        def add_ref2(self, new_ref):\n            self.ref2 = new_ref\n\n        def delete_ref1(self):\n            self.ref1 = None\n\n        def delete_ref2(self):\n            self.ref2 = None\n\n    @ray.remote\n    def put():\n        return np.zeros(40 * 1024 * 1024, dtype=np.uint8)\n\n    # Test that the reference held by the actor isn't evicted.\n    array_oid = put.remote()\n    actor = GreedyActor.remote()\n    actor.set_ref1.remote([array_oid])\n\n    # Test that giving the same actor a duplicate reference works.\n    ray.get(actor.add_ref2.remote([array_oid]))\n\n    # Remove the local reference.\n    array_oid_bytes =",
+      "total_lines": 602,
+      "ref": "e904711e74e3e75fb2b50cf2454b7dc47209dd1c"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "test_basic_serialized_reference",
+      "class_name": null,
+      "start_line": 270,
+      "end_line": 298,
+      "satd_line": 275,
+      "matched_by": "signature_or_comment",
+      "source": "def test_basic_serialized_reference(one_worker_100MiB):\n    @ray.remote\n    def pending(ref, dep):\n        ray.get(ref[0])\n\n    # TODO(edoakes): currently these tests don't work with ray.put() so we need\n    # to return from a task like this instead. Once that is fixed, should have\n    # tests run with both codepaths.\n    @ray.remote\n    def put():\n        return np.zeros(40 * 1024 * 1024, dtype=np.uint8)\n\n    array_oid = put.remote()\n    random_oid = ray.ObjectID.from_random()\n    oid = pending.remote([array_oid], random_oid)\n\n    # Remove the local reference.\n    array_oid_bytes = array_oid.binary()\n    del array_oid\n\n    # Check that the remote reference pins the object.\n    _fill_object_store_and_get(array_oid_bytes)\n\n    # Fulfill the dependency, causing the task to finish.\n    ray.worker.global_worker.put_object(None, object_id=random_oid)\n    ray.get(oid)\n\n    # Reference should be gone, check that array gets evicted.\n    _fill_object_store_and_get(array_oid_bytes, succeed=False)",
+      "calls": [
+        "_fill_object_store_and_get"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "_fill_object_store_and_get",
+        "np",
+        "pending",
+        "put",
+        "pytest",
+        "ray",
+        "ref"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "ray.put",
+        "put.remote",
+        "ray.get"
+      ],
+      "reason": "These methods are directly involved in the functionality that the SATD is addressing, particularly in relation to the issues with ray.put()."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "put",
+        "path": "python/ray/tests/test_reference_counting.py",
+        "class_name": null,
+        "start_line": 279,
+        "end_line": 280,
+        "source": "def put():\n        return np.zeros(40 * 1024 * 1024, dtype=np.uint8)",
+        "found": true
+      },
+      {
+        "method_name": "remote",
+        "path": "python/ray/remote_function.py",
+        "class_name": "FuncWrapper",
+        "start_line": 138,
+        "end_line": 139,
+        "source": "def remote(self, *args, **kwargs):\n                return func_cls._remote(args=args, kwargs=kwargs, **options)",
+        "found": true
+      }
+    ],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

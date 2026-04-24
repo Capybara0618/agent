@@ -41,11 +41,16 @@ class AnalysisResult:
     context_score: float
     clarity_score: float
     scope_radius: str
+    operation_concrete: str | None = None
+    localizable: str | None = None
+    local_scope: str | None = None
+    end_state_clear: str | None = None
+    comment_evidence: str = ""
+    code_evidence: str = ""
     validation_signals: list[str] = field(default_factory=list)
     context_gaps: list[str] = field(default_factory=list)
     followup_context_requests: list[str] = field(default_factory=list)
     repair_strategy: str = ""
-    drop_reason: str | None = None
     historical_snapshot_mismatch: bool = False
     github_evidence_strength: str = "low"
 

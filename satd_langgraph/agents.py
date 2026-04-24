@@ -2,7 +2,9 @@
 
 import ast
 import builtins
+import copy
 import json
+import re
 import os
 import re
 import textwrap
@@ -28,22 +30,6 @@ from .schema import (
     preprocess_python_code,
 )
 
-
-VALID_DECISIONS = {"repairable", "drop", "needs_more_context"}  
-FINAL_DECISIONS = {"repairable", "drop"}
-VALID_SCOPE_RADII = {"line", "function", "class", "file", "multi_file"}
-VALID_DROP_REASONS = {
-    "intent_too_vague",
-    "architecture_level_change",
-    "insufficient_context",
-    "missing_validation_signal",
-    "high_behavioral_risk",
-    "too_many_call_sites",
-    "external_dependency_blocked",
-    "repo_history_conflict",
-}
-VALID_RISK_LEVELS = {"low", "medium", "high"}
-VALID_GITHUB_EVIDENCE = {"low", "medium", "high"}
 MODEL_ALIASES = {"gpt-4o-mini-global": "gpt-4o-mini"}
 
 
@@ -1290,192 +1276,255 @@ class OpenAIAnalyzer:
         self.client = client
 
     def run(self, state: GraphState) -> AnalysisResult:
-        context_bundle = state.get("github_context") or self.client.build_base_context(state)
-        github_context = self.client.compact_shared_context(context_bundle)
+        context_summary = self._build_analyzer_context_summary(state.get("github_context"))
         system_prompt = (
-            "You are the analyzer agent in a SATD repair workflow. "
-            "Your job is to decide whether a SATD item is a good candidate for automatic repair, not whether it is theoretically fixable in some ideal setting. "
-            "Use SATD comment, original code, and file path as the primary evidence. "
-            "Use current GitHub repository state only as auxiliary evidence because the SATD may come from an older snapshot that has already been repaired. "
-            "Missing GitHub files, missing symbols, missing tests, or missing history must be treated as neutral missing evidence, not as automatic reasons to drop. "
-            "Score the task on five general dimensions: intent_clarity, change_locality, semantic_risk, context_sufficiency, and verifiability. "
-            "Prefer tasks that are clear, local, low-risk, and reviewable. "
-            "Drop only when the primary evidence itself indicates vague intent, architecture-level change, high behavioral risk, or an external blocking dependency. "
-            "Return JSON only."
+            "You are a SATD triage analyzer for generic SATD items only.\n"
+            "Your job is not to repair code.\n"
+            "Your job is to judge whether this SATD is a good candidate for automatic local repair.\n"
+            "Use only the SATD comment and the current code snippet.\n"
+            "Judge the item using four questions:\n"
+            "1. Does the SATD request a concrete editing operation rather than open-ended implementation, investigation, or design work?\n"
+            "2. Is the repair target localizable in the snippet?\n"
+            "3. Does the change appear local in scope?\n"
+            "4. Is the desired end state clear enough from the comment and snippet to attempt a local repair?\n"
+            "Decision policy:\n"
+            "- PASS: the SATD describes a clear local repair target that is visible or strongly implied in the snippet.\n"
+            "- UNCERTAIN: the SATD may still be repairable, but the target, intent, or scope is not clear enough for confident filtering.\n"
+            "- DROP: the SATD is clearly not a good candidate for automatic local repair because it is refactor-like, clearly non-local, or lacks any identifiable local repair target.\n"
+            "Do not assume extra repository facts.\n"
+            "Do not propose repairs.\n"
+            "Do not explain at length.\n"
+            "Do not think about whether a human expert could eventually fix it.\n"
+            "Decide only whether this is a good candidate for automatic local repair now.\n\n"
+            "Important:\n"
+            "- Prefer UNCERTAIN over DROP when evidence is mixed.\n"
+            "- Use DROP only for strong structural reasons, not just because the task looks difficult.\n"
+            "- Question-like wording, future-timing wording, or tentative wording are not automatic DROP signals.\n"
+            "- If a local code target is visible, prefer PASS or UNCERTAIN rather than DROP.\n"
+            "- Use the levels high / partial / low for each dimension.\n"
+            "- Treat the four dimension judgments seriously: they should reflect the actual evidence in the comment and snippet.\n"
+            "- Set operation_concrete=high only when the request implies a concrete edit such as remove, replace, annotate, document, adjust a return or raise path, or update a specific value or branch.\n"
+            "- Set operation_concrete=partial when the edit direction exists but is still somewhat open-ended, such as adding a check or enabling a path without a fully specified edit. If the comment already points to an existing API, parameter, key, path, branch, exception path, or value replacement target, it should be at least partial.\n"
+            "- Set operation_concrete=low only for open-ended implementation, design decisions, debugging, investigation, broad cleanup, or other underspecified work.\n"
+            "- If the comment already refers to an existing local object, API, parameter, key, path, branch, block, value, or current code path, operation_concrete should usually be at least partial unless the task is still clearly open-ended.\n"
+            "- Set localizable=high only if the snippet shows a concrete edit target such as a symbol, call, parameter, branch, return statement, exception path, variable, or doc block to change.\n"
+            "- Set localizable=partial when the rough area is visible but the exact local edit target is still unclear. If the current statement, call, key, parameter, branch, or code block is already visible, it should be at least partial.\n"
+            "- Set localizable=low only when the snippet does not expose any credible local target to edit.\n"
+            "- Set local_scope=high only if the change appears solvable within one local block or function without broader refactoring.\n"
+            "- Set local_scope=partial when the change still looks mostly local but may need a small amount of nearby surrounding context. If the discussion is still centered on the current function or block, it should be at least partial.\n"
+            "- Set local_scope=low only when the task looks cross-cutting, architectural, global, or broader than a local edit.\n"
+            "- Set end_state_clear=high only if the desired repaired state is reasonably clear from the comment and snippet, even if future timing or external versions are mentioned.\n"
+            "- Set end_state_clear=partial when the intended direction is visible but the exact repaired state is not fully pinned down.\n"
+            "- Set end_state_clear=low only when the final intended state is genuinely ambiguous, requires product or design choices, or depends on unspecified broader behavior.\n"
+            "- If the comment points to an existing local object or current code path, end_state_clear should usually be at least partial unless the request is still fundamentally open-ended or design-level.\n"
+            "Return strict JSON only."
         )
         user_prompt = (
-            "Return a JSON object with keys: "
-            "decision (repairable|drop|needs_more_context), repairability_score (float 0-1), confidence (float 0-1), "
-            "satd_type (string), evidence_summary (string), risk_level (low|medium|high), context_score (float 0-1), "
-            "clarity_score (float 0-1), scope_radius (line|function|class|file|multi_file), validation_signals (array of strings), "
-            "context_gaps (array of strings), repair_strategy (string), drop_reason (one of: intent_too_vague, architecture_level_change, insufficient_context, "
-            "missing_validation_signal, high_behavioral_risk, too_many_call_sites, external_dependency_blocked, repo_history_conflict, or null), "
-            "followup_context_requests (array of strings), intent_clarity (float 0-1), change_locality (float 0-1), semantic_risk (float 0-1), "
-            "context_sufficiency (float 0-1), verifiability (float 0-1), analyze_score (float 0-1). "
-            "Keep evidence_summary concise and evidence-based. If repository evidence is stale or missing but the task still looks clear and local from SATD comment plus original code, do not drop solely for that reason.\n\n"
-            f"Repository owner: {state['user']}\n"
-            f"Repository name: {state['project']}\n"
-            f"File path: {state['file_path']}\n"
-            f"SATD comment: {state['satd_comment']}\n"
-            f"Current code snippet:\n{state['original_code']}\n\n"
-            f"Unified GitHub context:\n{github_context}\n"
+            f"SATD comment:\n{state['satd_comment']}\n\n"
+            f"Current code snippet:\n```python\n{state['original_code']}\n```\n\n"
+            "Return JSON with exactly:\n"
+            "{\n"
+            '  "decision": "pass" | "uncertain" | "drop",\n'
+            '  "confidence": 0.0,\n'
+            '  "operation_concrete": "high" | "partial" | "low",\n'
+            '  "localizable": "high" | "partial" | "low",\n'
+            '  "local_scope": "high" | "partial" | "low",\n'
+            '  "end_state_clear": "high" | "partial" | "low",\n'
+            '  "comment_evidence": "short quote or phrase from the comment",\n'
+            '  "code_evidence": "short phrase describing the visible target or missing target",\n'
+            '  "notes": "one short sentence"\n'
+            "}\n"
         )
         payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"analyze:task_{state['task_id']}")
-        return self._coerce_analysis(payload, state, context_bundle)
+        return self._coerce_analysis(payload, state, source="llm_stage1")
 
-    def _coerce_analysis(
-        self,
-        payload: dict[str, Any],
-        state: GraphState,
-        context_bundle: dict[str, Any],
-    ) -> AnalysisResult:
-        metadata = (context_bundle.get("metadata") or {}) if isinstance(context_bundle, dict) else {}
-        historical_snapshot_mismatch = bool(metadata.get("historical_snapshot_mismatch"))
-        github_evidence_strength = self._normalize_choice(
-            metadata.get("github_evidence_strength"), VALID_GITHUB_EVIDENCE, "low"
+    def _build_analyzer_context_summary(self, bundle: dict[str, Any] | None) -> str:
+        if not bundle:
+            return ""
+        base = bundle.get("base_context") or {}
+        repair = bundle.get("repair_context") or {}
+        metadata = bundle.get("metadata") or {}
+        target_function = (base.get("target_function") or {}) if isinstance(base, dict) else {}
+        module_symbols = (repair.get("module_symbols") or {}) if isinstance(repair, dict) else {}
+        same_file_helpers = (repair.get("same_file_helpers") or {}) if isinstance(repair, dict) else {}
+        same_class_evidence = (repair.get("same_class_evidence") or {}) if isinstance(repair, dict) else {}
+        same_file_pattern = (repair.get("same_file_pattern") or {}) if isinstance(repair, dict) else {}
+        targeted_callsite = (repair.get("targeted_callsite_snippet") or {}) if isinstance(repair, dict) else {}
+        callsite_item = targeted_callsite.get("item") or {}
+
+        summary = {
+            "definition_context": {
+                "target_function_found": target_function.get("found"),
+                "symbol_name": target_function.get("symbol_name"),
+                "class_name": target_function.get("class_name"),
+                "matched_by": target_function.get("matched_by"),
+                "module_symbols_count": module_symbols.get("count", 0),
+                "module_symbols_preview": [
+                    {
+                        "symbol_name": item.get("symbol_name"),
+                        "kind": item.get("kind"),
+                    }
+                    for item in (module_symbols.get("items") or [])[:5]
+                ],
+            },
+            "usage_context": {
+                "call_sites_count": metadata.get("call_sites_count", 0),
+                "targeted_callsite_found": bool(targeted_callsite.get("used") and callsite_item),
+                "targeted_callsite_path": callsite_item.get("path"),
+                "targeted_callsite_excerpt": (callsite_item.get("excerpt") or "")[:400],
+            },
+            "replacement_context": {
+                "same_file_helpers_count": same_file_helpers.get("count", 0),
+                "same_class_methods_count": same_class_evidence.get("related_methods_count", 0),
+                "same_class_attributes_count": same_class_evidence.get("related_attributes_count", 0),
+                "same_file_pattern_count": same_file_pattern.get("count", 0),
+            },
+        }
+        return json.dumps(summary, ensure_ascii=False)
+
+    def build_easy_route_analysis(self, route_type: str) -> AnalysisResult:
+        note = f"Easy SATD route '{route_type}' bypassed the generic analyzer and passed directly."
+        return self._build_result(
+            decision="pass",
+            confidence=1.0,
+            operation_concrete="high",
+            localizable="high",
+            local_scope="high",
+            end_state_clear="high",
+            notes=note,
+            comment_evidence=route_type,
+            code_evidence="easy route bypass",
+            satd_type=route_type,
+            source="rule_easy_route",
+            scope_radius="function",
         )
 
-        decision = self._normalize_decision(payload.get("decision"))
-        repairability_score = self._clamp_float(payload.get("repairability_score"), 0.0)
+    def build_rule_drop_analysis(self, notes: str) -> AnalysisResult:
+        return self._build_result(
+            decision="drop",
+            confidence=1.0,
+            operation_concrete="low",
+            localizable="low",
+            local_scope="low",
+            end_state_clear="low",
+            notes=notes,
+            comment_evidence="",
+            code_evidence="rule-based missing input",
+            satd_type="generic",
+            source="rule_drop",
+            scope_radius="function",
+        )
+
+    def _coerce_analysis(self, payload: dict[str, Any], state: GraphState, source: str) -> AnalysisResult:
+        requested_decision = self._normalize_decision(payload.get("decision"))
         confidence = self._clamp_float(payload.get("confidence"), 0.0)
-        satd_type = str(payload.get("satd_type") or "unknown")
-        evidence_summary = str(payload.get("evidence_summary") or payload.get("reason") or "")
-        risk_level = self._normalize_choice(payload.get("risk_level"), VALID_RISK_LEVELS, "medium")
-        context_score = self._clamp_float(payload.get("context_score"), 0.0)
-        clarity_score = self._clamp_float(payload.get("clarity_score"), 0.0)
-        scope_radius = self._normalize_choice(payload.get("scope_radius"), VALID_SCOPE_RADII, "file")
-        validation_signals = self._normalize_list(payload.get("validation_signals"))
-        context_gaps = self._normalize_list(payload.get("context_gaps"))
-        followup_context_requests = self._normalize_list(payload.get("followup_context_requests"))
-        repair_strategy = str(payload.get("repair_strategy") or "")
-        drop_reason = self._normalize_drop_reason(payload.get("drop_reason"), decision)
-
-        intent_clarity = self._clamp_float(payload.get("intent_clarity"), clarity_score)
-        change_locality = self._clamp_float(payload.get("change_locality"), self._scope_to_locality(scope_radius))
-        semantic_risk = self._clamp_float(payload.get("semantic_risk"), self._risk_to_numeric(risk_level))
-        context_sufficiency = self._clamp_float(
-            payload.get("context_sufficiency"),
-            context_score,
+        operation_concrete = self._normalize_level(payload.get("operation_concrete"))
+        localizable = self._normalize_level(payload.get("localizable"))
+        local_scope = self._normalize_level(payload.get("local_scope"))
+        end_state_clear = self._normalize_level(payload.get("end_state_clear"))
+        operation_concrete, localizable, local_scope, end_state_clear = self._apply_existing_target_floors(
+            state=state,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
         )
-        verifiability = self._clamp_float(
-            payload.get("verifiability"),
-            self._estimate_verifiability(scope_radius, validation_signals, context_gaps),
+        notes = self._one_line(payload.get("notes") or payload.get("reason") or payload.get("evidence_summary") or "")
+        comment_evidence = self._one_line(payload.get("comment_evidence"))
+        code_evidence = self._one_line(payload.get("code_evidence"))
+        satd_type = str(state.get("satd_route_type") or "generic")
+        decision = self._decision_from_checks(
+            requested_decision=requested_decision,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
         )
-        analyze_score = self._clamp_float(
-            payload.get("analyze_score"),
-            self._weighted_analyze_score(
-                intent_clarity,
-                change_locality,
-                semantic_risk,
-                context_sufficiency,
-                verifiability,
-            ),
+        return self._build_result(
+            decision=decision,
+            confidence=confidence,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
+            notes=notes,
+            comment_evidence=comment_evidence,
+            code_evidence=code_evidence,
+            satd_type=satd_type,
+            source=source,
+            scope_radius=self._infer_scope_radius_from_code(state.get("original_code") or ""),
         )
 
-        if historical_snapshot_mismatch and "github_snapshot_mismatch" not in validation_signals:
-            validation_signals.append("github_snapshot_mismatch")
+    def _build_result(
+        self,
+        *,
+        decision: str,
+        confidence: float,
+        operation_concrete: str | None,
+        localizable: str | None,
+        local_scope: str | None,
+        end_state_clear: str | None,
+        notes: str,
+        comment_evidence: str,
+        code_evidence: str,
+        satd_type: str,
+        source: str,
+        scope_radius: str,
+    ) -> AnalysisResult:
+        repairable = decision != "drop"
+        confidence = self._clamp_float(confidence, 0.0)
+        operation_concrete = operation_concrete if operation_concrete is not None else ("high" if decision == "pass" else "low" if decision == "drop" else "partial")
+        localizable = localizable if localizable is not None else ("high" if decision == "pass" else "low" if decision == "drop" else "partial")
+        local_scope = local_scope if local_scope is not None else ("high" if decision == "pass" else "low" if decision == "drop" else "partial")
+        end_state_clear = end_state_clear if end_state_clear is not None else ("high" if decision == "pass" else "low" if decision == "drop" else "partial")
 
-        annotation_like_task = self._is_annotation_like_task(state, satd_type)
-        explicit_exception_task = self._is_explicit_exception_task(state, satd_type)
-        comment_removal_task = self._is_comment_removal_task(state, satd_type)
-        narrow_local_task = annotation_like_task or explicit_exception_task or comment_removal_task
-        if annotation_like_task:
-            risk_level = "medium" if risk_level == "high" else risk_level
-            semantic_risk = min(semantic_risk, 0.48)
-        elif explicit_exception_task:
-            risk_level = "medium" if risk_level == "high" else risk_level
-            semantic_risk = min(semantic_risk, 0.60)
-
-        primary_clear = self._primary_evidence_clear(
-            state,
-            intent_clarity=intent_clarity,
-            change_locality=change_locality,
-            context_sufficiency=context_sufficiency,
-            analyze_score=analyze_score,
-            scope_radius=scope_radius,
-        )
-        local_enough = scope_radius in {"line", "function", "class", "file"} and change_locality >= 0.52
-        hard_drop_reason = drop_reason in {
-            "intent_too_vague",
-            "architecture_level_change",
-            "high_behavioral_risk",
-            "external_dependency_blocked",
-        }
-        weak_drop_reason = drop_reason in {
-            None,
-            "insufficient_context",
-            "missing_validation_signal",
-            "too_many_call_sites",
-            "repo_history_conflict",
-        }
-
-        if decision == "needs_more_context" and primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.62:
-            decision = "repairable"
-            repairability_score = max(repairability_score, analyze_score, 0.64)
-            confidence = max(confidence, 0.60)
-            drop_reason = None
-            followup_context_requests = []
-
-        if decision == "drop" and weak_drop_reason:
-            if primary_clear and local_enough and semantic_risk <= 0.68 and analyze_score >= 0.66:
-                decision = "repairable"
-                repairability_score = max(repairability_score, analyze_score, 0.66)
-                confidence = max(confidence, 0.60 if historical_snapshot_mismatch else 0.58)
-                drop_reason = None
-            elif analyze_score >= 0.54 and not hard_drop_reason:
-                decision = "needs_more_context"
-                drop_reason = "insufficient_context"
-
-        if (
-            decision != "repairable"
-            and narrow_local_task
-            and scope_radius in {"line", "function"}
-            and intent_clarity >= 0.40
-            and change_locality >= 0.50
-            and context_sufficiency >= 0.20
-            and analyze_score >= 0.40
-        ):
-            decision = "repairable"
-            repairability_score = max(
-                repairability_score,
-                analyze_score,
-                0.56 if annotation_like_task else 0.55 if comment_removal_task else 0.54,
-            )
-            confidence = max(confidence, 0.52 if annotation_like_task else 0.50 if comment_removal_task else 0.48)
-            drop_reason = None
-            followup_context_requests = []
-
-        if (
-            decision == "drop"
-            and drop_reason == "architecture_level_change"
-            and scope_radius in {"line", "function", "class"}
-            and analyze_score >= 0.58
-        ):
-            decision = "repairable"
-            repairability_score = max(repairability_score, analyze_score, 0.62)
-            confidence = max(confidence, 0.57)
-            drop_reason = None
-
-        if decision == "repairable" and primary_clear and local_enough and semantic_risk <= 0.72:
-            repairability_score = max(repairability_score, analyze_score, 0.64)
-            confidence = max(confidence, 0.58)
-            drop_reason = None
-
-        if decision == "repairable":
-            repair_strategy = repair_strategy or "Apply a local, behavior-preserving fix within the smallest stable scope."
-            followup_context_requests = []
-        elif decision == "needs_more_context":
-            repair_strategy = repair_strategy or "Gather only the missing context needed to localize the change."
-            if not followup_context_requests:
-                followup_context_requests = ["clarify_missing_local_context"]
+        operation_score = self._level_score(operation_concrete)
+        localizable_score = self._level_score(localizable)
+        local_scope_score = self._level_score(local_scope)
+        end_state_score = self._level_score(end_state_clear)
+        if decision == "pass":
+            repairability_score = max(0.70, confidence or 0.80)
+            intent_clarity = 0.25 + (0.65 * operation_score)
+            change_locality = 0.25 + (0.65 * local_scope_score)
+            semantic_risk = 0.28
+            context_sufficiency = 0.20 + (0.35 * localizable_score) + (0.25 * end_state_score)
+            verifiability = 0.68
+            analyze_score = max(0.72, repairability_score)
+            risk_level = "medium" if satd_type == "generic" else "low"
+            context_score = context_sufficiency
+            clarity_score = intent_clarity
+            context_gaps: list[str] = []
+            repair_strategy = "Pass this item directly to the repair stage."
+        elif decision == "uncertain":
+            repairability_score = max(0.45, confidence or 0.55)
+            intent_clarity = 0.20 + (0.45 * operation_score)
+            change_locality = 0.20 + (0.45 * local_scope_score)
+            semantic_risk = 0.50
+            context_sufficiency = 0.12 + (0.28 * localizable_score) + (0.18 * end_state_score)
+            verifiability = 0.46
+            analyze_score = max(0.46, repairability_score)
+            risk_level = "medium"
+            context_score = context_sufficiency
+            clarity_score = intent_clarity
+            context_gaps = self._derive_context_gaps(operation_concrete, localizable, local_scope, end_state_clear)
+            repair_strategy = "Allow repair to try, but treat this item as ambiguous."
         else:
-            repair_strategy = repair_strategy or "Do not attempt automatic repair."
-            if not drop_reason:
-                drop_reason = "insufficient_context"
+            repairability_score = 0.0
+            intent_clarity = 0.08 + (0.22 * operation_score)
+            change_locality = 0.06 + (0.18 * local_scope_score)
+            semantic_risk = 0.82
+            context_sufficiency = 0.04 + (0.16 * localizable_score) + (0.10 * end_state_score)
+            verifiability = 0.18
+            analyze_score = min(0.30, confidence)
+            risk_level = "high"
+            context_score = context_sufficiency
+            clarity_score = intent_clarity
+            context_gaps = self._derive_context_gaps(operation_concrete, localizable, local_scope, end_state_clear)
+            repair_strategy = "Drop this item before repair."
 
         return AnalysisResult(
             decision=decision,
-            repairable=decision == "repairable",
+            repairable=repairable,
             repairability_score=repairability_score,
             intent_clarity=intent_clarity,
             change_locality=change_locality,
@@ -1485,156 +1534,369 @@ class OpenAIAnalyzer:
             analyze_score=analyze_score,
             confidence=confidence,
             satd_type=satd_type,
-            reason=evidence_summary,
-            evidence_summary=evidence_summary,
+            reason=notes or decision,
+            evidence_summary=notes or decision,
             risk_level=risk_level,
             context_score=context_score,
             clarity_score=clarity_score,
             scope_radius=scope_radius,
-            validation_signals=validation_signals,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
+            comment_evidence=comment_evidence,
+            code_evidence=code_evidence,
+            validation_signals=[
+                f"simple_analyzer:{source}",
+                f"decision:{decision}",
+                f"operation_concrete:{operation_concrete}",
+                f"localizable:{localizable}",
+                f"local_scope:{local_scope}",
+                f"end_state_clear:{end_state_clear}",
+            ],
             context_gaps=context_gaps,
-            followup_context_requests=followup_context_requests,
+            followup_context_requests=[],
             repair_strategy=repair_strategy,
-            drop_reason=drop_reason,
-            historical_snapshot_mismatch=historical_snapshot_mismatch,
-            github_evidence_strength=github_evidence_strength,
+            historical_snapshot_mismatch=False,
+            github_evidence_strength="low",
         )
 
-    def _primary_evidence_clear(
+    def _infer_scope_radius_from_code(self, code: str) -> str:
+        lowered = (code or "").lower()
+        if "class " in lowered:
+            return "class"
+        if "def " in lowered or "async def " in lowered:
+            return "function"
+        if len([line for line in (code or "").splitlines() if line.strip()]) <= 2:
+            return "line"
+        return "function"
+
+    def _decision_from_checks(
         self,
+        *,
+        requested_decision: str,
+        operation_concrete: str | None,
+        localizable: str | None,
+        local_scope: str | None,
+        end_state_clear: str | None,
+    ) -> str:
+        checks = [operation_concrete, localizable, local_scope, end_state_clear]
+        known = [item for item in checks if item is not None]
+        low_count = sum(1 for item in known if item == "low")
+        high_count = sum(1 for item in known if item == "high")
+
+        if localizable == "high" and local_scope == "high" and (operation_concrete == "high" or end_state_clear == "high"):
+            return "pass"
+
+        if operation_concrete == "low" and localizable == "low" and end_state_clear == "low":
+            return "drop"
+        if localizable == "low" and local_scope == "low" and end_state_clear == "low":
+            return "drop"
+        if low_count >= 3 and high_count == 0:
+            return "drop"
+
+        return "uncertain"
+
+    def _apply_existing_target_floors(
+        self,
+        *,
         state: GraphState,
-        intent_clarity: float,
-        change_locality: float,
-        context_sufficiency: float,
-        analyze_score: float,
-        scope_radius: str,
-    ) -> bool:
-        comment = (state.get("satd_comment") or "").strip()
-        code = (state.get("original_code") or "").strip()
-        comment_tokens = len(re.findall(r"[A-Za-z_]+", comment))
-        code_lines = len([line for line in code.splitlines() if line.strip()])
-        has_local_structure = bool(re.search(r"\b(def|class|return|if|for|while|try|except|with|raise)\b", code))
-        scope_local = scope_radius in {"line", "function", "class", "file"}
-        return (
-            comment_tokens >= 3
-            and code_lines >= 1
-            and has_local_structure
-            and scope_local
-            and intent_clarity >= 0.48
-            and change_locality >= 0.50
-            and context_sufficiency >= 0.45
-            and analyze_score >= 0.54
+        operation_concrete: str | None,
+        localizable: str | None,
+        local_scope: str | None,
+        end_state_clear: str | None,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        comment = str(state.get("satd_comment") or "")
+        code = str(state.get("original_code") or "")
+        if not self._has_existing_target_hint(comment, code):
+            return operation_concrete, localizable, local_scope, end_state_clear
+        if self._looks_open_ended_task(comment):
+            return operation_concrete, localizable, local_scope, end_state_clear
+
+        if localizable == "low":
+            localizable = "partial"
+        if operation_concrete == "low":
+            operation_concrete = "partial"
+        if end_state_clear == "low":
+            end_state_clear = "partial"
+        return operation_concrete, localizable, local_scope, end_state_clear
+
+    def _has_existing_target_hint(self, comment: str, code: str) -> bool:
+        lowered = (comment or "").lower()
+        if not lowered.strip() or not (code or "").strip():
+            return False
+        anchor_patterns = [
+            r"\bthis\b",
+            r"\bthese\b",
+            r"\bthat\b",
+            r"\bcurrent\b",
+            r"\bexisting\b",
+            r"\balready\b",
+            r"\bhere\b",
+            r"\bapi\b",
+            r"\bparameter\b",
+            r"\bparam\b",
+            r"\bargument\b",
+            r"\bkey\b",
+            r"\bkeys\b",
+            r"\bpath\b",
+            r"\bbranch\b",
+            r"\bblock\b",
+            r"\bvalue\b",
+            r"\bfield\b",
+            r"\bindex name\b",
+            r"\bline\b",
+            r"\bobject\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in anchor_patterns)
+
+    def _looks_open_ended_task(self, comment: str) -> bool:
+        lowered = (comment or "").lower()
+        open_ended_patterns = [
+            r"\bimplement\b",
+            r"\bdecide\b",
+            r"\bconsider\b",
+            r"\binvestigat",
+            r"\blook into\b",
+            r"\bdebug\b",
+            r"\brefactor\b",
+            r"\brewrite\b",
+            r"\bredesign\b",
+            r"\bclean up\b",
+            r"\bglobal\b",
+            r"\barchitecture\b",
+            r"\bintegration\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in open_ended_patterns)
+
+    def _maybe_compress_uncertain(self, state: GraphState, analysis: AnalysisResult) -> AnalysisResult:
+        if analysis.decision != "uncertain":
+            return analysis
+        if not self._is_second_stage_uncertain_candidate(state, analysis):
+            return analysis
+
+        context_summary = self._build_analyzer_context_summary(state.get("github_context"))
+        system_prompt = (
+            "You are a second-stage SATD triage analyzer for generic uncertain SATD items.\n"
+            "Your job is to decide whether an uncertain item should remain uncertain or be dropped after examining compact repository context.\n"
+            "Use only the SATD comment, current code snippet, first-stage structured summary, and the compact definition/usage context.\n"
+            "Prefer keeping the item as UNCERTAIN unless the context strongly shows that this is not a closed local edit task.\n"
+            "A DROP should be reserved for tasks that still lack a credible existing target, lack local usage evidence, or remain fundamentally open-ended after context is considered.\n"
+            "If the context shows an existing object, local usage, or a plausible replacement path, prefer UNCERTAIN.\n"
+            "If the context still indicates broad integration, migration, validation strategy, or open-ended improvement work with weak usage locality and weak replacement evidence, prefer DROP.\n"
+            "Return strict JSON only."
         )
+        user_prompt = (
+            f"SATD comment:\n{state['satd_comment']}\n\n"
+            f"Current code snippet:\n```python\n{state['original_code']}\n```\n\n"
+            "First-stage summary:\n"
+            f"- operation_concrete: {analysis.operation_concrete}\n"
+            f"- localizable: {analysis.localizable}\n"
+            f"- local_scope: {analysis.local_scope}\n"
+            f"- end_state_clear: {analysis.end_state_clear}\n"
+            f"- comment_evidence: {analysis.comment_evidence or '(none)'}\n"
+            f"- code_evidence: {analysis.code_evidence or '(none)'}\n\n"
+            + (f"Compact definition/usage context:\n{context_summary}\n\n" if context_summary else "")
+            +
+            "Return JSON with exactly:\n"
+            "{\n"
+            '  "decision": "drop" | "uncertain",\n'
+            '  "confidence": 0.0,\n'
+            '  "target_existence": "high" | "partial" | "low",\n'
+            '  "usage_locality": "high" | "partial" | "low",\n'
+            '  "replacement_evidence": "high" | "partial" | "low",\n'
+            '  "task_closedness": "high" | "partial" | "low",\n'
+            '  "notes": "one short sentence"\n'
+            "}\n"
+        )
+        payload = self.client.generate_json(
+            system_prompt,
+            user_prompt,
+            request_label=f"analyze_stage2:task_{state['task_id']}",
+        )
+        return self._coerce_uncertain_compression(payload, analysis, state)
 
-    def _scope_to_locality(self, scope_radius: str) -> float:
-        return {
-            "line": 0.95,
-            "function": 0.85,
-            "class": 0.70,
-            "file": 0.58,
-            "multi_file": 0.28,
-        }.get(scope_radius, 0.50)
+    def _is_second_stage_uncertain_candidate(self, state: GraphState, analysis: AnalysisResult) -> bool:
+        if str(state.get("satd_route_type") or "generic") != "generic":
+            return False
+        if analysis.decision != "uncertain":
+            return False
+        bundle = state.get("github_context") or {}
+        base = bundle.get("base_context") or {}
+        repair = bundle.get("repair_context") or {}
+        has_definition = bool((base.get("target_function") or {}).get("found")) or bool((repair.get("module_symbols") or {}).get("count"))
+        has_usage = bool((repair.get("targeted_callsite_snippet") or {}).get("used")) or bool((bundle.get("metadata") or {}).get("call_sites_count"))
+        has_replacement = bool((repair.get("same_file_helpers") or {}).get("count")) or bool((repair.get("same_file_pattern") or {}).get("count"))
+        if has_definition or has_usage or has_replacement:
+            return True
+        weak_local_shape = (
+            analysis.localizable == "high"
+            and analysis.local_scope == "high"
+            and analysis.operation_concrete in {"low", "partial"}
+            and analysis.end_state_clear in {"low", "partial"}
+        )
+        return weak_local_shape
 
-    def _risk_to_numeric(self, risk_level: str) -> float:
-        return {"low": 0.22, "medium": 0.55, "high": 0.86}.get(risk_level, 0.55)
-
-    def _estimate_verifiability(self, scope_radius: str, validation_signals: list[str], context_gaps: list[str]) -> float:
-        score = 0.45
-        if scope_radius in {"line", "function", "class"}:
-            score += 0.10
-        if validation_signals:
-            score += min(0.25, 0.05 * len(validation_signals))
-        if context_gaps:
-            score -= min(0.20, 0.04 * len(context_gaps))
-        return max(0.0, min(1.0, score))
-
-    def _weighted_analyze_score(
+    def _coerce_uncertain_compression(
         self,
-        intent_clarity: float,
-        change_locality: float,
-        semantic_risk: float,
-        context_sufficiency: float,
-        verifiability: float,
-    ) -> float:
-        score = (
-            0.30 * intent_clarity
-            + 0.25 * change_locality
-            + 0.20 * context_sufficiency
-            + 0.15 * verifiability
-            + 0.10 * (1.0 - semantic_risk)
-        )
-        return max(0.0, min(1.0, score))
+        payload: dict[str, Any],
+        base: AnalysisResult,
+        state: GraphState,
+    ) -> AnalysisResult:
+        requested = self._normalize_decision(payload.get("decision"))
+        confidence = self._clamp_float(payload.get("confidence"), 0.0)
+        target_existence = self._normalize_level(payload.get("target_existence"))
+        usage_locality = self._normalize_level(payload.get("usage_locality"))
+        replacement_evidence = self._normalize_level(payload.get("replacement_evidence"))
+        task_closedness = self._normalize_level(payload.get("task_closedness"))
+        notes = self._one_line(payload.get("notes"))
+        open_ended_comment = self._looks_open_ended_task(str(state.get("satd_comment") or ""))
 
-    def _is_annotation_like_task(self, state: GraphState, satd_type: str) -> bool:
-        satd = (satd_type or "").strip().lower()
-        comment = (state.get("satd_comment") or "").strip().lower()
-        return satd.startswith("type_annotation") or satd in {"pyre-fixme", "pyre_fixme"} or (
-            ("annotat" in comment or "type hint" in comment or "pyre-fixme" in comment)
-            and "return type" in comment
+        low_count = sum(
+            1 for item in (target_existence, usage_locality, replacement_evidence, task_closedness) if item == "low"
         )
-
-    def _is_explicit_exception_task(self, state: GraphState, satd_type: str) -> bool:
-        satd = (satd_type or "").strip().lower()
-        comment = (state.get("satd_comment") or "").strip().lower()
-        if satd not in {"exception_handling", "todo", "fixme", "bug"}:
-            return False
-        return "raise exception" in comment or ("raise" in comment and "handler" in comment)
-
-    def _is_comment_removal_task(self, state: GraphState, satd_type: str) -> bool:
-        satd = (satd_type or "").strip().lower()
-        comment = (state.get("satd_comment") or "").strip().lower()
-        if satd not in {"todo", "cleanup", "clarification"}:
-            return False
-        return any(marker in comment for marker in ("remove", "delete", "drop")) and any(
-            marker in comment for marker in ("todo", "fixme", "hack", "comment")
+        should_drop_by_open_task = (
+            requested == "drop"
+            and task_closedness == "low"
+            and usage_locality == "low"
+            and replacement_evidence != "high"
+            and confidence >= 0.55
         )
+        should_drop_by_missing_target = (
+            requested == "drop"
+            and target_existence == "low"
+            and usage_locality == "low"
+            and confidence >= 0.55
+        )
+        should_drop_by_broad_context = (
+            requested == "drop"
+            and task_closedness == "low"
+            and usage_locality != "high"
+            and replacement_evidence == "low"
+            and confidence >= 0.58
+        )
+        should_drop_by_partial_target_but_nonlocal = (
+            requested == "drop"
+            and target_existence == "partial"
+            and usage_locality == "low"
+            and task_closedness == "low"
+            and replacement_evidence != "high"
+            and confidence >= 0.60
+        )
+        should_drop_by_open_ended_weak_spec = (
+            open_ended_comment
+            and base.operation_concrete == "low"
+            and base.end_state_clear == "low"
+            and base.localizable == "high"
+            and base.local_scope == "high"
+            and replacement_evidence != "high"
+        )
+        should_drop = (
+            should_drop_by_open_task
+            or should_drop_by_missing_target
+            or should_drop_by_broad_context
+            or should_drop_by_partial_target_but_nonlocal
+            or should_drop_by_open_ended_weak_spec
+            or (
+                requested == "drop"
+                and target_existence == "low"
+                and task_closedness == "low"
+                and low_count >= 3
+                and confidence >= 0.60
+            )
+        )
+        if not should_drop:
+            if notes:
+                base.reason = notes
+                base.evidence_summary = notes
+            base.validation_signals.append(
+                "simple_analyzer:stage2_keep:"
+                f"{target_existence or 'unknown'}:{usage_locality or 'unknown'}:"
+                f"{replacement_evidence or 'unknown'}:{task_closedness or 'unknown'}"
+            )
+            return base
+
+        updated = copy.deepcopy(base)
+        updated.decision = "drop"
+        updated.repairable = False
+        updated.confidence = max(base.confidence, confidence)
+        updated.repairability_score = 0.0
+        updated.semantic_risk = max(updated.semantic_risk, 0.82)
+        updated.verifiability = min(updated.verifiability, 0.18)
+        updated.analyze_score = min(updated.analyze_score, 0.30)
+        updated.risk_level = "high"
+        updated.reason = notes or "Second-stage analyzer judged this uncertain item to be fundamentally open-ended."
+        updated.evidence_summary = updated.reason
+        updated.repair_strategy = "Drop this item after second-stage uncertain compression."
+        updated.validation_signals.append(
+            f"simple_analyzer:stage2_drop:{target_existence}:{usage_locality}:{replacement_evidence}:{task_closedness}"
+        )
+        return updated
 
     def _normalize_decision(self, value: Any) -> str:
         text = str(value or "").strip().lower()
-        if text in VALID_DECISIONS:
+        if text in {"pass", "uncertain", "drop"}:
             return text
-        if "repair" in text:
-            return "repairable"
-        if "need" in text or "more_context" in text or "context" in text:
-            return "needs_more_context"
-        if "drop" in text or "reject" in text:
+        if "drop" in text:
             return "drop"
-        return "needs_more_context"
+        if "uncertain" in text or "need" in text:
+            return "uncertain"
+        return "pass"
 
-    def _normalize_choice(self, value: Any, valid: set[str], default: str) -> str:
+    def _normalize_level(self, value: Any) -> str | None:
+        if isinstance(value, bool):
+            return "high" if value else "low"
         text = str(value or "").strip().lower()
-        return text if text in valid else default
-
-    def _normalize_drop_reason(self, value: Any, decision: str) -> str | None:
-        if decision == "repairable":
-            return None
-        text = str(value or "").strip().lower()
-        if text in VALID_DROP_REASONS:
-            return text
-        keyword_map = {
-            "vague": "intent_too_vague",
-            "arch": "architecture_level_change",
-            "context": "insufficient_context",
-            "validation": "missing_validation_signal",
-            "risk": "high_behavioral_risk",
-            "call": "too_many_call_sites",
-            "external": "external_dependency_blocked",
-            "history": "repo_history_conflict",
-        }
-        for keyword, mapped in keyword_map.items():
-            if keyword in text:
-                return mapped
+        if text in {"high", "strong", "clear"}:
+            return "high"
+        if text in {"partial", "medium", "mixed", "somewhat"}:
+            return "partial"
+        if text in {"low", "weak", "unclear"}:
+            return "low"
+        if text in {"true", "yes", "1"}:
+            return "high"
+        if text in {"false", "no", "0"}:
+            return "low"
         return None
 
-    def _normalize_list(self, value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        if isinstance(value, str):
-            pieces = re.split(r"[\n,;|]", value)
-            return [piece.strip() for piece in pieces if piece.strip()]
-        return [str(value).strip()]
+    def _derive_context_gaps(
+        self,
+        operation_concrete: str | None,
+        localizable: str | None,
+        local_scope: str | None,
+        end_state_clear: str | None,
+    ) -> list[str]:
+        gaps: list[str] = []
+        if operation_concrete == "low":
+            gaps.append("not_operation_concrete")
+        elif operation_concrete == "partial":
+            gaps.append("partially_operation_concrete")
+        if localizable == "low":
+            gaps.append("not_localizable")
+        elif localizable == "partial":
+            gaps.append("partially_localizable")
+        if local_scope == "low":
+            gaps.append("not_local_scope")
+        elif local_scope == "partial":
+            gaps.append("partially_local_scope")
+        if end_state_clear == "low":
+            gaps.append("not_end_state_clear")
+        elif end_state_clear == "partial":
+            gaps.append("partially_end_state_clear")
+        return gaps
+
+    def _level_score(self, value: str | None) -> float:
+        if value == "high":
+            return 1.0
+        if value == "partial":
+            return 0.55
+        if value == "low":
+            return 0.0
+        return 0.45
+
+    def _one_line(self, value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        return text[:240]
 
     def _clamp_float(self, value: Any, default: float) -> float:
         try:

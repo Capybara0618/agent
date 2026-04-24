@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable reviewer gating after repair. Default is off for fixer-only experiments.",
     )
     parser.add_argument(
+        "--analysis-only",
+        action="store_true",
+        help="Run analyzer-only triage and stop before repair/review.",
+    )
+    parser.add_argument(
         "--repair-context-mode",
         choices=["clone_treesitter", "method_query"],
         default="clone_treesitter",
@@ -97,6 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.analysis_only:
+        args.enable_analyzer = True
+        args.enable_review = False
     if args.git_remote_base:
         os.environ["SATD_GIT_REMOTE_BASE"] = args.git_remote_base
     if args.git_remote_template:
@@ -115,6 +123,7 @@ def main() -> None:
         write_batch_size=args.write_batch_size,
         use_analyzer=args.enable_analyzer,
         use_reviewer=args.enable_review,
+        analysis_only=args.analysis_only,
         repair_context_mode=args.repair_context_mode,
         max_method_contexts=args.max_method_contexts,
     )
@@ -135,6 +144,8 @@ def main() -> None:
     print(f"Write batch size: {summary['write_batch_size']}")
     print(f"Analyzer enabled: {args.enable_analyzer}")
     print(f"Review enabled: {args.enable_review}")
+    print(f"Analysis only: {summary.get('analysis_only')}")
+    print(f"Analyzer pass count: {summary.get('analyzer_pass_count')}")
     print(f"Repair context mode: {summary.get('repair_context_mode')}")
     print(f"Single repair path: {summary.get('single_repair_path')}")
     print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")

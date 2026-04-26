@@ -1,0 +1,108 @@
+{
+  "task_id": "337",
+  "repo_owner": "nyu-mll",
+  "repo_name": "jiant",
+  "file_path": "src/trainer.py",
+  "commit": "5912adff9df78699f38627a4aeddbdc1914836a4",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T12:32:03+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "5912adff9df78699f38627a4aeddbdc1914836a4",
+    "symbol_name": "_save_checkpoint",
+    "satd_line": 526,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T12:32:03+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 5,
+    "retrieved_method_count": 0,
+    "missing_method_count": 5,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/trainer.py",
+    "original_signature": "def _save_checkpoint(self, training_state, phase=\"main\", new_best_macro=False, keep_all=False):",
+    "target_file": {
+      "ok": true,
+      "path": "src/trainer.py",
+      "sha": "db392154cc4324069a758c6e9c846922045e3a90",
+      "download_url": "https://raw.githubusercontent.com/nyu-mll/jiant/5912adff9df78699f38627a4aeddbdc1914836a4/src/trainer.py",
+      "content_excerpt": "\"\"\" Trainer \"\"\"\n\nimport os\nimport glob\nimport time\nimport copy\nimport random\nimport logging as log\nimport itertools\nimport ipdb as pdb  # pylint: disable=unused-import\n\nimport torch\nimport torch.optim.lr_scheduler\nfrom torch.nn.utils.clip_grad import clip_grad_norm_\n\nfrom allennlp.common import Params\nfrom allennlp.common.checks import ConfigurationError\nfrom allennlp.data.iterators import BasicIterator, BucketIterator\nfrom allennlp.training.learning_rate_schedulers import LearningRateScheduler\nfrom allennlp.training.optimizers import Optimizer\nfrom utils import device_mapping\n\n\ndef build_trainer(args, model):\n    '''Build a trainer'''\n    iterator = BasicIterator(args.batch_size)\n    # iterator = BucketIterator(sorting_keys=[(\"sentence1\", \"num_tokens\")],\n    #                          batch_size=args.batch_size)\n\n    if args.optimizer == 'adam':\n        # AMSGrad is a flag variant of Adam, not its own object.\n        opt_params = Params({'type': args.optimizer, 'lr': args.lr,\n                             'weight_decay': 1e-5, 'amsgrad': True})\n    else:\n        opt_params = Params({'type': args.optimizer, 'lr': args.lr, 'weight_decay': 1e-5})\n\n    if args.sent_enc == 'transformer':\n        schd_params = Params({'type': 'noam',\n                              'model_size': 100,\n                              'warmup_steps': 4000,\n                              'factor': 1.0})\n    else:\n        schd_params = Params({'type': 'reduce_on_plateau',\n                              'mode': 'max',\n                              'factor': args.lr_decay_factor,\n                              'patience': args.task_patience,\n                              'threshold': args.scheduler_threshold,\n                              'threshold_mode': 'abs',\n                              'verbose': True})\n\n    train_params = Params({'num_epochs': args.n_epochs, 'cuda_device': args.cuda,\n                           'patience': args.patience, 'grad_norm': args.max_grad_norm,\n                           'lr_decay': .99, 'min_lr': args.min_lr, 'no_tqdm': args.no_tqdm})\n    trainer = SamplingMultiTaskTrainer.from_params(model, args.run_dir, iterator,\n                                                   copy.deepcopy(train_params))\n    return trainer, train_params, opt_params, schd_params\n\n\ndef get_task_order(method, tasks, iterator):\n    '''Get order to train tasks on'''\n    if method == 'given':\n        task_order = range(len(tasks))\n    elif 'random' in method:\n        task_order = [i for i in range(len(tasks))]\n        random.shuffle(task_order)\n    else:\n        task_sizes = [(idx, iterator.get_num_batches(task.train_data))\n                      for idx, task in enumerate(tasks)]\n        task_sizes.sort(key=lambda x: x[1], reverse=bool(method == 'large_to_small'))\n        task_order = [task_idx for task_idx, _ in task_sizes]\n    return task_order\n\n\nclass SamplingMultiTaskTrainer:\n    def __init__(self, model, iterator, patience=2, num_epochs=20, max_vals=50,\n                 serialization_dir=None, cuda_device=-1,\n                 grad_norm=None, grad_clipping=None, lr_decay=None, min_lr=None,\n                 no_tqdm=False):\n        \"\"\" Parameters\n        ----------\n        model : ``Model``, required.\n            An AllenNLP model to be optimized. Pytorch Modules can also be optimized if\n            their ``forward`` method returns a dictionary with a \"loss\" key, containing a\n            scalar tensor representing the loss function to be optimized.\n        optimizer : ``torch.nn.Optimizer``, required.\n            An instance of a Pytorch Optimizer, instantiated with the parameters of the\n            model to be optimized.\n        iterator : ``DataIterator``, required.\n            A method for iterating over a ``Dataset``, yielding padded indexed batches.\n        patience , optional (default=2)\n            Number of epochs to be patient before early stopping.\n        val_metric , optional (default=\"loss\")\n            Validation metric to measure for whether to stop training using patience\n            and whether to serialize an ``is_best`` model each epoch. The metric name\n            must be prepended with either \"+\" or \"-\", which specifies whether the metric\n            is an increasing or decreasing function.\n        num_epochs , optional (default = 20)\n            Number of training epochs.\n        serialization_dir , optional (default=None)\n            Path to directory for saving and loading model files. Models will not be saved if\n            this parameter is not passed.\n        cuda_device , optional (default = -1)\n            An integer specifying the CUDA device to use. If -1, the CPU is used.\n            Multi-gpu training is not currently supported, but will be once the\n            Pytorch DataParallel API stabilises.\n        grad_norm : float, optional, (default = None).\n            If provided, gradient norms will be rescaled to have a maximum of this value.\n        grad_clipping : ``float``, optional (default = ``None``).\n            If provided, gradients will be clipped `during the backward pass` to have an (absolute)\n            maximum of this value.  If you are getting ``NaNs`` in your gradients during training\n            that are not solved by using ``grad_norm``, you may need this.\n        learning_rate_scheduler : PytorchLRScheduler, optional, (default = None)\n            A Pytorch learning rate scheduler. The learning rate will be decayed with respect to\n            this schedule at the end of each epoch. If you use\n            :class:`torch.optim.lr_scheduler.ReduceLROnPlateau`,\n            this will use the ``val_metric`` provided to determine if learning has plateaued.\n        no_tqdm : ``bool``, optional (default=False)\n            We use ``tqdm`` for log, which will print a nice progress bar that updates in place\n            after every batch.  This is nice if you're running training on a local shell, but can\n            cause problems with log files from, e.g., a docker image running on kubernetes.  If\n            ``no_tqdm`` is ``True``, we will not use tqdm, and instead log batch statistics using\n            ``log.info``, outputting a line at most every 10 seconds.\n        \"\"\"\n        self._model = model\n        self._iterator = iterator\n\n        self._patience = patience\n        self._num_epochs = num_epochs\n        self._max_vals = max_vals\n        self._serialization_dir = serialization_dir\n        self._cuda_device = cuda_device\n        self._grad_norm = grad_norm\n        self._grad_clipping = grad_clipping\n        self._lr_decay = lr_decay\n        self._min_lr = min_lr\n\n        self._task_infos = None\n        self._metric_infos = None\n\n        self._no_tqdm = no_tqdm\n        self._log_interval = 10  # seconds\n        self._summary_interval = 100  # num batches between log to tensorboard\n        if self._cuda_device >= 0:\n            self._model = self._model.cuda(self._cuda_device)\n\n    def _check_history(self, metric_history, cur_score, should_decrease=False):\n        '''\n        Given a task, the history of the performance on that task,\n        and the current score, check if current score is\n        best so far and if out of patience.\n        '''\n        patience = self._patience + 1\n        best_fn = min if should_decrease else max\n        best_score = best_fn(metric_history)\n        if best_score == cur_score:\n            best_so_far = metric_history.index(best_score) == len(metric_history) - 1\n        else:\n            best_so_far = False\n\n        out_of_patience = False\n        if len(metric_history) > patience:\n            if should_decrease:\n                out_of_patience = max(metric_history[-patience:]) <= cur_score\n            else:\n                out_of_patience = min(metric_history[-patience:]) >= cur_score\n\n        if best_so_far and out_of_patience:\n            pdb.set_trace()\n\n        return best_so_far, out_of_patience\n\n    def _setup_training(self, tasks, train_params, optimizer_params, scheduler_params, iterator):\n        # Task bookkeeping\n        task_infos = {task.name: {} for task in tasks}\n        for task in tasks:\n            task_info = task_infos[task.name]\n            tr_generator = iterator(task.train_data, num_epochs=None, cuda_device=self._cuda_device)\n            task_info['n_tr_batches'] = iterator.get_num_batches(task.train_data)\n            task_info['tr_generator'] = tr_generator\n            task_info['loss'] = 0.0\n            task_info['total_batches_trained'] = 0\n            task_info['n_batches_since_val'] = 0\n            task_info['optimizer'] = Optimizer.from_params(train_params,\n                                                           copy.deepcopy(optimizer_params))\n            task_info['scheduler'] = LearningRateScheduler.from_params(\n                task_info['optimizer'], copy.deepcopy(scheduler_params))\n            task_info['stopped'] = False\n            task_info['last_log'] = time.time()\n        # Metric bookkeeping\n        all_metrics = [task.val_metric for task in tasks] + ['micro_avg', 'macro_avg']\n        metric_infos = {metric: {'hist': [], 'stopped': False, 'best': (-1, {})} for\n                        metric in all_metrics}\n        self._task_infos = task_infos\n        self._metric_infos = metric_infos\n        return task_infos, metric_infos\n\n    def train(self, tasks, validation_interval, n_batches_per_pass,\n              weighting_method, scaling_method,\n              train_params, optimizer_params, scheduler_params,\n              shared_optimizer=0, load_model=1):\n\n        if weighting_method == 'uniform':\n            log.info(\"Sampling tasks uniformly\")\n        elif weighting_method == 'proportional':\n            log.info(\"Sampling tasks proportional to number of training batches\")\n\n        if scaling_method == 'max':\n            # divide by # batches, multiply by max # batches\n            log.info(\"Scaling losses to largest task\")\n        elif scaling_method == 'min':\n            # divide by # batches, multiply by fewest # batches\n            log.info(\"Scaling losses to the smallest task\")\n        elif scaling_method == 'unit':\n            log.info(\"Dividing losses by number of training batches\")\n\n        iterator = self._iterator\n        task_infos, metric_infos = self._setup_training(tasks, train_params, optimizer_params,\n                                                        scheduler_params, iterator)\n        if shared_optimizer:\n            g_optimizer = Optimizer.from_params(train_params, copy.deepcopy(optimizer_params))\n            g_scheduler = LearningRateScheduler.from_params(\n                g_optimizer, copy.deepcopy(scheduler_params))\n        else:\n            g_optimizer, g_scheduler = None, None\n        self._g_optimizer = g_optimizer\n        self._g_scheduler = g_scheduler\n\n        n_pass, should_stop = 0, False  # define these here b/c they might get overridden on load\n        if self._serialization_dir is not None:  # Resume from serialization path\n            if load_model and any(\n                    [\"model_state_epoch_\" in x for x in os.listdir(self._serialization_dir)]):\n                n_pass, should_stop = self._restore_checkpoint()\n                log.info(\"Loaded model from checkpoint. Starting at pass %d\", n_pass)\n            else:\n                log.info(\"Not loading. Deleting any existing checkpoints.\")\n                checkpoint_pattern = os.path.join(self._serialization_dir, \"*.th\")\n                for f in glob.glob(checkpoint_pattern):\n                    os.remove(f)\n\n        if self._grad_clipping is not None:  # pylint: disable=invalid-unary-operand-type\n            def clip_function(grad): return grad.clamp(-self._grad_clipping, self._grad_clipping)\n            for parameter in self._model.parameters():\n                if parameter.requires_grad:\n                    parameter.register_hook(clip_function)\n\n        if weighting_method == 'uniform':\n            sample_weights = [1] * len(tasks)\n        elif weighting_method == 'proportional':\n            sample_w",
+      "total_lines": 655,
+      "ref": "5912adff9df78699f38627a4aeddbdc1914836a4"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_save_checkpoint",
+      "class_name": "SamplingMultiTaskTrainer",
+      "start_line": 509,
+      "end_line": 570,
+      "satd_line": 526,
+      "matched_by": "signature_or_comment",
+      "source": "    def _save_checkpoint(self, training_state):\n        \"\"\"\n        Parameters\n        ----------\n        epoch , required.\n            The epoch of training.\n        is_best, optional (default = None)\n            A flag which causes the model weights at the given epoch to\n            be copied to a \"best.th\" file. The value of this flag should\n            be based on some validation metric computed by your model.\n        \"\"\"\n        epoch = training_state[\"epoch\"]\n        model_path = os.path.join(self._serialization_dir, \"model_state_epoch_{}.th\".format(epoch))\n\n        model_state = self._model.state_dict()\n\n        # Don't save embeddings here. \n        # TODO: There has to be a prettier way to do this.\n        keys_to_skip = []\n        for key in model_state:\n            if 'token_embedder_words' in key:\n                keys_to_skip.append(key)\n        for key in keys_to_skip:\n            del model_state[key]\n\n        torch.save(model_state, model_path)\n\n        torch.save(training_state, os.path.join(self._serialization_dir,\n                                                \"training_state_epoch_{}.th\".format(epoch)))\n\n        task_states = {}\n        for task_name, task_info in self._task_infos.items():\n            task_states[task_name] = {}\n            task_states[task_name]['total_batches_trained'] = task_info['total_batches_trained']\n            task_states[task_name]['stopped'] = task_info['stopped']\n            task_states[task_name]['optimizer'] = task_info['optimizer'].state_dict()\n            sched = task_info['scheduler']\n            sched_params = {}  # {'best': sched.best, 'num_bad_epochs': sched.num_bad_epochs,\n            #'cooldown_counter': sched.cooldown_counter}\n            task_states[task_name]['scheduler'] = sched_params\n        task_states['global'] = {}\n        task_states['global']['optimizer'] = self._g_optimizer.state_dict() if \\\n            self._g_optimizer is not None else None\n        if self._g_scheduler is not None:\n            sched = self._g_scheduler\n            sched_params = {}  # {'best': sched.best, 'num_bad_epochs': sched.num_bad_epochs,\n            #'cooldown_counter': sched.cooldown_counter}\n            task_states['global']['scheduler'] = sched_params\n        else:\n            task_states['global']['scheduler'] = None\n        torch.save(task_states, os.path.join(self._serialization_dir,\n                                             \"task_state_epoch_{}.th\".format(epoch)))\n\n        metric_states = {}\n        for metric_name, metric_info in self._metric_infos.items():\n            metric_states[metric_name] = {}\n            metric_states[metric_name]['hist'] = metric_info['hist']\n            metric_states[metric_name]['stopped'] = metric_info['stopped']\n            metric_states[metric_name]['best'] = metric_info['best']\n        torch.save(metric_states, os.path.join(self._serialization_dir,\n                                               \"metric_state_epoch_{}.th\".format(epoch)))\n        log.info(\"Saved files to %s\", self._serialization_dir)",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [
+        "_g_optimizer",
+        "_g_scheduler",
+        "_metric_infos",
+        "_model",
+        "_serialization_dir",
+        "_task_infos"
+      ],
+      "global_uses": [
+        "log",
+        "os",
+        "torch"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "dont_save",
+        "torch.save",
+        "_model.state_dict",
+        "_unmark_previous_best",
+        "_delete_old_checkpoints"
+      ],
+      "reason": "These methods are directly involved in the checkpointing process and are essential for understanding how to improve the current implementation as suggested by the TODO comment."
+    },
+    "retrieved_methods": [],
+    "missing_method_names": [
+      "dont_save",
+      "torch.save",
+      "state_dict",
+      "_unmark_previous_best",
+      "_delete_old_checkpoints"
+    ]
+  },
+  "review_context": {}
+}

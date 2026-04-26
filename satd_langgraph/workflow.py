@@ -2,8 +2,10 @@
 
 import csv
 import json
+import os
 import re
 import shutil
+import traceback
 from pathlib import Path
 
 from .bootstrap import bootstrap_vendor
@@ -290,35 +292,49 @@ class LangGraphSATDWorkflow:
             return False
         if state["round_id"] >= min(state["max_rounds"], 2):
             return False
-        feedback = state.get("repair_feedback") or {}
-        return bool(feedback.get("can_retry"))
+        if self._repair_failed_due_to_infrastructure(state.get("latest_repair")):
+            return False
+        return True
+
+    def _repair_failed_due_to_infrastructure(self, repair: RepairAttempt | None) -> bool:
+        if repair is None:
+            return False
+        haystack = " ".join(
+            [
+                str(getattr(repair, "repair_plan", "") or ""),
+                str(getattr(repair, "notes", "") or ""),
+                str(getattr(repair, "changed_scope", "") or ""),
+            ]
+        ).lower()
+        if "fallback no-op repair" not in haystack and "fixer_exception" not in haystack:
+            return False
+        infrastructure_markers = (
+            "apitimeouterror",
+            "apiconnectionerror",
+            "timeout",
+            "connection",
+            "rate limit",
+            "ratelimit",
+        )
+        return any(marker in haystack for marker in infrastructure_markers)
 
     def _build_repair_feedback(self, review: ReviewResult) -> dict | None:
-        issues = []
-        seen = set()
-        for issue in review.issues:
-            cleaned = str(issue).strip()
-            if not cleaned or cleaned in seen:
-                continue
-            seen.add(cleaned)
-            issues.append(cleaned)
-            if len(issues) >= 3:
+        repair_constraints = []
+        for item in getattr(review, "repair_constraints", None) or []:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in repair_constraints:
+                repair_constraints.append(cleaned)
+            if len(repair_constraints) >= 4:
                 break
-
-        reject_type = str(review.reject_type or "").strip()
-        revision_advice = str(review.revision_advice or "").strip()
-        rationale = str(review.rationale or "").strip()
-        combined = " ".join(part.lower() for part in [reject_type, revision_advice, rationale, *issues] if part)
+        retry_hint = " ".join(str(getattr(review, "retry_hint", "") or "").split())
+        if not repair_constraints and not retry_hint:
+            repair_constraints = ["make_smallest_local_edit"]
+            retry_hint = "Make the smallest local edit that directly addresses the SATD comment."
         feedback = {
-            "reject_type": reject_type or None,
-            "revision_advice": revision_advice or None,
-            "key_issues": issues,
-            "has_api_shape_drift": any(token in combined for token in ("api shape", "api change", "signature")),
-            "has_noop_change": any(token in combined for token in ("no-op", "no change", "comment-only", "comment only")),
-            "has_over_edit": any(token in combined for token in ("overwritten", "over-edit", "too broad", "broader", "minimality")),
-            "has_comment_only_problem": any(token in combined for token in ("comment-only", "comment only")),
+            "repair_constraints": repair_constraints,
+            "retry_hint": retry_hint or None,
         }
-        feedback["can_retry"] = bool(feedback["reject_type"] or feedback["revision_advice"] or feedback["key_issues"])
+        feedback["can_retry"] = bool(feedback["repair_constraints"] or feedback["retry_hint"])
         return feedback if feedback["can_retry"] else None
 
     def _run_repair_candidates(
@@ -349,6 +365,9 @@ class LangGraphSATDWorkflow:
                 missing_method_names = missing
             except Exception as exc:
                 error_message = " ".join(str(exc).split())
+                error_traceback = "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__, limit=8)
+                )
                 self.fixer._checkpoint(
                     candidate_state,
                     stage="generation_error",
@@ -357,8 +376,62 @@ class LangGraphSATDWorkflow:
                         "candidate_mode": candidate_mode,
                         "error_type": type(exc).__name__,
                         "error_message": error_message[:500],
+                        "error_traceback": error_traceback[-4000:],
                     },
                 )
+                retry_mode = "baseline_no_context"
+                can_retry_without_context = (
+                    candidate_mode != retry_mode
+                    and retry_mode not in candidate_modes
+                )
+                if can_retry_without_context:
+                    retry_state = {**candidate_state, "candidate_mode": retry_mode}
+                    self._log(
+                        f"{self._task_label(state)} repair candidate={candidate_mode} "
+                        f"exception type={type(exc).__name__}; retrying without method context"
+                    )
+                    try:
+                        repair, inquiry, contexts, missing, uncertainty_items, edit_constraints = self.fixer.run(
+                            retry_state,
+                            candidate_mode=retry_mode,
+                        )
+                        repair.candidate_mode = retry_mode
+                        repair.notes = (
+                            f"{repair.notes} | recovered_from_context_candidate_error:{type(exc).__name__}"
+                        ).strip()
+                        method_inquiry = inquiry
+                        retrieved_method_contexts = contexts
+                        missing_method_names = missing
+                        candidates.append(repair)
+                        continue
+                    except Exception as retry_exc:
+                        retry_error_message = " ".join(str(retry_exc).split())
+                        retry_error_traceback = "".join(
+                            traceback.format_exception(
+                                type(retry_exc),
+                                retry_exc,
+                                retry_exc.__traceback__,
+                                limit=8,
+                            )
+                        )
+                        self.fixer._checkpoint(
+                            retry_state,
+                            stage="generation_retry_error",
+                            payload={
+                                "round_id": int(retry_state.get("round_id", 0)) + 1,
+                                "candidate_mode": retry_mode,
+                                "source_candidate_mode": candidate_mode,
+                                "source_error_type": type(exc).__name__,
+                                "error_type": type(retry_exc).__name__,
+                                "error_message": retry_error_message[:500],
+                                "error_traceback": retry_error_traceback[-4000:],
+                            },
+                        )
+                        self._log(
+                            f"{self._task_label(state)} repair no-context retry exception "
+                            f"type={type(retry_exc).__name__} message={retry_error_message[:200]}; "
+                            "using fallback no-op repair"
+                        )
                 if self.context_client._is_content_filter_error(exc):
                     self._log(
                         f"{self._task_label(state)} repair candidate={candidate_mode} "
@@ -505,40 +578,68 @@ class LangGraphSATDWorkflow:
         total = len(records)
         summary: dict | None = None
         output_dir.mkdir(parents=True, exist_ok=True)
-        self._current_output_dir = output_dir
-        if not resume:
-            self._reset_output_dir_for_fresh_run(output_dir)
-        self._context_cache_dir().mkdir(parents=True, exist_ok=True)
-        if not resume:
-            self._write_task_progress_csv(output_dir / "task_progress.csv", [])
+        lock_path = self._acquire_run_lock(output_dir)
+        try:
+            self._current_output_dir = output_dir
+            if not resume:
+                self._reset_output_dir_for_fresh_run(output_dir)
+            self._context_cache_dir().mkdir(parents=True, exist_ok=True)
+            if not resume:
+                self._write_task_progress_csv(output_dir / "task_progress.csv", [])
 
-        existing_rows = self._load_existing_rows(output_dir) if resume else self._empty_existing_rows()
-        completed_ids = {row.get("task_id") for row in existing_rows["results"] if row.get("task_id")}
-        pending_records = [record for record in records if record.task_id not in completed_ids]
-        new_traces = []
-        pending_flush_traces = []
+            existing_rows = self._load_existing_rows(output_dir) if resume else self._empty_existing_rows()
+            completed_ids = {row.get("task_id") for row in existing_rows["results"] if row.get("task_id")}
+            pending_records = [record for record in records if record.task_id not in completed_ids]
+            new_traces = []
+            pending_flush_traces = []
 
-        if self.verbose and resume:
-            print(f"[resume] found {len(completed_ids)} completed tasks in {output_dir}")
-            print(f"[resume] remaining {len(pending_records)}/{total} tasks to run")
+            if self.verbose and resume:
+                print(f"[resume] found {len(completed_ids)} completed tasks in {output_dir}")
+                print(f"[resume] remaining {len(pending_records)}/{total} tasks to run")
 
-        for offset, record in enumerate(pending_records, start=1):
-            overall_index = len(completed_ids) + offset
-            if self.verbose:
-                print(f"[progress] {overall_index}/{total} task_id={record.task_id} begin")
-            trace = self.run_record(record, task_index=overall_index, task_total=total)
-            new_traces.append(trace)
-            pending_flush_traces.append(trace)
-            self._append_task_progress_csv(output_dir / "task_progress.csv", [trace], overall_index, total)
-            if self.verbose:
-                print(f"[progress] {overall_index}/{total} task_id={record.task_id} status={trace.status} rounds={trace.rounds_used} exact={trace.exact_match}")
+            for offset, record in enumerate(pending_records, start=1):
+                overall_index = len(completed_ids) + offset
+                if self.verbose:
+                    print(f"[progress] {overall_index}/{total} task_id={record.task_id} begin")
+                trace = self.run_record(record, task_index=overall_index, task_total=total)
+                new_traces.append(trace)
+                pending_flush_traces.append(trace)
+                self._append_task_progress_csv(output_dir / "task_progress.csv", [trace], overall_index, total)
+                if self.verbose:
+                    print(f"[progress] {overall_index}/{total} task_id={record.task_id} status={trace.status} rounds={trace.rounds_used} exact={trace.exact_match}")
 
-            if offset % self.write_batch_size == 0 or offset == len(pending_records):
-                summary = self._summarize_from_existing_and_new(existing_rows, new_traces)
+                if offset % self.write_batch_size == 0 or offset == len(pending_records):
+                    summary = self._summarize_from_existing_and_new(existing_rows, new_traces)
+                    summary["agent_mode"] = "openai_analyzer_only" if self.analysis_only else "openai"
+                    summary["model"] = self.model
+                    summary["max_rounds"] = self.max_rounds
+                    summary["written_tasks"] = len(completed_ids) + len(new_traces)
+                    summary["write_batch_size"] = self.write_batch_size
+                    summary["use_analyzer"] = self.use_analyzer
+                    summary["use_reviewer"] = self.use_reviewer
+                    summary["analysis_only"] = self.analysis_only
+                    summary["use_selector"] = self.use_selector
+                    summary["repair_prompt_mode"] = "lightweight"
+                    summary["dual_repair_candidates"] = self.dual_repair_candidates
+                    summary["repair_context_mode"] = self.repair_context_mode
+                    summary["max_method_contexts"] = self.max_method_contexts
+                    summary["single_repair_path"] = not self._dual_candidate_enabled()
+                    summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
+                    if resume and completed_ids:
+                        self._append_outputs(output_dir, pending_flush_traces)
+                        self._write_summary_csv(output_dir / "summary.csv", summary)
+                    else:
+                        self._write_outputs(output_dir, new_traces, summary)
+                    pending_flush_traces = []
+                    if self.verbose:
+                        print(f"[flush] wrote {len(completed_ids) + len(new_traces)}/{total} tasks to {output_dir}")
+
+            if not pending_records:
+                summary = self._summarize_from_existing_and_new(existing_rows, [])
                 summary["agent_mode"] = "openai_analyzer_only" if self.analysis_only else "openai"
                 summary["model"] = self.model
                 summary["max_rounds"] = self.max_rounds
-                summary["written_tasks"] = len(completed_ids) + len(new_traces)
+                summary["written_tasks"] = len(completed_ids)
                 summary["write_batch_size"] = self.write_batch_size
                 summary["use_analyzer"] = self.use_analyzer
                 summary["use_reviewer"] = self.use_reviewer
@@ -550,36 +651,56 @@ class LangGraphSATDWorkflow:
                 summary["max_method_contexts"] = self.max_method_contexts
                 summary["single_repair_path"] = not self._dual_candidate_enabled()
                 summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
-                if resume and completed_ids:
-                    self._append_outputs(output_dir, pending_flush_traces)
-                    self._write_summary_csv(output_dir / "summary.csv", summary)
-                else:
-                    self._write_outputs(output_dir, new_traces, summary)
-                pending_flush_traces = []
-                if self.verbose:
-                    print(f"[flush] wrote {len(completed_ids) + len(new_traces)}/{total} tasks to {output_dir}")
+                self._write_summary_csv(output_dir / "summary.csv", summary)
 
-        if not pending_records:
-            summary = self._summarize_from_existing_and_new(existing_rows, [])
-            summary["agent_mode"] = "openai_analyzer_only" if self.analysis_only else "openai"
-            summary["model"] = self.model
-            summary["max_rounds"] = self.max_rounds
-            summary["written_tasks"] = len(completed_ids)
-            summary["write_batch_size"] = self.write_batch_size
-            summary["use_analyzer"] = self.use_analyzer
-            summary["use_reviewer"] = self.use_reviewer
-            summary["analysis_only"] = self.analysis_only
-            summary["use_selector"] = self.use_selector
-            summary["repair_prompt_mode"] = "lightweight"
-            summary["dual_repair_candidates"] = self.dual_repair_candidates
-            summary["repair_context_mode"] = self.repair_context_mode
-            summary["max_method_contexts"] = self.max_method_contexts
-            summary["single_repair_path"] = not self._dual_candidate_enabled()
-            summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
-            self._write_summary_csv(output_dir / "summary.csv", summary)
+            assert summary is not None
+            return summary
+        finally:
+            self._release_run_lock(lock_path)
 
-        assert summary is not None
-        return summary
+    def _acquire_run_lock(self, output_dir: Path) -> Path:
+        lock_path = output_dir / ".run.lock"
+        payload = json.dumps({"pid": os.getpid()}, ensure_ascii=False)
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = self._read_json_file_safely(lock_path)
+            pid = existing.get("pid") if isinstance(existing, dict) else None
+            if isinstance(pid, int) and not self._pid_is_running(pid):
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            else:
+                raise RuntimeError(
+                    f"Output directory is already locked by another run: {output_dir}. "
+                    "Stop the other process or remove .run.lock if it is stale."
+                )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        return lock_path
+
+    def _release_run_lock(self, lock_path: Path) -> None:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _pid_is_running(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _read_json_file_safely(self, path: Path) -> dict | None:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
     def _reset_output_dir_for_fresh_run(self, output_dir: Path) -> None:
         for directory in (output_dir / "repair_debug", output_dir / "context_cache"):
@@ -650,8 +771,8 @@ class LangGraphSATDWorkflow:
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_review_failed_checks", "round_1_review_repair_constraints", "round_1_review_failure_anchor", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_review_failed_checks", "round_2_review_repair_constraints", "round_2_review_failure_anchor", "round_2_revision_advice",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -761,6 +882,9 @@ class LangGraphSATDWorkflow:
             row[f"round_{round_id}_review_softened_gate_used"] = review.get("softened_gate_used")
             row[f"round_{round_id}_review_reject_type"] = review.get("reject_type")
             row[f"round_{round_id}_review_issues"] = " | ".join(review.get("issues", [])) if review else None
+            row[f"round_{round_id}_review_failed_checks"] = " | ".join(review.get("failed_checks", [])) if review else None
+            row[f"round_{round_id}_review_repair_constraints"] = " | ".join(review.get("repair_constraints", [])) if review else None
+            row[f"round_{round_id}_review_failure_anchor"] = review.get("failure_anchor")
             row[f"round_{round_id}_revision_advice"] = review.get("revision_advice")
             row[f"round_{round_id}_selector_mode"] = selector.get("selected_candidate_mode")
             row[f"round_{round_id}_selector_confidence"] = selector.get("confidence")
@@ -814,8 +938,8 @@ class LangGraphSATDWorkflow:
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_review_failed_checks", "round_1_review_repair_constraints", "round_1_review_failure_anchor", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_review_failed_checks", "round_2_review_repair_constraints", "round_2_review_failure_anchor", "round_2_revision_advice",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -857,7 +981,7 @@ class LangGraphSATDWorkflow:
                     writer.writerow({"task_id": trace.task_id, **row})
 
     def _write_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale", "failed_checks", "repair_constraints", "failure_anchor", "retry_hint"]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -865,10 +989,12 @@ class LangGraphSATDWorkflow:
                 for review in trace.reviews:
                     row = dict(review)
                     row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
+                    row["failed_checks"] = json.dumps(row.get("failed_checks", []), ensure_ascii=False)
+                    row["repair_constraints"] = json.dumps(row.get("repair_constraints", []), ensure_ascii=False)
                     writer.writerow({"task_id": trace.task_id, **row})
 
     def _write_candidate_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale", "failed_checks", "repair_constraints", "failure_anchor", "retry_hint"]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -876,6 +1002,8 @@ class LangGraphSATDWorkflow:
                 for review in trace.candidate_reviews:
                     row = dict(review)
                     row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
+                    row["failed_checks"] = json.dumps(row.get("failed_checks", []), ensure_ascii=False)
+                    row["repair_constraints"] = json.dumps(row.get("repair_constraints", []), ensure_ascii=False)
                     writer.writerow({"task_id": trace.task_id, **row})
 
     def _write_github_context_csv(self, path: Path, traces: list) -> None:
@@ -1094,8 +1222,8 @@ class LangGraphSATDWorkflow:
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
-            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
-            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_1_selector_mode", "round_1_selector_confidence", "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_review_failed_checks", "round_1_review_repair_constraints", "round_1_review_failure_anchor", "round_1_revision_advice",
+            "round_2_selector_mode", "round_2_selector_confidence", "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_review_failed_checks", "round_2_review_repair_constraints", "round_2_review_failure_anchor", "round_2_revision_advice",
         ]
         rows = [self._trajectory_row(trace) for trace in traces]
         self._append_csv_rows(path, fieldnames, rows)
@@ -1111,9 +1239,9 @@ class LangGraphSATDWorkflow:
             "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "selector_selected_candidate_mode", "selector_confidence", "selector_rationale", "original_code", "processed_manual_code", "processed_final_repaired_code",
             "round_1_selector_mode", "round_1_selector_confidence",
-            "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_revision_advice",
+            "round_1_candidate_mode", "round_1_repair_plan", "round_1_repaired_code", "round_1_changed_scope", "round_1_fix_confidence", "round_1_review_approved", "round_1_review_score", "round_1_review_problem_alignment", "round_1_review_minimality", "round_1_review_semantic_preservation", "round_1_review_internal_consistency", "round_1_review_softened_gate_used", "round_1_review_reject_type", "round_1_review_issues", "round_1_review_failed_checks", "round_1_review_repair_constraints", "round_1_review_failure_anchor", "round_1_revision_advice",
             "round_2_selector_mode", "round_2_selector_confidence",
-            "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_revision_advice",
+            "round_2_candidate_mode", "round_2_repair_plan", "round_2_repaired_code", "round_2_changed_scope", "round_2_fix_confidence", "round_2_review_approved", "round_2_review_score", "round_2_review_problem_alignment", "round_2_review_minimality", "round_2_review_semantic_preservation", "round_2_review_internal_consistency", "round_2_review_softened_gate_used", "round_2_review_reject_type", "round_2_review_issues", "round_2_review_failed_checks", "round_2_review_repair_constraints", "round_2_review_failure_anchor", "round_2_revision_advice",
         ]
         rows = []
         for trace in traces:
@@ -1151,22 +1279,26 @@ class LangGraphSATDWorkflow:
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale", "failed_checks", "repair_constraints", "failure_anchor", "retry_hint"]
         rows = []
         for trace in traces:
             for review in trace.reviews:
                 row = dict(review)
                 row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
+                row["failed_checks"] = json.dumps(row.get("failed_checks", []), ensure_ascii=False)
+                row["repair_constraints"] = json.dumps(row.get("repair_constraints", []), ensure_ascii=False)
                 rows.append({"task_id": trace.task_id, **row})
         self._append_csv_rows(path, fieldnames, rows)
 
     def _append_candidate_reviews_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale"]
+        fieldnames = ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "issues", "revision_advice", "reject_type", "rationale", "failed_checks", "repair_constraints", "failure_anchor", "retry_hint"]
         rows = []
         for trace in traces:
             for review in trace.candidate_reviews:
                 row = dict(review)
                 row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
+                row["failed_checks"] = json.dumps(row.get("failed_checks", []), ensure_ascii=False)
+                row["repair_constraints"] = json.dumps(row.get("repair_constraints", []), ensure_ascii=False)
                 rows.append({"task_id": trace.task_id, **row})
         self._append_csv_rows(path, fieldnames, rows)
 

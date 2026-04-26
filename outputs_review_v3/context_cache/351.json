@@ -1,0 +1,135 @@
+{
+  "task_id": "351",
+  "repo_owner": "archlinux",
+  "repo_name": "archweb",
+  "file_path": "devel/management/commands/reporead.py",
+  "commit": "a9819e3d715ce3e5c20c9665db9a6100f06ab562",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T12:36:51+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "a9819e3d715ce3e5c20c9665db9a6100f06ab562",
+    "symbol_name": "db_update",
+    "satd_line": 50,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T12:36:51+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 4,
+    "retrieved_method_count": 2,
+    "missing_method_count": 2,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "devel/management/commands/reporead.py",
+    "original_signature": "def db_update(archname, reponame, pkgs, force=False):",
+    "target_file": {
+      "ok": true,
+      "path": "devel/management/commands/reporead.py",
+      "sha": "b6bd84575b8ef31f841d31cde974efb7bba0cad4",
+      "download_url": "https://raw.githubusercontent.com/archlinux/archweb/a9819e3d715ce3e5c20c9665db9a6100f06ab562/devel/management/commands/reporead.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n\"\"\"\nreporead command\n\nParses a repo.db.tar.gz file and updates the Arch database with the relevant\nchanges.\n\nUsage: ./manage.py reporead ARCH PATH\n ARCH:  architecture to update; must be available in the database\n PATH:  full path to the repo.db.tar.gz file.\n\nExample:\n  ./manage.py reporead i686 /tmp/core.db.tar.gz\n\"\"\"\n\nfrom collections import defaultdict\nimport io\nimport os\nimport re\nimport sys\nimport tarfile\nimport logging\nfrom datetime import datetime\nfrom optparse import make_option\n\nfrom django.core.management.base import BaseCommand, CommandError\nfrom django.contrib.auth.models import User\nfrom django.db import connections, router, transaction\nfrom django.db.utils import IntegrityError\n\nfrom devel.utils import UserFinder\nfrom main.models import Arch, Package, PackageDepend, PackageFile, Repo\nfrom packages.models import Conflict, Provision, Replacement\n\nlogging.basicConfig(\n    level=logging.WARNING,\n    format='%(asctime)s -> %(levelname)s: %(message)s',\n    datefmt='%Y-%m-%d %H:%M:%S',\n    stream=sys.stderr)\nTRACE = 5\nlogging.addLevelName(TRACE, 'TRACE')\nlogger = logging.getLogger()\n\nclass Command(BaseCommand):\n    option_list = BaseCommand.option_list + (\n        make_option('-f', '--force', action='store_true', dest='force', default=False,\n            help='Force a re-import of data for all packages instead of only new ones. Will not touch the \\'last updated\\' value.'),\n        make_option('--filesonly', action='store_true', dest='filesonly', default=False,\n            help='Load filelists if they are outdated, but will not add or remove any packages. Will not touch the \\'last updated\\' value.'),\n    )\n    help = \"Runs a package repository import for the given arch and file.\"\n    args = \"<arch> <filename>\"\n\n    def handle(self, arch=None, filename=None, **options):\n        if not arch:\n            raise CommandError('Architecture is required.')\n        if not filename:\n            raise CommandError('Package database file is required.')\n        filename = os.path.normpath(filename)\n        if not os.path.exists(filename) or not os.path.isfile(filename):\n            raise CommandError('Specified package database file does not exist.')\n\n        v = int(options.get('verbosity', 0))\n        if v == 0:\n            logger.level = logging.ERROR\n        elif v == 1:\n            logger.level = logging.INFO\n        elif v == 2:\n            logger.level = logging.DEBUG\n\n        return read_repo(arch, filename, options)\n\n\nclass Pkg(object):\n    \"\"\"An interim 'container' object for holding Arch package data.\"\"\"\n    bare = ( 'name', 'base', 'arch', 'desc', 'filename',\n            'md5sum', 'sha256sum', 'url', 'packager' )\n    number = ( 'csize', 'isize' )\n    collections = ( 'depends', 'optdepends', 'conflicts',\n            'provides', 'replaces', 'groups', 'license', 'files' )\n\n    version_re = re.compile(r'^((\\d+):)?(.+)-([^-]+)$')\n\n    def __init__(self, repo):\n        self.repo = repo\n        self.ver = None\n        self.rel = None\n        self.epoch = 0\n        self.pgpsig = None\n        for k in self.bare + self.number:\n            setattr(self, k, None)\n        for k in self.collections:\n            setattr(self, k, ())\n        self.files = None\n        self.has_files = False\n\n    def populate(self, values):\n        for k, v in values.iteritems():\n            # ensure we stay under our DB character limit\n            if k in self.bare:\n                setattr(self, k, v[0][:254])\n            elif k in self.number:\n                setattr(self, k, long(v[0]))\n            elif k == 'pgpsig':\n                # do NOT prune this value at all\n                setattr(self, k, v[0])\n            elif k == 'version':\n                match = self.version_re.match(v[0])\n                self.ver = match.group(3)\n                self.rel = match.group(4)\n                if match.group(2):\n                    self.epoch = int(match.group(2))\n            elif k == 'builddate':\n                try:\n                    self.builddate = datetime.utcfromtimestamp(int(v[0]))\n                except ValueError:\n                    try:\n                        self.builddate = datetime.strptime(v[0],\n                                '%a %b %d %H:%M:%S %Y')\n                    except ValueError:\n                        logger.warning('Package %s had unparsable build date %s',\n                                self.name, v[0])\n            elif k == 'files':\n                self.files = tuple(v)\n                self.has_files = True\n            else:\n                # anything left in collections\n                setattr(self, k, tuple(v))\n\n    @property\n    def full_version(self):\n        '''Very similar to the main.models.Package method.'''\n        if self.epoch > 0:\n            return u'%d:%s-%s' % (self.epoch, self.ver, self.rel)\n        return u'%s-%s' % (self.ver, self.rel)\n\n\nDEPEND_RE = re.compile(r\"^(.+?)((>=|<=|=|>|<)(.*))?$\")\n\ndef create_depend(package, dep_str, optional=False):\n    depend = PackageDepend(pkg=package, optional=optional)\n    # lop off any description first\n    parts = dep_str.split(':', 1)\n    if len(parts) > 1:\n        depend.description = parts[1].strip()\n    match = DEPEND_RE.match(parts[0].strip())\n    if match:\n        depend.depname = match.group(1)\n        if match.group(2):\n            depend.depvcmp = match.group(2)\n    else:\n        logger.warning('Package %s had unparsable depend string %s',\n                package.pkgname, dep_str)\n        return None\n    depend.save(force_insert=True)\n    return depend\n\ndef create_related(model, package, rel_str, equals_only=False):\n    related = model(pkg=package)\n    match = DEPEND_RE.match(rel_str)\n    if match:\n        related.name = match.group(1)\n        if match.group(3):\n            comp = match.group(3)\n            if not equals_only:\n                related.comparison = comp\n            elif comp != '=':\n                logger.warning(\n                        'Package %s had unexpected comparison operator %s for %s in %s',\n                        package.pkgname, comp, model.__name__, rel_str)\n        if match.group(4):\n            related.version = match.group(4)\n    else:\n        logger.warning('Package %s had unparsable %s string %s',\n                package.pkgname, model.___name__, rel_str)\n        return None\n    related.save(force_insert=True)\n    return related\n\ndef create_multivalued(dbpkg, repopkg, db_attr, repo_attr):\n    '''Populate the simplest of multivalued attributes. These are those that\n    only deal with a 'name' attribute, such as licenses, groups, etc. The input\n    and output objects and attribute names are specified, and everything is\n    done via getattr().'''\n    collection = getattr(dbpkg, db_attr)\n    collection.all().delete()\n    for name in getattr(repopkg, repo_attr):\n        collection.create(name=name)\n\nfinder = UserFinder()\n\ndef populate_pkg(dbpkg, repopkg, force=False, timestamp=None):\n    if repopkg.base:\n        dbpkg.pkgbase = repopkg.base\n    else:\n        dbpkg.pkgbase = repopkg.name\n    dbpkg.pkgver = repopkg.ver\n    dbpkg.pkgrel = repopkg.rel\n    dbpkg.epoch = repopkg.epoch\n    dbpkg.pkgdesc = repopkg.desc\n    dbpkg.url = repopkg.url\n    dbpkg.filename = repopkg.filename\n    dbpkg.compressed_size = repopkg.csize\n    dbpkg.installed_size = repopkg.isize\n    dbpkg.build_date = repopkg.builddate\n    dbpkg.packager_str = repopkg.packager\n    # attempt to find the corresponding django user for this string\n    dbpkg.packager = finder.find(repopkg.packager)\n    dbpkg.pgp_signature = repopkg.pgpsig\n\n    if timestamp:\n        dbpkg.flag_date = None\n        dbpkg.last_update = timestamp\n    dbpkg.save()\n\n    populate_files(dbpkg, repopkg, force=force)\n\n    dbpkg.packagedepend_set.all().delete()\n    for y in repopkg.depends:\n        create_depend(dbpkg, y)\n    for y in repopkg.optdepends:\n        create_depend(dbpkg, y, True)\n\n    dbpkg.conflicts.all().delete()\n    for y in repopkg.conflicts:\n        create_related(Conflict, dbpkg, y)\n    dbpkg.provides.all().delete()\n    for y in repopkg.provides:\n        create_related(Provision, dbpkg, y, equals_only=True)\n    dbpkg.replaces.all().delete()\n    for y in repopkg.replaces:\n        create_related(Replacement, dbpkg, y)\n\n    create_multivalued(dbpkg, repopkg, 'groups', 'groups')\n    create_multivalued(dbpkg, repopkg, 'licenses', 'license')\n\n\npkg_same_version = lambda pkg, dbpkg: pkg.ver == dbpkg.pkgver \\\n        and pkg.rel == dbpkg.pkgrel and pkg.epoch == dbpkg.epoch\n\n\ndef populate_files(dbpkg, repopkg, force=False):\n    if not force:\n        if not pkg_same_version(repopkg, dbpkg):\n            logger.info(\"DB version (%s) didn't match repo version \"\n                    \"(%s) for package %s, skipping file list addition\",\n                    dbpkg.full_version, repopkg.full_version, dbpkg.pkgname)\n            return\n        if not dbpkg.files_last_update or not dbpkg.last_update:\n            pass\n        elif dbpkg.files_last_update > dbpkg.last_update:\n            return\n\n    # only delete files if we are reading a DB that contains them\n    if repopkg.has_files:\n        dbpkg.packagefile_set.all().delete()\n        logger.info(\"adding %d files for package %s\",\n                len(repopkg.files), dbpkg.pkgname)\n        for f in repopkg.files:\n            dirname, filename = f.rsplit('/', 1)\n            if filename == '':\n                filename = None\n            # this is basically like calling dbpkg.packagefile_set.create(),\n            # but much faster as we can skip a lot of the repeated code paths\n            pkgfile = PackageFile(pkg=dbpkg,\n                    is_directory=(filename is None),\n                    directory=dirname + '/',\n                    filename=filename)\n            pkgfile.save(force_insert=True)\n        dbpkg.files_last_update = datetime.utcnow()\n        dbpkg.save()\n\n\ndef select_pkg_for_update(dbpkg):\n    database = router.db_for_write(Package, instance=dbpkg)\n    connection = connections[database]\n    if 'sqlite' in connection.settings_dict['ENGINE'].lower():\n        return dbpkg\n    new_pkg = Package.objects.raw(\n            'SELECT * FROM packages WHERE id = %s FOR UPDATE',\n            [dbpkg.id])\n    return list(new_pkg)[0]\n\n\ndef db_update(archname, reponame, pkgs, options):\n    \"\"\"\n    Parses a list and updates the Arch dev database accordingly.\n\n    Arguments:\n      pkgs -- A list of Pkg objects.\n\n    \"\"\"\n    logger.info('Updating Arch: %s', archname)\n    force = options.get('force', False)\n    filesonly = options.get('filesonly', False)\n\n    with transaction.commit_manually():\n        repository = Repo.objects.get(name__iexact=reponame)\n        architecture = Arch.objects.get(name__iexact=archname)\n        # no-arg order_by() removes even the default ordering; we don't need it\n        dbpkgs = Package.objects.filter(\n                arch=architecture, repo=repository).order_by()\n        # This makes our inner loop where we find packages by name *way* more\n        # efficient by not having to go to the database for each package to\n        # SELECT them by name.\n        dbdict = dict((dbpkg.pkgname, dbpkg) for dbpkg in dbpkgs)\n\n        logger.debug(\"Creating sets\")\n        dbset = set(dbdict.keys())\n        syncset = set([pkg.name for pkg in pkgs])\n        logger.info(\"%d packages in current web DB\", len(dbset))\n        logger.info(\"%d packages in new updating db\", len(syncset))\n        in_sync_not_db = syncset - dbset\n        logger.info(\"%d packages in sync not db\", len(in_sync_not_db))\n\n        # Try to catch those random package deletions that make Eric so unhappy.\n        if len(dbset):\n            dbpercent = 100.0 * len(syncset) / len(dbset)\n        else:\n            dbpercent = 0.0\n        logger.info(\"DB package ratio: %.1f%%\", dbpercent)\n\n        # Fewer than 20 packages makes the percentage check unreliable, but it also\n        # means we expect the repo to fluctuate a lot.\n        msg = \"Package database has %.1f%% the number of packages in the \" \\\n                \"web",
+      "total_lines": 514,
+      "ref": "a9819e3d715ce3e5c20c9665db9a6100f06ab562"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "db_update",
+      "class_name": null,
+      "start_line": 285,
+      "end_line": 402,
+      "satd_line": 50,
+      "matched_by": "signature_or_comment",
+      "source": "def db_update(archname, reponame, pkgs, options):\n    \"\"\"\n    Parses a list and updates the Arch dev database accordingly.\n\n    Arguments:\n      pkgs -- A list of Pkg objects.\n\n    \"\"\"\n    logger.info('Updating Arch: %s', archname)\n    force = options.get('force', False)\n    filesonly = options.get('filesonly', False)\n\n    with transaction.commit_manually():\n        repository = Repo.objects.get(name__iexact=reponame)\n        architecture = Arch.objects.get(name__iexact=archname)\n        # no-arg order_by() removes even the default ordering; we don't need it\n        dbpkgs = Package.objects.filter(\n                arch=architecture, repo=repository).order_by()\n        # This makes our inner loop where we find packages by name *way* more\n        # efficient by not having to go to the database for each package to\n        # SELECT them by name.\n        dbdict = dict((dbpkg.pkgname, dbpkg) for dbpkg in dbpkgs)\n\n        logger.debug(\"Creating sets\")\n        dbset = set(dbdict.keys())\n        syncset = set([pkg.name for pkg in pkgs])\n        logger.info(\"%d packages in current web DB\", len(dbset))\n        logger.info(\"%d packages in new updating db\", len(syncset))\n        in_sync_not_db = syncset - dbset\n        logger.info(\"%d packages in sync not db\", len(in_sync_not_db))\n\n        # Try to catch those random package deletions that make Eric so unhappy.\n        if len(dbset):\n            dbpercent = 100.0 * len(syncset) / len(dbset)\n        else:\n            dbpercent = 0.0\n        logger.info(\"DB package ratio: %.1f%%\", dbpercent)\n\n        # Fewer than 20 packages makes the percentage check unreliable, but it also\n        # means we expect the repo to fluctuate a lot.\n        msg = \"Package database has %.1f%% the number of packages in the \" \\\n                \"web database\" % dbpercent\n        if len(dbset) == 0 and len(syncset) == 0:\n            pass\n        elif not filesonly and \\\n                len(dbset) > 20 and dbpercent < 50.0 and \\\n                not repository.testing and not repository.staging:\n            logger.error(msg)\n            raise Exception(msg)\n        elif dbpercent < 75.0:\n            logger.warning(msg)\n\n        # If isolation level is repeatable-read, we need to ensure each package\n        # update starts a new transaction and re-queries the database as necessary\n        # to guard against simultaneous updates\n        transaction.commit()\n\n    if not filesonly:\n        # packages in syncdb and not in database (add to database)\n        for pkg in (pkg for pkg in pkgs if pkg.name in in_sync_not_db):\n            logger.info(\"Adding package %s\", pkg.name)\n            dbpkg = Package(pkgname=pkg.name, arch=architecture, repo=repository)\n            try:\n                with transaction.commit_on_success():\n                    populate_pkg(dbpkg, pkg, timestamp=datetime.utcnow())\n            except IntegrityError:\n                logger.warning(\"Could not add package %s; \"\n                        \"not fatal if another thread beat us to it.\",\n                        pkg.name, exc_info=True)\n\n        # packages in database and not in syncdb (remove from database)\n        for pkgname in (dbset - syncset):\n            logger.info(\"Removing package %s\", pkgname)\n            dbpkg = dbdict[pkgname]\n            with transaction.commit_on_success():\n                # no race condition here as long as simultaneous threads both\n                # issue deletes; second delete will be a no-op\n                dbpkg.delete()\n\n    # packages in both database and in syncdb (update in database)\n    pkg_in_both = syncset & dbset\n    for pkg in (x for x in pkgs if x.name in pkg_in_both):\n        logger.debug(\"Checking package %s\", pkg.name)\n        dbpkg = dbdict[pkg.name]\n        timestamp = None\n        # for a force, we don't want to update the timestamp.\n        # for a non-force, we don't want to do anything at all.\n        if filesonly:\n            pass\n        elif pkg_same_version(pkg, dbpkg):\n            if not force:\n                continue\n        else:\n            timestamp = datetime.utcnow()\n\n        # The odd select_for_update song and dance here are to ensure\n        # simultaneous updates don't happen on a package, causing\n        # files/depends/all related items to be double-imported.\n        if filesonly:\n            with transaction.commit_on_success():\n                # TODO Django 1.4 select_for_update() will work once released\n                dbpkg = select_pkg_for_update(dbpkg)\n                if pkg_same_version(pkg, dbpkg):\n                    logger.debug(\"Package %s was already updated\", pkg.name)\n                    continue\n                logger.debug(\"Checking files for package %s\", pkg.name)\n                populate_files(dbpkg, pkg, force=force)\n        else:\n            with transaction.commit_on_success():\n                # TODO Django 1.4 select_for_update() will work once released\n                dbpkg = select_pkg_for_update(dbpkg)\n                if pkg_same_version(pkg, dbpkg):\n                    logger.debug(\"Package %s was already updated\", pkg.name)\n                    continue\n                logger.info(\"Updating package %s\", pkg.name)\n                populate_pkg(dbpkg, pkg, force=force, timestamp=timestamp)\n\n    logger.info('Finished updating Arch: %s', archname)",
+      "calls": [
+        "Exception",
+        "Package",
+        "dict",
+        "len",
+        "pkg_same_version",
+        "populate_files",
+        "populate_pkg",
+        "select_pkg_for_update",
+        "set"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "Arch",
+        "IntegrityError",
+        "Package",
+        "Repo",
+        "datetime",
+        "logger",
+        "pkg_same_version",
+        "populate_files",
+        "populate_pkg",
+        "select_pkg_for_update",
+        "transaction",
+        "x"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "select_pkg_for_update",
+        "pkg_same_version",
+        "populate_pkg",
+        "transaction.commit_on_success"
+      ],
+      "reason": "These methods are essential for understanding the logic and handling of package updates, especially in relation to the TODO comment about select_for_update()."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "select_pkg_for_update",
+        "path": "devel/management/commands/reporead.py",
+        "class_name": null,
+        "start_line": 274,
+        "end_line": 282,
+        "source": "def select_pkg_for_update(dbpkg):\n    database = router.db_for_write(Package, instance=dbpkg)\n    connection = connections[database]\n    if 'sqlite' in connection.settings_dict['ENGINE'].lower():\n        return dbpkg\n    new_pkg = Package.objects.raw(\n            'SELECT * FROM packages WHERE id = %s FOR UPDATE',\n            [dbpkg.id])\n    return list(new_pkg)[0]",
+        "found": true
+      },
+      {
+        "method_name": "populate_pkg",
+        "path": "devel/management/commands/reporead.py",
+        "class_name": null,
+        "start_line": 192,
+        "end_line": 235,
+        "source": "def populate_pkg(dbpkg, repopkg, force=False, timestamp=None):\n    if repopkg.base:\n        dbpkg.pkgbase = repopkg.base\n    else:\n        dbpkg.pkgbase = repopkg.name\n    dbpkg.pkgver = repopkg.ver\n    dbpkg.pkgrel = repopkg.rel\n    dbpkg.epoch = repopkg.epoch\n    dbpkg.pkgdesc = repopkg.desc\n    dbpkg.url = repopkg.url\n    dbpkg.filename = repopkg.filename\n    dbpkg.compressed_size = repopkg.csize\n    dbpkg.installed_size = repopkg.isize\n    dbpkg.build_date = repopkg.builddate\n    dbpkg.packager_str = repopkg.packager\n    # attempt to find the corresponding django user for this string\n    dbpkg.packager = finder.find(repopkg.packager)\n    dbpkg.pgp_signature = repopkg.pgpsig\n\n    if timestamp:\n        dbpkg.flag_date = None\n        dbpkg.last_update = timestamp\n    dbpkg.save()\n\n    populate_files(dbpkg, repopkg, force=force)\n\n    dbpkg.packagedepend_set.all().delete()\n    for y in repopkg.depends:\n        create_depend(dbpkg, y)\n    for y in repopkg.optdepends:\n        create_depend(dbpkg, y, True)\n\n    dbpkg.conflicts.all().delete()\n    for y in repopkg.conflicts:\n        create_related(Conflict, dbpkg, y)\n    dbpkg.provides.all().delete()\n    for y in repopkg.provides:\n        create_related(Provision, dbpkg, y, equals_only=True)\n    dbpkg.replaces.all().delete()\n    for y in repopkg.replaces:\n        create_related(Replacement, dbpkg, y)\n\n    create_multivalued(dbpkg, repopkg, 'groups', 'groups')\n    create_multivalued(dbpkg, repopkg, 'licenses', 'license')",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "pkg_same_version",
+      "transaction.commit_on_success"
+    ]
+  },
+  "review_context": {}
+}

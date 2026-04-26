@@ -1,0 +1,100 @@
+{
+  "task_id": "334",
+  "repo_owner": "dropbox",
+  "repo_name": "changes",
+  "file_path": "changes/backends/jenkins/builder.py",
+  "commit": "ba0563283c41ba4daebc057842ff7de79f47e1e3",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T12:30:58+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ba0563283c41ba4daebc057842ff7de79f47e1e3",
+    "symbol_name": "_parse_parameters",
+    "satd_line": 58,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T12:30:58+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 2,
+    "retrieved_method_count": 1,
+    "missing_method_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "changes/backends/jenkins/builder.py",
+    "original_signature": "def _sync_step_from_queue(self, step):",
+    "target_file": {
+      "ok": true,
+      "path": "changes/backends/jenkins/builder.py",
+      "sha": "e9b5d1dbeb3cbe67921caa53d00ed309bb0c56b2",
+      "download_url": "https://raw.githubusercontent.com/dropbox/changes/ba0563283c41ba4daebc057842ff7de79f47e1e3/changes/backends/jenkins/builder.py",
+      "content_excerpt": "from __future__ import absolute_import, division\n\nimport json\nimport logging\nimport requests\n\nfrom datetime import datetime\n\nfrom changes.backends.base import BaseBackend\nfrom changes.config import db\nfrom changes.constants import Result, Status\nfrom changes.models import RemoteEntity, Test\n\n\nclass NotFound(Exception):\n    pass\n\n\nclass JenkinsBuilder(BaseBackend):\n    provider = 'jenkins'\n\n    def __init__(self, base_url=None, token=None, *args, **kwargs):\n        super(JenkinsBuilder, self).__init__(*args, **kwargs)\n        self.base_url = base_url or self.app.config['JENKINS_URL']\n        self.token = token or self.app.config['JENKINS_TOKEN']\n        self.logger = logging.getLogger('jenkins')\n\n    def _get_response(self, path, method='GET', params=None, **kwargs):\n        url = '{}/{}/api/json/'.format(self.base_url, path.strip('/'))\n\n        if params is None:\n            params = {}\n\n        params.setdefault('token', self.token)\n\n        self.logger.info('Fetching %r', url)\n        resp = getattr(requests, method.lower())(url, params=params, **kwargs)\n\n        if resp.status_code == 404:\n            raise NotFound\n        elif not (200 <= resp.status_code < 300):\n            raise Exception('Invalid response. Status code was %s' % resp.status_code)\n\n        data = resp.text\n        if data:\n            try:\n                return json.loads(data)\n            except ValueError:\n                raise Exception('Invalid JSON data')\n        return\n\n    def _parse_parameters(self, json):\n        params = {}\n        for action in json['actions']:\n            params.update(\n                (p['name'], p['value'])\n                for p in action.get('parameters', [])\n            )\n        return params\n\n    def _sync_build_from_queue(self, build, entity):\n        build_item = entity.data\n\n        # TODO(dcramer): when we hit a NotFound in the queue, maybe we should\n        # attempt to scrape the list of jobs for a matching CHANGES_BID, as this\n        # doesnt explicitly mean that the job doesnt exist\n        try:\n            item = self._get_response('/queue/item/{}'.format(\n                build_item['item_id']))\n        except NotFound:\n            build.status = Status.finished\n            build.result = Result.unknown\n            db.session.add(build)\n            return\n\n        if item['blocked']:\n            build.status = Status.queued\n            db.session.add(build)\n        elif item.get('cancelled'):\n            build.status = Status.finished\n            build.result = Result.aborted\n            db.session.add(build)\n        elif item.get('executable'):\n            build_no = item['executable']['number']\n            build_item['build_no'] = build_no\n            db.session.add(entity)\n            self._sync_build_from_active(build, entity)\n\n    def _sync_build_from_active(self, build, entity):\n        build_item = entity.data\n        item = self._get_response('/job/{}/{}'.format(\n            build_item['job_name'], build_item['build_no']))\n\n        if item['timestamp'] and not build.date_started:\n            build.date_started = min(datetime.utcfromtimestamp(\n                item['timestamp'] / 1000), datetime.utcnow())\n\n        if item['building']:\n            build.status = Status.in_progress\n        else:\n            build.date_finished = datetime.utcnow()\n\n        if item['result']:\n            build.status = Status.finished\n            if item['result'] == 'SUCCESS':\n                build.result = Result.passed\n            elif item['result'] == 'ABORTED':\n                build.result = Result.aborted\n            elif item['result'] == 'FAILURE':\n                build.result = Result.failed\n            else:\n                raise ValueError('Invalid build result: %s' % (item['result'],))\n\n        if item['duration']:\n            build.duration = item['duration']\n\n        build.data = {\n            'backend': {\n                'uri': item['url'],\n                'label': item['fullDisplayName'],\n            }\n        }\n\n        db.session.add(build)\n\n        for action in item['actions']:\n            # is this the best way to find this?\n            if action.get('urlName') == 'testReport':\n                self._sync_test_results(build, entity)\n                break\n\n    def _sync_test_results(self, build, entity):\n        build_item = entity.data\n        test_report = self._get_response('/job/{}/{}/testReport/'.format(\n            build_item['job_name'], build_item['build_no']))\n\n        for suite in test_report['suites']:\n            for case in suite['cases']:\n                label = '{}.{}'.format(case['className'], case['name'])\n                if Test.query.filter_by(build=build, label=label).first():\n                    continue\n\n                message = []\n                if case['errorDetails']:\n                    message.append('Error\\n-----')\n                    message.append(case['errorDetails'] + '\\n')\n                if case['errorStackTrace']:\n                    message.append('Stacktrace\\n----------')\n                    message.append(case['errorStackTrace'] + '\\n')\n                if case['skippedMessage']:\n                    message.append(case['skippedMessage'] + '\\n')\n\n                # TODO: expand Test to handle more message types\n                test = Test(\n                    build=build,\n                    project=build.project,\n                    label=label,\n                    duration=int(case['duration'] * 1000),\n                    message='\\n'.join(message).strip(),\n                )\n                if case['status'] == 'PASSED':\n                    test.result = Result.passed\n                elif case['status'] == 'FAILURE':\n                    test.result = Result.failed\n                elif case['status'] == 'SKIPPED':\n                    test.result = Result.skipped\n                else:\n                    raise ValueError('Invalid test result: %s' % (case['status'],))\n\n                db.session.add(test)\n\n    def _find_job(self, job_name, build_id):\n        \"\"\"\n        Given a build identifier, we attempt to poll the various endpoints\n        for a limited amount of time, trying to match up either a queued item\n        or a running job that has the CHANGES_BID parameter.\n\n        This is nescesary because Jenkins does not give us any identifying\n        information when we create a job initially.\n\n        The build_id parameter should be the corresponding value to look for in\n        the CHANGES_BID parameter.\n\n        The result is a mapping with the following keys:\n\n        - queued: is it currently present in the queue\n        - item_id: the queued item ID, if available\n        - build_no: the build number, if available\n        \"\"\"\n        # Check the queue first to ensure that we don't miss a transition\n        # from queue -> active builds\n        for item in self._get_response('/queue')['items']:\n            if item['task']['name'] != job_name:\n                continue\n\n            params = self._parse_parameters(item)\n            try:\n                job_build_id = params['CHANGES_BID']\n            except KeyError:\n                continue\n\n            if job_build_id == build_id:\n                return {\n                    'job_name': job_name,\n                    'queued': True,\n                    'item_id': item['id'],\n                    'build_no': None,\n                }\n\n        # It wasn't found in the queue, so lets look for an active build\n        # the depth=2 is important here, otherwise parameters are not included\n        for item in self._get_response('/job/{}'.format(job_name), params={'depth': 2})['builds']:\n            params = self._parse_parameters(item)\n            try:\n                job_build_id = params['CHANGES_BID']\n            except KeyError:\n                continue\n\n            if job_build_id == build_id:\n                return {\n                    'job_name': job_name,\n                    'queued': False,\n                    'item_id': None,\n                    'build_no': item['number'],\n                }\n\n    def sync_build(self, build):\n        entity = RemoteEntity.query.filter_by(\n            provider=self.provider,\n            internal_id=build.id,\n            type='build',\n        )[0]\n\n        if entity.data['queued']:\n            self._sync_build_from_queue(build, entity)\n        else:\n            self._sync_build_from_active(build, entity)\n\n    def create_build(self, build):\n        \"\"\"\n        Creates a build within Jenkins.\n\n        Due to the way the API works, this consists of two steps:\n\n        - Submitting the build\n        - Polling for the newly created build to associate either a queue ID\n          or a finalized build number.\n        \"\"\"\n\n        # TODO: patch support\n        entity = RemoteEntity.query.filter_by(\n            provider=self.provider,\n            internal_id=build.project.id,\n            type='job',\n        )[0]\n        job_name = entity.remote_id\n\n        json_data = {\n            'parameter': [\n                {'name': 'REVISION', 'value': build.parent_revision_sha},\n                {'name': 'CHANGES_BID', 'value': build.id.hex},\n            ]\n        }\n        # TODO: Jenkins will return a 302 if it cannot queue the job which I\n        # believe implies that there is already a job with the same parameters\n        # queued.\n        self._get_response('/job/{}/build'.format(job_name), method='POST', data={\n            'json': json.dumps(json_data),\n        })\n\n        build_item = self._find_job(job_name, build.id.hex)\n        if build_item is None:\n            raise Exception('Unable to find matching job after creation. GLHF')\n\n        if build_item['queued']:\n            remote_id = 'queue:{}'.format(build_item['item_id'])\n        else:\n            remote_id = '{}#{}'.format(build_item['job_name'], build_item['build_no'])\n\n        entity = RemoteEntity(\n            provider=self.provider,\n            internal_id=build.id,\n            type='build',\n            remote_id=remote_id,\n            data=build_item,\n        )\n        db.session.add(entity)\n",
+      "total_lines": 287,
+      "ref": "ba0563283c41ba4daebc057842ff7de79f47e1e3"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_parse_parameters",
+      "class_name": "JenkinsBuilder",
+      "start_line": 52,
+      "end_line": 59,
+      "satd_line": 58,
+      "matched_by": "signature_or_comment",
+      "source": "    def _parse_parameters(self, json):\n        params = {}\n        for action in json['actions']:\n            params.update(\n                (p['name'], p['value'])\n                for p in action.get('parameters', [])\n            )\n        return params",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": []
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "_get_json_response",
+        "NotFound"
+      ],
+      "reason": "These methods are essential for understanding the flow of the code related to the NotFound scenario, which is the focus of the SATD repair."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "NotFound",
+        "path": "changes/backends/jenkins/builder.py",
+        "class_name": null,
+        "start_line": 15,
+        "end_line": 16,
+        "source": "class NotFound(Exception):\n    pass",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "_get_json_response"
+    ]
+  },
+  "review_context": {}
+}

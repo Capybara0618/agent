@@ -1,0 +1,96 @@
+{
+  "task_id": "457",
+  "repo_owner": "jelmer",
+  "repo_name": "janitor",
+  "file_path": "janitor/vcs_store.py",
+  "commit": "a288500633784de08b079559e4c2b9e5023a150f",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T13:07:19+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "a288500633784de08b079559e4c2b9e5023a150f",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T13:07:19+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 5,
+    "retrieved_method_count": 1,
+    "missing_method_count": 4,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "janitor/vcs_store.py",
+    "original_signature": "async def git_backend(request):",
+    "target_file": {
+      "ok": true,
+      "path": "janitor/vcs_store.py",
+      "sha": "e94a2ce9a472dfb7ef4bc6530bd2a28020e1a5f9",
+      "download_url": "https://raw.githubusercontent.com/jelmer/janitor/a288500633784de08b079559e4c2b9e5023a150f/janitor/vcs_store.py",
+      "content_excerpt": "#!/usr/bin/python3\n# Copyright (C) 2019 Jelmer Vernooij <jelmer@jelmer.uk>\n#\n# This program is free software; you can redistribute it and/or modify\n# it under the terms of the GNU General Public License as published by\n# the Free Software Foundation; either version 2 of the License, or\n# (at your option) any later version.\n#\n# This program is distributed in the hope that it will be useful,\n# but WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n# GNU General Public License for more details.\n#\n# You should have received a copy of the GNU General Public License\n# along with this program; if not, write to the Free Software\n# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA\n\n\"\"\"Manage VCS repositories.\"\"\"\n\nimport asyncio\nfrom io import BytesIO\nimport logging\nfrom aiohttp import web\nfrom aiohttp.web_middlewares import normalize_path_middleware\nfrom http.client import parse_headers  # type: ignore\n\nfrom breezy.controldir import ControlDir, format_registry\nfrom breezy.bzr.smart import medium\nfrom breezy.transport import get_transport_from_url\n-from dulwich.web import HTTPGitApplication\nfrom dulwich.protocol import ReceivableProtocol\nfrom dulwich.server import (\n    DEFAULT_HANDLERS as DULWICH_SERVICE_HANDLERS,\n    DictBackend,\n)\nfrom . import (\n    state,\n)\n\nfrom .config import read_config\nfrom .prometheus import setup_metrics\nfrom .site import is_worker\nfrom .vcs import (\n    VcsManager,\n    LocalVcsManager,\n    get_run_diff,\n)\n\n\nasync def diff_request(request):\n    run_id = request.match_info[\"run_id\"]\n    role = request.match_info[\"role\"]\n    async with request.app.db.acquire() as conn:\n        run = await state.get_run(conn, run_id)\n        if not run:\n            raise web.HTTPNotFound(text=\"No such run: %r\" % run_id)\n    diff = get_run_diff(request.app.vcs_manager, run, role)\n    return web.Response(body=diff, content_type=\"text/x-diff\")\n\n\nasync def _git_open_repo(vcs_manager, db, package):\n    repo = vcs_manager.get_repository(package, \"git\")\n\n    if repo is None:\n        async with db.acquire() as conn:\n            if not await state.package_exists(conn, package):\n                raise web.HTTPNotFound()\n        controldir = ControlDir.create(\n            vcs_manager.get_repository_url(package, \"git\"),\n            format=format_registry.get(\"git-bare\")(),\n        )\n        logging.info(\n            \"Created missing git repository for %s at %s\", package, controldir.user_url\n        )\n        return controldir.open_repository()\n    else:\n        return repo\n\n\ndef _git_check_service(service: str, allow_writes: bool = False):\n    if service == \"git-upload-pack\":\n        return\n\n    if service == \"git-receive-pack\":\n        if not allow_writes:\n            raise web.HTTPUnauthorized(\n                text=\"git-receive-pack requires login\",\n                headers={\"WWW-Authenticate\": 'Basic Realm=\"Debian Janitor\"'},\n            )\n        return\n\n    raise web.HTTPForbidden(text=\"Unsupported service %s\" % service)\n\n\nasync def handle_klaus(request):\n    package = request.match_info[\"package\"]\n\n    repo = await _git_open_repo(request.app.vcs_manager, request.app.db, package)\n\n    from klaus import views, utils, KLAUS_VERSION\n    from flask import Flask\n    from klaus.repo import FancyRepo\n\n    class Klaus(Flask):\n        def __init__(self, package, repo):\n            super(Klaus, self).__init__(\"klaus\")\n            self.package = package\n            self.valid_repos = {package: FancyRepo(repo._transport.local_abspath(\".\"))}\n\n        def should_use_ctags(self, git_repo, git_commit):\n            return False\n\n        def create_jinja_environment(self):\n            \"\"\"Called by Flask.__init__\"\"\"\n            env = super(Klaus, self).create_jinja_environment()\n            for func in [\n                \"force_unicode\",\n                \"timesince\",\n                \"shorten_sha1\",\n                \"shorten_message\",\n                \"extract_author_name\",\n                \"formattimestamp\",\n            ]:\n                env.filters[func] = getattr(utils, func)\n\n            env.globals[\"KLAUS_VERSION\"] = KLAUS_VERSION\n            env.globals[\"USE_SMARTHTTP\"] = False\n            env.globals[\"SITE_NAME\"] = \"Package list\"\n            return env\n\n    app = Klaus(package, repo)\n\n    for endpoint, rule in [\n        (\"blob\", \"/blob/\"),\n        (\"blob\", \"/blob/<rev>/<path:path>\"),\n        (\"blame\", \"/blame/\"),\n        (\"blame\", \"/blame/<rev>/<path:path>\"),\n        (\"raw\", \"/raw/<path:path>/\"),\n        (\"raw\", \"/raw/<rev>/<path:path>\"),\n        (\"submodule\", \"/submodule/<rev>/\"),\n        (\"submodule\", \"/submodule/<rev>/<path:path>\"),\n        (\"commit\", \"/commit/<path:rev>/\"),\n        (\"patch\", \"/commit/<path:rev>.diff\"),\n        (\"patch\", \"/commit/<path:rev>.patch\"),\n        (\"index\", \"/\"),\n        (\"index\", \"/<path:rev>\"),\n        (\"history\", \"/tree/<rev>/\"),\n        (\"history\", \"/tree/<rev>/<path:path>\"),\n        (\"download\", \"/tarball/<path:rev>/\"),\n        (\"repo_list\", \"/..\"),\n    ]:\n        app.add_url_rule(\n            rule, view_func=getattr(views, endpoint), defaults={\"repo\": package}\n        )\n\n    from aiohttp_wsgi import WSGIHandler\n\n    wsgi_handler = WSGIHandler(app)\n\n    return await wsgi_handler(request)\n\n\nasync def handle_set_git_remote(request):\n    package = request.match_info[\"package\"]\n    remote = request.match_info[\"remote\"]\n\n    repo = await _git_open_repo(request.app.vcs_manager, request.app.db, package)\n\n    post = await request.post()\n    r = repo._git\n    c = r.get_config()\n    section = (\"remote\", remote)\n    c.set(section, \"url\", post[\"url\"])\n    c.set(section, \"fetch\", \"+refs/heads/*:refs/remotes/%s/*\" % remote)\n    b = BytesIO()\n    c.write_to_file(b)\n    r._controltransport.put_bytes(\"config\", b.getvalue())\n\n    # TODO(jelmer): Run 'git fetch $remote'?\n\n    return web.Response()\n\n\nasync def handle_set_bzr_remote(request):\n    package = request.match_info[\"package\"]\n    remote = request.match_info[\"remote\"]\n    post = await request.post()\n\n    local_branch = request.app.vcs_manager.get_branch(package, remote)\n\n    local_branch.set_parent(post[\"url\"])\n\n    # TODO(jelmer): Run 'bzr pull'?\n\n    return web.Response()\n\n\nasync def git_backend(request):\n    package = request.match_info['package']\n    subpath = request.match_info['subpath']\n\n    allow_writes = await is_worker(request.app.db, request)\n\n    repo = await _git_open_repo(request.app.vcs_manager, request.app.db, package)\n\n    args = ['/usr/bin/git']\n    if allow_writes:\n        args.extend(['-c', 'http.receivepack=1'])\n    args.append('http-backend')\n    local_path = repo.user_transport.local_abspath('.')\n    full_path = local_path + '/' + subpath\n    env = {\n        'GIT_HTTP_EXPORT_ALL': 'true',\n        'REQUEST_METHOD': request.method,\n        'REMOTE_ADDR': request.remote,\n        'CONTENT_TYPE': request.content_type,\n        'PATH_TRANSLATED': full_path,\n        'QUERY_STRING': request.query_string,\n        # REMOTE_USER is not set\n        }\n\n    for key, value in request.headers.items():\n        env['HTTP_' + key.replace('-', '_').upper()] = value\n\n    for name in ['HTTP_CONTENT_ENCODING', 'HTTP_CONTENT_LENGTH']:\n        try:\n            del env[name]\n        except KeyError:\n            pass\n\n    p = await asyncio.create_subprocess_exec(\n        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,\n        env=env, stdin=asyncio.subprocess.PIPE)\n\n    stdin = await request.read()\n\n    # TODO(jelmer): Stream output, rather than reading everything into a buffer\n    # and then sending it on.\n\n    (stdout, stderr) = await p.communicate(stdin)\n    if stderr:\n        if stderr.decode().strip() == 'Service not enabled: \\'receive-pack\\'':\n            raise web.HTTPUnauthorized(text=stderr.decode())\n        if not stdout:\n            return web.Response(\n                status=400, reason='Bad Request', body=stderr)\n        for line in stderr.splitlines():\n            logging.warning('Git warning: %s', line.decode())\n\n    b = BytesIO(stdout)\n\n    headers = parse_headers(b)\n    status = headers.get('Status')\n    if status:\n        del headers['Status']\n        (status_code, status_reason) = status.split(' ', 1)\n        status_code = int(status_code)\n        status_reason = status_reason\n    else:\n        status_code = 200\n        status_reason = 'OK'\n\n    response = web.StreamResponse(\n        headers=headers.items(), status=status_code,\n        reason=status_reason)\n    await response.prepare(request)\n\n    await response.write(b.read())\n\n    await response.write_eof()\n\n    return response\n\n\nasync def dulwich_refs(request):\n    package = request.match_info[\"package\"]\n\n    allow_writes = await is_worker(request.app.db, request)\n\n    repo = await _git_open_repo(request.app.vcs_manager, request.app.db, package)\n    r = repo._git\n\n    service = request.query.get(\"service\")\n    _git_check_service(service, allow_writes)\n\n    headers = {\n        \"Expires\": \"Fri, 01 Jan 1980 00:00:00 GMT\",\n        \"Pragma\": \"no-cache\",\n        \"Cache-Control\": \"no-cache, max-age=0, must-revalidate\",\n    }\n\n    handler_cls = DULWICH_SERVICE_HANDLERS[service.encode(\"ascii\")]\n\n    response = web.StreamResponse(status=200, headers=headers)\n    response.content_type = \"application/x-%s-advertisement\" % service\n\n    await response.prepare(request)\n\n    out = BytesIO()\n    proto = ReceivableProtocol(BytesIO().read, out.write)\n    handler = handler_cls(\n        DictBackend({\".\": r}), [\".\"], proto, stateless_rpc=True, advertise_refs=True\n    )\n    handler.proto.write_pkt_line(b\"# service=\" + service.encode(\"ascii\") + b\"\\n\")\n    handler.proto.write_pkt_line(None)\n\n    await asyncio.to_thread(handler.handle)\n\n    await response.write(out.getvalue())\n\n    await response.write_eof()\n\n    return response\n\n\nasync def dulwich_service(request):\n    package = request.match_info[\"package\"]\n    service = request.match_info[\"service\"]\n\n    allow_writes = await is_worker(request.app.db, request)\n\n    repo = await _git_open_repo(request.app.vcs_manager, request.app.db, package)\n\n    _git_check_service(service, allow_writes)\n\n    headers = {\n        \"Expires\": \"Fri, 01 Jan 1980 00:00:00 GMT\",\n        \"Pragma\": \"no-cache\",\n        \"Cache-Control\": \"no-cache, max-age=0, must-revalidate\",\n    }\n    handler_cls = DULWICH_SERVICE_HANDLERS[service.encode(\"ascii\")]\n\n    response = web.StreamResponse(status=200, headers=headers)\n    response.content_type = \"application/x-%s-result\" % service\n\n    await response.prepare(request)\n\n    inf = BytesIO(await request.read())\n    outf = BytesIO()\n\n    def handle():\n        r = repo._git\n        proto = ReceivableProtocol(inf.read, outf.write)\n        handler = handler_cls(DictBackend({\".\": r}), [\".\"], proto, stateless_rpc=True)\n        handler.handle()\n\n    await asyncio.to_thread(handle)\n\n    await response.write(outf.getvalue())\n\n    await response.write_eof()\n    return response\n\n\nasync def bzr_backend(request):\n    vcs_manager = request.app.vcs_manager\n    package = request.match_info[\"package\"]\n    branch = request.match_info.get(\"branch\")\n    repo = vcs_manager.get_repository(package, \"bzr\")\n    if await is_worker(request.app.db, request):\n        if repo is None:\n            controldir = ControlDir.create(\n                vcs_manager.get_repository_url(package, \"bzr\")\n            )\n            repo = controldir.create_repository(shared=True)\n        backing_transport = repo.user_transport\n    else:\n        if repo is None:\n            raise web.HTTPNotFound()\n        backing_transport = get_transport_from_url(\"readonly+\" + repo.user_url)\n    transport = backing_transport.clone(branch)\n    out_buffer = BytesIO()\n    request_data_bytes = await request.read()\n\n    protocol_factory, unused_bytes = medium._get_protocol_factory_for_bytes(\n        request_data_bytes\n    )\n    smart_protocol_request = protocol_factory(\n        transport, out_buffer.write, \".\", backing_transport\n    )\n    smart_protocol_request.accep",
+      "total_lines": 472,
+      "ref": "a288500633784de08b079559e4c2b9e5023a150f"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "request.read",
+        "asyncio.create_subprocess_exec",
+        "p.communicate",
+        "BytesIO",
+        "web.StreamResponse"
+      ],
+      "reason": "These methods are directly related to the handling of input and output in the context of the TODO comment, which focuses on improving the streaming of output rather than buffering it."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "read",
+        "path": "janitor/tests/test_pull_worker.py",
+        "class_name": "AsyncBytesIO",
+        "start_line": 44,
+        "end_line": 45,
+        "source": "async def read(self, size=None):\n        return self._io.read(size)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "asyncio.create_subprocess_exec",
+      "p.communicate",
+      "BytesIO",
+      "web.StreamResponse"
+    ]
+  },
+  "review_context": {}
+}

@@ -1,0 +1,175 @@
+{
+  "task_id": "184",
+  "repo_owner": "safe-global",
+  "repo_name": "safe-transaction-service",
+  "file_path": "safe_transaction_service/history/services/reorg_service.py",
+  "commit": "78394c6315d822292481412935e2a81a2a932f48",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T11:35:01+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "78394c6315d822292481412935e2a81a2a932f48",
+    "symbol_name": "__init__",
+    "satd_line": 51,
+    "target_file_ok": true,
+    "context_strategy": "function_external_evidence",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T11:35:01+00:00",
+    "repair_cache_source": "github_fetch",
+    "shared_context_mode": true
+  },
+  "base_context": {
+    "file_path": "safe_transaction_service/history/services/reorg_service.py",
+    "original_signature": "def __init__(",
+    "target_file": {
+      "ok": true,
+      "path": "safe_transaction_service/history/services/reorg_service.py",
+      "sha": "d3a5bf23293e932e91e6662ec0bea6ec2b8b3931",
+      "download_url": "https://raw.githubusercontent.com/safe-global/safe-transaction-service/78394c6315d822292481412935e2a81a2a932f48/safe_transaction_service/history/services/reorg_service.py",
+      "content_excerpt": "import logging\nfrom typing import Dict, Optional\n\nfrom django.db import models, transaction\n\nfrom hexbytes import HexBytes\n\nfrom gnosis.eth import EthereumClient, EthereumClientProvider\n\nfrom ..models import EthereumBlock, IndexingStatus, ProxyFactory, SafeMasterCopy\n\nlogger = logging.getLogger(__name__)\n\n\nclass ReorgServiceProvider:\n    def __new__(cls):\n        if not hasattr(cls, \"instance\"):\n            from django.conf import settings\n\n            cls.instance = ReorgService(\n                EthereumClientProvider(), settings.ETH_REORG_BLOCKS\n            )\n        return cls.instance\n\n    @classmethod\n    def del_singleton(cls):\n        if hasattr(cls, \"instance\"):\n            del cls.instance\n\n\n# TODO Test ReorgService\nclass ReorgService:\n    def __init__(\n        self,\n        ethereum_client: EthereumClient,\n        eth_reorg_blocks: int,\n        eth_reorg_rewind_blocks: Optional[int] = 250,\n    ):\n        \"\"\"\n        :param ethereum_client:\n        :param eth_reorg_blocks: Minimum number of blocks to consider a block confirmed and safe to rely on. In Mainnet\n            10 blocks is considered safe\n        :param eth_reorg_rewind_blocks: Number of blocks to rewind indexing when a reorg is found\n        \"\"\"\n        self.ethereum_client = ethereum_client\n        self.eth_reorg_blocks = eth_reorg_blocks  #\n        self.eth_reorg_rewind_blocks = eth_reorg_rewind_blocks\n        # Dictionary with Django model and attribute for reorgs\n        self.reorg_models: Dict[models.Model, str] = {\n            ProxyFactory: \"tx_block_number\",\n            # TODO Refactor this to accept a function\n            # IndexingStatus: \"block_number\",\n            SafeMasterCopy: \"tx_block_number\",\n        }\n\n    def check_reorgs(self) -> Optional[int]:\n        \"\"\"\n        :return: Number of oldest block with reorg detected. `None` if not reorg found\n        \"\"\"\n        current_block_number = self.ethereum_client.current_block_number\n        to_block = current_block_number - self.eth_reorg_blocks\n        for database_block in (\n            EthereumBlock.objects.not_confirmed(to_block_number=to_block)\n            .only(\"number\", \"block_hash\", \"confirmed\")\n            .order_by(\"number\")\n        ):\n            blockchain_block = self.ethereum_client.get_block(\n                database_block.number, full_transactions=False\n            )\n            blockchain_next_block = self.ethereum_client.get_block(\n                database_block.number + 1, full_transactions=False\n            )\n            if (\n                HexBytes(blockchain_block[\"hash\"])\n                == HexBytes(blockchain_next_block[\"parentHash\"])\n                == HexBytes(database_block.block_hash)\n            ):\n                database_block.set_confirmed()\n            else:\n                logger.warning(\"Reorg found for block-number=%d\", database_block.number)\n                return database_block.number\n\n    def reset_all_to_block(self, block_number: int) -> int:\n        \"\"\"\n        Reset database fields to a block to start reindexing from that block. It's useful when you want to trigger\n        a indexation for txs that are not appearing on database but you don't want to delete anything\n\n        :param block_number:\n        :return: Number of updated models\n        \"\"\"\n        updated = 0\n        for model, field in self.reorg_models.items():\n            updated += model.objects.filter(**{field + \"__gt\": block_number}).update(\n                **{field: block_number}\n            )\n        if IndexingStatus.objects.set_erc20_721_indexing_status(block_number):\n            updated += 1\n\n        return updated\n\n    @transaction.atomic\n    def recover_from_reorg(self, first_reorg_block_number: int) -> int:\n        \"\"\"\n        Reset database fields to a block to start reindexing from that block and remove blocks greater or equal\n        than `first_reorg_block_number`\n\n        :param first_reorg_block_number:\n        :return: Return number of elements updated\n        \"\"\"\n        safe_reorg_block_number = max(\n            first_reorg_block_number - self.eth_reorg_rewind_blocks, 0\n        )\n\n        updated = 0\n        for model, field in self.reorg_models.items():\n            updated += model.objects.filter(\n                **{field + \"__gte\": first_reorg_block_number}\n            ).update(**{field: safe_reorg_block_number})\n\n        EthereumBlock.objects.filter(number__gte=first_reorg_block_number).delete()\n        logger.warning(\n            \"Reorg of block-number=%d fixed, %d elements updated\",\n            first_reorg_block_number,\n            updated,\n        )\n        return updated\n",
+      "total_lines": 126,
+      "ref": "78394c6315d822292481412935e2a81a2a932f48"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "__init__",
+      "class_name": "ReorgService",
+      "start_line": 33,
+      "end_line": 54,
+      "satd_line": 51,
+      "matched_by": "normalized_source",
+      "source": "    def __init__(\n        self,\n        ethereum_client: EthereumClient,\n        eth_reorg_blocks: int,\n        eth_reorg_rewind_blocks: Optional[int] = 250,\n    ):\n        \"\"\"\n        :param ethereum_client:\n        :param eth_reorg_blocks: Minimum number of blocks to consider a block confirmed and safe to rely on. In Mainnet\n            10 blocks is considered safe\n        :param eth_reorg_rewind_blocks: Number of blocks to rewind indexing when a reorg is found\n        \"\"\"\n        self.ethereum_client = ethereum_client\n        self.eth_reorg_blocks = eth_reorg_blocks  #\n        self.eth_reorg_rewind_blocks = eth_reorg_rewind_blocks\n        # Dictionary with Django model and attribute for reorgs\n        self.reorg_models: Dict[models.Model, str] = {\n            ProxyFactory: \"tx_block_number\",\n            # TODO Refactor this to accept a function\n            # IndexingStatus: \"block_number\",\n            SafeMasterCopy: \"tx_block_number\",\n        }",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [
+        "eth_reorg_blocks",
+        "eth_reorg_rewind_blocks",
+        "ethereum_client",
+        "reorg_models"
+      ],
+      "global_uses": [
+        "Dict",
+        "EthereumClient",
+        "Optional",
+        "ProxyFactory",
+        "SafeMasterCopy",
+        "models"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "function_external_evidence",
+    "same_file_helpers": {
+      "count": 0,
+      "items": []
+    },
+    "same_class_evidence": {
+      "class_name": "ReorgService",
+      "related_methods_count": 0,
+      "related_attributes_count": 3,
+      "related_methods": [],
+      "related_attributes": [
+        {
+          "attribute": "ethereum_client",
+          "start_line": 44,
+          "end_line": 46,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "        \"\"\"\n        self.ethereum_client = ethereum_client\n        self.eth_reorg_blocks = eth_reorg_blocks  #"
+        },
+        {
+          "attribute": "eth_reorg_blocks",
+          "start_line": 45,
+          "end_line": 47,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "        self.ethereum_client = ethereum_client\n        self.eth_reorg_blocks = eth_reorg_blocks  #\n        self.eth_reorg_rewind_blocks = eth_reorg_rewind_blocks"
+        },
+        {
+          "attribute": "eth_reorg_rewind_blocks",
+          "start_line": 46,
+          "end_line": 48,
+          "relevance": [
+            "direct_attribute_assignment"
+          ],
+          "snippet": "        self.eth_reorg_blocks = eth_reorg_blocks  #\n        self.eth_reorg_rewind_blocks = eth_reorg_rewind_blocks\n        # Dictionary with Django model and attribute for reorgs"
+        }
+      ]
+    },
+    "module_symbols": {
+      "count": 3,
+      "items": [
+        {
+          "symbol_name": "Dict",
+          "kind": "import_from",
+          "start_line": 2,
+          "end_line": 2,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from typing import Dict, Optional"
+        },
+        {
+          "symbol_name": "models",
+          "kind": "import_from",
+          "start_line": 4,
+          "end_line": 4,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from django.db import models, transaction"
+        },
+        {
+          "symbol_name": "EthereumClient",
+          "kind": "import_from",
+          "start_line": 8,
+          "end_line": 8,
+          "relevance": [
+            "direct_global_use"
+          ],
+          "source": "from gnosis.eth import EthereumClient, EthereumClientProvider"
+        }
+      ]
+    },
+    "same_file_pattern": {
+      "count": 0,
+      "items": []
+    },
+    "targeted_test_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    },
+    "targeted_callsite_snippet": {
+      "used": false,
+      "reason": "rule_not_triggered",
+      "item": null
+    }
+  },
+  "review_context": {}
+}

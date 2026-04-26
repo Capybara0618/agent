@@ -1854,6 +1854,7 @@ class GitHubToolbox:
         log_prefix: str = "",
     ) -> dict[str, list[dict[str, Any]]]:
         index: dict[str, list[dict[str, Any]]] = {}
+        seen_records: dict[str, set[tuple[str, str, str, str, str]]] = {}
         total_files = len(repo_paths)
         scanned_files = 0
         total_symbols = 0
@@ -1880,13 +1881,20 @@ class GitHubToolbox:
                 if not symbol_name:
                     continue
                 record = {
-                    "path": path,
+                    "path": str(path),
                     "symbol_name": symbol_name,
                     "qualified_name": str(item.get("qualified_name") or symbol_name),
-                    "class_name": item.get("class_name"),
+                    "class_name": str(item.get("class_name") or "").strip() or None,
                     "start_line": item.get("start_line"),
                     "end_line": item.get("end_line"),
                 }
+                record_key = (
+                    str(record["path"]),
+                    str(record["symbol_name"]),
+                    str(record["qualified_name"]),
+                    str(record.get("start_line") or ""),
+                    str(record.get("end_line") or ""),
+                )
                 keys = {
                     symbol_name,
                     str(record["qualified_name"]),
@@ -1895,7 +1903,9 @@ class GitHubToolbox:
                     keys.add(f"{record['class_name']}.{symbol_name}")
                 for key in [k for k in keys if str(k).strip()]:
                     index.setdefault(key, [])
-                    if record not in index[key]:
+                    seen_for_key = seen_records.setdefault(str(key), set())
+                    if record_key not in seen_for_key:
+                        seen_for_key.add(record_key)
                         index[key].append(record)
                 file_symbols += 1
             total_symbols += file_symbols
@@ -2186,7 +2196,9 @@ class GitHubToolbox:
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
 
-        def visit(node: Any) -> None:
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
             if node.type == "call":
                 function_node = node.child_by_field_name("function")
                 raw_call = self._node_text(source_bytes, function_node)
@@ -2201,10 +2213,7 @@ class GitHubToolbox:
                             "line": node.start_point.row + 1,
                         }
                     )
-            for child in node.children:
-                visit(child)
-
-        visit(tree.root_node)
+            stack.extend(reversed(node.children))
         results.sort(key=lambda item: (int(item.get("line") or 0), str(item.get("qualified_name") or "")))
         return results
 
@@ -2457,7 +2466,9 @@ class GitHubToolbox:
         source_bytes = source.encode("utf-8", errors="replace")
         matches: list[dict[str, Any]] = []
 
-        def visit(node: Any, enclosing_class: str | None = None) -> None:
+        stack: list[tuple[Any, str | None]] = [(tree.root_node, None)]
+        while stack:
+            node, enclosing_class = stack.pop()
             node_type = node.type
             if node_type == "class_definition":
                 name_node = node.child_by_field_name("name")
@@ -2474,9 +2485,9 @@ class GitHubToolbox:
                 )
                 body = node.child_by_field_name("body")
                 if body is not None:
-                    for child in body.named_children:
-                        visit(child, symbol_name or enclosing_class)
-                return
+                    for child in reversed(body.named_children):
+                        stack.append((child, symbol_name or enclosing_class))
+                continue
             if node_type in {"function_definition", "async_function_definition"}:
                 name_node = node.child_by_field_name("name")
                 symbol_name = self._node_text(source_bytes, name_node)
@@ -2491,10 +2502,8 @@ class GitHubToolbox:
                         "source": self._node_text(source_bytes, node),
                     }
                 )
-            for child in node.children:
-                visit(child, enclosing_class)
-
-        visit(tree.root_node)
+            for child in reversed(node.children):
+                stack.append((child, enclosing_class))
         self._write_json_file(cache_path, matches)
         return matches
 

@@ -1,0 +1,89 @@
+{
+  "task_id": "284",
+  "repo_owner": "hypothesis",
+  "repo_name": "h",
+  "file_path": "h/db/__init__.py",
+  "commit": "5ab65de93b020abf075b19cde716cffec07b61d0",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T11:58:48+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "5ab65de93b020abf075b19cde716cffec07b61d0",
+    "symbol_name": "_session",
+    "satd_line": 87,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-25T11:58:58+00:00",
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "h/db/__init__.py",
+    "original_signature": "def _session(request):",
+    "target_file": {
+      "ok": true,
+      "path": "h/db/__init__.py",
+      "sha": "141dd1efff37d4cb9e874f74cfaa2e46cda0a798",
+      "download_url": "https://raw.githubusercontent.com/hypothesis/h/5ab65de93b020abf075b19cde716cffec07b61d0/h/db/__init__.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n\n\"\"\"\nConfigure and expose the application database session.\n\nThis module is responsible for setting up the database session and engine, and\nmaking that accessible to other parts of the application.\n\nModels should inherit from `h.db.Base` in order to have their metadata bound at\napplication startup (and if `h.db.should_create_all` is set, their tables will\nbe automatically created).\n\nMost application code should access the database session using the request\nproperty `request.db` which is provided by this module.\n\"\"\"\n\nimport logging\n\nimport sqlalchemy\nimport zope.sqlalchemy\nimport zope.sqlalchemy.datamanager\nfrom pyramid.settings import asbool\nfrom sqlalchemy import event\nfrom sqlalchemy.ext.declarative import declarative_base\nfrom sqlalchemy.orm import sessionmaker\n\nfrom memex import db as api_db\n\n__all__ = (\n    'Base',\n    'Session',\n    'init',\n    'make_engine',\n)\n\nlog = logging.getLogger(__name__)\n\n# Create a default metadata object with naming conventions for indexes and\n# constraints. This makes changing such constraints and indexes with alembic\n# after creation much easier. See:\n#\n#   http://docs.sqlalchemy.org/en/latest/core/constraints.html#configuring-constraint-naming-conventions\n#\n# N.B. This must be kept in sync with the naming conventions in\n# :py:mod:`memex.db`.\n#\nmetadata = sqlalchemy.MetaData(naming_convention={\n    \"ix\": \"ix__%(column_0_label)s\",\n    \"uq\": \"uq__%(table_name)s__%(column_0_name)s\",\n    \"ck\": \"ck__%(table_name)s__%(constraint_name)s\",\n    \"fk\": \"fk__%(table_name)s__%(column_0_name)s__%(referred_table_name)s\",\n    \"pk\": \"pk__%(table_name)s\"\n})\n\nBase = declarative_base(metadata=metadata)\n\nSession = sessionmaker()\n\n\ndef init(engine, base=Base, should_create=False, should_drop=False):\n    \"\"\"Initialise the database tables managed by `h.db`.\"\"\"\n    if should_drop:\n        base.metadata.reflect(engine)\n        base.metadata.drop_all(engine)\n    if should_create:\n        base.metadata.create_all(engine)\n    api_db.init(engine, should_create=should_create, should_drop=should_drop)\n\n\ndef make_engine(settings):\n    \"\"\"Construct a sqlalchemy engine from the passed ``settings``.\"\"\"\n    return sqlalchemy.create_engine(settings['sqlalchemy.url'])\n\n\ndef _session(request):\n    engine = request.registry['sqlalchemy.engine']\n    session = Session(bind=engine)\n\n    # Work around what appears to be a consistency/synchronisation bug in\n    # zope.sqlalchemy, in which old sessions aren't correctly cleared from\n    # _SESSION_STATE, causing new sessions to not be registered with the\n    # request transaction manager.\n    #\n    # N.B. This is *only* safe as long as we use a synchronous web worker in\n    # single-threaded mode.\n    #\n    # TODO: Remove this as and when we have a fix upstream.\n    zope.sqlalchemy.datamanager._SESSION_STATE.clear()\n\n    # If the request has a transaction manager, associate the session with it.\n    try:\n        tm = request.tm\n    except AttributeError:\n        pass\n    else:\n        zope.sqlalchemy.register(session, transaction_manager=tm)\n\n    # pyramid_tm doesn't always close the database session for us.\n    #\n    # For example if an exception view accesses the session and causes a new\n    # transaction to be opened, pyramid_tm won't close this connection because\n    # pyramid_tm's transaction has already ended before exception views are\n    # executed.\n    # Connections opened by NewResponse and finished callbacks aren't closed by\n    # pyramid_tm either.\n    #\n    # So add our own callback here to make sure db sessions are always closed.\n    #\n    # See: https://github.com/Pylons/pyramid_tm/issues/40\n    @request.add_finished_callback\n    def close_the_sqlalchemy_session(request):\n        if session.dirty:\n            request.sentry.captureMessage('closing a dirty session', stack=True, extra={\n                'dirty': session.dirty,\n            })\n        session.close()\n\n    return session\n\n\ndef includeme(config):\n    settings = config.registry.settings\n    should_create = asbool(settings.get('h.db.should_create_all', False))\n    should_drop = asbool(settings.get('h.db.should_drop_all', False))\n\n    # Create the SQLAlchemy engine and save a reference in the app registry.\n    engine = make_engine(settings)\n    config.registry['sqlalchemy.engine'] = engine\n\n    # Add a property to all requests for easy access to the session. This means\n    # that view functions need only refer to `request.db` in order to retrieve\n    # the current database session.\n    config.add_request_method(_session, name='db', reify=True)\n\n    # Register a deferred action to bind the engine when the configuration is\n    # committed. Deferring the action means that this module can be included\n    # before model modules without ill effect.\n    config.action(None, init, (engine,), {\n        'should_create': should_create,\n        'should_drop': should_drop\n    }, order=10)\n",
+      "total_lines": 141,
+      "ref": "5ab65de93b020abf075b19cde716cffec07b61d0"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_session",
+      "class_name": null,
+      "start_line": 75,
+      "end_line": 118,
+      "satd_line": 87,
+      "matched_by": "normalized_source",
+      "source": "def _session(request):\n    engine = request.registry['sqlalchemy.engine']\n    session = Session(bind=engine)\n\n    # Work around what appears to be a consistency/synchronisation bug in\n    # zope.sqlalchemy, in which old sessions aren't correctly cleared from\n    # _SESSION_STATE, causing new sessions to not be registered with the\n    # request transaction manager.\n    #\n    # N.B. This is *only* safe as long as we use a synchronous web worker in\n    # single-threaded mode.\n    #\n    # TODO: Remove this as and when we have a fix upstream.\n    zope.sqlalchemy.datamanager._SESSION_STATE.clear()\n\n    # If the request has a transaction manager, associate the session with it.\n    try:\n        tm = request.tm\n    except AttributeError:\n        pass\n    else:\n        zope.sqlalchemy.register(session, transaction_manager=tm)\n\n    # pyramid_tm doesn't always close the database session for us.\n    #\n    # For example if an exception view accesses the session and causes a new\n    # transaction to be opened, pyramid_tm won't close this connection because\n    # pyramid_tm's transaction has already ended before exception views are\n    # executed.\n    # Connections opened by NewResponse and finished callbacks aren't closed by\n    # pyramid_tm either.\n    #\n    # So add our own callback here to make sure db sessions are always closed.\n    #\n    # See: https://github.com/Pylons/pyramid_tm/issues/40\n    @request.add_finished_callback\n    def close_the_sqlalchemy_session(request):\n        if session.dirty:\n            request.sentry.captureMessage('closing a dirty session', stack=True, extra={\n                'dirty': session.dirty,\n            })\n        session.close()\n\n    return session",
+      "calls": [
+        "Session"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "Session",
+        "zope"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "rule_without_method_context:remove_temporary"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

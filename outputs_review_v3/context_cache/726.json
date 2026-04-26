@@ -1,0 +1,105 @@
+{
+  "task_id": "726",
+  "repo_owner": "rotki",
+  "repo_name": "rotki",
+  "file_path": "rotkehlchen/db/updates.py",
+  "commit": "1c2b474293edcfc46e9290cffe15f11634f26d19",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T17:28:55+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "1c2b474293edcfc46e9290cffe15f11634f26d19",
+    "symbol_name": "update_accounting_rules",
+    "satd_line": 191,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-25T17:29:02+00:00",
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "rotkehlchen/db/updates.py",
+    "original_signature": "def update_accounting_rules(self, data: list[dict[str, Any]], version: int) -> None:",
+    "target_file": {
+      "ok": true,
+      "path": "rotkehlchen/db/updates.py",
+      "sha": "348ed774c4edc52be8a6d1f13069f68e761db034",
+      "download_url": "https://raw.githubusercontent.com/rotki/rotki/1c2b474293edcfc46e9290cffe15f11634f26d19/rotkehlchen/db/updates.py",
+      "content_excerpt": "import json\nimport logging\nfrom collections.abc import Sequence\nfrom typing import TYPE_CHECKING, Any\n\nimport requests\n\nfrom packaging import version as pversion\nfrom rotkehlchen.accounting.structures.types import HistoryEventSubType, HistoryEventType\nfrom rotkehlchen.api.websockets.typedefs import WSMessageType\nfrom rotkehlchen.assets.spam_assets import update_spam_assets\nfrom rotkehlchen.chain.evm.accounting.structures import BaseEventSettings, TxAccountingTreatment\nfrom rotkehlchen.db.accounting_rules import DBAccountingRules\nfrom rotkehlchen.db.addressbook import DBAddressbook\nfrom rotkehlchen.db.filtering import AccountingRulesFilterQuery\nfrom rotkehlchen.db.settings import CachedSettings\nfrom rotkehlchen.errors.misc import InputError, RemoteError\nfrom rotkehlchen.errors.serialization import DeserializationError\nfrom rotkehlchen.fval import FVal\nfrom rotkehlchen.globaldb.handler import GlobalDBHandler\nfrom rotkehlchen.logging import RotkehlchenLogsAdapter\nfrom rotkehlchen.serialization.deserialize import deserialize_evm_address\nfrom rotkehlchen.types import (\n    AddressbookEntry,\n    AddressbookType,\n    OptionalChainAddress,\n    SupportedBlockchain,\n)\nfrom rotkehlchen.utils.misc import is_production, ts_now\nfrom rotkehlchen.utils.network import query_file\nfrom rotkehlchen.utils.version_check import get_current_version\n\nif TYPE_CHECKING:\n    from rotkehlchen.db.dbhandler import DBCursor, DBHandler\n    from rotkehlchen.user_messages import MessagesAggregator\n\nfrom .constants import LAST_DATA_UPDATES_KEY, NO_ACCOUNTING_COUNTERPARTY, UpdateType\n\nlogger = logging.getLogger(__name__)\nlog = RotkehlchenLogsAdapter(logger)\n\n\nclass RotkiDataUpdater:\n    \"\"\"\n    Handle updates from the rotki repository related to data that needs to be provided to\n    the users. It includes:\n    - Spam assets\n    - RPC nodes\n    - Contracts\n    \"\"\"\n\n    def __init__(self, msg_aggregator: 'MessagesAggregator', user_db: 'DBHandler') -> None:\n        self.msg_aggregator = msg_aggregator\n        self.user_db = user_db\n        self.branch = 'develop'\n        if is_production():\n            self.branch = 'main'\n        self.update_type_mappings = {  # better than dynamic getattr. More explicit, negligible memory overhead if any  # noqa: E501\n            UpdateType.SPAM_ASSETS: self.update_spam_assets,\n            UpdateType.RPC_NODES: self.update_rpc_nodes,\n            UpdateType.CONTRACTS: self.update_contracts,\n            UpdateType.GLOBAL_ADDRESSBOOK: self.update_global_addressbook,\n            UpdateType.ACCOUNTING_RULES: self.update_accounting_rules,\n        }  # If we ever change this also change tests/unit/test_data_updates::reset_update_type_mappings  # noqa: E501\n        self.version = pversion.parse(get_current_version().our_version)\n\n    def update_single(\n            self,\n            update_type: UpdateType,\n            from_version: int,\n            to_version: int,\n            limits: dict[str, dict],\n    ) -> None:\n        \"\"\"Common code to update a single type of data\n\n        Check the updates in the inclusive range [from_version + 1, to_version] and apply\n        the needed updates if any. Also save latest applied update type in the DB.\n        \"\"\"\n        for update_version in range(from_version + 1, to_version + 1):\n            version_info = limits.get(str(update_version), {})  # json treats keys as string\n            min_version = version_info.get('min_version', None)\n            if min_version is not None:\n                p_min_version = pversion.parse(min_version)\n                if p_min_version > self.version:\n                    log.warning(f'Not updating {update_type.value} to {update_version=} due to {min_version=}')  # noqa: E501\n                    break  # stop iteration since all next versions will also hit this. User needs to update  # noqa: E501\n\n            max_version = version_info.get('max_version', None)\n            if max_version is not None:\n                p_max_version = pversion.parse(max_version)\n                if p_max_version < self.version:\n                    log.warning(f'Not updating {update_type.value} to {update_version=} due to {max_version=}')  # noqa: E501\n                    continue  # probably can never apply this update. Check next one\n\n            file_url = f'https://raw.githubusercontent.com/rotki/data/{self.branch}/updates/{update_type.value}/v{update_version}.json'\n            try:\n                updates = query_file(file_url, True)\n            except RemoteError as e:\n                log.warning(f'Failed to update {update_type.value} due to {e!s}')\n                continue  # perhaps broken link? Skipping\n\n            updated_data = updates.get(update_type.value)\n            if updated_data is None:\n                log.error(f'Remote update {file_url} does not contain {update_type.value} key')\n                continue  # perhaps broken file? Skipping\n\n            # At this point we can apply the update. Type ignore is due to different sigs of data\n            self.update_type_mappings[update_type](updated_data, update_version)  # type: ignore\n            with self.user_db.conn.write_ctx() as write_cursor:\n                write_cursor.execute(  # this was the last update to be applied for this data type, so remember it  # noqa: E501\n                    'INSERT OR REPLACE INTO settings(name, value) VALUES (?, ?)',\n                    (update_type.serialize(), update_version),\n                )\n\n    def _get_remote_info_json(self) -> dict[str, Any]:\n        \"\"\"Retrieve remote file with information for different updates\n\n        May raise RemoteError if anything is wrong contacting github\n        \"\"\"\n        url = f'https://raw.githubusercontent.com/rotki/data/{self.branch}/updates/info.json'\n        try:\n            response = requests.get(url=url, timeout=CachedSettings().get_timeout_tuple())\n        except requests.exceptions.RequestException as e:\n            raise RemoteError(f'Failed to query {url} during assets update: {e!s}') from e\n\n        try:\n            json_data = response.json()\n        except json.decoder.JSONDecodeError as e:\n            raise RemoteError(\n                f'Could not parse update info from {url} as json: {response.text}',\n            ) from e\n\n        return json_data\n\n    def update_spam_assets(self, data: list[dict[str, Any]], version: int) -> None:\n        \"\"\"\n        Spam assets update code. Assets are also added to the globaldb if they don't exist\n        locally\n        \"\"\"\n        log.info(f'Applying update for spam assets to v{version}. {len(data)} tokens to add')\n        with GlobalDBHandler().conn.critical_section():\n            # Use a critical section to avoid another greenlet adding spam assets at\n            # the same time\n            update_spam_assets(db=self.user_db, assets_info=data)\n\n    def update_rpc_nodes(self, data: list[dict[str, Any]], version: int) -> None:\n        \"\"\"RPC nodes update code. It also updates the user db with these default nodes.\"\"\"\n        log.info(f'Applying update for rpc nodes to v{version}')\n        new_default_nodes: list[tuple[Any, ...]] = [\n            (\n                node['name'],\n                node['endpoint'],\n                node['owned'],\n                node['active'],\n                str(FVal(node['weight'])),\n                node['blockchain'],\n            )\n            for node in data\n        ]\n        with GlobalDBHandler().conn.write_ctx() as write_cursor:\n            # Update the default nodes, stored in the global DB\n            existing_default_nodes = write_cursor.execute('SELECT * FROM default_rpc_nodes').fetchall()  # noqa: E501\n            write_cursor.execute('DELETE FROM default_rpc_nodes')\n            write_cursor.executemany(\n                'INSERT OR IGNORE INTO default_rpc_nodes(name, endpoint, owned, active, weight, blockchain) '  # noqa: E501\n                'VALUES (?, ?, ?, ?, ?, ?)',\n                new_default_nodes,\n            )\n\n        self._update_user_nodes(\n            existing_default_nodes=existing_default_nodes,\n            new_default_nodes=new_default_nodes,\n        )\n\n    def update_accounting_rules(self, data: list[dict[str, Any]], version: int) -> None:\n        \"\"\"\n        Add remote rules to the user database. In case of conflict we notify the user sending\n        a ws message\n        \"\"\"\n        log.info(f'Applying update for accounting rules to v{version}')\n        rules_db = DBAccountingRules(self.user_db)\n        for rule_data in data:\n            try:\n                event_type = HistoryEventType.deserialize(rule_data['event_type'])\n                event_subtype = HistoryEventSubType.deserialize(rule_data['event_subtype'])\n                counterparty = rule_data['counterparty'] if rule_data['counterparty'] is not None else NO_ACCOUNTING_COUNTERPARTY  # noqa: E501\n                rule = BaseEventSettings(\n                    taxable=rule_data['taxable'],\n                    count_entire_amount_spend=rule_data['count_entire_amount_spend'],\n                    count_cost_basis_pnl=rule_data['count_cost_basis_pnl'],\n                    method=rule_data['method'],  # todo 1.31. Remove it\n                    accounting_treatment=TxAccountingTreatment.deserialize(rule_data['accounting_treatment']) if rule_data['accounting_treatment'] else None,  # noqa: E501\n                )\n            except (KeyError, DeserializationError) as e:\n                log.error(f'Failed to read key {e} while iterating new accounting rules')\n                continue\n\n            try:\n                rules_db.add_accounting_rule(\n                    event_type=event_type,\n                    event_subtype=event_subtype,\n                    counterparty=counterparty,\n                    rule=rule,\n                    links={} if 'links' not in rule_data else rule_data['links'],\n                )\n            except InputError as e:\n                # there is a conflict in the rule. Notify the frontend about it\n                rules, _ = rules_db.query_rules_and_serialize(\n                    filter_query=AccountingRulesFilterQuery.make(\n                        event_types=[event_type],\n                        event_subtypes=[event_subtype],\n                        counterparties=[counterparty],\n                    ),\n                )\n                if len(rules) == 1:  # can be either 0 or 1\n                    self.msg_aggregator.add_message(\n                        message_type=WSMessageType.ACCOUNTING_RULE_CONFLICT,\n                        data={\n                            'local_rule': rules[0],\n                            'remote_rule': rule_data,\n                        },\n                    )\n\n                log.debug(f'Failed to add accounting rule {rule_data} due to {e}')\n                continue\n\n    def update_contracts(self, data: dict[str, Any], version: int) -> None:\n        \"\"\"\n        Updates evm contracts and ABIs in globaldb.\n        If an ABI already exists in the db, it is reused.\n        If a contract (address + chain id) exists, it is replaced by the remote counterpart.\n        \"\"\"\n        log.info(f'Applying update for contracts to v{version}')\n        remote_id_to_local_id = {}\n        for single_abi_data in data['abis_data']:\n            # store a mapping of the virtual id to the id in the user's globaldb\n            abi_id = GlobalDBHandler().get_or_write_abi(\n                serialized_abi=single_abi_data['value'],\n                abi_name=single_abi_data.get('name'),\n            )\n            remote_id_to_local_id[single_abi_data['id']] = abi_id\n\n        new_contracts_data = []\n        for single_contract_data in data['contracts_data']:\n            if single_contract_data['abi'] not in remote_id_to_local_id:\n                self.msg_aggregator.add_error(\n                    f'ABI with id {single_contract_data[\"abi\"]} was missing in a contracts '\n                    f'update. Please report it to the rotki team.',\n                )\n                continue\n            new_contracts_data.append",
+      "total_lines": 414,
+      "ref": "1c2b474293edcfc46e9290cffe15f11634f26d19"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "update_accounting_rules",
+      "class_name": "RotkiDataUpdater",
+      "start_line": 175,
+      "end_line": 225,
+      "satd_line": 191,
+      "matched_by": "normalized_source",
+      "source": "    def update_accounting_rules(self, data: list[dict[str, Any]], version: int) -> None:\n        \"\"\"\n        Add remote rules to the user database. In case of conflict we notify the user sending\n        a ws message\n        \"\"\"\n        log.info(f'Applying update for accounting rules to v{version}')\n        rules_db = DBAccountingRules(self.user_db)\n        for rule_data in data:\n            try:\n                event_type = HistoryEventType.deserialize(rule_data['event_type'])\n                event_subtype = HistoryEventSubType.deserialize(rule_data['event_subtype'])\n                counterparty = rule_data['counterparty'] if rule_data['counterparty'] is not None else NO_ACCOUNTING_COUNTERPARTY  # noqa: E501\n                rule = BaseEventSettings(\n                    taxable=rule_data['taxable'],\n                    count_entire_amount_spend=rule_data['count_entire_amount_spend'],\n                    count_cost_basis_pnl=rule_data['count_cost_basis_pnl'],\n                    method=rule_data['method'],  # todo 1.31. Remove it\n                    accounting_treatment=TxAccountingTreatment.deserialize(rule_data['accounting_treatment']) if rule_data['accounting_treatment'] else None,  # noqa: E501\n                )\n            except (KeyError, DeserializationError) as e:\n                log.error(f'Failed to read key {e} while iterating new accounting rules')\n                continue\n\n            try:\n                rules_db.add_accounting_rule(\n                    event_type=event_type,\n                    event_subtype=event_subtype,\n                    counterparty=counterparty,\n                    rule=rule,\n                    links={} if 'links' not in rule_data else rule_data['links'],\n                )\n            except InputError as e:\n                # there is a conflict in the rule. Notify the frontend about it\n                rules, _ = rules_db.query_rules_and_serialize(\n                    filter_query=AccountingRulesFilterQuery.make(\n                        event_types=[event_type],\n                        event_subtypes=[event_subtype],\n                        counterparties=[counterparty],\n                    ),\n                )\n                if len(rules) == 1:  # can be either 0 or 1\n                    self.msg_aggregator.add_message(\n                        message_type=WSMessageType.ACCOUNTING_RULE_CONFLICT,\n                        data={\n                            'local_rule': rules[0],\n                            'remote_rule': rule_data,\n                        },\n                    )\n\n                log.debug(f'Failed to add accounting rule {rule_data} due to {e}')\n                continue",
+      "calls": [
+        "BaseEventSettings",
+        "DBAccountingRules",
+        "len"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "msg_aggregator",
+        "user_db"
+      ],
+      "global_uses": [
+        "AccountingRulesFilterQuery",
+        "Any",
+        "BaseEventSettings",
+        "DBAccountingRules",
+        "DeserializationError",
+        "HistoryEventSubType",
+        "HistoryEventType",
+        "InputError",
+        "NO_ACCOUNTING_COUNTERPARTY",
+        "TxAccountingTreatment",
+        "WSMessageType",
+        "e",
+        "log"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "rule_without_method_context:remove_temporary"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

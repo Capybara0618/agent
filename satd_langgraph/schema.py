@@ -137,6 +137,10 @@ class ReviewResult:
     rationale: str
     softened_gate_used: bool = False
     candidate_mode: str = "single"
+    failed_checks: list[str] = field(default_factory=list)
+    repair_constraints: list[str] = field(default_factory=list)
+    failure_anchor: str = ""
+    retry_hint: str = ""
 
 
 @dataclass

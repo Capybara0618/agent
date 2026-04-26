@@ -1,0 +1,125 @@
+{
+  "task_id": "551",
+  "repo_owner": "log2timeline",
+  "repo_name": "plaso",
+  "file_path": "lib/storage.py",
+  "commit": "db1e4bb6965cfa0e6b3724389ffa421fe19e33bd",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T15:34:49+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "db1e4bb6965cfa0e6b3724389ffa421fe19e33bd",
+    "symbol_name": "GetEntry",
+    "satd_line": 178,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 2,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T15:34:49+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 6,
+    "retrieved_method_count": 2,
+    "missing_method_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "lib/storage.py",
+    "original_signature": "def GetEntry(self, number, entry=None):",
+    "target_file": {
+      "ok": true,
+      "path": "lib/storage.py",
+      "sha": "9c39961160a0332c3be5ecacb70215792e8efd04",
+      "download_url": "https://raw.githubusercontent.com/log2timeline/plaso/db1e4bb6965cfa0e6b3724389ffa421fe19e33bd/lib/storage.py",
+      "content_excerpt": "# Copyright 2012 Google Inc. All Rights Reserved.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#    http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"The storage mechanism for Plaso.\n\nThe storage mechanism can be described as a collection of storage files\nthat are stored together in a single ZIP compressed container.\n\nEach storage file contains several serialized events (as protobufs)\nthat are fully sorted. However, since the storage container can contain\nmore than one storage file the overall storage is not fully sorted.\n\nThe basic structure of a single storage file in Plaso is:\n  plaso_meta.<seq_num>\n  plaso_proto.<seq_num>\n  plaso_index.<seq_num>\n\nWhere the meta file is a simple text file using YAML for variable\ndefinition, example:\n  variable: value\n  a_list: [value, value, value]\n\nThis can be used to filter out which proto files should be included\nin processing.\n\nThe index file contains an index to all the entries stored within\nthe protobuf file, so that it can be easily seeked. The layout is:\n\n+-----+-----+-...+\n| int | int | ...|\n+-----+-----+-...+\n\nWhere int is an unsigned integer '<I' that represents the byte offset\ninto the .proto file where the beginning of the size variable lies.\n\nThis can be used to seek the proto file directly to read a particular\nentry within the proto file.\n\nOtherwise the structure of a proto file is:\n+------+---------------------------------+------+------...+\n| size |  protobuf (plaso_storage_proto) | size | proto...|\n+------+---------------------------------+------+------...+\n\nFor further details about the storage design see:\nhttps://sites.google.com/a/kiddaland.net/plaso/developer/libraries/storage\n\"\"\"\nimport heapq\nimport logging\nimport struct\nimport sys\nimport zipfile\nimport yaml\n\nfrom google.protobuf import message\n\nfrom plaso.lib import errors\nfrom plaso.lib import pfile\nfrom plaso.lib import queue\nfrom plaso.proto import plaso_storage_pb2\nfrom plaso.proto import transmission_pb2\n\n\nclass PlasoStorage(object):\n  \"\"\"Abstract the storage reading and writing.\"\"\"\n\n  # Set the buffer size to 256Mb\n  MAX_BUFFER_SIZE = 1024 * 1024 * 256\n\n  # Set the version of this storage mechanism.\n  STORAGE_VERSION = 1\n\n  source_short_map = {}\n  for value in plaso_storage_pb2.EventObject.DESCRIPTOR.enum_types_by_name[\n      'SourceShort'].values:\n    source_short_map[value.name] = value.number\n\n  def __init__(self, output_file, buffer_size=0, read_only=False,\n               pre_obj=None):\n    \"\"\"Constructor for PlasoStorage.\n\n    Args:\n      output_file: The name of the output file.\n      buffer_size: The estimated size of a protobuf file.\n      read_only: Indicate we are just opening up ZIP file for reading.\n      pre_obj: A preprocessing object that gets stored inside the storage\n      if defined.\n\n    Raises:\n      IOError: if we open up the file in read only mode and the file does\n      not exist.\n    \"\"\"\n    compression = zipfile.ZIP_DEFLATED\n\n    self._filenumber = 1\n    self._buffer = []\n    self._buffer_size = 0\n    self.protofiles = {}\n    self._buffer_first_timestamp = sys.maxint\n    self._buffer_last_timestamp = 0\n    self._max_buffer_size = buffer_size or self.MAX_BUFFER_SIZE\n    self._write_counter = 0\n\n    if read_only:\n      mode = 'r'\n    else:\n      mode = 'a'\n\n    try:\n      self.zipfile = zipfile.ZipFile(output_file, mode, compression)\n    except zipfile.BadZipfile as e:\n      raise IOError('Not a ZIP file, cannot read. Error message: %s', e)\n    self._file_open = True\n\n    if not read_only:\n      logging.debug('Writing to file. Buffer size used: %s',\n                    self._max_buffer_size)\n      if pre_obj:\n        self._StorePreObject(pre_obj)\n\n      # Need to get the last number in the list.\n      for name in self.zipfile.namelist():\n        if 'plaso_meta.' in name:\n          _, number = name.split('.')\n          if int(number) >= self._filenumber:\n            self._filenumber = int(number) + 1\n\n  def _StorePreObject(self, pre_obj):\n    \"\"\"Store information gathered during preprocessing to the storage file.\"\"\"\n    current_object = self.GetStorageInformation()\n    if current_object:\n      current_object.append(pre_obj)\n    else:\n      current_object = [pre_obj, ]  # pylint: disable=g-illegal-space\n\n    self.zipfile.writestr('information.yaml', yaml.dump(current_object))\n\n  def GetStorageInformation(self):\n    \"\"\"Return gathered preprocessing information from a storage file.\"\"\"\n    try:\n      pre_file = self.zipfile.open('information.yaml', 'r')\n      return yaml.load(pre_file)\n    except KeyError:\n      return None\n\n  def GetEntry(self, number, entry=None):\n    \"\"\"Return a protobuf read from filehandle.\n\n    By default the next entry in the appropriate proto file is read\n    and returned, however any entry can be read using the index file.\n\n    Args:\n      number: The proto file number.\n      entry: Read a specific entry in the file, otherwise the next one.\n\n    Returns:\n      A protobuf entry read from the file.\n\n    Raises:\n      EOFError: When we reach the end of the protobuf file.\n    \"\"\"\n    if number in self.protofiles:\n      fh = self.protofiles[number]\n    else:\n      fh = self.zipfile.open('plaso_proto.%06d' % number, 'r')\n      self.protofiles[number] = fh\n\n    if entry:\n      # TODO: Add the possibility to seek a particular entry.\n      # The problem here is that seeking to a file can be problematic\n      # since it is stored within a ZIP container.\n      # Extracting the file and then parsing it may serve as a quick\n      # workaraound, yet these files may be 256Mb or larger so that isn't\n      # perhaps what we would like to do.\n      # The commented-out implementation below both does not work and is\n      # very slow, it needs to be cached and handled properly.\n      logging.error('This is not supported as of now.')\n      return ''\n\n    unpacked = fh.read(4)\n\n    if len(unpacked) != 4:\n      return None\n\n    size = struct.unpack('<I', unpacked)[0]\n\n    if size > 1024 * 1024 * 40:\n      raise errors.WrongProtobufEntry('Protobuf size too large: %d', size)\n\n    proto_serialized = fh.read(size)\n    proto = plaso_storage_pb2.EventObject()\n    proto.ParseFromString(proto_serialized)\n\n    return proto\n\n  def GetEntries(self, number):\n    \"\"\"A generator to read all plaso_storage protobufs from a filehandle.\n\n    The storage mechanism of Plaso works in the way that it creates potentially\n    several files inside the ZIP container. As soon as the number of protobufs\n    stored exceed the size of buffer_size they will be flushed to disk as:\n\n          plaso_proto.XXX\n\n    Where XXX is an increasing integer, starting from one. To get all the files\n    or the numbers that are available this class implements a method called\n    GetProtoNumbers() that returns a list of all available protobuf files within\n    the container.\n\n    This method returns a generator that returns all plaso_storage protobufs in\n    the named container, as indicated by the number argument. So if this method\n    is called as storage_object.GetEntries(1) the generator will return the\n    entries found in the file plaso_proto.000001.\n\n    Args:\n      number: The protofile number.\n\n    Yields:\n      A protobuf object from the protobuf file.\n    \"\"\"\n    while True:\n      try:\n        proto = self.GetEntry(number)\n        if not proto:\n          logging.debug('End of protobuf file plaso_proto.%06d reached.',\n                        number)\n          break\n        yield proto\n      except errors.WrongProtobufEntry as e:\n        logging.warning(('Problem while parsing a protobuf entry from: '\n                         'plaso_proto.%06d <%s>'), number, e)\n\n  def GetProtoNumbers(self):\n    \"\"\"Return all available protobuf numbers.\"\"\"\n    numbers = []\n    for name in self.zipfile.namelist():\n      if 'plaso_proto' in name:\n        _, num = name.split('.')\n        numbers.append(int(num))\n\n    for number in sorted(numbers):\n      yield number\n\n  def ReadMeta(self, number):\n    \"\"\"Return a dict with the metadata entries.\n\n    Args:\n      number: The number of the metadata file (name is plaso_meta_XXX where\n              XXX is this number.\n\n    Returns:\n      A dict object containing all the variables inside the metadata file.\n    \"\"\"\n    meta_file = self.zipfile.open('plaso_meta.%06d' % number, 'r')\n    return yaml.load(meta_file)\n\n  def GetBufferSize(self):\n    \"\"\"Return the size of the buffer.\"\"\"\n    return self._buffer_size\n\n  def GetFileNumber(self):\n    return self._filenumber\n\n  def AddEntry(self, event):\n    \"\"\"Add an entry into the buffer.\n\n    Args:\n      event: An EventObject to append to the buffer.\n\n    Raises:\n      IOError: When trying to write to a closed storage file.\n    \"\"\"\n    if not self._file_open:\n      raise IOError('Trying to add an entry to a closed storage file.')\n\n    if event.timestamp > self._buffer_last_timestamp:\n      self._buffer_last_timestamp = event.timestamp\n\n    if event.timestamp < self._buffer_first_timestamp and event.timestamp > 0:\n      self._buffer_first_timestamp = event.timestamp\n\n    serialized = self.SerializeEvent(event)\n    if not serialized:\n      return\n\n    heapq.heappush(self._buffer, (event.timestamp, serialized))\n    self._buffer_size += len(serialized)\n    self._write_counter += 1\n\n    if self._buffer_size > self._max_buffer_size:\n      self.FlushBuffer()\n\n  def SerializeEvent(self, an_event):\n    \"\"\"Return a serialized event.\"\"\"\n    proto = plaso_storage_pb2.EventObject()\n    for attr in an_event.GetAttributes():\n      if attr == 'source_short':\n        proto.source_short = self.source_short_map.get(\n            an_event.source_short, 6)\n      elif attr == 'pathspec':\n        path = transmission_pb2.PathSpec()\n        path.ParseFromString(an_event.pathspec)\n        proto.pathspec.MergeFrom(path)\n      elif hasattr(proto, attr):\n        attribute_value = getattr(an_event, attr)\n        if type(attribute_value) == str:\n          attribute_value = pfile.GetUnicodeString(attribute_value)\n        setattr(proto, attr, attribute_value)\n      else:\n        a = proto.attributes.add()\n        a.key = attr\n        a.value = pfile.GetUnicodeString(getattr(an_event, attr))\n    try:\n      return proto.SerializeToString()\n    except message.EncodeError as e:\n      logging.warning('Unable to serialize event (skip), error msg: %s', e)\n\n    return ''\n\n  def FlushBuffer(self):\n    \"\"\"Flush a buffer to disk.\"\"\"\n\n    if not self._buffer_size:\n      return\n    meta_fh = 'plaso_meta.%06d' % self._filenumber\n    proto_fh = 'plaso_proto.%06d' % self._filenumber\n    index_fh = 'plaso_index.%06d' % self._filenumber\n\n    # TODO: Add more information into the meta file\n    # that can be used for quick filtering data chunks.\n    yaml_dict = {'range': (self._buffer_first_timestamp,\n                           self._buffer_last_timestamp),\n                 'version': self.STORAGE_VERSION}\n    self.zipfile.writestr(meta_fh, yaml.dump(yaml_dict))\n\n    ofs = 0\n    proto_str = []\n    index_str = []\n    for _ in range(len(self._buffer)):\n      _, entry = heapq.heappop(self._buffer)\n      # TODO: Instead of appending to an array\n      # which is not optimal (loads up the entire max file\n      # size into memory) Zipfile should be extended to\n      # allow appending to files (implement lock).\n      index_str.append(struct.pack('<I', ofs))\n      packed = struct.pack('<I', len(entry)) + entry\n      ofs += len(packed)\n      proto_str.append(packed)\n\n    self.zipfile.writestr(index_fh, ''.join(index_str))\n    self.zipfile.writestr(proto_fh, ''.join(proto_str))\n\n    self._filenumber += 1\n    self._buffer_size = 0\n   ",
+      "total_lines": 414,
+      "ref": "db1e4bb6965cfa0e6b3724389ffa421fe19e33bd"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "GetEntry",
+      "class_name": "PlasoStorage",
+      "start_line": 155,
+      "end_line": 203,
+      "satd_line": 178,
+      "matched_by": "normalized_source",
+      "source": "  def GetEntry(self, number, entry=None):\n    \"\"\"Return a protobuf read from filehandle.\n\n    By default the next entry in the appropriate proto file is read\n    and returned, however any entry can be read using the index file.\n\n    Args:\n      number: The proto file number.\n      entry: Read a specific entry in the file, otherwise the next one.\n\n    Returns:\n      A protobuf entry read from the file.\n\n    Raises:\n      EOFError: When we reach the end of the protobuf file.\n    \"\"\"\n    if number in self.protofiles:\n      fh = self.protofiles[number]\n    else:\n      fh = self.zipfile.open('plaso_proto.%06d' % number, 'r')\n      self.protofiles[number] = fh\n\n    if entry:\n      # TODO: Add the possibility to seek a particular entry.\n      # The problem here is that seeking to a file can be problematic\n      # since it is stored within a ZIP container.\n      # Extracting the file and then parsing it may serve as a quick\n      # workaraound, yet these files may be 256Mb or larger so that isn't\n      # perhaps what we would like to do.\n      # The commented-out implementation below both does not work and is\n      # very slow, it needs to be cached and handled properly.\n      logging.error('This is not supported as of now.')\n      return ''\n\n    unpacked = fh.read(4)\n\n    if len(unpacked) != 4:\n      return None\n\n    size = struct.unpack('<I', unpacked)[0]\n\n    if size > 1024 * 1024 * 40:\n      raise errors.WrongProtobufEntry('Protobuf size too large: %d', size)\n\n    proto_serialized = fh.read(size)\n    proto = plaso_storage_pb2.EventObject()\n    proto.ParseFromString(proto_serialized)\n\n    return proto",
+      "calls": [
+        "len"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "protofiles",
+        "zipfile"
+      ],
+      "global_uses": [
+        "errors",
+        "logging",
+        "plaso_storage_pb2",
+        "struct"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "zipfile.open",
+        "fh.read",
+        "struct.unpack",
+        "errors.WrongProtobufEntry",
+        "plaso_storage_pb2.EventObject",
+        "proto.ParseFromString"
+      ],
+      "reason": "These methods are directly involved in the reading and processing of protobuf entries from a ZIP file, which is central to the TODO comment about implementing seeking functionality."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "PlasoFile.read",
+        "path": "lib/pfile.py",
+        "class_name": "PlasoFile",
+        "start_line": 183,
+        "end_line": 193,
+        "source": "def read(self, size=None):   # pylint: disable=C6409\n    \"\"\"Read size bytes from file and return them.\"\"\"\n    if self.fh:\n      # Some internal implementations require unbound read operations\n      # to use a -1 as the default value, others None.\n      try:\n        return self.fh.read(size)\n      except TypeError:\n        return self.fh.read(-1)\n    else:\n      return ''",
+        "found": true
+      },
+      {
+        "method_name": "WrongProtobufEntry",
+        "path": "lib/errors.py",
+        "class_name": null,
+        "start_line": 33,
+        "end_line": 34,
+        "source": "class WrongProtobufEntry(Error):\n  \"\"\"Raised when an EventObject cannot be serialized as a protobuf.\"\"\"",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "ZipFile.open",
+      "struct.unpack",
+      "GetEntry.ParseFromString"
+    ]
+  },
+  "review_context": {}
+}

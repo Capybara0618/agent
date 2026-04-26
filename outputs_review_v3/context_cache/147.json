@@ -1,0 +1,124 @@
+{
+  "task_id": "147",
+  "repo_owner": "hazyresearch",
+  "repo_name": "metal",
+  "file_path": "metal/label_model/label_model.py",
+  "commit": "35ac1c97edbd5fc0213b5b9ccbace89ac9df2d00",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-25T11:27:36+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "35ac1c97edbd5fc0213b5b9ccbace89ac9df2d00",
+    "symbol_name": "predict_proba",
+    "satd_line": 214,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 2,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-25T11:27:36+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 7,
+    "retrieved_method_count": 1,
+    "missing_method_count": 6,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "metal/label_model/label_model.py",
+    "original_signature": "def predict_proba(self, L):",
+    "target_file": {
+      "ok": true,
+      "path": "metal/label_model/label_model.py",
+      "sha": "76f6ec716d800bb43f71546862b15bf3cd1acb4f",
+      "download_url": "https://raw.githubusercontent.com/HazyResearch/metal/35ac1c97edbd5fc0213b5b9ccbace89ac9df2d00/metal/label_model/label_model.py",
+      "content_excerpt": "import numpy as np\nfrom scipy.sparse import issparse, csc_matrix\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport torch.optim as optim\n\nfrom metal.analysis import (\n    plot_probabilities_histogram,\n    plot_predictions_histogram,\n    confusion_matrix,\n)\nfrom metal.classifier import Classifier\nfrom metal.label_model.lm_defaults import lm_model_defaults\nfrom metal.utils import recursive_merge_dicts\n\n\nclass LabelModel(Classifier):\n    def __init__(self, deps=[], **kwargs):\n        \"\"\"\n        Args:\n            cardinality: int: Classifier output dimension\n            seed: int: Random state seed\n            deps: list: A list of LF dependencies as tuples of LF indices\n        \"\"\"\n        self.config = recursive_merge_dicts(lm_model_defaults, kwargs)\n        super().__init__(self.config['cardinality'], self.config['seed'])\n        self.deps = deps\n\n        # TODO: This is temporary, need to update to handle categorical!\n        if self.k > 2:\n            raise NotImplementedError(\"Cardinaltiy > 2 not implemented.\")\n        \n        # TODO: Extend to handl LF deps (merge with other branch...)\n        if len(self.deps) > 0:\n            raise NotImplementedError(\"Dependency handling not implemented.\")\n    \n    def _check_L(self, L, init=False):\n        \"\"\"Check the format and content of the label tensor\n        \n        Args:\n            L: An [n, m] scipy.sparse matrix of labels\n            init: If True, initialize self.m; else set based on input L\n        \"\"\"\n        # Accept single CSC-sparse matrix (for efficient column/LF slicing)\n        if not issparse(L):\n            raise Exception(f\"L has type {type(L)}, but should be a\"\n                \"scipy.sparse matrix.\")\n        if L.dtype != np.dtype(int):\n            raise Exception(f\"L has type {L.dtype}, should be int.\")\n        L = L.tocsc()\n\n        # Check or set number of labeling functions\n        # M should be the same for all tasks, since all LFs label all inputs\n        n, m = L.shape\n        self._check_or_set_attr('m', m, set_val=init)\n        return L    \n    \n    def _infer_polarity(self, L, j):\n        \"\"\"Infer the polarity (labeled class) of LF j\"\"\"\n        assert(isinstance(L, csc_matrix))\n        vals = set(L.data[L.indptr[j]:L.indptr[j+1]])\n        if len(vals) > 1:\n            raise Exception(f\"LF {j} is non-unipolar with values: {vals}.\")\n        elif len(vals) == 0:\n            # If an LF doesn't label this task, set its polarity to 0 = abstain\n            return 0\n        else:\n            return list(vals)[0]\n    \n    def _compute_overlaps_matrix(self, L):\n        \"\"\"Initializes the data structures for training task t\"\"\"\n        # Check to make sure that L_t is unipolar, and infer polarities\n        self.polarity = [self._infer_polarity(L, j) for j in range(self.m)]\n\n        # Next, we form the empirical overlaps matrix O\n        # In the unipolar categorical setting, this is just the empirical count\n        # of non-zero overlaps; whether these were agreements or disagreements\n        # is then just a function of the polarities p\n        n, m = L.shape\n        L_nz = L.copy()\n        L_nz.data[:] = 1\n        O = L_nz.T @ L_nz / n \n        self.O = torch.from_numpy(O.todense()).double()\n    \n    def _init_params(self, mu_init, learn_class_balance, class_balance_init):\n        \"\"\"Initialize the parameters for each LF on each task separately.\n        \n        Args:\n            mu_init: float: Initial value & prior value for parameter mu, where\n                mu is the rank-2 factorization of O. Here, one row represents\n                (e.g. for k=2): \n                    $[P(\\lambda_i=p_i|Y=1), P(\\lambda_i=p_i|Y=2)]$\n                where $p_i \\in {1,2}$ is the polarity of $\\lambda_i$.\n            learn_class_balance: bool: If true, learn the class balance\n                parameters $P(Y=y_k)$\n            class_balance_init: array(float) or None: If None, set to be the\n                uniform distribution across the classes. If \n                `learn_class_balance=True`, then this is the initial value & \n                prior value for the class balance; else, this is fixed as the\n                class balance.\n        \"\"\"\n        self.mu_init = mu_init\n        self.mu = nn.Parameter(torch.randn(self.m, 2).double())\n\n        # Default to uniform class_balance_init\n        if class_balance_init is None:\n            class_balance_init = 0.5\n\n        # Class balance- can be fixed or learnable\n        if learn_class_balance:\n            # TODO: Currently this is for binary- extend to categorical\n            self.class_balance = nn.Parameter(torch.randn(1,).double())\n        else:\n            self.class_balance = class_balance_init\n        self.P = torch.diag(torch.DoubleTensor(\n            [self.class_balance, 1-self.class_balance]))\n\n        # Initialize mask\n        self.mask = torch.ones(self.m, self.m).byte()\n        for i in range(self.m):\n            for j in range(self.m):\n                if i == j or (i,j) in self.deps or (j,i) in self.deps:\n                    self.mask[i,j] = 0\n    \n    def loss(self, l2=0.0):\n        \"\"\"Returns the loss.\n\n        Note: A *centered* L2 loss term is incorporated here.\n        The L2 term is centered around the self.mu_init property, which thus\n        also serves as the value of a prior on the mus.\n        \"\"\"\n        loss_1 = torch.norm( \n            (self.O - self.mu @ self.P @ self.mu.t())[self.mask] )**2\n        loss_2 = torch.norm(\n            torch.sum(self.mu @ self.P, 1) - torch.diag(self.O) )**2\n\n        # L2 regularization, centered around mu_init\n        loss_3 = torch.sum((self.mu - self.mu_init)**2)\n        return loss_1 + loss_2 + l2 * loss_3\n    \n    def config_set(self, update_dict):\n        \"\"\"Updates self.config with the values in a given update dictionary\"\"\"\n        recursive_merge_dicts(self.config, update_dict)\n\n    def _betas(self):\n        \"\"\"Returns the estimated beta (labeling propensity) parameters.\n        Note: As an internal function, returns torch.Tensor.\n        \"\"\"\n        return torch.sum(self.mu.detach(), 1)\n    \n    def _alphas(self):\n        \"\"\"Returns the estimated alpha (accuracy) parameters.\n        Note: As an internal function, returns torch.Tensor.\n        \"\"\"\n        alphas = self.mu.detach() / self._betas().repeat(2,1).t()\n\n        # Swap elements in each row so that column 1 corresponds to the polarity\n        # of the LF---i.e. represents P(\\lf_i = p_i | Y = p_i)---and column 2\n        # is then P(\\lf_i = p_i | Y != p_i)\n        for j in range(self.m):\n            # TODO: Update this to support categorical!\n            if self.polarity[j] != 1:\n                # TODO: Has to be better way to do this in PyTorch...\n                row = alphas[j].numpy().copy()\n                alphas[j,0] = row[1]\n                alphas[j,1] = row[0]\n        \n        # Need to break symmetry in the columns by assuming the more \n        # net-accurate one is correct\n        if torch.sum(1-alphas[:,0]) > torch.sum(alphas[:,0]):\n            alphas_col = alphas[:,1]\n        else:\n            alphas_col = alphas[:,0]\n        return torch.clamp(alphas_col, min=0.05, max=0.95)\n    \n    def accs(self):\n        \"\"\"The float numpy array of LF accuracies P(\\lf_i=p_i|Y=p_i).\"\"\"\n        accs = self._alphas() * self._betas()\n        return accs.numpy()    \n    \n    def predict_proba(self, L):\n        \"\"\"Get conditional probabilities P(Y | L) given the learned model\n\n        Args:\n            L: An [n, m] scipy.sparse matrix of labels \n        Returns:\n            Y_p: An n x k numpy matrix of probabilistic labels (conditional\n                probabilities), i.e. $Y_p[i,j] = P(Y_i=j|L)$.\n        \"\"\"\n        L = self._check_L(L)\n        # Note we cast to dense here\n        L = torch.from_numpy(L.todense()).float()\n        n = L.shape[0]\n\n        log_odds_alphas = torch.log(self._alphas() / (1-self._alphas())).float()\n\n        # Here we iterate over the values of Y in {1,...,k}, forming\n        # an [n, k] matrix of unnormalized predictions\n        # Note in the unipolar setting:\n        #   P(\\lambda_j=k|y_t=k, \\lambda_j != 0) = \\alpha_i\n        #   P(\\lambda_j=k|y_t=l != k, \\lambda_j != 0) = 1 - \\alpha_i\n        # So the computation is the same as in the binary case, except we\n        # compute\n        #   \\theta^T \\ind \\{ \\lambda_j != 0 \\} \\ind^{\\pm} \\{ \\lambda_j = k \\}\n        Y_p = torch.zeros((n, self.k))\n        for y_k in range(1, self.k):\n            L_y = torch.where(\n                (L != y_k) & (L != 0), torch.full((n, self.m), -1) , L)\n            L_y = torch.where(L_y == y_k, torch.full((n, self.m), 1), L_y)\n            Y_p[:, y_k-1] = L_y @ log_odds_alphas\n        \n        # Add the class balance factor if not balanced\n        # TODO: Update for categorical!\n        y_pos = torch.ones(n) * self.class_balance\n        log_y_pos = torch.log( y_pos / (1-y_pos))\n        Y_p[:,0] += log_y_pos\n        Y_p[:,1] -= log_y_pos\n\n        # Take the softmax to return an [n, k] numpy array\n        return F.softmax(Y_p, dim=1).numpy()\n\n    def get_accs_score(self, accs):\n        \"\"\"Returns the *averaged squared estimation error.\"\"\"\n        return np.linalg.norm(self.accs() - accs)**2 / self.m\n\n    def train(self, L_train, L_dev=None, Y_dev=None, accs=None, **kwargs):\n        \"\"\"Learns the accuracies of the labeling functions from L_train\n\n        Args:\n            L_train:\n            L_dev:\n            Y_dev:\n            accs: An M-length list of the true accuracies of the LFs if known\n\n        Note that in this class, we learn this for each task separately by\n        default, and store a separate accuracy for each LF in each task.\n        \"\"\"\n        self.config = recursive_merge_dicts(self.config, kwargs)\n        train_config = self.config['train_config']\n        optimizer_config = train_config['optimizer_config']\n\n        Y_dev = self._to_torch(Y_dev)\n\n        # Initialize class parameters based on L_train\n        L_train = self._check_L(L_train, init=True)\n\n        # Compute overlaps matrix self.O\n        self._compute_overlaps_matrix(L_train)\n\n        # Initialize params\n        self._init_params(\n            train_config['mu_init'],\n            train_config['learn_class_balance'],\n            train_config['class_balance_init'])\n\n        # Set optimizer as SGD w/ momentum\n        optimizer = optim.SGD(\n            self.parameters(), \n            **optimizer_config['optimizer_common'],\n            **optimizer_config['sgd_config']\n        )\n        \n        # Train model\n        for epoch in range(train_config['n_epochs']):\n            optimizer.zero_grad()\n            \n            # Compute gradient and take a step\n            # Note that since this uses all N training points this is an epoch!\n            loss = self.loss(l2=train_config['l2'])\n            loss.backward()\n            optimizer.step()\n            \n            # Print loss every print_at steps\n            if (self.config['verbose'] and \n                (epoch % train_config['print_at'] == 0 \n                or epoch == train_config['n_epochs'] - 1)):\n                msg = f\"[Epoch {epoch}] Loss: {loss.item():0.6f}\"\n                if accs is not None:\n                    accs_score = self.get_accs_score(accs)\n                    msg += f\"\\tAccs mean sq. error = {accs_score}\"\n                print(msg)\n\n        # if self.config['verbose']:\n        #     print('Finished Training')\n        #     Y_p_train = self.predict_proba(L_train)\n        #     if L_dev and Y_dev:\n        #         Y_ph_dev = self.predict(L_dev)\n\n        #     # if self.config['show_plots']:\n        #     #     plot_probabilities_histogram(Y_p_train[:, 0], \n        #     #         title=\"Training Set Predictions\")\n\n        #     #     if L_dev and Y_dev:\n        #     #         plot_predictions_histogram(Y_ph_dev, Y_dev[0],\n        #     #             title=\"Dev Set Hard Predictions:\")\n\n\n        #     print(\"Confusion Matrix (Dev)\")\n        #     mat = confusion_matrix(Y_ph_dev, Y_dev[0], pr",
+      "total_lines": 300,
+      "ref": "35ac1c97edbd5fc0213b5b9ccbace89ac9df2d00"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "predict_proba",
+      "class_name": "LabelModel",
+      "start_line": 182,
+      "end_line": 221,
+      "satd_line": 214,
+      "matched_by": "normalized_source",
+      "source": "    def predict_proba(self, L):\n        \"\"\"Get conditional probabilities P(Y | L) given the learned model\n\n        Args:\n            L: An [n, m] scipy.sparse matrix of labels \n        Returns:\n            Y_p: An n x k numpy matrix of probabilistic labels (conditional\n                probabilities), i.e. $Y_p[i,j] = P(Y_i=j|L)$.\n        \"\"\"\n        L = self._check_L(L)\n        # Note we cast to dense here\n        L = torch.from_numpy(L.todense()).float()\n        n = L.shape[0]\n\n        log_odds_alphas = torch.log(self._alphas() / (1-self._alphas())).float()\n\n        # Here we iterate over the values of Y in {1,...,k}, forming\n        # an [n, k] matrix of unnormalized predictions\n        # Note in the unipolar setting:\n        #   P(\\lambda_j=k|y_t=k, \\lambda_j != 0) = \\alpha_i\n        #   P(\\lambda_j=k|y_t=l != k, \\lambda_j != 0) = 1 - \\alpha_i\n        # So the computation is the same as in the binary case, except we\n        # compute\n        #   \\theta^T \\ind \\{ \\lambda_j != 0 \\} \\ind^{\\pm} \\{ \\lambda_j = k \\}\n        Y_p = torch.zeros((n, self.k))\n        for y_k in range(1, self.k):\n            L_y = torch.where(\n                (L != y_k) & (L != 0), torch.full((n, self.m), -1) , L)\n            L_y = torch.where(L_y == y_k, torch.full((n, self.m), 1), L_y)\n            Y_p[:, y_k-1] = L_y @ log_odds_alphas\n        \n        # Add the class balance factor if not balanced\n        # TODO: Update for categorical!\n        y_pos = torch.ones(n) * self.class_balance\n        log_y_pos = torch.log( y_pos / (1-y_pos))\n        Y_p[:,0] += log_y_pos\n        Y_p[:,1] -= log_y_pos\n\n        # Take the softmax to return an [n, k] numpy array\n        return F.softmax(Y_p, dim=1).numpy()",
+      "calls": [
+        "range"
+      ],
+      "self_calls": [
+        "_alphas",
+        "_check_L"
+      ],
+      "self_attrs": [
+        "_alphas",
+        "_check_L",
+        "class_balance",
+        "k",
+        "m"
+      ],
+      "global_uses": [
+        "F",
+        "torch"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "_check_L",
+        "torch.from_numpy",
+        "torch.log",
+        "torch.zeros",
+        "torch.where",
+        "torch.full",
+        "F.softmax"
+      ],
+      "reason": "These methods are directly involved in the computations and transformations of the input data and the output probabilities, making them essential for understanding and repairing the SATD."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "LabelModel._check_L",
+        "path": "metal/label_model/label_model.py",
+        "class_name": "LabelModel",
+        "start_line": 38,
+        "end_line": 57,
+        "source": "def _check_L(self, L, init=False):\n        \"\"\"Check the format and content of the label tensor\n        \n        Args:\n            L: An [n, m] scipy.sparse matrix of labels\n            init: If True, initialize self.m; else set based on input L\n        \"\"\"\n        # Accept single CSC-sparse matrix (for efficient column/LF slicing)\n        if not issparse(L):\n            raise Exception(f\"L has type {type(L)}, but should be a\"\n                \"scipy.sparse matrix.\")\n        if L.dtype != np.dtype(int):\n            raise Exception(f\"L has type {L.dtype}, should be int.\")\n        L = L.tocsc()\n\n        # Check or set number of labeling functions\n        # M should be the same for all tasks, since all LFs label all inputs\n        n, m = L.shape\n        self._check_or_set_attr('m', m, set_val=init)\n        return L",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "torch.from_numpy",
+      "torch.log",
+      "torch.zeros",
+      "torch.where",
+      "torch.full",
+      "F.softmax"
+    ]
+  },
+  "review_context": {}
+}

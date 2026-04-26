@@ -1,0 +1,113 @@
+{
+  "task_id": "527",
+  "repo_owner": "opendatacube",
+  "repo_name": "datacube-stats",
+  "file_path": "datacube_stats/output_drivers.py",
+  "commit": "eb3a402f50f7d31c4248e5ae888c740bb8896773",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T09:55:05+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "eb3a402f50f7d31c4248e5ae888c740bb8896773",
+    "symbol_name": "write_data",
+    "satd_line": 327,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 1,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 2,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T09:55:05+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 3,
+    "retrieved_method_count": 1,
+    "missing_method_count": 2,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "datacube_stats/output_drivers.py",
+    "original_signature": "def write_data(self, prod_name, measurement_name, tile_index, values):",
+    "target_file": {
+      "ok": true,
+      "path": "datacube_stats/output_drivers.py",
+      "sha": "c462b46fd49669233f9a1c7135a017d891e7d5d5",
+      "download_url": "https://raw.githubusercontent.com/opendatacube/datacube-stats/eb3a402f50f7d31c4248e5ae888c740bb8896773/datacube_stats/output_drivers.py",
+      "content_excerpt": "\"\"\"\nProvide some classes for writing data out to files on disk.\n\nThe `NetcdfOutputDriver` will write multiple variables into a single file.\n\nThe `RioOutputDriver` writes a single __band__ of data per file.\n\"\"\"\nimport abc\nimport logging\nimport operator\nfrom collections import OrderedDict\nfrom functools import reduce as reduce_\nfrom pathlib import Path\n\nimport numpy\nimport xarray\n\nimport rasterio\nfrom datacube.model import Coordinate, Variable, GeoPolygon\nfrom datacube.model.utils import make_dataset, xr_apply, datasets_to_doc\nfrom datacube.storage import netcdf_writer\nfrom datacube.storage.storage import create_netcdf_storage_unit\nfrom datacube.utils import unsqueeze_data_array\n\n_LOG = logging.getLogger(__name__)\n_NETCDF_VARIABLE__PARAMETER_NAMES = {'zlib',\n                                     'complevel',\n                                     'shuffle',\n                                     'fletcher32',\n                                     'contiguous',\n                                     'attrs'}\n\n\nclass OutputDriver(object):\n    \"\"\"\n    Handles the creation of output data files for a StatsTask.\n\n    Depending on the implementation, may create one or more files per instance.\n\n    To use, instantiate the class, then use as a context manager, eg.\n\n        output_driver = MyOutputDriver(storage, task, output_path)\n        with output_driver:\n            output_driver.write_data(prod_name, measure_name, tile_index, values)\n\n    :param StatsTask task: A StatsTask that will be producing data\n    :param output_path: Directory name to output file/s into\n    :param storage: Dictionary structure describing the _storage format\n    :param app_info:\n    \"\"\"\n    __metaclass__ = abc.ABCMeta\n    valid_extensions = []\n\n    def __init__(self, storage, task, output_path, app_info=None):\n        #: datacube_stats.models.StatsTask\n        self._task = task\n        self._output_path = output_path\n        self._storage = storage\n\n        self._geobox = task.geobox\n        self._output_products = task.output_products\n\n        self._app_info = app_info\n\n        self._output_file_handles = {}\n        self._output_paths = {}\n        self._written_some_data = set()\n\n    def close_files(self):\n        for output_name, output_fh in self._output_file_handles.items():\n            output_fh.close()\n\n            # Remove '.tmp' suffix\n            output_path = self._output_paths[output_name]\n            output_path.rename(output_path.with_suffix(''))\n\n            # self._output_paths[output_name].rename\n            if output_name not in self._written_some_data:\n                # TODO: No data written to file, should delete or log\n                pass\n\n    @abc.abstractmethod\n    def open_output_files(self):\n        raise NotImplementedError\n\n    @abc.abstractmethod\n    def write_data(self, prod_name, measurement_name, tile_index, values):\n        pass\n\n    @abc.abstractmethod\n    def write_global_attributes(self, attributes):\n        raise NotImplementedError\n\n    def _get_dtype(self, out_prod_name, measurement_name=None):\n        if measurement_name:\n            return self._output_products[out_prod_name].product.measurements[measurement_name]['dtype']\n        else:\n            dtypes = set(m['dtype'] for m in self._output_products[out_prod_name].product.measurements.values())\n            if len(dtypes) == 1:\n                return dtypes.pop()\n            else:\n                raise RuntimeError('Not all measurements for %s have the same dtype.' % out_prod_name)\n\n    def __enter__(self):\n        self.open_output_files()\n        return self\n\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        self.close_files()\n\n    def _prepare_output_file(self, stat, **kwargs):\n        x, y = self._task['tile_index']\n        epoch_start, epoch_end = self._task['time_period']\n\n        output_path = Path(self._output_path,\n                           stat.file_path_template.format(\n                               x=x, y=y,\n                               epoch_start=epoch_start,\n                               epoch_end=epoch_end,\n                               **kwargs))\n\n        if output_path.suffix not in self.valid_extensions:\n            raise RuntimeError('Invalid Filename: %s for this Output Driver: %s' % (output_path, self))\n\n        if output_path.exists():\n            raise RuntimeError('Output file already exists: %s' % output_path)\n\n        try:\n            output_path.parent.mkdir(parents=True)\n        except OSError:\n            pass\n\n        tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')\n        if tmp_path.exists():\n            tmp_path.unlink()\n\n        return tmp_path\n\n\nclass NetcdfOutputDriver(OutputDriver):\n    \"\"\"\n    Write data to Datacube compatible NetCDF files\n    \"\"\"\n\n    valid_extensions = ['.nc']\n\n    def open_output_files(self):\n        for prod_name, stat in self._output_products.items():\n            output_filename = self._prepare_output_file(stat)\n            self._output_paths[prod_name] = output_filename\n            self._output_file_handles[prod_name] = self._create_storage_unit(stat, output_filename)\n\n    def _create_storage_unit(self, stat, output_filename):\n        all_measurement_defns = list(stat.product.measurements.values())\n\n        datasets, sources = _find_source_datasets(self._task, stat, self._geobox, self._app_info,\n                                                  uri=output_filename.as_uri())\n\n        variable_params = self._create_netcdf_var_params(stat)\n        nco = self._nco_from_sources(sources,\n                                     self._geobox,\n                                     all_measurement_defns,\n                                     variable_params,\n                                     output_filename)\n\n        netcdf_writer.create_variable(nco, 'dataset', datasets, zlib=True)\n        nco['dataset'][:] = netcdf_writer.netcdfy_data(datasets.values)\n        return nco\n\n    def _create_netcdf_var_params(self, stat):\n        chunking = self._storage['chunking']\n        chunking = [chunking[dim] for dim in self._storage['dimension_order']]\n\n        variable_params = {}\n        for measurement in stat.data_measurements:\n            name = measurement['name']\n            variable_params[name] = {k: v for k, v in stat._definition.items() if\n                                     k in _NETCDF_VARIABLE__PARAMETER_NAMES}\n            variable_params[name]['chunksizes'] = chunking\n            variable_params[name].update(\n                {k: v for k, v in measurement.items() if k in _NETCDF_VARIABLE__PARAMETER_NAMES})\n        return variable_params\n\n    @staticmethod\n    def _nco_from_sources(sources, geobox, measurements, variable_params, filename):\n        coordinates = OrderedDict((name, Coordinate(coord.values, coord.units))\n                                  for name, coord in sources.coords.items())\n        coordinates.update(geobox.coordinates)\n\n        variables = OrderedDict((variable['name'], Variable(dtype=numpy.dtype(variable['dtype']),\n                                                            nodata=variable['nodata'],\n                                                            dims=sources.dims + geobox.dimensions,\n                                                            units=variable['units']))\n                                for variable in measurements)\n\n        return create_netcdf_storage_unit(filename, geobox.crs, coordinates, variables, variable_params)\n\n    def write_data(self, prod_name, measurement_name, tile_index, values):\n        self._output_file_handles[prod_name][measurement_name][(0,) + tile_index[1:]] = netcdf_writer.netcdfy_data(\n            values)\n        self._output_file_handles[prod_name].sync()\n        self._written_some_data.add(prod_name)\n        _LOG.debug(\"Updated %s %s\", measurement_name, tile_index[1:])\n\n    def write_global_attributes(self, attributes):\n        for output_file in self._output_file_handles.values():\n            for k, v in attributes.items():\n                output_file.attrs[k] = v\n\n\nclass RioOutputDriver(OutputDriver):\n    \"\"\"\n    Save data to file/s using rasterio. Eg. GeoTiff\n\n    Writes to a different file per statistic/measurement.\n\n    \"\"\"\n    valid_extensions = ['.tif', '.tiff']\n    default_profile = {\n        'compress': 'lzw',\n        'driver': 'GTiff',\n        'interleave': 'band',\n        'tiled': True\n    }\n    _dtype_map = {\n        'int8': 'uint8'\n    }\n\n    def __init__(self, storage, task, output_path, app_info=None):\n        super(RioOutputDriver, self).__init__(storage, task, output_path, app_info)\n\n        self._measurement_bands = {}\n\n    def _get_dtype(self, prod_name, measurement_name=None):\n        dtype = super(RioOutputDriver, self)._get_dtype(prod_name, measurement_name)\n        return self._dtype_map.get(dtype, dtype)\n\n    def _get_nodata(self, prod_name, measurement_name=None):\n        dtype = self._get_dtype(prod_name, measurement_name)\n        if measurement_name:\n            nodata = self._output_products[prod_name].product.measurements[measurement_name]['nodata']\n        else:\n            nodatas = set(m['nodata'] for m in self._output_products[prod_name].product.measurements.values())\n            if len(nodatas) == 1:\n                nodata = nodatas.pop()\n            else:\n                raise RuntimeError('Not all nodata values for output product %s are the same.' % prod_name)\n        if dtype == 'uint8' and nodata < 0:\n            # Convert to uint8 for Geotiff\n            return 255\n        else:\n            return nodata\n\n    def open_output_files(self):\n        for prod_name, stat in self._output_products.items():\n            num_measurements = len(stat.product.measurements)\n            if num_measurements > 1 and 'var_name' in stat.file_path_template:\n                # Multi_file output\n                for measurement_name, measure_def in stat.product.measurements.items():\n                    self._open_one_band_geotiff(prod_name, stat, measurement_name)\n            else:  # Single file output\n                output_filename = self._prepare_output_file(stat)\n                profile = self.default_profile.copy()\n                dtype = self._get_dtype(prod_name)\n                nodata = self._get_nodata(prod_name)\n                profile.update({\n                    'blockxsize': self._storage['chunking']['x'],\n                    'blockysize': self._storage['chunking']['y'],\n\n                    'dtype': dtype,\n                    'nodata': nodata,\n                    'width': self._geobox.width,\n                    'height': self._geobox.height,\n                    'affine': self._geobox.affine,\n                    'crs': self._geobox.crs.crs_str,\n                    'count': num_measurements\n                })\n                output_name = prod_name\n                _LOG.debug(\"Opening %s for writing.\", output_filename)\n                dest = rasterio.open(str(output_filename), mode='w', **profile)\n                # dest.update_tags(created=self._app_info) # TODO record creation metadata\n                for band, (measurement_name, measure_def) in enumerate(stat.product.measurements.items(), start=1):\n                    dest.update_tags(band,\n                                     source_product=self._task.sources[0]['data'].product.name,\n                                     date='{:%Y-%m-%d}'.format(self._task.time_period[0]),\n                                     name=measurement_name)\n                self._output_paths[output_name] = output_filename\n                self._output_file_handles[output_name] = dest\n\n    def _open_one_band_geotiff(self, prod_name, stat, num_bands=1, measurement_name=None):\n        output_filename = self._prepare_output_file(stat, var_name=measurement_name)\n        profile = self.default_profile.copy()\n        dtype = self._get_dtype(prod_name, measurement_name)\n        nodata = self._get_nodata(prod_name, measurement_name)\n        profile.update({\n            'blockxsize': self._storage['chunking']['x'],\n         ",
+      "total_lines": 385,
+      "ref": "eb3a402f50f7d31c4248e5ae888c740bb8896773"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "write_data",
+      "class_name": "RioOutputDriver",
+      "start_line": 318,
+      "end_line": 329,
+      "satd_line": 327,
+      "matched_by": "normalized_source",
+      "source": "    def write_data(self, prod_name, measurement_name, tile_index, values):\n        super(RioOutputDriver, self).write_data(prod_name, measurement_name, tile_index, values)\n        output_name = prod_name + measurement_name\n        y, x = tile_index[1:]\n        window = ((y.start, y.stop), (x.start, x.stop))\n        _LOG.debug(\"Updating %s.%s %s\", prod_name, measurement_name, window)\n\n        dtype = self._get_dtype(prod_name, measurement_name)\n\n        # TODO Lookup indexes based on measurement_name\n        self._output_file_handles[output_name].write(values.astype(dtype), indexes=1, window=window)\n        self._written_some_data.add(output_name)",
+      "calls": [
+        "super"
+      ],
+      "self_calls": [
+        "_get_dtype"
+      ],
+      "self_attrs": [
+        "_get_dtype",
+        "_output_file_handles",
+        "_written_some_data"
+      ],
+      "global_uses": [
+        "RioOutputDriver",
+        "_LOG"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "_get_dtype",
+        "write",
+        "Lookup"
+      ],
+      "reason": "These methods are directly related to the functionality that needs to be modified or understood in order to implement the TODO comment regarding index lookup based on measurement_name."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "OutputDriver._get_dtype",
+        "path": "datacube_stats/output_drivers.py",
+        "class_name": "OutputDriver",
+        "start_line": 94,
+        "end_line": 102,
+        "source": "def _get_dtype(self, out_prod_name, measurement_name=None):\n        if measurement_name:\n            return self._output_products[out_prod_name].product.measurements[measurement_name]['dtype']\n        else:\n            dtypes = set(m['dtype'] for m in self._output_products[out_prod_name].product.measurements.values())\n            if len(dtypes) == 1:\n                return dtypes.pop()\n            else:\n                raise RuntimeError('Not all measurements for %s have the same dtype.' % out_prod_name)",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "_output_file_handles.output_name.write",
+      "Lookup"
+    ]
+  },
+  "review_context": {}
+}

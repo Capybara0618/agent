@@ -1,0 +1,138 @@
+{
+  "task_id": "148",
+  "repo_owner": "shinya7y",
+  "repo_name": "universenet",
+  "file_path": "tools/test.py",
+  "commit": "2bd4c84340a3c35b011026657a9ed30e380d0d75",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T07:14:47+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "2bd4c84340a3c35b011026657a9ed30e380d0d75",
+    "symbol_name": "main",
+    "satd_line": 149,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 1,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 1,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T07:14:47+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 4,
+    "retrieved_method_count": 1,
+    "missing_method_count": 3,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "tools/test.py",
+    "original_signature": "def main():",
+    "target_file": {
+      "ok": true,
+      "path": "tools/test.py",
+      "sha": "f8c0e2d76f35db86d711ce446ad5e54fea6c4804",
+      "download_url": "https://raw.githubusercontent.com/shinya7y/UniverseNet/2bd4c84340a3c35b011026657a9ed30e380d0d75/tools/test.py",
+      "content_excerpt": "import argparse\nimport os.path as osp\nimport shutil\nimport tempfile\n\nimport mmcv\nimport torch\nimport torch.distributed as dist\nfrom mmcv.runner import load_checkpoint, get_dist_info\nfrom mmcv.parallel import MMDataParallel, MMDistributedDataParallel\n\nfrom mmdet.apis import init_dist\nfrom mmdet.core import results2json, coco_eval\nfrom mmdet.datasets import build_dataloader, get_dataset\nfrom mmdet.models import build_detector\n\n\ndef single_gpu_test(model, data_loader, show=False):\n    model.eval()\n    results = []\n    dataset = data_loader.dataset\n    prog_bar = mmcv.ProgressBar(len(dataset))\n    for i, data in enumerate(data_loader):\n        with torch.no_grad():\n            result = model(return_loss=False, rescale=not show, **data)\n        results.append(result)\n\n        if show:\n            model.module.show_result(data,\n                                     result,\n                                     dataset.img_norm_cfg,\n                                     dataset=dataset.CLASSES)\n\n        batch_size = data['img'][0].size(0)\n        for _ in range(batch_size):\n            prog_bar.update()\n    return results\n\n\ndef multi_gpu_test(model, data_loader, tmpdir=None):\n    model.eval()\n    results = []\n    dataset = data_loader.dataset\n    rank, world_size = get_dist_info()\n    if rank == 0:\n        prog_bar = mmcv.ProgressBar(len(dataset))\n    for i, data in enumerate(data_loader):\n        with torch.no_grad():\n            result = model(return_loss=False, rescale=True, **data)\n        results.append(result)\n\n        if rank == 0:\n            batch_size = data['img'][0].size(0)\n            for _ in range(batch_size * world_size):\n                prog_bar.update()\n\n    # collect results from all ranks\n    results = collect_results(results, len(dataset), tmpdir)\n\n    return results\n\n\ndef collect_results(result_part, size, tmpdir=None):\n    rank, world_size = get_dist_info()\n    # create a tmp dir if it is not specified\n    if tmpdir is None:\n        MAX_LEN = 512\n        # 32 is whitespace\n        dir_tensor = torch.full((MAX_LEN, ),\n                                32,\n                                dtype=torch.uint8,\n                                device='cuda')\n        if rank == 0:\n            tmpdir = tempfile.mkdtemp()\n            tmpdir = torch.tensor(bytearray(tmpdir.encode()),\n                                  dtype=torch.uint8,\n                                  device='cuda')\n            dir_tensor[:len(tmpdir)] = tmpdir\n        dist.broadcast(dir_tensor, 0)\n        tmpdir = dir_tensor.cpu().numpy().tobytes().decode().rstrip()\n    else:\n        mmcv.mkdir_or_exist(tmpdir)\n    # dump the part result to the dir\n    mmcv.dump(result_part, osp.join(tmpdir, 'part_{}.pkl'.format(rank)))\n    dist.barrier()\n    # collect all parts\n    if rank != 0:\n        return None\n    else:\n        # load results of all parts from tmp dir\n        part_list = []\n        for i in range(world_size):\n            part_file = osp.join(tmpdir, 'part_{}.pkl'.format(i))\n            part_list.append(mmcv.load(part_file))\n        # sort the results\n        ordered_results = []\n        for res in zip(*part_list):\n            ordered_results.extend(list(res))\n        # the dataloader may pad some samples\n        ordered_results = ordered_results[:size]\n        # remove tmp dir\n        shutil.rmtree(tmpdir)\n        return ordered_results\n\n\ndef parse_args():\n    parser = argparse.ArgumentParser(description='MMDet test detector')\n    parser.add_argument('config', help='test config file path')\n    parser.add_argument('checkpoint', help='checkpoint file')\n    parser.add_argument('--out', help='output result file')\n    parser.add_argument(\n        '--eval',\n        type=str,\n        nargs='+',\n        choices=['proposal', 'proposal_fast', 'bbox', 'segm', 'keypoints'],\n        help='eval types')\n    parser.add_argument('--show', action='store_true', help='show results')\n    parser.add_argument('--tmpdir', help='tmp dir for writing some results')\n    parser.add_argument('--launcher',\n                        choices=['none', 'pytorch', 'slurm', 'mpi'],\n                        default='none',\n                        help='job launcher')\n    parser.add_argument('--local_rank', type=int, default=0)\n    args = parser.parse_args()\n    return args\n\n\ndef main():\n    args = parse_args()\n\n    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):\n        raise ValueError('The output file must be a pkl file.')\n\n    cfg = mmcv.Config.fromfile(args.config)\n    # set cudnn_benchmark\n    if cfg.get('cudnn_benchmark', False):\n        torch.backends.cudnn.benchmark = True\n    cfg.model.pretrained = None\n    cfg.data.test.test_mode = True\n\n    # init distributed env first, since logger depends on the dist info.\n    if args.launcher == 'none':\n        distributed = False\n    else:\n        distributed = True\n        init_dist(args.launcher, **cfg.dist_params)\n\n    # build the dataloader\n    # TODO: support multiple images per gpu (only minor changes are needed)\n    dataset = get_dataset(cfg.data.test)\n    data_loader = build_dataloader(dataset,\n                                   imgs_per_gpu=1,\n                                   workers_per_gpu=cfg.data.workers_per_gpu,\n                                   dist=distributed,\n                                   shuffle=False)\n\n    # build the model and load checkpoint\n    model = build_detector(cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)\n    load_checkpoint(model, args.checkpoint, map_location='cpu')\n\n    if not distributed:\n        model = MMDataParallel(model, device_ids=[0])\n        outputs = single_gpu_test(model, data_loader, args.show)\n    else:\n        model = MMDistributedDataParallel(model.cuda())\n        outputs = multi_gpu_test(model, data_loader, args.tmpdir)\n\n    rank, _ = get_dist_info()\n    if args.out and rank == 0:\n        print('\\nwriting results to {}'.format(args.out))\n        mmcv.dump(outputs, args.out)\n        eval_types = args.eval\n        if eval_types:\n            print('Starting evaluate {}'.format(' and '.join(eval_types)))\n            if eval_types == ['proposal_fast']:\n                result_file = args.out\n                coco_eval(result_file, eval_types, dataset.coco)\n            else:\n                if not isinstance(outputs[0], dict):\n                    result_file = args.out + '.json'\n                    results2json(dataset, outputs, result_file)\n                    coco_eval(result_file, eval_types, dataset.coco)\n                else:\n                    for name in outputs[0]:\n                        print('\\nEvaluating {}'.format(name))\n                        outputs_ = [out[name] for out in outputs]\n                        result_file = args.out + '.{}.json'.format(name)\n                        results2json(dataset, outputs_, result_file)\n                        coco_eval(result_file, eval_types, dataset.coco)\n\n\nif __name__ == '__main__':\n    main()\n",
+      "total_lines": 193,
+      "ref": "2bd4c84340a3c35b011026657a9ed30e380d0d75"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "main",
+      "class_name": null,
+      "start_line": 128,
+      "end_line": 189,
+      "satd_line": 149,
+      "matched_by": "signature_or_comment",
+      "source": "def main():\n    args = parse_args()\n\n    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):\n        raise ValueError('The output file must be a pkl file.')\n\n    cfg = mmcv.Config.fromfile(args.config)\n    # set cudnn_benchmark\n    if cfg.get('cudnn_benchmark', False):\n        torch.backends.cudnn.benchmark = True\n    cfg.model.pretrained = None\n    cfg.data.test.test_mode = True\n\n    # init distributed env first, since logger depends on the dist info.\n    if args.launcher == 'none':\n        distributed = False\n    else:\n        distributed = True\n        init_dist(args.launcher, **cfg.dist_params)\n\n    # build the dataloader\n    # TODO: support multiple images per gpu (only minor changes are needed)\n    dataset = get_dataset(cfg.data.test)\n    data_loader = build_dataloader(dataset,\n                                   imgs_per_gpu=1,\n                                   workers_per_gpu=cfg.data.workers_per_gpu,\n                                   dist=distributed,\n                                   shuffle=False)\n\n    # build the model and load checkpoint\n    model = build_detector(cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)\n    load_checkpoint(model, args.checkpoint, map_location='cpu')\n\n    if not distributed:\n        model = MMDataParallel(model, device_ids=[0])\n        outputs = single_gpu_test(model, data_loader, args.show)\n    else:\n        model = MMDistributedDataParallel(model.cuda())\n        outputs = multi_gpu_test(model, data_loader, args.tmpdir)\n\n    rank, _ = get_dist_info()\n    if args.out and rank == 0:\n        print('\\nwriting results to {}'.format(args.out))\n        mmcv.dump(outputs, args.out)\n        eval_types = args.eval\n        if eval_types:\n            print('Starting evaluate {}'.format(' and '.join(eval_types)))\n            if eval_types == ['proposal_fast']:\n                result_file = args.out\n                coco_eval(result_file, eval_types, dataset.coco)\n            else:\n                if not isinstance(outputs[0], dict):\n                    result_file = args.out + '.json'\n                    results2json(dataset, outputs, result_file)\n                    coco_eval(result_file, eval_types, dataset.coco)\n                else:\n                    for name in outputs[0]:\n                        print('\\nEvaluating {}'.format(name))\n                        outputs_ = [out[name] for out in outputs]\n                        result_file = args.out + '.{}.json'.format(name)\n                        results2json(dataset, outputs_, result_file)\n                        coco_eval(result_file, eval_types, dataset.coco)",
+      "calls": [
+        "MMDataParallel",
+        "MMDistributedDataParallel",
+        "ValueError",
+        "build_dataloader",
+        "build_detector",
+        "coco_eval",
+        "get_dataset",
+        "get_dist_info",
+        "init_dist",
+        "isinstance",
+        "load_checkpoint",
+        "multi_gpu_test",
+        "parse_args",
+        "print",
+        "results2json",
+        "single_gpu_test"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "MMDataParallel",
+        "MMDistributedDataParallel",
+        "build_dataloader",
+        "build_detector",
+        "coco_eval",
+        "get_dataset",
+        "get_dist_info",
+        "init_dist",
+        "load_checkpoint",
+        "mmcv",
+        "multi_gpu_test",
+        "out",
+        "parse_args",
+        "results2json",
+        "single_gpu_test",
+        "torch"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "build_dataloader",
+        "build_dataset",
+        "MMDataParallel",
+        "MMDistributedDataParallel"
+      ],
+      "reason": "The selected methods are directly involved in data loading and model parallelization, which are critical for implementing the support for multiple images per GPU as indicated in the SATD."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "build_dataloader",
+        "path": "mmdet/datasets/loader/build_loader.py",
+        "class_name": null,
+        "start_line": 15,
+        "end_line": 48,
+        "source": "def build_dataloader(dataset,\n                     imgs_per_gpu,\n                     workers_per_gpu,\n                     num_gpus=1,\n                     dist=True,\n                     **kwargs):\n    shuffle = kwargs.get('shuffle', True)\n    if dist:\n        rank, world_size = get_dist_info()\n        if shuffle:\n            sampler = DistributedGroupSampler(dataset, imgs_per_gpu,\n                                              world_size, rank)\n        else:\n            sampler = DistributedSampler(dataset,\n                                         world_size,\n                                         rank,\n                                         shuffle=False)\n        batch_size = imgs_per_gpu\n        num_workers = workers_per_gpu\n    else:\n        sampler = GroupSampler(dataset, imgs_per_gpu) if shuffle else None\n        batch_size = num_gpus * imgs_per_gpu\n        num_workers = num_gpus * workers_per_gpu\n\n    data_loader = DataLoader(dataset,\n                             batch_size=batch_size,\n                             sampler=sampler,\n                             num_workers=num_workers,\n                             collate_fn=partial(collate,\n                                                samples_per_gpu=imgs_per_gpu),\n                             pin_memory=False,\n                             **kwargs)\n\n    return data_loader",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "build_dataset",
+      "MMDataParallel",
+      "MMDistributedDataParallel"
+    ]
+  },
+  "review_context": {}
+}

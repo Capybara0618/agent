@@ -1,0 +1,89 @@
+{
+  "task_id": "584",
+  "repo_owner": "mlc-ai",
+  "repo_name": "relax",
+  "file_path": "python/tvm/relay/frontend/pytorch.py",
+  "commit": "93dff448b06a8fd6e133326cf8c32bb623817fc3",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T10:11:33+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "93dff448b06a8fd6e133326cf8c32bb623817fc3",
+    "symbol_name": "_expand_as",
+    "satd_line": 720,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T10:11:33+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "python/tvm/relay/frontend/pytorch.py",
+    "original_signature": "def _expand_as():",
+    "target_file": {
+      "ok": true,
+      "path": "python/tvm/relay/frontend/pytorch.py",
+      "sha": "ff37f823f28b28435bc1e5aa417cd57bf50be037",
+      "download_url": "https://raw.githubusercontent.com/mlc-ai/relax/93dff448b06a8fd6e133326cf8c32bb623817fc3/python/tvm/relay/frontend/pytorch.py",
+      "content_excerpt": "# Licensed to the Apache Software Foundation (ASF) under one\n# or more contributor license agreements.  See the NOTICE file\n# distributed with this work for additional information\n# regarding copyright ownership.  The ASF licenses this file\n# to you under the Apache License, Version 2.0 (the\n# \"License\"); you may not use this file except in compliance\n# with the License.  You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing,\n# software distributed under the License is distributed on an\n# \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n# KIND, either express or implied.  See the License for the\n# specific language governing permissions and limitations\n# under the License.\n# pylint: disable=import-self, too-many-lines, len-as-condition, no-else-return, unused-variable, too-many-nested-blocks\n# pylint: disable=consider-iterating-dictionary, invalid-name, unused-argument, unused-variable, broad-except\n# pylint: disable=import-outside-toplevel, simplifiable-if-expression, unnecessary-comprehension\n\"\"\"PT: PyTorch frontend.\"\"\"\nimport itertools\nimport logging\n\nimport numpy as np\n\nimport tvm\nfrom tvm.ir import module as _module\n\nfrom .. import analysis as _analysis\nfrom .. import expr as _expr\nfrom .. import op as _op\nfrom .common import get_relay_op\nfrom .common import infer_shape as _infer_shape\nfrom .common import infer_value as _infer_value\n\nfrom . import qnn_torch\n\n__all__ = [\"from_pytorch\"]\n\n# operator implementation\ndef _elemwise(name):\n    def _impl(inputs, input_types):\n        # TODO: Figure out a better way to get typing to work for tensor + scalar\n        type0 = input_types[0]\n        if isinstance(inputs[1], _expr.Expr):\n            type0 = input_types[1]\n\n        type1 = input_types[1]\n        if isinstance(inputs[0], _expr.Expr):\n            type1 = input_types[0]\n\n        data0 = _convert_elemwise_input(inputs[0], type0)\n        data1 = _convert_elemwise_input(inputs[1], type1)\n\n        return get_relay_op(name)(data0, data1)\n    return _impl\n\ndef _unsqueeze():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        axis = inputs[1]\n\n        return _op.transform.expand_dims(data, int(axis), 1)\n    return _impl\n\ndef _concatenate():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        axis = inputs[1]\n\n        if isinstance(data, _expr.Expr):\n            data = [data]\n\n        return _op.tensor.concatenate(data, int(axis))\n    return _impl\n\ndef _slice():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        strides = []\n\n        if isinstance(data, _expr.Expr):\n            inferred_shape = _infer_shape(data)\n            end = []\n            for infer in inferred_shape:\n                end.append(int(infer))\n            if isinstance(data, _expr.Var):\n                end = inferred_shape\n                end = list(end)\n        else:\n            end = data.shape\n\n        begin = [0]*len(end)\n        dim = int(inputs[1])\n        begin[dim] = int(inputs[2])\n\n        if isinstance(inputs[3], str) and inputs[3].isdigit():\n            end[dim] = min(end[dim], int(inputs[3]))\n        else:\n            end[dim] = inputs[3]\n\n        strides.append(int(inputs[4]))\n        return _op.transform.strided_slice(data, begin, end, strides)\n    return _impl\n\ndef _select():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        dim = int(inputs[1])\n        index = int(inputs[2])\n\n        return _op.transform.take(data, _expr.const(index, dtype=\"int32\"), axis=dim)\n    return _impl\n\ndef _ones():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n\n        import torch\n        if isinstance(data, _expr.Expr):\n            shape = _infer_shape(data)\n        elif isinstance(data, list):\n            shape = data\n        elif isinstance(data, (torch.Tensor, np.ndarray)):\n            shape = data.shape\n        else:\n            assert \"data type {} could not be parsed in ones op\" % (type(data))\n\n        return _op.full(_expr.const(1), shape, dtype=_convert_data_type(input_types[0]))\n    return _impl\n\ndef _zeros():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n\n        import torch\n        if isinstance(data, _expr.Expr):\n            shape = _infer_shape(data)\n        elif isinstance(data, list):\n            shape = data\n        elif isinstance(data, (torch.Tensor, np.ndarray)):\n            shape = data.shape\n        else:\n            assert \"data type {} could not be parsed in zeros op\" % (type(data))\n\n        return _op.full(_expr.const(0), shape, dtype=_convert_data_type(input_types[0]))\n    return _impl\n\ndef _relu():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        if input_types[0] == \"quint8\":\n            assert len(inputs) == 3, \"Input quant param not found in op inputs\"\n            input_zero_point = _expr.const(inputs[2], dtype=\"int32\")\n            return qnn_torch.quantized_relu(data, input_zero_point)\n        return _op.nn.relu(data)\n    return _impl\n\ndef _adaptive_avg_2d():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        output_size = _infer_shape(inputs[1])\n\n        def func(x):\n            return _op.nn.adaptive_avg_pool2d(x, output_size=output_size)\n\n        if input_types[0] == \"quint8\":\n            return qnn_torch.quantized_adaptive_avg_2d(data, func)\n\n        return func(data)\n\n    return _impl\n\ndef _adaptive_max_2d():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        output_size = _infer_shape(inputs[1])\n\n        return _op.nn.adaptive_max_pool2d(\n            data,\n            output_size=output_size)\n    return _impl\n\ndef _maxpool_2d():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n\n        pool_size = _infer_shape(inputs[1])\n        strides = _infer_shape(inputs[2])\n        padding = _infer_shape(inputs[3])\n\n        ceil_mode = int(inputs[5])\n\n        return _op.nn.max_pool2d(data, pool_size, strides, padding, \"NCHW\", ceil_mode)\n    return _impl\n\ndef _hardtanh():\n    def _impl(inputs, input_types):\n        a = inputs[0]\n        tanh_min = float(inputs[1])\n        tanh_max = float(inputs[2])\n        return _op.tensor.clip(a, tanh_min, tanh_max)\n    return _impl\n\ndef _convolution():\n    def _impl(inputs, input_types):\n        # Use transpose or normal\n        use_transpose = True if inputs[6] == \"1\" else False\n\n        data = inputs[0]\n        weight = inputs[1]\n        bias = inputs[2]\n        strides = inputs[3]\n        padding = inputs[4]\n        dilation = inputs[5]\n\n        if isinstance(weight, _expr.Expr):\n            inferred_shape = _infer_shape(weight)\n            weight_shape = []\n            for infer in inferred_shape:\n                weight_shape.append(infer)\n        else:\n            assert \"data type {} could not be parsed in conv op\" % (type(weight))\n\n        # TODO: Add reshape when channel multiplier > 1. Pending PR #4644\n        channels = weight_shape[0]\n        groups = int(inputs[8])\n\n        if groups > 1:\n            # in torch, groups == in_channels for depth wise conv\n            channel_multiplier = channels // groups\n            new_weight_shape = (groups, channel_multiplier, weight_shape[2], weight_shape[3])\n            weight = _op.transform.reshape(weight, new_weight_shape)\n\n        kernel_size = weight_shape[2:]\n        use_bias = isinstance(bias, _expr.Expr)\n\n        if isinstance(strides, _expr.Expr):\n            strides = _infer_shape(strides)\n\n        if isinstance(padding, _expr.Expr):\n            padding = _infer_shape(padding)\n\n        if isinstance(dilation, _expr.Expr):\n            dilation = _infer_shape(dilation)\n\n        if use_transpose:\n            conv_out = _op.nn.conv2d_transpose(data,\n                                               weight,\n                                               strides=strides,\n                                               padding=padding,\n                                               dilation=dilation,\n                                               groups=groups,\n                                               channels=channels,\n                                               kernel_size=kernel_size,\n                                               data_layout=\"NCHW\",\n                                               kernel_layout=\"OIHW\",\n                                               out_layout=\"\",\n                                               out_dtype=\"\")\n        else:\n            conv_out = _op.nn.conv2d(data,\n                                     weight,\n                                     strides=strides,\n                                     padding=padding,\n                                     dilation=dilation,\n                                     groups=groups,\n                                     channels=channels,\n                                     kernel_size=kernel_size,\n                                     data_layout=\"NCHW\",\n                                     kernel_layout=\"OIHW\",\n                                     out_layout=\"\",\n                                     out_dtype=\"\")\n\n        if use_bias:\n            return _op.nn.bias_add(conv_out, bias)\n        else:\n            return conv_out\n    return _impl\n\ndef _softmax():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        axis = inputs[1]\n        if isinstance(axis, str):\n            axis = int(axis)\n\n        return _op.nn.softmax(data, axis=axis)\n    return _impl\n\ndef _threshold():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        return _op.nn.relu(data)\n    return _impl\n\ndef _contiguous():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        return _op.tensor.copy(data)\n    return _impl\n\ndef _batch_norm():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n        data_type = input_types[0]\n\n        channels = _infer_shape(data)\n\n        if isinstance(inputs[1], _expr.Expr) and isinstance(inputs[2], _expr.Expr):\n            scale = center = True\n            weight = inputs[1]\n            beta = inputs[2]\n            gamma = weight\n        else:\n            scale = center = False\n\n        if not scale:\n            gamma = _create_typed_const(np.ones([int(channels[1])]), data_type)\n\n        if not center:\n            beta = _create_typed_const(np.zeros([int(channels[1])]), data_type)\n\n        moving_mean = inputs[3]\n        moving_var = inputs[4]\n        epsilon = float(inputs[7])\n\n        return _op.nn.batch_norm(data,\n                                 gamma,\n                                 beta,\n                                 moving_mean,\n                                 moving_var,\n                                 axis=1,\n                                 epsilon=epsilon,\n                                 center=center,\n                                 scale=scale)[0]\n    return _impl\n\ndef _transpose():\n    def _impl(inputs, input_types):\n        data = inputs[0]\n\n        import torch\n        if isinstance(data, _expr.Expr):\n            ndims = len(_infer_shape(data))\n        elif isinstance(data, list):\n            ndims = data\n        elif isinstance(data, (torch.Tensor, np.ndarray)):\n            ndims = data.shape\n        else:\n            assert \"data type {} could not be parsed in transpose op\" % (type(data))\n\n        if isinstance(data, tvm.runtime.NDArray):\n            ndims = len(data.shape)\n        axes = list(range(ndims))\n\n        num_inputs = len(inputs)\n\n        if num_inputs == 1:\n            if ndims >= 2:\n                axes[-1] = ndims - 2\n                axes[-2] = ndims - 1\n            if not isinstance(data, _expr.Expr):\n                data = _expr.const(data)\n\n        elif num_inputs == 3:\n            parse = lambda i: ndims * (i < 0) + i\n            src, dst = [parse(int(inputs[i])) for i in [1, 2]]\n            axes[src] = dst\n            axes[dst] = src\n        else:\n            axes = inputs[1]\n        return _op.transform.transpose(data, axes)\n    return _impl\n\ndef _flatten():\n ",
+      "total_lines": 1193,
+      "ref": "93dff448b06a8fd6e133326cf8c32bb623817fc3"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_expand_as",
+      "class_name": null,
+      "start_line": 718,
+      "end_line": 725,
+      "satd_line": 720,
+      "matched_by": "normalized_source",
+      "source": "def _expand_as():\n    def _impl(inputs, input_types):\n        # TODO: maybe fix this\n        # This assumes expand_as can be removed because TVM has broadcast op\n        msg = \"aten::expand_as(...) found, assume it is part of broadcast op\"\n        logging.warning(msg)\n        return inputs[0]\n    return _impl",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "_impl",
+        "inputs",
+        "logging"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "no_retrieval_eligible_method_symbol"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

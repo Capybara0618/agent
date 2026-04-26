@@ -1286,53 +1286,52 @@ class OpenAIAnalyzer:
     def __init__(self, client: OpenAICompatClient) -> None:
         self.client = client
 
-    def run(self, state: GraphState) -> AnalysisResult:
-        context_summary = self._build_analyzer_context_summary(state.get("github_context"))
+    def run(self, state: GraphState, method_context_block: str = "[none]") -> AnalysisResult:
+        method_inquiry = state.get("method_inquiry")
+        required_methods = method_inquiry.required_methods if isinstance(method_inquiry, MethodInquiryResult) else []
+        missing_method_names = [str(item) for item in (state.get("missing_method_names") or []) if str(item).strip()]
+        retrieved_method_count = len(state.get("retrieved_method_contexts") or [])
+        missing_method_count = len(missing_method_names)
+        edit_constraints = [
+            item for item in (state.get("edit_constraints") or []) if isinstance(item, EditConstraint)
+        ]
+        repair_evidence_mode = "strong" if retrieved_method_count else "weak"
         system_prompt = (
-            "You are a SATD triage analyzer for generic SATD items only.\n"
-            "Your job is not to repair code.\n"
-            "Your job is to judge whether this SATD is a good candidate for automatic local repair.\n"
-            "Use only the SATD comment and the current code snippet.\n"
-            "Judge the item using four questions:\n"
-            "1. Does the SATD request a concrete editing operation rather than open-ended implementation, investigation, or design work?\n"
-            "2. Is the repair target localizable in the snippet?\n"
-            "3. Does the change appear local in scope?\n"
-            "4. Is the desired end state clear enough from the comment and snippet to attempt a local repair?\n"
-            "Decision policy:\n"
-            "- PASS: the SATD describes a clear local repair target that is visible or strongly implied in the snippet.\n"
-            "- UNCERTAIN: the SATD may still be repairable, but the target, intent, or scope is not clear enough for confident filtering.\n"
-            "- DROP: the SATD is clearly not a good candidate for automatic local repair because it is refactor-like, clearly non-local, or lacks any identifiable local repair target.\n"
-            "Do not assume extra repository facts.\n"
-            "Do not propose repairs.\n"
-            "Do not explain at length.\n"
-            "Do not think about whether a human expert could eventually fix it.\n"
-            "Decide only whether this is a good candidate for automatic local repair now.\n\n"
-            "Important:\n"
-            "- Prefer UNCERTAIN over DROP when evidence is mixed.\n"
-            "- Use DROP only for strong structural reasons, not just because the task looks difficult.\n"
-            "- Question-like wording, future-timing wording, or tentative wording are not automatic DROP signals.\n"
-            "- If a local code target is visible, prefer PASS or UNCERTAIN rather than DROP.\n"
-            "- Use the levels high / partial / low for each dimension.\n"
-            "- Treat the four dimension judgments seriously: they should reflect the actual evidence in the comment and snippet.\n"
-            "- Set operation_concrete=high only when the request implies a concrete edit such as remove, replace, annotate, document, adjust a return or raise path, or update a specific value or branch.\n"
-            "- Set operation_concrete=partial when the edit direction exists but is still somewhat open-ended, such as adding a check or enabling a path without a fully specified edit. If the comment already points to an existing API, parameter, key, path, branch, exception path, or value replacement target, it should be at least partial.\n"
-            "- Set operation_concrete=low only for open-ended implementation, design decisions, debugging, investigation, broad cleanup, or other underspecified work.\n"
-            "- If the comment already refers to an existing local object, API, parameter, key, path, branch, block, value, or current code path, operation_concrete should usually be at least partial unless the task is still clearly open-ended.\n"
-            "- Set localizable=high only if the snippet shows a concrete edit target such as a symbol, call, parameter, branch, return statement, exception path, variable, or doc block to change.\n"
-            "- Set localizable=partial when the rough area is visible but the exact local edit target is still unclear. If the current statement, call, key, parameter, branch, or code block is already visible, it should be at least partial.\n"
-            "- Set localizable=low only when the snippet does not expose any credible local target to edit.\n"
-            "- Set local_scope=high only if the change appears solvable within one local block or function without broader refactoring.\n"
-            "- Set local_scope=partial when the change still looks mostly local but may need a small amount of nearby surrounding context. If the discussion is still centered on the current function or block, it should be at least partial.\n"
-            "- Set local_scope=low only when the task looks cross-cutting, architectural, global, or broader than a local edit.\n"
-            "- Set end_state_clear=high only if the desired repaired state is reasonably clear from the comment and snippet, even if future timing or external versions are mentioned.\n"
-            "- Set end_state_clear=partial when the intended direction is visible but the exact repaired state is not fully pinned down.\n"
-            "- Set end_state_clear=low only when the final intended state is genuinely ambiguous, requires product or design choices, or depends on unspecified broader behavior.\n"
-            "- If the comment points to an existing local object or current code path, end_state_clear should usually be at least partial unless the request is still fundamentally open-ended or design-level.\n"
-            "Return strict JSON only."
+            "You are the analyzer agent in a SATD repair workflow. "
+            "Return valid JSON only with keys: decision, confidence, operation_concrete, localizable, "
+            "local_scope, end_state_clear, context_sufficiency, method_context_used, drop_reason, "
+            "comment_evidence, code_evidence, notes. "
+            "Your job is to decide whether the SATD should enter the fixer agent. "
+            "Do not repair the code. Do not output repaired_code. Do not propose replacement code."
         )
         user_prompt = (
-            f"SATD comment:\n{state['satd_comment']}\n\n"
-            f"Current code snippet:\n```python\n{state['original_code']}\n```\n\n"
+            "Analyze whether the SATD is suitable for automatic local repair.\n\n"
+            f"### SATD comment:\n{state['satd_comment']}\n\n"
+            f"### Code:\n```python\n{state['original_code']}\n```\n\n"
+            f"### Required methods:\n{self._format_required_methods(required_methods)}\n\n"
+            f"### Supporting evidence:\n{method_context_block or '[none]'}\n\n"
+            f"### Missing methods:\n{self._format_missing_methods(missing_method_names)}\n\n"
+            f"### Edit constraints:\n{self._format_analyzer_constraints(edit_constraints)}\n\n"
+            "### Context quality:\n"
+            f"retrieved_method_count: {retrieved_method_count}\n"
+            f"missing_method_count: {missing_method_count}\n"
+            f"repair_evidence_mode: {repair_evidence_mode}\n\n"
+            "### Hard rules:\n"
+            "- Return decision=\"pass\" when the SATD has a clear local repair target and the supporting evidence makes a small automatic repair plausible.\n"
+            "- Return decision=\"uncertain\" when the SATD may be repairable but the exact edit, target, or supporting method context is incomplete.\n"
+            "- Return decision=\"drop\" only when the SATD is clearly unsuitable for automatic local repair.\n"
+            "- Prefer uncertain over drop when evidence is mixed.\n"
+            "- Do not drop only because a method is missing.\n"
+            "- Do not drop only because the repair looks difficult.\n"
+            "- Drop broad, open-ended, architectural, migration, investigation, redesign, or product-decision tasks.\n"
+            "- Use supporting evidence only to judge target existence, locality, context sufficiency, and repairability.\n"
+            "- Do not let retrieved method context override an unclear SATD comment.\n"
+            "- If the SATD asks to decide, investigate, figure out, redesign, rewrite, refactor, implement an unspecified behavior, or optimize broadly, return decision=\"drop\" unless the code and evidence expose a specific small edit.\n"
+            "- Return decision=\"drop\" when both the requested operation and the desired end state are too unclear to write a local patch.\n"
+            "- Return decision=\"drop\" when supporting evidence only proves that related methods exist but does not identify what should change.\n"
+            "- For generic SATD, pass requires both a concrete operation and a local target; method context alone is insufficient.\n"
+            "- Do not generate repaired code.\n"
+            "- Do not invent repository facts not present in the code or supporting evidence.\n\n"
             "Return JSON with exactly:\n"
             "{\n"
             '  "decision": "pass" | "uncertain" | "drop",\n'
@@ -1341,13 +1340,42 @@ class OpenAIAnalyzer:
             '  "localizable": "high" | "partial" | "low",\n'
             '  "local_scope": "high" | "partial" | "low",\n'
             '  "end_state_clear": "high" | "partial" | "low",\n'
-            '  "comment_evidence": "short quote or phrase from the comment",\n'
-            '  "code_evidence": "short phrase describing the visible target or missing target",\n'
+            '  "context_sufficiency": "high" | "partial" | "low",\n'
+            '  "method_context_used": true,\n'
+            '  "drop_reason": "",\n'
+            '  "comment_evidence": "short phrase from the SATD comment",\n'
+            '  "code_evidence": "short phrase from code or supporting evidence",\n'
             '  "notes": "one short sentence"\n'
             "}\n"
         )
         payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"analyze:task_{state['task_id']}")
         return self._coerce_analysis(payload, state, source="llm_stage1")
+
+    def _format_required_methods(self, methods: list[str]) -> str:
+        items = [str(item).strip() for item in methods if str(item).strip()]
+        return ", ".join(items) if items else "[none]"
+
+    def _format_missing_methods(self, methods: list[str]) -> str:
+        items = [str(item).strip() for item in methods if str(item).strip()]
+        return ", ".join(items) if items else "[none]"
+
+    def _format_analyzer_constraints(self, edit_constraints: list[EditConstraint]) -> str:
+        lines = [
+            "- Make the smallest plausible local edit.",
+            "- Preserve the existing function/class signature unless the SATD explicitly asks for a signature-local fix.",
+            "- Do not add new helpers, new control flow, or unrelated rewrites without evidence.",
+        ]
+        for item in edit_constraints[:3]:
+            focus = str(item.focus_point or "").strip()
+            if focus:
+                lines.append(f"- Focus on: {focus}")
+            must_do = str(item.must_do or "").strip()
+            if must_do:
+                lines.append(f"- Must do: {must_do}")
+            must_not_do = str(item.must_not_do or "").strip()
+            if must_not_do:
+                lines.append(f"- Must not do: {must_not_do}")
+        return "\n".join(lines)
 
     def _build_analyzer_context_summary(self, bundle: dict[str, Any] | None) -> str:
         if not bundle:
@@ -1440,7 +1468,13 @@ class OpenAIAnalyzer:
             local_scope=local_scope,
             end_state_clear=end_state_clear,
         )
-        notes = self._one_line(payload.get("notes") or payload.get("reason") or payload.get("evidence_summary") or "")
+        notes = self._one_line(
+            payload.get("notes")
+            or payload.get("drop_reason")
+            or payload.get("reason")
+            or payload.get("evidence_summary")
+            or ""
+        )
         comment_evidence = self._one_line(payload.get("comment_evidence"))
         code_evidence = self._one_line(payload.get("code_evidence"))
         satd_type = str(state.get("satd_route_type") or "generic")
@@ -1451,6 +1485,24 @@ class OpenAIAnalyzer:
             local_scope=local_scope,
             end_state_clear=end_state_clear,
         )
+        strict_drop_reason = self._strict_generic_drop_reason(
+            state=state,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
+        )
+        if strict_drop_reason:
+            decision = "drop"
+            confidence = max(confidence, 0.70)
+            if strict_drop_reason == "open_ended_without_specific_local_edit":
+                operation_concrete = "low"
+                end_state_clear = "low"
+            elif strict_drop_reason == "not_local_repair":
+                local_scope = "low"
+            elif strict_drop_reason == "target_not_localizable":
+                localizable = "low"
+            notes = self._append_analysis_note(notes, f"Analyzer strict drop: {strict_drop_reason}.")
         return self._build_result(
             decision=decision,
             confidence=confidence,
@@ -1465,6 +1517,69 @@ class OpenAIAnalyzer:
             source=source,
             scope_radius=self._infer_scope_radius_from_code(state.get("original_code") or ""),
         )
+
+    def _strict_generic_drop_reason(
+        self,
+        *,
+        state: GraphState,
+        operation_concrete: str | None,
+        localizable: str | None,
+        local_scope: str | None,
+        end_state_clear: str | None,
+    ) -> str:
+        if str(state.get("satd_route_type") or "generic").strip().lower() != "generic":
+            return ""
+        comment = str(state.get("satd_comment") or "")
+        code = str(state.get("original_code") or "")
+        open_ended_comment = self._looks_open_ended_task(comment)
+        if operation_concrete == "low" and end_state_clear == "low":
+            return "unclear_operation_and_end_state"
+        if localizable == "low" and (
+            operation_concrete == "low" or end_state_clear == "low" or open_ended_comment
+        ):
+            return "target_not_localizable"
+        if local_scope == "low" and (
+            operation_concrete == "low" or end_state_clear == "low" or open_ended_comment
+        ):
+            return "not_local_repair"
+        if open_ended_comment and not self._has_strong_local_edit_signal(comment, code):
+            return "open_ended_without_specific_local_edit"
+        return ""
+
+    def _has_strong_local_edit_signal(self, comment: str, code: str) -> bool:
+        lowered = (comment or "").lower()
+        if not lowered.strip() or not (code or "").strip():
+            return False
+        strong_patterns = [
+            r"\bremove\b",
+            r"\bdelete\b",
+            r"\breplace\b",
+            r"\brename\b",
+            r"\bswitch to\b",
+            r"\buse .{1,80}\binstead\b",
+            r"\binstead of\b",
+            r"\bdeprecated\b.{0,80}\buse\b",
+            r"\bannotat",
+            r"\bdocument\b",
+            r"\bdocstring\b",
+            r"\bmissing doc\b",
+            r"\bupdate description\b",
+            r"\bchange (?:the )?(?:default|value|return|exception|error|message|type)\b",
+            r"\badd (?:a |an |the )?missing (?:argument|parameter|annotation|doc|string|check|guard)\b",
+            r"\bhandle (?:a |an |the )?(?:missing|none|null|empty|exception|error)\b",
+            r"\braise (?:a |an |the )?(?:specific )?(?:exception|error)\b",
+            r"\breturn (?:a |an |the )?(?:specific |default |empty |none|null|false|true)",
+        ]
+        return any(re.search(pattern, lowered) for pattern in strong_patterns)
+
+    def _append_analysis_note(self, notes: str, addition: str) -> str:
+        base = self._one_line(notes)
+        extra = self._one_line(addition)
+        if not base:
+            return extra
+        if not extra:
+            return base
+        return self._one_line(f"{base} {extra}")
 
     def _build_result(
         self,
@@ -1666,14 +1781,27 @@ class OpenAIAnalyzer:
         open_ended_patterns = [
             r"\bimplement\b",
             r"\bdecide\b",
+            r"\bdecide whether\b",
             r"\bconsider\b",
+            r"\bfigure out\b",
+            r"\bmechanism\b",
+            r"\bdetermine\b",
             r"\binvestigat",
             r"\blook into\b",
             r"\bdebug\b",
             r"\brefactor\b",
             r"\brewrite\b",
             r"\bredesign\b",
+            r"\bdeprecat",
             r"\bclean up\b",
+            r"\bfrom scratch\b",
+            r"\boptimi[sz]e\b",
+            r"\bperformance\b",
+            r"\bmemory\b",
+            r"\bexploding memory\b",
+            r"\badd this\b",
+            r"\b1:1\b",
+            r"\b1:many\b",
             r"\bglobal\b",
             r"\barchitecture\b",
             r"\bintegration\b",
@@ -1937,6 +2065,100 @@ class OpenAIFixer:
         candidate_mode: str = "baseline_context",
     ) -> tuple[RepairAttempt, MethodInquiryResult, list[RetrievedMethodContext], list[str], list[UncertaintyItem], list[EditConstraint]]:
         round_id = state["round_id"] + 1
+        (
+            method_inquiry,
+            found_method_contexts,
+            missing_method_names,
+            uncertainty_items,
+            edit_constraints,
+            _method_context_block,
+        ) = self._method_context_from_state(state, candidate_mode=candidate_mode)
+        effective_candidate_mode = self._effective_candidate_mode(candidate_mode, found_method_contexts)
+        self._checkpoint(
+            state,
+            stage="generation_start",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": candidate_mode,
+                "required_methods": list(method_inquiry.required_methods),
+                "method_notes": self._serialize_method_notes(method_inquiry.method_notes),
+                "uncertainty_items": self._serialize_uncertainty_items(uncertainty_items),
+                "retrieved_method_contexts": self._serialize_retrieved_method_contexts(found_method_contexts),
+                "missing_method_names": list(missing_method_names),
+                "edit_constraints": self._serialize_edit_constraints(edit_constraints),
+            },
+        )
+        system_prompt, user_prompt = self._build_repair_prompts(
+            state=state,
+            round_id=round_id,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=found_method_contexts,
+            missing_method_names=missing_method_names,
+            edit_constraints=edit_constraints,
+        )
+        payload = self.client.generate_json(
+            system_prompt,
+            user_prompt,
+            request_label=f"repair:task_{state['task_id']}:round_{round_id}:candidate_{effective_candidate_mode}",
+            max_tokens=self._repair_max_tokens(),
+        )
+        repaired_code = str(payload.get("repaired_code") or state["original_code"])
+        repair_plan = self._default_repair_plan(state)
+        changed_scope = self._infer_changed_scope(state["original_code"], repaired_code)
+        confidence = self._default_repair_confidence(state, repaired_code, found_method_contexts)
+        notes = "repair metadata generated locally"
+        if method_inquiry.required_methods and not found_method_contexts:
+            notes = f"{notes} | no_method_context_found"
+        elif found_method_contexts:
+            notes = f"{notes} | method_contexts={len(found_method_contexts)}"
+        else:
+            notes = f"{notes} | no_required_methods_identified"
+
+        em_risk_notes = self._em_risk_notes(state["original_code"], repaired_code)
+        if em_risk_notes:
+            confidence = min(confidence, 0.42)
+            notes = f"{notes} | em_risk={','.join(em_risk_notes)}"
+        self._log(
+            state,
+            f"repair output scope={changed_scope} confidence={confidence:.2f} mode={effective_candidate_mode}"
+        )
+        self._checkpoint(
+            state,
+            stage="generation_done",
+            payload={
+                "round_id": round_id,
+                "candidate_mode": effective_candidate_mode,
+                "repair_plan": repair_plan,
+                "repaired_code": repaired_code,
+                "changed_scope": changed_scope,
+                "confidence": confidence,
+                "notes": notes,
+            },
+        )
+
+        return (
+            RepairAttempt(
+                round_id=round_id,
+                repair_plan=repair_plan,
+                repaired_code=repaired_code,
+                changed_scope=changed_scope,
+                confidence=confidence,
+                notes=notes,
+                candidate_mode=effective_candidate_mode,
+            ),
+            method_inquiry,
+            found_method_contexts,
+            missing_method_names,
+            uncertainty_items,
+            edit_constraints,
+        )
+
+    def prepare_method_context(
+        self,
+        state: GraphState,
+        candidate_mode: str = "baseline_context",
+    ) -> tuple[MethodInquiryResult, list[RetrievedMethodContext], list[str], list[UncertaintyItem], list[EditConstraint], str]:
+        round_id = state["round_id"] + 1
         use_method_context = self._candidate_uses_method_context(candidate_mode)
         self._checkpoint(
             state,
@@ -2051,83 +2273,64 @@ class OpenAIFixer:
                 "edit_constraints": self._serialize_edit_constraints(edit_constraints),
             },
         )
-        self._checkpoint(
-            state,
-            stage="generation_start",
-            payload={
-                "round_id": round_id,
-                "candidate_mode": candidate_mode,
-                "required_methods": list(method_inquiry.required_methods),
-                "method_notes": self._serialize_method_notes(method_inquiry.method_notes),
-                "uncertainty_items": self._serialize_uncertainty_items(uncertainty_items),
-                "retrieved_method_contexts": self._serialize_retrieved_method_contexts(retrieved_method_contexts),
-                "missing_method_names": list(missing_method_names),
-                "edit_constraints": self._serialize_edit_constraints(edit_constraints),
-            },
-        )
-        system_prompt, user_prompt = self._build_repair_prompts(
-            state=state,
-            round_id=round_id,
-            method_inquiry=method_inquiry,
-            retrieved_method_contexts=found_method_contexts,
-            missing_method_names=missing_method_names,
-            edit_constraints=edit_constraints,
-        )
-        payload = self.client.generate_json(
-            system_prompt,
-            user_prompt,
-            request_label=f"repair:task_{state['task_id']}:round_{round_id}:candidate_{effective_candidate_mode}",
-            max_tokens=self._repair_max_tokens(),
-        )
-        repaired_code = str(payload.get("repaired_code") or state["original_code"])
-        repair_plan = self._default_repair_plan(state)
-        changed_scope = self._infer_changed_scope(state["original_code"], repaired_code)
-        confidence = self._default_repair_confidence(state, repaired_code, found_method_contexts)
-        notes = "repair metadata generated locally"
-        if method_inquiry.required_methods and not found_method_contexts:
-            notes = f"{notes} | no_method_context_found"
-        elif found_method_contexts:
-            notes = f"{notes} | method_contexts={len(found_method_contexts)}"
-        else:
-            notes = f"{notes} | no_required_methods_identified"
-
-        em_risk_notes = self._em_risk_notes(state["original_code"], repaired_code)
-        if em_risk_notes:
-            confidence = min(confidence, 0.42)
-            notes = f"{notes} | em_risk={','.join(em_risk_notes)}"
-        self._log(
-            state,
-            f"repair output scope={changed_scope} confidence={confidence:.2f} mode={effective_candidate_mode}"
-        )
-        self._checkpoint(
-            state,
-            stage="generation_done",
-            payload={
-                "round_id": round_id,
-                "candidate_mode": effective_candidate_mode,
-                "repair_plan": repair_plan,
-                "repaired_code": repaired_code,
-                "changed_scope": changed_scope,
-                "confidence": confidence,
-                "notes": notes,
-            },
-        )
+        method_context_block = "[none]"
+        if self._candidate_uses_method_context(candidate_mode):
+            method_context_block = self._format_method_context_block(
+                state=state,
+                method_inquiry=method_inquiry,
+                retrieved_method_contexts=found_method_contexts,
+                missing_method_names=missing_method_names,
+            )
 
         return (
-            RepairAttempt(
-                round_id=round_id,
-                repair_plan=repair_plan,
-                repaired_code=repaired_code,
-                changed_scope=changed_scope,
-                confidence=confidence,
-                notes=notes,
-                candidate_mode=effective_candidate_mode,
-            ),
             method_inquiry,
             found_method_contexts,
             missing_method_names,
             uncertainty_items,
             edit_constraints,
+            method_context_block,
+        )
+
+    def _method_context_from_state(
+        self,
+        state: GraphState,
+        candidate_mode: str,
+    ) -> tuple[MethodInquiryResult, list[RetrievedMethodContext], list[str], list[UncertaintyItem], list[EditConstraint], str]:
+        if not self._candidate_uses_method_context(candidate_mode):
+            method_inquiry = MethodInquiryResult(reason="candidate_mode_without_method_context")
+            return method_inquiry, [], [], [], [], "[none]"
+        method_inquiry = state.get("method_inquiry")
+        if not isinstance(method_inquiry, MethodInquiryResult):
+            method_inquiry = MethodInquiryResult(reason="analyzer_method_context_not_available")
+        retrieved_method_contexts = [
+            item
+            for item in (state.get("retrieved_method_contexts") or [])
+            if isinstance(item, RetrievedMethodContext)
+        ]
+        missing_method_names = [str(item) for item in (state.get("missing_method_names") or []) if str(item).strip()]
+        uncertainty_items = [
+            item
+            for item in (state.get("uncertainty_items") or [])
+            if isinstance(item, UncertaintyItem)
+        ]
+        edit_constraints = [
+            item
+            for item in (state.get("edit_constraints") or [])
+            if isinstance(item, EditConstraint)
+        ]
+        method_context_block = self._format_method_context_block(
+            state=state,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=retrieved_method_contexts,
+            missing_method_names=missing_method_names,
+        )
+        return (
+            method_inquiry,
+            retrieved_method_contexts,
+            missing_method_names,
+            uncertainty_items,
+            edit_constraints,
+            method_context_block,
         )
 
     def identify_required_methods(self, state: GraphState) -> MethodInquiryResult:

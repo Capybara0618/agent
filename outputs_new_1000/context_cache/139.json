@@ -1,0 +1,130 @@
+{
+  "task_id": "139",
+  "repo_owner": "leapcode",
+  "repo_name": "bitmask-dev",
+  "file_path": "src/leap/bitmask/vpn/tunnel.py",
+  "commit": "2d7543e8c3828a8a0ab7b77b1c3a492c7ff28ed7",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T07:13:32+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "2d7543e8c3828a8a0ab7b77b1c3a492c7ff28ed7",
+    "symbol_name": "_start_vpn",
+    "satd_line": 110,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 2,
+    "same_class_methods_count": 2,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 4,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T07:13:32+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 3,
+    "retrieved_method_count": 2,
+    "missing_method_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "src/leap/bitmask/vpn/tunnel.py",
+    "original_signature": "def _start_vpn(self):",
+    "target_file": {
+      "ok": true,
+      "path": "src/leap/bitmask/vpn/tunnel.py",
+      "sha": "d05a50e215c842c6347573314ab1d8fc22cdf181",
+      "download_url": "https://raw.githubusercontent.com/leapcode/bitmask-dev/2d7543e8c3828a8a0ab7b77b1c3a492c7ff28ed7/src/leap/bitmask/vpn/tunnel.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# manager.py\n# Copyright (C) 2015 LEAP\n#\n# This program is free software: you can redistribute it and/or modify\n# it under the terms of the GNU General Public License as published by\n# the Free Software Foundation, either version 3 of the License, or\n# (at your option) any later version.\n#\n# This program is distributed in the hope that it will be useful,\n# but WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n# GNU General Public License for more details.\n#\n# You should have received a copy of the GNU General Public License\n# along with this program.  If not, see <http://www.gnu.org/licenses/>.\n\n\"\"\"\nVPN Tunnel.\n\"\"\"\n\nimport os\nimport tempfile\n\nfrom twisted.internet import reactor, defer\nfrom twisted.logger import Logger\n\nfrom ._config import _TempVPNConfig, _TempProviderConfig\nfrom .constants import IS_WIN\nfrom .process import VPNProcess\n\n\n# TODO ----------------- refactor --------------------\n# [ ] register change state listener\n# emit_async(catalog.VPN_STATUS_CHANGED)\n# [ ] catch ping-restart\n# 'NETWORK_UNREACHABLE': (\n#    'Network is unreachable (code=101)',),\n# 'PROCESS_RESTART_TLS': (\n#    \"SIGTERM[soft,tls-error]\",),\n# TODO ----------------- refactor --------------------\n\n\nclass ConfiguredTunnel(object):\n\n    \"\"\"\n    A ConfiguredTunne holds the configuration for a VPN connection, and allows\n    to control that connection.\n\n    This is the high-level object that the service knows about.\n    It exposes the start and terminate methods for the VPN Tunnel.\n\n    On start, it spawns a VPNProcess instance that will use a vpnlauncher\n    suited for the running platform and connect to the management interface\n    opened by the openvpn process, executing commands over that interface on\n    demand.\n    \"\"\"\n\n    log = Logger()\n\n    def __init__(self, provider, remotes, cert_path, key_path, ca_path,\n                 extra_flags):\n        \"\"\"\n        :param remotes: a list of gateways tuple (ip, port) looking like this:\n            ((ip1, portA), (ip2, portB), ...)\n        :type remotes: tuple of tuple(str, int)\n        \"\"\"\n        self._remotes = remotes\n        ports = []\n\n        self._vpnconfig = _TempVPNConfig(extra_flags, cert_path, ports)\n        self._providerconfig = _TempProviderConfig(provider, ca_path)\n\n        host, port = _get_management_location()\n        self._host = host\n        self._port = port\n        self._vpnproc = None\n\n    def start(self):\n        return self._start_vpn()\n\n    def stop(self):\n        return self._stop_vpn(restart=False)\n\n    #  status\n\n    @property\n    def status(self):\n        if not self._vpnproc:\n            return {'status': 'off', 'error': None}\n        return self._vpnproc.status\n\n    @property\n    def traffic_status(self):\n        return self._vpnproc.traffic_status\n\n    # VPN Control\n\n    def _start_vpn(self):\n        self.log.debug('VPN: start')\n        args = [self._vpnconfig, self._providerconfig, self._host,\n                self._port]\n        kwargs = {'openvpn_verb': 4, 'remotes': self._remotes,\n                  'restartfun': self._restart_vpn}\n        vpnproc = VPNProcess(*args, **kwargs)\n        self._vpnproc = vpnproc\n\n        self._start_pre_up(vpnproc)\n        cmd = self.__start_get_cmd(vpnproc)\n        # XXX this should be a deferred\n        running = self.__start_spawn_proc(vpnproc, cmd)\n        if running:\n            vpnproc.pid = running.pid\n            return True\n        else:\n            return False\n\n    def __start_pre_up(self, proc):\n        try:\n            proc.preUp()\n        except Exception as exc:\n            self.log.error('Error on vpn pre-up {0!r}'.format(exc))\n            raise\n\n    def __start_get_cmd(self, proc):\n        try:\n            cmd = proc.getCommand()\n        except Exception as exc:\n            self.log.error(\n                'Error while getting vpn command... {0!r}'.format(exc))\n            raise\n        return cmd\n\n    def __start_spawn_proc(self, proc, cmd):\n        env = os.environ\n        try:\n            running_p = reactor.spawnProcess(proc, cmd[0], cmd, env)\n        except Exception as e:\n            self.log.error(\n                'Error while spawning vpn process... {0!r}'.format(e))\n            return False\n        return running_p\n\n    @defer.inlineCallbacks\n    def _restart_vpn(self):\n        yield self.stop(restart=True)\n        reactor.callLater(\n            self.RESTART_WAIT, self.start)\n\n    def _stop_vpn(self, restart=False):\n        \"\"\"\n        Stops the openvpn subprocess.\n\n        Attempts to send a SIGTERM first, and after a timeout\n        it sends a SIGKILL.\n\n        :param restart: whether this stop is part of a hard restart.\n        :type restart: bool\n        \"\"\"\n        # TODO how to return False if this fails\n        # XXX maybe return a deferred\n\n        if self._vpnproc is None:\n            self.log.debug('Tried to stop VPN but no process found')\n            return\n\n        self._vpnproc.restarting = restart\n        self.__stop_pre_down(self._vpnproc)\n        self._vpnproc.terminate_or_kill()\n\n    def __stop_pre_down(self, proc):\n        try:\n            proc.preDown()\n        except Exception as e:\n            self.log.error('Error on vpn pre-down {0!r}'.format(e))\n            raise\n\n\n# utils\n\n\ndef _get_management_location():\n    \"\"\"\n    Return a tuple with the host (socket) and port to be used for VPN.\n\n    :return: (host, port)\n    :rtype: tuple (str, str)\n    \"\"\"\n    if IS_WIN:\n        host = \"localhost\"\n        port = \"9876\"\n    else:\n        host = os.path.join(\n            tempfile.mkdtemp(prefix=\"leap-tmp\"), 'openvpn.socket')\n        port = \"unix\"\n    return host, port\n",
+      "total_lines": 196,
+      "ref": "2d7543e8c3828a8a0ab7b77b1c3a492c7ff28ed7"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_start_vpn",
+      "class_name": "ConfiguredTunnel",
+      "start_line": 99,
+      "end_line": 116,
+      "satd_line": 110,
+      "matched_by": "normalized_source",
+      "source": "    def _start_vpn(self):\n        self.log.debug('VPN: start')\n        args = [self._vpnconfig, self._providerconfig, self._host,\n                self._port]\n        kwargs = {'openvpn_verb': 4, 'remotes': self._remotes,\n                  'restartfun': self._restart_vpn}\n        vpnproc = VPNProcess(*args, **kwargs)\n        self._vpnproc = vpnproc\n\n        self._start_pre_up(vpnproc)\n        cmd = self.__start_get_cmd(vpnproc)\n        # XXX this should be a deferred\n        running = self.__start_spawn_proc(vpnproc, cmd)\n        if running:\n            vpnproc.pid = running.pid\n            return True\n        else:\n            return False",
+      "calls": [
+        "VPNProcess"
+      ],
+      "self_calls": [
+        "__start_get_cmd",
+        "__start_spawn_proc",
+        "_start_pre_up"
+      ],
+      "self_attrs": [
+        "__start_get_cmd",
+        "__start_spawn_proc",
+        "_host",
+        "_port",
+        "_providerconfig",
+        "_remotes",
+        "_restart_vpn",
+        "_start_pre_up",
+        "_vpnconfig",
+        "_vpnproc",
+        "log"
+      ],
+      "global_uses": [
+        "VPNProcess"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "_start_pre_up",
+        "__start_get_cmd",
+        "__start_spawn_proc"
+      ],
+      "reason": "These methods are directly involved in the process of starting the VPN and are crucial for understanding how to implement the deferred functionality indicated by the comment."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "ConfiguredTunnel.__start_get_cmd",
+        "path": "src/leap/bitmask/vpn/tunnel.py",
+        "class_name": "ConfiguredTunnel",
+        "start_line": 125,
+        "end_line": 132,
+        "source": "def __start_get_cmd(self, proc):\n        try:\n            cmd = proc.getCommand()\n        except Exception as exc:\n            self.log.error(\n                'Error while getting vpn command... {0!r}'.format(exc))\n            raise\n        return cmd",
+        "found": true
+      },
+      {
+        "method_name": "ConfiguredTunnel.__start_spawn_proc",
+        "path": "src/leap/bitmask/vpn/tunnel.py",
+        "class_name": "ConfiguredTunnel",
+        "start_line": 134,
+        "end_line": 142,
+        "source": "def __start_spawn_proc(self, proc, cmd):\n        env = os.environ\n        try:\n            running_p = reactor.spawnProcess(proc, cmd[0], cmd, env)\n        except Exception as e:\n            self.log.error(\n                'Error while spawning vpn process... {0!r}'.format(e))\n            return False\n        return running_p",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "_start_pre_up"
+    ]
+  },
+  "review_context": {}
+}

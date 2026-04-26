@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from satd_langgraph.agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer
 from satd_langgraph.github_tools import GitHubToolbox
-from satd_langgraph.schema import MethodInquiryResult, RepairAttempt, ReviewResult
+from satd_langgraph.schema import EditConstraint, MethodInquiryResult, RepairAttempt, RetrievedMethodContext, ReviewResult
 from satd_langgraph.workflow import LangGraphSATDWorkflow
 
 
@@ -149,6 +149,111 @@ class ContextPromptSafetyTests(unittest.TestCase):
         self.assertEqual(repair.repaired_code, "def f():\n    return 2\n")
         self.assertEqual(client.kwargs.get("max_tokens"), 4096)
 
+    def test_analyzer_prompt_uses_method_context_sections(self) -> None:
+        client = _FakeReviewClient(
+            {
+                "decision": "pass",
+                "confidence": 0.82,
+                "operation_concrete": "high",
+                "localizable": "high",
+                "local_scope": "high",
+                "end_state_clear": "high",
+                "context_sufficiency": "high",
+                "method_context_used": True,
+                "drop_reason": "",
+                "comment_evidence": "handle missing config",
+                "code_evidence": "read_json supports default",
+                "notes": "The repair target is local.",
+            }
+        )
+        analyzer = OpenAIAnalyzer(client)
+        state = {
+            "task_id": "unit",
+            "satd_comment": "TODO: handle missing config file gracefully",
+            "original_code": "def load_config(path):\n    return read_json(path)\n",
+            "satd_route_type": "generic",
+            "method_inquiry": MethodInquiryResult(required_methods=["read_json"], reason="needed for behavior"),
+            "retrieved_method_contexts": [
+                RetrievedMethodContext(
+                    method_name="read_json",
+                    path="pkg/config.py",
+                    class_name=None,
+                    start_line=1,
+                    end_line=2,
+                    source="def read_json(path, default=None):\n    return default\n",
+                    found=True,
+                    signature="read_json(path, default=None)",
+                )
+            ],
+            "missing_method_names": [],
+            "edit_constraints": [EditConstraint(focus_point="read_json call", must_do="use existing default argument")],
+        }
+        result = analyzer.run(
+            state,
+            method_context_block="- method: read_json\n  method behavior:\n    def read_json(path, default=None): ...",
+        )
+
+        self.assertTrue(result.repairable)
+        self.assertIn("### Required methods:", client.user_prompt)
+        self.assertIn("read_json", client.user_prompt)
+        self.assertIn("### Supporting evidence:", client.user_prompt)
+        self.assertIn("def read_json(path, default=None)", client.user_prompt)
+        self.assertIn("### Context quality:", client.user_prompt)
+        self.assertIn("repair_evidence_mode: strong", client.user_prompt)
+        self.assertIn("method context alone is insufficient", client.user_prompt)
+        self.assertIn("supporting evidence only proves that related methods exist", client.user_prompt)
+        self.assertIn("Do not output repaired_code", client.system_prompt)
+        self.assertNotIn('"repaired_code"', client.user_prompt)
+
+    def test_fixer_run_reuses_analyzer_method_context_without_inquiry(self) -> None:
+        client = _FakeReviewClient({"repaired_code": "def load_config(path):\n    return read_json(path, default={})\n"})
+        fixer = OpenAIFixer(client)
+
+        def fail_identify_required_methods(_state: dict) -> MethodInquiryResult:
+            raise AssertionError("Fixer should reuse Analyzer method context instead of asking again.")
+
+        fixer.identify_required_methods = fail_identify_required_methods
+        state = {
+            "task_id": "unit",
+            "round_id": 0,
+            "satd_comment": "TODO: handle missing config file gracefully",
+            "original_code": "def load_config(path):\n    return read_json(path)\n",
+            "satd_route_type": "generic",
+            "candidate_mode": "baseline_context",
+            "method_inquiry": MethodInquiryResult(required_methods=["read_json"], reason="needed for behavior"),
+            "retrieved_method_contexts": [
+                RetrievedMethodContext(
+                    method_name="read_json",
+                    path="pkg/config.py",
+                    class_name=None,
+                    start_line=1,
+                    end_line=2,
+                    source="def read_json(path, default=None):\n    return default\n",
+                    found=True,
+                    signature="read_json(path, default=None)",
+                )
+            ],
+            "missing_method_names": [],
+            "uncertainty_items": [],
+            "edit_constraints": [EditConstraint(focus_point="read_json call", must_do="use existing default argument")],
+            "repair_feedback": {},
+        }
+
+        repair, method_inquiry, contexts, missing, uncertainty, constraints = fixer.run(
+            state,
+            candidate_mode="baseline_context",
+        )
+
+        self.assertEqual(repair.repaired_code, "def load_config(path):\n    return read_json(path, default={})\n")
+        self.assertEqual(method_inquiry.required_methods, ["read_json"])
+        self.assertEqual([item.method_name for item in contexts], ["read_json"])
+        self.assertEqual(missing, [])
+        self.assertEqual(uncertainty, [])
+        self.assertEqual(constraints[0].focus_point, "read_json call")
+        self.assertIn("### Supporting evidence:", client.user_prompt)
+        self.assertIn("def read_json(path, default=None)", client.user_prompt)
+        self.assertEqual(client.kwargs.get("max_tokens"), 4096)
+
     def test_special_routes_skip_method_context_again(self) -> None:
         fixer = OpenAIFixer.__new__(OpenAIFixer)
         for route in ("remove_temporary", "type_annotation", "replace_symbol", "document"):
@@ -227,6 +332,43 @@ class ContextPromptSafetyTests(unittest.TestCase):
         self.assertEqual(result.localizable, "low")
         self.assertEqual(result.local_scope, "low")
         self.assertEqual(result.end_state_clear, "low")
+
+    def test_simple_analyzer_drops_open_ended_decision_even_with_context(self) -> None:
+        analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)
+        payload = {
+            "decision": "pass",
+            "confidence": 0.78,
+            "operation_concrete": "partial",
+            "localizable": "high",
+            "local_scope": "high",
+            "end_state_clear": "partial",
+            "context_sufficiency": "high",
+            "method_context_used": True,
+            "comment_evidence": "Decide whether we want 1:1 or 1:many",
+            "code_evidence": "related method context was retrieved",
+            "notes": "The supporting method exists.",
+        }
+        state = {
+            "satd_route_type": "generic",
+            "satd_comment": "TODO: Decide whether we want 1:1 or 1:many",
+            "original_code": "def map_items(items):\n    return build_mapping(items)\n",
+            "method_inquiry": MethodInquiryResult(required_methods=["build_mapping"]),
+            "retrieved_method_contexts": [
+                RetrievedMethodContext(
+                    method_name="build_mapping",
+                    path="pkg/mapping.py",
+                    class_name=None,
+                    start_line=1,
+                    end_line=2,
+                    source="def build_mapping(items):\n    return dict(items)\n",
+                    found=True,
+                )
+            ],
+        }
+        result = OpenAIAnalyzer._coerce_analysis(analyzer, payload, state, source="llm")
+        self.assertFalse(result.repairable)
+        self.assertEqual(result.decision, "drop")
+        self.assertIn("open_ended_without_specific_local_edit", result.evidence_summary)
 
     def test_reviewer_rejects_no_effective_change(self) -> None:
         reviewer = OpenAIReviewer.__new__(OpenAIReviewer)
@@ -1254,7 +1396,7 @@ class ContextPromptSafetyTests(unittest.TestCase):
         self.assertEqual(result.decision, "uncertain")
         self.assertEqual(result.localizable, "high")
 
-    def test_existing_target_hint_lifts_all_low_to_partial_when_not_open_ended(self) -> None:
+    def test_existing_target_hint_with_nonlocal_scope_now_drops(self) -> None:
         analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)
         payload = {
             "decision": "drop",
@@ -1273,11 +1415,12 @@ class ContextPromptSafetyTests(unittest.TestCase):
             "original_code": "if index_name is not None:\n    kwargs['hint'] = index_name",
         }
         result = OpenAIAnalyzer._coerce_analysis(analyzer, payload, state, source="llm")
-        self.assertTrue(result.repairable)
-        self.assertEqual(result.decision, "uncertain")
-        self.assertEqual(result.operation_concrete, "partial")
-        self.assertEqual(result.localizable, "partial")
-        self.assertEqual(result.end_state_clear, "partial")
+        self.assertFalse(result.repairable)
+        self.assertEqual(result.decision, "drop")
+        self.assertEqual(result.operation_concrete, "low")
+        self.assertEqual(result.localizable, "low")
+        self.assertEqual(result.local_scope, "low")
+        self.assertEqual(result.end_state_clear, "low")
 
     def test_open_ended_task_does_not_get_existing_target_floor(self) -> None:
         analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)
@@ -1323,7 +1466,7 @@ class ContextPromptSafetyTests(unittest.TestCase):
         self.assertTrue(result.repairable)
         self.assertEqual(result.decision, "pass")
 
-    def test_simple_analyzer_ambiguous_end_state_stays_uncertain(self) -> None:
+    def test_simple_analyzer_ambiguous_open_check_drops(self) -> None:
         analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)
         payload = {
             "decision": "uncertain",
@@ -1342,8 +1485,9 @@ class ContextPromptSafetyTests(unittest.TestCase):
             "original_code": "def f(x):\n    return x",
         }
         result = OpenAIAnalyzer._coerce_analysis(analyzer, payload, state, source="llm")
-        self.assertTrue(result.repairable)
-        self.assertEqual(result.decision, "uncertain")
+        self.assertFalse(result.repairable)
+        self.assertEqual(result.decision, "drop")
+        self.assertIn("open_ended_without_specific_local_edit", result.evidence_summary)
 
     def test_simple_analyzer_partial_partial_high_partial_stays_uncertain_in_stage1(self) -> None:
         analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)

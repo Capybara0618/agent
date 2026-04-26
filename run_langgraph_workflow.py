@@ -57,7 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-analyzer",
         action="store_true",
-        help="Enable analyzer gating before repair. Default is off for fixer-only experiments.",
+        help="Compatibility flag; analyzer is enabled by default.",
+    )
+    parser.add_argument(
+        "--disable-analyzer",
+        action="store_true",
+        help="Disable analyzer gating before repair.",
     )
     parser.add_argument(
         "--enable-review",
@@ -105,6 +110,7 @@ def main() -> None:
     if args.analysis_only:
         args.enable_analyzer = True
         args.enable_review = False
+        args.disable_analyzer = False
     if args.git_remote_base:
         os.environ["SATD_GIT_REMOTE_BASE"] = args.git_remote_base
     if args.git_remote_template:
@@ -121,7 +127,7 @@ def main() -> None:
         model=args.model,
         verbose=args.verbose,
         write_batch_size=args.write_batch_size,
-        use_analyzer=args.enable_analyzer,
+        use_analyzer=not args.disable_analyzer,
         use_reviewer=args.enable_review,
         analysis_only=args.analysis_only,
         repair_context_mode=args.repair_context_mode,
@@ -142,7 +148,7 @@ def main() -> None:
     print(f"Recall: {summary['recall']}")
     print(f"Written tasks: {summary['written_tasks']}")
     print(f"Write batch size: {summary['write_batch_size']}")
-    print(f"Analyzer enabled: {args.enable_analyzer}")
+    print(f"Analyzer enabled: {not args.disable_analyzer}")
     print(f"Review enabled: {args.enable_review}")
     print(f"Analysis only: {summary.get('analysis_only')}")
     print(f"Analyzer pass count: {summary.get('analyzer_pass_count')}")

@@ -38,7 +38,7 @@ class LangGraphSATDWorkflow:
         model: str = "gpt-4o-mini",
         verbose: bool = False,
         write_batch_size: int = 10,
-        use_analyzer: bool = False,
+        use_analyzer: bool = True,
         use_reviewer: bool = False,
         analysis_only: bool = False,
         use_selector: bool = False,
@@ -97,6 +97,12 @@ class LangGraphSATDWorkflow:
         self._log(f"{self._task_label(state)} analyze start")
         satd_route_type = self._infer_satd_route_type(state)
         context_bundle = state.get("github_context")
+        method_inquiry = MethodInquiryResult(reason="analyzer_method_context_not_run")
+        retrieved_method_contexts: list[RetrievedMethodContext] = []
+        missing_method_names: list[str] = []
+        uncertainty_items = []
+        edit_constraints = []
+        method_context_block = "[none]"
         if satd_route_type == "generic":
             rule_drop = self._rule_based_analyzer_drop(state)
             if rule_drop is None:
@@ -110,7 +116,43 @@ class LangGraphSATDWorkflow:
                 analysis = self.analyzer.build_rule_drop_analysis(notes=rule_drop["notes"])
             else:
                 try:
-                    analysis = self.analyzer.run({**state, "satd_route_type": satd_route_type, "github_context": context_bundle})
+                    analyzer_state = {**state, "satd_route_type": satd_route_type, "github_context": context_bundle}
+                    try:
+                        (
+                            method_inquiry,
+                            retrieved_method_contexts,
+                            missing_method_names,
+                            uncertainty_items,
+                            edit_constraints,
+                            method_context_block,
+                        ) = self.fixer.prepare_method_context(analyzer_state, candidate_mode="baseline_context")
+                        context_bundle = self._attach_method_context(
+                            context_bundle,
+                            method_inquiry=method_inquiry,
+                            retrieved_method_contexts=retrieved_method_contexts,
+                            missing_method_names=missing_method_names,
+                        )
+                    except Exception as context_exc:
+                        self._log(
+                            f"{self._task_label(state)} analyzer method-context exception "
+                            f"type={type(context_exc).__name__}; continuing without method context"
+                        )
+                        method_inquiry = MethodInquiryResult(reason=f"analyzer_method_context_exception:{type(context_exc).__name__}")
+                        retrieved_method_contexts = []
+                        missing_method_names = []
+                        uncertainty_items = []
+                        edit_constraints = []
+                        method_context_block = "[none]"
+                    analyzer_state = {
+                        **analyzer_state,
+                        "github_context": context_bundle,
+                        "method_inquiry": method_inquiry,
+                        "retrieved_method_contexts": retrieved_method_contexts,
+                        "missing_method_names": missing_method_names,
+                        "uncertainty_items": uncertainty_items,
+                        "edit_constraints": edit_constraints,
+                    }
+                    analysis = self.analyzer.run(analyzer_state, method_context_block=method_context_block)
                 except Exception as exc:
                     if self.context_client._is_content_filter_error(exc):
                         self._log(f"{self._task_label(state)} analyze content-filtered; using fallback drop")
@@ -128,6 +170,11 @@ class LangGraphSATDWorkflow:
             "analysis": analysis,
             "satd_route_type": satd_route_type,
             "github_context": context_bundle,
+            "method_inquiry": method_inquiry,
+            "uncertainty_items": uncertainty_items,
+            "edit_constraints": edit_constraints,
+            "retrieved_method_contexts": retrieved_method_contexts,
+            "missing_method_names": missing_method_names,
             "status": "repairable" if analysis.repairable else "dropped_by_analyzer",
         }
 

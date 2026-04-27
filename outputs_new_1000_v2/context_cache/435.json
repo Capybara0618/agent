@@ -1,0 +1,98 @@
+{
+  "task_id": "435",
+  "repo_owner": "yelp",
+  "repo_name": "clusterman",
+  "file_path": "clusterman/kubernetes/kubernetes_cluster_connector.py",
+  "commit": "1e40bbb3e0c26f1a45ce0c2a6a1f3b8ae21fb98a",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T12:25:24+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "1e40bbb3e0c26f1a45ce0c2a6a1f3b8ae21fb98a",
+    "symbol_name": "_get_pod_unschedulable_reason",
+    "satd_line": 60,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-26T12:25:26+00:00",
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "clusterman/kubernetes/kubernetes_cluster_connector.py",
+    "original_signature": "def _get_pod_unschedulable_reason(self, pod: KubernetesPod) -> PodUnschedulableReason:",
+    "target_file": {
+      "ok": true,
+      "path": "clusterman/kubernetes/kubernetes_cluster_connector.py",
+      "sha": "da4606ff0a1bc78afd9b2d773fdaed4b7cbe0804",
+      "download_url": "https://raw.githubusercontent.com/YelpArchive/clusterman/1e40bbb3e0c26f1a45ce0c2a6a1f3b8ae21fb98a/clusterman/kubernetes/kubernetes_cluster_connector.py",
+      "content_excerpt": "# Copyright 2019 Yelp Inc.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\nimport copy\nfrom collections import defaultdict\nfrom distutils.util import strtobool\nfrom typing import List\nfrom typing import Mapping\nfrom typing import Optional\nfrom typing import Tuple\n\nimport colorlog\nimport kubernetes\nimport staticconf\nfrom kubernetes.client.models.v1_node import V1Node as KubernetesNode\nfrom kubernetes.client.models.v1_node_selector_requirement import V1NodeSelectorRequirement\nfrom kubernetes.client.models.v1_node_selector_term import V1NodeSelectorTerm\nfrom kubernetes.client.models.v1_pod import V1Pod as KubernetesPod\n\nfrom clusterman.interfaces.cluster_connector import ClusterConnector\nfrom clusterman.interfaces.types import AgentMetadata\nfrom clusterman.interfaces.types import AgentState\nfrom clusterman.kubernetes.util import allocated_node_resources\nfrom clusterman.kubernetes.util import CachedCoreV1Api\nfrom clusterman.kubernetes.util import get_node_ip\nfrom clusterman.kubernetes.util import PodUnschedulableReason\nfrom clusterman.kubernetes.util import selector_term_matches_requirement\nfrom clusterman.kubernetes.util import total_node_resources\nfrom clusterman.kubernetes.util import total_pod_resources\n\nlogger = colorlog.getLogger(__name__)\nKUBERNETES_SCHEDULED_PHASES = {'Pending', 'Running'}\n\n\nclass KubernetesClusterConnector(ClusterConnector):\n    SCHEDULER = 'kubernetes'\n    _core_api: kubernetes.client.CoreV1Api\n    _pods: List[KubernetesPod]\n    _prev_nodes_by_ip: Mapping[str, KubernetesNode]\n    _nodes_by_ip: Mapping[str, KubernetesNode]\n    _pending_pods: List[KubernetesPod]\n    _pods_by_ip: Mapping[str, List[KubernetesPod]]\n\n    def __init__(self, cluster: str, pool: Optional[str]) -> None:\n        super().__init__(cluster, pool)\n        self.kubeconfig_path = staticconf.read_string(f'clusters.{cluster}.kubeconfig_path')\n        self._safe_to_evict_annotation = staticconf.read_string(\n            f'clusters.{cluster}.pod_safe_to_evict_annotation',\n            default='cluster-autoscaler.kubernetes.io/safe-to-evict',\n        )\n        self._nodes_by_ip = {}\n\n    def reload_state(self) -> None:\n        logger.info('Reloading nodes')\n\n        self._core_api = CachedCoreV1Api(self.kubeconfig_path)\n\n        # store the previous _nodes_by_ip for use in get_removed_nodes_before_last_reload()\n        self._prev_nodes_by_ip = copy.deepcopy(self._nodes_by_ip)\n        self._nodes_by_ip = self._get_nodes_by_ip()\n        self._pods_by_ip, self._pending_pods = self._get_pods_by_ip_or_pending()\n\n    def get_num_removed_nodes_before_last_reload(self) -> int:\n        previous_nodes = self._prev_nodes_by_ip\n        current_nodes = self._nodes_by_ip\n\n        return max(0, len(previous_nodes) - len(current_nodes))\n\n    def get_resource_pending(self, resource_name: str) -> float:\n        return getattr(allocated_node_resources([p for p, __ in self.get_unschedulable_pods()]), resource_name)\n\n    def get_resource_allocation(self, resource_name: str) -> float:\n        return sum(\n            getattr(allocated_node_resources(pod), resource_name)\n            for pod in self._pods_by_ip.values()\n        )\n\n    def get_resource_total(self, resource_name: str) -> float:\n        return sum(\n            getattr(total_node_resources(node), resource_name)\n            for node in self._nodes_by_ip.values()\n        )\n\n    def get_unschedulable_pods(self) -> List[Tuple[KubernetesPod, PodUnschedulableReason]]:\n        unschedulable_pods = []\n        for pod in self._pending_pods:\n            is_unschedulable = False\n            if not pod.status or not pod.status.conditions:\n                logger.info('No conditions in pod status, skipping')\n                continue\n\n            for condition in pod.status.conditions:\n                if condition.reason == 'Unschedulable':\n                    is_unschedulable = True\n            if is_unschedulable:\n                unschedulable_pods.append((pod, self._get_pod_unschedulable_reason(pod)))\n        return unschedulable_pods\n\n    def _pod_belongs_to_pool(self, pod: KubernetesPod) -> bool:\n        # Check if the pod is on a node in the pool -- this should cover most cases\n        if pod.status.phase in KUBERNETES_SCHEDULED_PHASES and pod.status.host_ip in self._nodes_by_ip:\n            return True\n\n        # Otherwise, check if the node selector matches the pool; we'll only get to either of the\n        # following checks if the pod _should_ be running on the cluster, but isn't currently.  (This won't catch things\n        # that have a nodeSelector or nodeAffinity for anything other than \"pool name\", for example, system-level\n        # DaemonSets like kiam)\n        if pod.spec.node_selector:\n            for key, value in pod.spec.node_selector.items():\n                if key == self.pool_label_key:\n                    return value == self.pool\n\n        # Lastly, check if an affinity rule matches\n        selector_requirement = V1NodeSelectorRequirement(\n            key=self.pool_label_key, operator='In', values=[self.pool]\n        )\n\n        if pod.spec.affinity and pod.spec.affinity.node_affinity:\n            node_affinity = pod.spec.affinity.node_affinity\n            terms: List[V1NodeSelectorTerm] = []\n            if node_affinity.required_during_scheduling_ignored_during_execution:\n                terms.extend(node_affinity.required_during_scheduling_ignored_during_execution.node_selector_terms)\n            if node_affinity.preferred_during_scheduling_ignored_during_execution:\n                terms.extend([\n                    term.preference\n                    for term in node_affinity.preferred_during_scheduling_ignored_during_execution\n                ])\n            if selector_term_matches_requirement(terms, selector_requirement):\n                return True\n        return False\n\n    def _get_pod_unschedulable_reason(self, pod: KubernetesPod) -> PodUnschedulableReason:\n        # TODO (CLUSTERMAN-587) delete this feature toggle once we're sure everything's working as planned\n        if not self.pool_config.read_bool('autoscale_signal.prioritize_pending_pods', default=False):\n            return PodUnschedulableReason.Unknown\n\n        pod_resource_request = total_pod_resources(pod)\n        for node_ip, pods_on_node in self._pods_by_ip.items():\n            node = self._nodes_by_ip.get(node_ip)\n            if node and pod_resource_request < total_node_resources(node) - allocated_node_resources(pods_on_node):\n                return PodUnschedulableReason.Unknown\n\n        return PodUnschedulableReason.InsufficientResources\n\n    def _get_agent_metadata(self, node_ip: str) -> AgentMetadata:\n        node = self._nodes_by_ip.get(node_ip)\n        if not node:\n            return AgentMetadata(state=AgentState.ORPHANED)\n        return AgentMetadata(\n            agent_id=node.metadata.name,\n            allocated_resources=allocated_node_resources(self._pods_by_ip[node_ip]),\n            is_safe_to_kill=self._is_node_safe_to_kill(node_ip),\n            batch_task_count=self._count_batch_tasks(node_ip),\n            state=(AgentState.RUNNING if self._pods_by_ip[node_ip] else AgentState.IDLE),\n            task_count=len(self._pods_by_ip[node_ip]),\n            total_resources=total_node_resources(node),\n        )\n\n    def _is_node_safe_to_kill(self, node_ip: str) -> bool:\n        for pod in self._pods_by_ip[node_ip]:\n            annotations = pod.metadata.annotations or dict()\n            pod_safe_to_evict = strtobool(annotations.get(self.safe_to_evict_key, 'true'))\n            if not pod_safe_to_evict:\n                return False\n        return True\n\n    def _get_nodes_by_ip(self) -> Mapping[str, KubernetesNode]:\n        pool_label_selector = self.pool_config.read_string('pool_label_key', default='clusterman.com/pool')\n        pool_nodes = self._core_api.list_node().items\n\n        return {\n            get_node_ip(node): node\n            for node in pool_nodes\n            if not self.pool or node.metadata.labels.get(pool_label_selector, None) == self.pool\n        }\n\n    def _get_pods_by_ip_or_pending(self) -> Tuple[Mapping[str, List[KubernetesPod]], List[KubernetesPod]]:\n        pods_by_ip: Mapping[str, List[KubernetesPod]] = defaultdict(list)\n        pending_pods: List[KubernetesPod] = []\n\n        all_pods = self._core_api.list_pod_for_all_namespaces().items\n        for pod in all_pods:\n            if self._pod_belongs_to_pool(pod):\n                if pod.status.phase == 'Running':\n                    pods_by_ip[pod.status.host_ip].append(pod)\n                else:\n                    pending_pods.append(pod)\n        return pods_by_ip, pending_pods\n\n    def _count_batch_tasks(self, node_ip: str) -> int:\n        count = 0\n        for pod in self._pods_by_ip[node_ip]:\n            if pod.metadata.annotations is None:\n                continue\n            for annotation, value in pod.metadata.annotations.items():\n                if annotation == self._safe_to_evict_annotation:\n                    count += (not strtobool(value))  # if it's safe to evict, it's NOT a batch task\n                    break\n        return count\n\n    @property\n    def pool_label_key(self):\n        return self.pool_config.read_string('pool_label_key', default='clusterman.com/pool')\n\n    @property\n    def safe_to_evict_key(self):\n        return self.pool_config.read_string('safe_to_evict_key', default='clusterman.com/safe_to_evict')\n",
+      "total_lines": 217,
+      "ref": "1e40bbb3e0c26f1a45ce0c2a6a1f3b8ae21fb98a"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_get_pod_unschedulable_reason",
+      "class_name": "KubernetesClusterConnector",
+      "start_line": 142,
+      "end_line": 153,
+      "satd_line": 60,
+      "matched_by": "normalized_source",
+      "source": "    def _get_pod_unschedulable_reason(self, pod: KubernetesPod) -> PodUnschedulableReason:\n        # TODO (CLUSTERMAN-587) delete this feature toggle once we're sure everything's working as planned\n        if not self.pool_config.read_bool('autoscale_signal.prioritize_pending_pods', default=False):\n            return PodUnschedulableReason.Unknown\n\n        pod_resource_request = total_pod_resources(pod)\n        for node_ip, pods_on_node in self._pods_by_ip.items():\n            node = self._nodes_by_ip.get(node_ip)\n            if node and pod_resource_request < total_node_resources(node) - allocated_node_resources(pods_on_node):\n                return PodUnschedulableReason.Unknown\n\n        return PodUnschedulableReason.InsufficientResources",
+      "calls": [
+        "allocated_node_resources",
+        "total_node_resources",
+        "total_pod_resources"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "_nodes_by_ip",
+        "_pods_by_ip",
+        "pool_config"
+      ],
+      "global_uses": [
+        "KubernetesPod",
+        "PodUnschedulableReason",
+        "allocated_node_resources",
+        "total_node_resources",
+        "total_pod_resources"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "analyzer_method_context_not_run"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

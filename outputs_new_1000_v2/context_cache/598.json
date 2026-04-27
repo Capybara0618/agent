@@ -1,0 +1,102 @@
+{
+  "task_id": "598",
+  "repo_owner": "jromang",
+  "repo_name": "picochess",
+  "file_path": "server.py",
+  "commit": "9956dcf355a22953787addcb2eeb7997eb0af860",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T13:03:49+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "9956dcf355a22953787addcb2eeb7997eb0af860",
+    "symbol_name": "_build_game_header",
+    "satd_line": 380,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 1,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T13:03:49+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 4,
+    "retrieved_method_count": 0,
+    "missing_method_count": 4
+  },
+  "base_context": {
+    "file_path": "server.py",
+    "original_signature": "def _build_game_header(self, pgn_game: chess.pgn.Game):",
+    "target_file": {
+      "ok": true,
+      "path": "server.py",
+      "sha": "9328e364deba87f6f995efe469d88c2423dd94ad",
+      "download_url": "https://raw.githubusercontent.com/jromang/picochess/9956dcf355a22953787addcb2eeb7997eb0af860/server.py",
+      "content_excerpt": "# Copyright (C) 2013-2017 Jean-Francois Romang (jromang@posteo.de)\n#                         Shivkumar Shivaji ()\n#                         Jürgen Précour (LocutusOfPenguin@posteo.de)\n#\n# This program is free software: you can redistribute it and/or modify\n# it under the terms of the GNU General Public License as published by\n# the Free Software Foundation, either version 3 of the License, or\n# (at your option) any later version.\n#\n# This program is distributed in the hope that it will be useful,\n# but WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the\n# GNU General Public License for more details.\n#\n# You should have received a copy of the GNU General Public License\n# along with this program. If not, see <http://www.gnu.org/licenses/>.\n\nimport datetime\nimport threading\nimport logging\nfrom collections import OrderedDict\n\nimport chess\nimport chess.pgn as pgn\n\nimport tornado.web\nimport tornado.wsgi\nfrom tornado.ioloop import IOLoop\nfrom tornado.websocket import WebSocketHandler\n\nfrom utilities import Observable, DisplayMsg, hours_minutes_seconds, RepeatedTimer\nfrom web.picoweb import picoweb as pw\n\nfrom dgt.api import Event, Message\nfrom dgt.util import PlayMode, Mode, ClockSide\nfrom dgt.iface import DgtIface\nfrom dgt.translate import DgtTranslate\nfrom dgt.board import DgtBoard\n\n# This needs to be reworked to be session based (probably by token)\n# Otherwise multiple clients behind a NAT can all play as the 'player'\nclient_ips = []\n\n\nclass ServerRequestHandler(tornado.web.RequestHandler):\n    def initialize(self, shared=None):\n        self.shared = shared\n\n    def data_received(self, chunk):\n        pass\n\n\nclass ChannelHandler(ServerRequestHandler):\n    def process_console_command(self, raw):\n        cmd = raw.lower()\n\n        try:\n            # Here starts the simulation of a dgt-board!\n            # Let the user send events like the board would do\n            if cmd.startswith('fen:'):\n                fen = raw.split(':')[1].strip()\n                # dgt board only sends the basic fen => be sure it's same no matter what fen the user entered\n                fen = fen.split(' ')[0]\n                bit_board = chess.Board()  # valid the fen\n                bit_board.set_board_fen(fen)\n                Observable.fire(Event.KEYBOARD_FEN(fen=fen))\n            # end simulation code\n            elif cmd.startswith('go'):\n                if 'last_dgt_move_msg' in self.shared:\n                    fen = self.shared['last_dgt_move_msg']['fen'].split(' ')[0]\n                    Observable.fire(Event.KEYBOARD_FEN(fen=fen))\n            else:\n                # Event.KEYBOARD_MOVE tranfers \"move\" to \"fen\" and then continues with \"Message.DGT_FEN\"\n                move = chess.Move.from_uci(cmd)\n                Observable.fire(Event.KEYBOARD_MOVE(move=move))\n        except (ValueError, IndexError):\n            logging.warning('Invalid user input [%s]', raw)\n\n    def post(self):\n        action = self.get_argument('action')\n\n        if action == 'broadcast':\n            fen = self.get_argument('fen')\n            pgn_str = self.get_argument('pgn')\n            result = {'event': 'Broadcast', 'msg': 'Position from Spectators!', 'pgn': pgn_str, 'fen': fen}\n            EventHandler.write_to_clients(result)\n        elif action == 'move':\n            uci_move = self.get_argument('source') + self.get_argument('target')\n            Observable.fire(Event.REMOTE_MOVE(uci_move=uci_move, fen=self.get_argument('fen')))\n        elif action == 'clockbutton':\n            Observable.fire(Event.KEYBOARD_BUTTON(button=self.get_argument('button'), dev='web'))\n        elif action == 'command':\n            self.process_console_command(self.get_argument('command'))\n\n\nclass EventHandler(WebSocketHandler):\n    clients = set()\n\n    def initialize(self, shared=None):\n        self.shared = shared\n\n    def on_message(self, message):\n        pass\n\n    def data_received(self, chunk):\n        pass\n\n    def real_ip(self):\n        x_real_ip = self.request.headers.get('X-Real-IP')\n        real_ip = x_real_ip if x_real_ip else self.request.remote_ip\n        return real_ip\n\n    def open(self):\n        EventHandler.clients.add(self)\n        client_ips.append(self.real_ip())\n\n    def on_close(self):\n        EventHandler.clients.remove(self)\n        client_ips.remove(self.real_ip())\n\n    @classmethod\n    def write_to_clients(cls, msg):\n        for client in cls.clients:\n            client.write_message(msg)\n\n\nclass DGTHandler(ServerRequestHandler):\n    def get(self, *args, **kwargs):\n        action = self.get_argument('action')\n        if action == 'get_last_move':\n            if 'last_dgt_move_msg' in self.shared:\n                self.write(self.shared['last_dgt_move_msg'])\n\n\nclass InfoHandler(ServerRequestHandler):\n    def get(self, *args, **kwargs):\n        action = self.get_argument('action')\n        if action == 'get_system_info':\n            if 'system_info' in self.shared:\n                self.write(self.shared['system_info'])\n        if action == 'get_ip_info':\n            if 'ip_info' in self.shared:\n                self.write(self.shared['ip_info'])\n        if action == 'get_headers':\n            if 'headers' in self.shared:\n                self.write(self.shared['headers'])\n        if action == 'get_clock_text':\n            if 'clock_text' in self.shared:\n                self.write(self.shared['clock_text'])\n\n\nclass ChessBoardHandler(ServerRequestHandler):\n    def get(self):\n        self.render('web/picoweb/templates/clock.html')\n\n\nclass WebServer(threading.Thread):\n    def __init__(self, port: int, dgttranslate: DgtTranslate, dgtboard: DgtBoard):\n        shared = {}\n\n        WebDisplay(shared).start()\n        WebVr(shared, dgttranslate, dgtboard).start()\n        super(WebServer, self).__init__()\n        wsgi_app = tornado.wsgi.WSGIContainer(pw)\n\n        application = tornado.web.Application([\n            (r'/', ChessBoardHandler, dict(shared=shared)),\n            (r'/event', EventHandler, dict(shared=shared)),\n            (r'/dgt', DGTHandler, dict(shared=shared)),\n            (r'/info', InfoHandler, dict(shared=shared)),\n\n            (r'/channel', ChannelHandler, dict(shared=shared)),\n            (r'.*', tornado.web.FallbackHandler, {'fallback': wsgi_app})\n        ])\n        application.listen(port)\n\n    def run(self):\n        \"\"\"Call by threading.Thread start() function.\"\"\"\n        logging.info('evt_queue ready')\n        IOLoop.instance().start()\n\n\nclass WebVr(DgtIface):\n\n    \"\"\"Handle the web (clock) communication.\"\"\"\n\n    def __init__(self, shared, dgttranslate: DgtTranslate, dgtboard: DgtBoard):\n        super(WebVr, self).__init__(dgttranslate, dgtboard)\n        self.shared = shared\n        self.virtual_timer = None\n        self.time_side = ClockSide.NONE\n        self.enable_dgt_pi = dgtboard.is_pi\n        sub = 2 if dgtboard.is_pi else 0\n        DisplayMsg.show(Message.DGT_CLOCK_VERSION(main=2, sub=sub, dev='web', text=None))\n        self.clock_show_time = True\n\n    def _create_clock_text(self):\n        if 'clock_text' not in self.shared:\n            self.shared['clock_text'] = {}\n\n    def _runclock(self):\n        if self.time_side == ClockSide.LEFT:\n            hours, mins, secs = self.time_left\n            time_left = 3600 * hours + 60 * mins + secs - 1\n            if time_left <= 0:\n                logging.info('negative/zero time left: %s', time_left)\n                self.virtual_timer.stop()\n                self.time_left = 0\n            self.time_left = hours_minutes_seconds(time_left)\n        if self.time_side == ClockSide.RIGHT:\n            hours, mins, secs = self.time_right\n            time_right = 3600 * hours + 60 * mins + secs - 1\n            if time_right <= 0:\n                logging.info('negative/zero time right: %s', time_right)\n                self.virtual_timer.stop()\n                self.time_right = 0\n            self.time_right = hours_minutes_seconds(time_right)\n        self._display_time(self.time_left, self.time_right)\n\n    def _display_time(self, time_l, time_r):\n        if time_l is None or time_r is None:\n            logging.debug('time values not set - abort function')\n        elif self.clock_show_time:\n            text_l = '{}:{:02d}.{:02d}'.format(time_l[0], time_l[1], time_l[2])\n            text_r = '{}:{:02d}.{:02d}'.format(time_r[0], time_r[1], time_r[2])\n            icon_d = 'fa-caret-right' if self.time_side == ClockSide.RIGHT else 'fa-caret-left'\n            if self.time_side == ClockSide.NONE:\n                icon_d = 'fa-sort'\n            text = text_l + '&nbsp;<i class=\"fa ' + icon_d + '\"></i>&nbsp;' + text_r\n            self._create_clock_text()\n            self.shared['clock_text'] = text\n            result = {'event': 'Clock', 'msg': text}\n            EventHandler.write_to_clients(result)\n\n    def display_move_on_clock(self, message):\n        \"\"\"Display a move on the web clock.\"\"\"\n        if self.enable_dgt_3000 or self.enable_dgt_pi:\n            bit_board, text = self.get_san(message, not self.enable_dgt_pi)\n            points = '...' if message.side == ClockSide.RIGHT else '.'\n            if self.enable_dgt_pi:\n                text = '{:3d}{:s}{:s}'.format(bit_board.fullmove_number, points, text)\n            else:\n                text = '{:2d}{:s}{:s}'.format(bit_board.fullmove_number % 100, points, text)\n        else:\n            text = message.move.uci()\n            if message.side == ClockSide.RIGHT:\n                text = text[:2].rjust(3) + text[2:].rjust(3)\n            else:\n                text = text[:2].ljust(3) + text[2:].ljust(3)\n        if self.getName() not in message.devs:\n            logging.debug('ignored %s - devs: %s', text, message.devs)\n            return True\n        self.clock_show_time = False\n        self._create_clock_text()\n        self.shared['clock_text'] = text\n        result = {'event': 'Clock', 'msg': text}\n        EventHandler.write_to_clients(result)\n        return True\n\n    def display_text_on_clock(self, message):\n        \"\"\"Display a text on the web clock.\"\"\"\n        if self.enable_dgt_pi:\n            text = message.l\n        else:\n            text = message.m if self.enable_dgt_3000 else message.s\n        if text is None:\n            text = message.m\n        if self.getName() not in message.devs:\n            logging.debug('ignored %s - devs: %s', text, message.devs)\n            return True\n        self.clock_show_time = False\n        self._create_clock_text()\n        self.shared['clock_text'] = text\n        result = {'event': 'Clock', 'msg': text}\n        EventHandler.write_to_clients(result)\n        return True\n\n    def display_time_on_clock(self, message):\n        \"\"\"Display the time on the web clock.\"\"\"\n        if self.getName() not in message.devs:\n            logging.debug('ignored endText - devs: %s', message.devs)\n            return True\n        if self.clock_running or message.force:\n            self.clock_show_time = True\n            self._display_time(self.time_left, self.time_right)\n        else:\n            logging.debug('(web) clock isnt running - no need for endText')\n        return True\n\n    def stop_clock(self, devs: set):\n        \"\"\"Stop the time on the web clock.\"\"\"\n        if self.getName() not in devs:\n            logging.debug('ignored stopClock - devs: %s', devs)\n            return True\n        if self.virtual_timer:\n            self.virtual_timer.stop()\n        self._resume_clock(ClockSide.NONE)\n        return True\n\n    def _resume_clock(self, side: ClockSide):\n        self.clock_running = (side != ClockSide.NONE)\n        self.time_side = side\n\n    def start_clock(self, time_left: int, time_right: int, side: ClockSide, devs: set):\n        \"\"\"Start the time on the web clock.\"\"\"\n        if self.getName() not in devs:\n            logging.debug('ignored startClock - devs: %s', devs)\n            return True\n        if self.virtual_timer and self.virtual_timer.is_running():\n            self.virtual_timer.stop()\n        if side != ClockSide.NONE:\n",
+      "total_lines": 604,
+      "ref": "9956dcf355a22953787addcb2eeb7997eb0af860"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_build_game_header",
+      "class_name": "WebDisplay",
+      "start_line": 359,
+      "end_line": 412,
+      "satd_line": 380,
+      "matched_by": "signature_or_comment",
+      "source": "    def _build_game_header(self, pgn_game: chess.pgn.Game):\n        # pgn_game.headers['Result'] = '*'\n        pgn_game.headers['Event'] = 'PicoChess game'\n        pgn_game.headers['Site'] = 'picochess.org'\n        pgn_game.headers['Date'] = datetime.datetime.today().strftime('%Y.%m.%d')\n        pgn_game.headers['Round'] = '?'\n        pgn_game.headers['White'] = '?'\n        pgn_game.headers['Black'] = '?'\n\n        user_name = 'User'\n        engine_name = 'Picochess'\n        user_elo = '-'\n        comp_elo = 2900\n        if 'system_info' in self.shared:\n            if 'user_name' in self.shared['system_info']:\n                user_name = self.shared['system_info']['user_name']\n            if 'engine_name' in self.shared['system_info']:\n                engine_name = self.shared['system_info']['engine_name']\n            if 'user_elo' in self.shared['system_info']:\n                user_elo = self.shared['system_info']['user_elo']\n\n        # @todo find a better way to setup engine elo\n        engine_elo = {'stockfish': 3300, 'texel': 3140, 'rodent': 2920,\n                      'zurichess': 2790, 'floyd': 2660, 'cinnamon': 2060}\n        for name, elo in engine_elo.items():\n            if engine_name.lower().startswith(name):\n                comp_elo = elo\n                break\n\n        if 'game_info' in self.shared:\n            if 'level_text' in self.shared['game_info']:\n                engine_level = ' ({0})'.format(self.shared['game_info']['level_text'].m)\n            else:\n                engine_level = ''\n            if 'level_name' in self.shared['game_info']:\n                level_name = self.shared['game_info']['level_name']\n                if level_name.startswith('Elo@'):\n                    comp_elo = int(level_name[4:])\n                    engine_level = ''\n            if 'play_mode' in self.shared['game_info']:\n                if self.shared['game_info']['play_mode'] == PlayMode.USER_WHITE:\n                    pgn_game.headers['White'] = user_name\n                    pgn_game.headers['Black'] = engine_name + engine_level\n                    pgn_game.headers['WhiteElo'] = user_elo\n                    pgn_game.headers['BlackElo'] = comp_elo\n                else:\n                    pgn_game.headers['White'] = engine_name + engine_level\n                    pgn_game.headers['Black'] = user_name\n                    pgn_game.headers['WhiteElo'] = comp_elo\n                    pgn_game.headers['BlackElo'] = user_elo\n\n        if 'ip_info' in self.shared:\n            if 'location' in self.shared['ip_info']:\n                pgn_game.headers['Site'] = self.shared['ip_info']['location']",
+      "calls": [
+        "int"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "shared"
+      ],
+      "global_uses": [
+        "PlayMode",
+        "chess",
+        "datetime"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "engine_elo.items",
+        "engine_name.lower",
+        "engine_name.lower.startswith",
+        "level_name.startswith"
+      ],
+      "reason": "These methods are directly involved in the logic for setting up engine ELO ratings, which is the focus of the SATD."
+    },
+    "retrieved_methods": [],
+    "missing_method_names": [
+      "engine_elo.items",
+      "lower",
+      "startswith",
+      "startswith"
+    ]
+  },
+  "review_context": {}
+}

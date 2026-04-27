@@ -1396,7 +1396,7 @@ class ContextPromptSafetyTests(unittest.TestCase):
         self.assertEqual(result.decision, "uncertain")
         self.assertEqual(result.localizable, "high")
 
-    def test_existing_target_hint_with_nonlocal_scope_now_drops(self) -> None:
+    def test_grounded_target_hint_preserves_deprecate_as_uncertain(self) -> None:
         analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)
         payload = {
             "decision": "drop",
@@ -1415,12 +1415,13 @@ class ContextPromptSafetyTests(unittest.TestCase):
             "original_code": "if index_name is not None:\n    kwargs['hint'] = index_name",
         }
         result = OpenAIAnalyzer._coerce_analysis(analyzer, payload, state, source="llm")
-        self.assertFalse(result.repairable)
-        self.assertEqual(result.decision, "drop")
+        self.assertTrue(result.repairable)
+        self.assertEqual(result.decision, "uncertain")
         self.assertEqual(result.operation_concrete, "low")
-        self.assertEqual(result.localizable, "low")
-        self.assertEqual(result.local_scope, "low")
+        self.assertEqual(result.localizable, "partial")
+        self.assertEqual(result.local_scope, "partial")
         self.assertEqual(result.end_state_clear, "low")
+        self.assertIn("grounded_local_target", result.evidence_summary)
 
     def test_open_ended_task_does_not_get_existing_target_floor(self) -> None:
         analyzer = OpenAIAnalyzer.__new__(OpenAIAnalyzer)

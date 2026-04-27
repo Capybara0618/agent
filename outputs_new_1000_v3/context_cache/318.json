@@ -1,0 +1,80 @@
+{
+  "task_id": "318",
+  "repo_owner": "kimchi-project",
+  "repo_name": "gingerbase",
+  "file_path": "src/kimchi/model.py",
+  "commit": "ab63bbadae7917b7fa378b5383b458e52b1fd26a",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T16:19:59+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "ab63bbadae7917b7fa378b5383b458e52b1fd26a",
+    "symbol_name": null,
+    "satd_line": null,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": false,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": false,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "true_mismatch",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": true,
+    "github_evidence_strength": "low",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T16:19:59+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 2,
+    "retrieved_method_count": 0,
+    "missing_method_count": 2
+  },
+  "base_context": {
+    "file_path": "src/kimchi/model.py",
+    "original_signature": "def prepare(self, conn):",
+    "target_file": {
+      "ok": true,
+      "path": "src/kimchi/model.py",
+      "sha": "269fc97391917b66d0a4cc08b6303cc8750104a7",
+      "download_url": "https://raw.githubusercontent.com/kimchi-project/gingerbase/ab63bbadae7917b7fa378b5383b458e52b1fd26a/src/kimchi/model.py",
+      "content_excerpt": "#\n# Project Kimchi\n#\n# Copyright IBM, Corp. 2013\n#\n# Authors:\n#  Adam Litke <agl@linux.vnet.ibm.com>\n#\n# This library is free software; you can redistribute it and/or\n# modify it under the terms of the GNU Lesser General Public\n# License as published by the Free Software Foundation; either\n# version 2.1 of the License, or (at your option) any later version.\n#\n# This library is distributed in the hope that it will be useful,\n# but WITHOUT ANY WARRANTY; without even the implied warranty of\n# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU\n# Lesser General Public License for more details.\n#\n# You should have received a copy of the GNU Lesser General Public\n# License along with this library; if not, write to the Free Software\n# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA\n\nimport cherrypy\nimport copy\nimport disks\nimport fnmatch\nimport functools\nimport glob\nimport ipaddr\nimport json\nimport libvirt\nimport logging\nimport os\nimport platform\nimport psutil\nimport re\nimport shutil\nimport subprocess\nimport sys\nimport threading\nimport time\nimport uuid\n\n\nfrom cherrypy.process.plugins import BackgroundTask\nfrom cherrypy.process.plugins import SimplePlugin\nfrom collections import defaultdict\nfrom xml.etree import ElementTree\n\n\ntry:\n    from collections import OrderedDict\nexcept ImportError:\n    from ordereddict import OrderedDict\n\n\nfrom kimchi import config\nfrom kimchi import isoinfo\nfrom kimchi import netinfo\nfrom kimchi import network as knetwork\nfrom kimchi import vnc\nfrom kimchi import xmlutils\nfrom kimchi.asynctask import AsyncTask\nfrom kimchi.distroloader import DistroLoader\nfrom kimchi.exception import InvalidOperation, InvalidParameter, MissingParameter\nfrom kimchi.exception import NotFoundError, OperationFailed\nfrom kimchi.featuretests import FeatureTests\nfrom kimchi.networkxml import to_network_xml\nfrom kimchi.objectstore import ObjectStore\nfrom kimchi.scan import Scanner\nfrom kimchi.screenshot import VMScreenshot\nfrom kimchi.utils import get_enabled_plugins, is_digit, kimchi_log\nfrom kimchi.vmtemplate import VMTemplate\n\n\nISO_POOL_NAME = u'kimchi_isos'\nGUESTS_STATS_INTERVAL = 5\nHOST_STATS_INTERVAL = 1\nVM_STATIC_UPDATE_PARAMS = {'name': './name'}\nVM_LIVE_UPDATE_PARAMS = {}\nSTORAGE_SOURCES = {'netfs': {'addr': '/pool/source/host/@name',\n                             'path': '/pool/source/dir/@path'}}\n\n\ndef _uri_to_name(collection, uri):\n    expr = '/%s/(.*?)/?$' % collection\n    m = re.match(expr, uri)\n    if not m:\n        raise InvalidParameter(uri)\n    return m.group(1)\n\ndef template_name_from_uri(uri):\n    return _uri_to_name('templates', uri)\n\ndef pool_name_from_uri(uri):\n    return _uri_to_name('storagepools', uri)\n\ndef get_vm_name(vm_name, t_name, name_list):\n    if vm_name:\n        return vm_name\n    for i in xrange(1, 1000):\n        vm_name = \"%s-vm-%i\" % (t_name, i)\n        if vm_name not in name_list:\n            return vm_name\n    raise OperationFailed(\"Unable to choose a VM name\")\n\nclass Model(object):\n    dom_state_map = {0: 'nostate',\n                     1: 'running',\n                     2: 'blocked',\n                     3: 'paused',\n                     4: 'shutdown',\n                     5: 'shutoff',\n                     6: 'crashed'}\n\n    pool_state_map = {0: 'inactive',\n                      1: 'initializing',\n                      2: 'active',\n                      3: 'degraded',\n                      4: 'inaccessible'}\n\n    volume_type_map = {0: 'file',\n                       1: 'block',\n                       2: 'directory',\n                       3: 'network'}\n\n    def __init__(self, libvirt_uri=None, objstore_loc=None):\n        self.libvirt_uri = libvirt_uri or 'qemu:///system'\n        self.conn = LibvirtConnection(self.libvirt_uri)\n        self.objstore = ObjectStore(objstore_loc)\n        self.graphics_ports = {}\n        self.next_taskid = 1\n        self.stats = {}\n        self.host_stats = defaultdict(int)\n        self.host_info = {}\n        self.qemu_stream = False\n        self.qemu_stream_dns = False\n        self.libvirt_stream_protocols = []\n        # Subscribe function to set host capabilities to be run when cherrypy\n        # server is up\n        # It is needed because some features tests depends on the server\n        cherrypy.engine.subscribe('start', self._set_capabilities)\n        self.scanner = Scanner(self._clean_scan)\n        self.scanner.delete()\n        self.guests_stats_thread = BackgroundTask(GUESTS_STATS_INTERVAL,\n                                                  self._update_guests_stats)\n        self.host_stats_thread = BackgroundTask(HOST_STATS_INTERVAL,\n                                                self._update_host_stats)\n        self.guests_stats_thread.start()\n        self.host_stats_thread.start()\n\n        # Please add new possible debug report command here\n        # and implement the report generating function\n        # based on the new report command\n        self.report_tools = ({'cmd': 'sosreport --help', 'fn': self._sosreport_generate},\n                             {'cmd': 'supportconfig -h', 'fn':None},\n                             {'cmd': 'linuxexplorers --help', 'fn':None})\n\n        self.distros = self._get_distros()\n        if 'qemu:///' in self.libvirt_uri:\n            self.host_info = self._get_host_info()\n            self._default_pool_check()\n            self._default_network_check()\n\n    def _default_network_check(self):\n        conn = self.conn.get()\n        xml = \"\"\"\n             <network>\n              <name>default</name>\n              <forward mode='nat'/>\n              <bridge name='virbr0' stp='on' delay='0' />\n              <ip address='192.168.122.1' netmask='255.255.255.0'>\n                <dhcp>\n                  <range start='192.168.122.2' end='192.168.122.254' />\n                </dhcp>\n              </ip>\n            </network>\n        \"\"\"\n        try:\n            net = conn.networkLookupByName(\"default\")\n        except libvirt.libvirtError:\n            try:\n                net = conn.networkDefineXML(xml)\n            except libvirt.libvirtError, e:\n                cherrypy.log.error(\n                    \"Fatal: Cannot create default network because of %s, exit kimchid\" % e.message,\n                    severity=logging.ERROR)\n                sys.exit(1)\n\n        if net.isActive() == 0:\n            try:\n                net.create()\n            except libvirt.libvirtError, e:\n                cherrypy.log.error(\n                    \"Fatal: Cannot activate default network because of %s, exit kimchid\" % e.message,\n                    severity=logging.ERROR)\n                sys.exit(1)\n\n    def _default_pool_check(self):\n        default_pool = {'name': 'default',\n                        'path': '/var/lib/libvirt/images',\n                        'type': 'dir'}\n        try:\n            self.storagepools_create(default_pool)\n        except InvalidOperation:\n            # ignore error when pool existed\n            pass\n        except OperationFailed as e:\n            # path used by other pool or other reasons of failure, exit\n            cherrypy.log.error(\n                \"Fatal: Cannot create default pool because of %s, exit kimchid\" % e.message,\n                severity=logging.ERROR)\n            sys.exit(1)\n\n        if self.storagepool_lookup('default')['state'] == 'inactive':\n            try:\n                self.storagepool_activate('default')\n            except OperationFailed:\n                cherrypy.log.error(\n                    \"Fatal: Default pool cannot be activated, exit kimchid\",\n                    severity=logging.ERROR)\n                sys.exit(1)\n\n    def _set_capabilities(self):\n        kimchi_log.info(\"*** Running feature tests ***\")\n        self.qemu_stream = FeatureTests.qemu_supports_iso_stream()\n        self.qemu_stream_dns = FeatureTests.qemu_iso_stream_dns()\n\n        self.libvirt_stream_protocols = []\n        for p in ['http', 'https', 'ftp', 'ftps', 'tftp']:\n            if FeatureTests.libvirt_supports_iso_stream(p):\n                self.libvirt_stream_protocols.append(p)\n\n        kimchi_log.info(\"*** Feature tests completed ***\")\n    _set_capabilities.priority = 90\n\n    def get_capabilities(self):\n        report_tool = self._get_system_report_tool()\n\n        return {'libvirt_stream_protocols': self.libvirt_stream_protocols,\n                'qemu_stream': self.qemu_stream,\n                'screenshot': VMScreenshot.get_stream_test_result(),\n                'system_report_tool': bool(report_tool)}\n\n    def _update_guests_stats(self):\n        vm_list = self.vms_get_list()\n\n        for name in vm_list:\n            dom = self._get_vm(name)\n            vm_uuid = dom.UUIDString()\n            info = dom.info()\n            state = Model.dom_state_map[info[0]]\n\n            if state != 'running':\n                self.stats[vm_uuid] = {}\n                continue\n\n            if self.stats.get(vm_uuid, None) is None:\n                self.stats[vm_uuid] = {}\n\n            timestamp = time.time()\n            prevStats = self.stats.get(vm_uuid, {})\n            seconds = timestamp - prevStats.get('timestamp', 0)\n            self.stats[vm_uuid].update({'timestamp': timestamp})\n\n            self._get_percentage_cpu_usage(vm_uuid, info, seconds)\n            self._get_network_io_rate(vm_uuid, dom, seconds)\n            self._get_disk_io_rate(vm_uuid, dom, seconds)\n\n    def _get_host_info(self):\n        res = {}\n        with open('/proc/cpuinfo') as f:\n            for line in f.xreadlines():\n                if \"model name\" in line:\n                    res['cpu'] = line.split(':')[1].strip()\n                    break\n\n        res['memory'] = psutil.TOTAL_PHYMEM\n        # 'fedora' '17' 'Beefy Miracle'\n        distro, version, codename = platform.linux_distribution()\n        res['os_distro'] = distro\n        res['os_version'] = version\n        res['os_codename'] = unicode(codename,\"utf-8\")\n\n        return res\n\n    def _get_percentage_cpu_usage(self, vm_uuid, info, seconds):\n        prevCpuTime = self.stats[vm_uuid].get('cputime', 0)\n\n        cpus = info[3]\n        cpuTime = info[4] - prevCpuTime\n\n        base = (((cpuTime) * 100.0) / (seconds * 1000.0 * 1000.0 * 1000.0))\n        percentage = max(0.0, min(100.0, base / cpus))\n\n        self.stats[vm_uuid].update({'cputime': info[4], 'cpu': percentage})\n\n    def _get_network_io_rate(self, vm_uuid, dom, seconds):\n        prevNetRxKB = self.stats[vm_uuid].get('netRxKB', 0)\n        prevNetTxKB = self.stats[vm_uuid].get('netTxKB', 0)\n        currentMaxNetRate = self.stats[vm_uuid].get('max_net_io', 100)\n\n        rx_bytes = 0\n        tx_bytes = 0\n\n        tree = ElementTree.fromstring(dom.XMLDesc(0))\n        for target in tree.findall('devices/interface/target'):\n            dev = target.get('dev')\n            io = dom.interfaceStats(dev)\n            rx_bytes += io[0]\n            tx_bytes += io[4]\n\n        netRxKB = float(rx_bytes) / 1000\n        netTxKB = float(tx_bytes) / 1000\n\n        rx_stats = (netRxKB - prevNetRxKB) / seconds\n        tx_stats = (netTxKB - prevNetTxKB) / seconds\n\n        rate = rx_stats + tx_stats\n        max_net_io = round(max(currentMaxNetRate, int(rate)), 1)\n\n        self.stats[vm_uuid].update({'net_io': rate, 'max_net_io': max_net_io,\n                                 'netRxKB': netRxKB, 'netTxKB': netTxKB})\n\n    def _get_disk_io_rate(self, vm_uuid, dom, seconds):\n        prevDiskRdKB = self.stats[vm_uuid].get('diskRdKB', 0)\n        prevDiskWrKB = self.stats[vm_uuid].get('diskWrKB', 0)\n        currentMaxDiskRate = self.stats[vm_uuid].get('max_disk_io', 100)\n\n        rd_bytes = 0\n        wr_bytes = 0\n\n        tree = ElementTree.fromstring(dom.XMLDesc(0))\n        for target in tree.findall(\"devices/disk/target\"):\n            dev = target.get(\"dev\")\n            io = dom.blockStats(dev)\n            rd_bytes += io[1]\n            wr_bytes += io[3]\n\n        diskRdKB = float(rd_bytes) / 1024\n        diskWrKB = float(wr_bytes) / 1024\n\n        rd_stats = (diskRdKB - prevDiskRdKB) / seconds\n     ",
+      "total_lines": 1665,
+      "ref": "ab63bbadae7917b7fa378b5383b458e52b1fd26a"
+    },
+    "target_function": {
+      "found": false,
+      "error": "function_not_found"
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "Verify",
+        "NFS"
+      ],
+      "reason": "Both methods are essential for addressing the TODO comment regarding the verification of NFS export mounting."
+    },
+    "retrieved_methods": [],
+    "missing_method_names": [
+      "Verify",
+      "NFS"
+    ]
+  },
+  "review_context": {}
+}

@@ -1,0 +1,108 @@
+{
+  "task_id": "350",
+  "repo_owner": "astrazeneca",
+  "repo_name": "kazu",
+  "file_path": "kazu/steps/ner/rule_based.py",
+  "commit": "79f8381fc690c0ee266f5c8c5636a8fc9a5ef5ca",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T16:28:32+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "79f8381fc690c0ee266f5c8c5636a8fc9a5ef5ca",
+    "symbol_name": "build_pipeline",
+    "satd_line": 76,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T16:28:32+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 2,
+    "retrieved_method_count": 1,
+    "missing_method_count": 1,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "kazu/steps/ner/rule_based.py",
+    "original_signature": "def build_pipeline(",
+    "target_file": {
+      "ok": true,
+      "path": "kazu/steps/ner/rule_based.py",
+      "sha": "d97d5e1d5207c73635933ee55dd0bd5b0881168e",
+      "download_url": "https://raw.githubusercontent.com/AstraZeneca/KAZU/79f8381fc690c0ee266f5c8c5636a8fc9a5ef5ca/kazu/steps/ner/rule_based.py",
+      "content_excerpt": "from collections import defaultdict\nimport logging\nimport traceback\nfrom typing import Dict, Iterator, List, Optional, Set, Tuple\n\nimport spacy\n\nfrom kazu.data.data import CharSpan, Document, Mapping, Section, Entity, PROCESSING_EXCEPTION\nfrom kazu.modelling.ontology_matching.assemble_pipeline import main as assemble_pipeline\nfrom kazu.steps import BaseStep\nfrom kazu.utils.caching import SynonymTableCache\nfrom kazu.utils.utils import as_path, PathLike\n\n\nlogger = logging.getLogger(__name__)\n\n\nclass RuleBasedNerAndLinkingStep(BaseStep):\n    \"\"\"\n    A wrapper for the explosion ontology-based entity matcher and linker\n    \"\"\"\n\n    def __init__(\n        self,\n        depends_on: List[str],\n        path: PathLike,\n        rebuild_pipeline: bool = False,\n        labels: Optional[List[str]] = None,\n        synonym_table_cache: Optional[SynonymTableCache] = None,\n    ):\n        \"\"\"\n        :param path: path to spacy pipeline including Ontology Matcher.\n        :param depends_on:\n        \"\"\"\n\n        super().__init__(depends_on=depends_on)\n\n        self.path = as_path(path)\n        self.synonym_table_cache = synonym_table_cache\n        self.labels = labels\n\n        if rebuild_pipeline or not self.path.exists():\n            if self.synonym_table_cache is None or self.labels is None:\n                # invalid - no way to get a spacy pipeline.\n                # gather the relevant information for the error message\n                if rebuild_pipeline:\n                    reason_for_trying_to_build_pipeline = (\n                        \"rebuild_pipeline parameter was set to True\"\n                    )\n                else:\n                    reason_for_trying_to_build_pipeline = (\n                        f\"the path parameter {self.path} does not exist\"\n                    )\n\n                none_param = \"synonyn_table_cache\" if synonym_table_cache is None else \"labels\"\n                raise ValueError(\n                    f\"Cannot instantiate {self.__class__.__name__} as the {none_param} param was None and {reason_for_trying_to_build_pipeline}\"\n                )\n\n            logger.info(\"forcing a rebuild of spacy 'arizona' NER and EL pipeline\")\n            self.spacy_pipeline = self.build_pipeline(\n                self.path, self.synonym_table_cache, self.labels\n            )\n        else:\n            self.spacy_pipeline = spacy.load(self.path)\n\n    @staticmethod\n    def build_pipeline(\n        path: PathLike, synonym_table_cache: SynonymTableCache, labels: List[str]\n    ) -> spacy.language.Language:\n        synonym_table_paths = synonym_table_cache.get_synonym_table_paths()\n        return assemble_pipeline(\n            parquet_files=synonym_table_paths,\n            # TODO: just use the list all the way through\n            labels=\",\".join(labels),\n            # TODO: take this from config\n            span_key=\"span_key\",\n            output_dir=path,\n        )\n\n    def _run(self, docs: List[Document]) -> Tuple[List[Document], List[Document]]:\n        texts_and_sections = (\n            (section.text, (section, doc)) for doc in docs for section in doc.sections\n        )\n\n        doc_to_processed_sections: Dict[Document, Set[Section]] = defaultdict(set)\n        # TODO: multiprocessing within the pipe command?\n        try:\n            spacy_result: Iterator[\n                Tuple[spacy.tokens.Doc, Tuple[Section, Document]]\n            ] = self.spacy_pipeline.pipe(texts_and_sections, as_tuples=True)\n\n            span_key = self.spacy_pipeline.get_pipe(\"ontology_matcher\").span_key\n\n            for processed_text, (section, doc) in spacy_result:\n                # TODO: not sure if spacy OntologyMatcher gives us multiple spans with\n                # the same positions if there are multiple linking options\n\n                entities = []\n\n                for span in processed_text.spans[span_key]:\n                    mappings = [\n                        Mapping(\n                            default_label=\"fix_this\",\n                            source=\"fix_this\",\n                            idx=span.kb_id,\n                            mapping_type=[\"fix_this\"],\n                        )\n                    ]\n\n                    entities.append(\n                        Entity(\n                            match=span.text,\n                            # not quite true, this is spacy's entity classes, not Kazu's\n                            entity_class=span.label_,\n                            # the end might be off by one here due to how spacy defined\n                            # ends vs kazu - not sure\n                            spans=frozenset((CharSpan(start=span.start, end=span.end),)),\n                            namespace=self.namespace(),\n                            mappings=mappings,\n                        )\n                    )\n\n                # TODO: merge with potentially existing entities from the Transformer steps (or other steps)\n                # should the transformer method also do this so that they can be run in either order?\n\n                # if one section of a doc fails after others have succeeded, this will leave failed docs\n                # in a partially processed state. It's actually unclear to me whether this is desireable or not.\n                section.entities.extend(entities)\n                doc_to_processed_sections[doc].add(section)\n\n            return docs, []\n\n        # this will give up on all docs as soon as one fails - we could have an additional\n        # try-except inside the loop. We'd probably need to handle the case when the iterator raises an\n        # error when we try iterating further though, or we might get stuck in a loop.\n        except Exception:\n            failed_docs: List[Document] = []\n            failed_doc_ids: List[str] = []\n            succeeded_docs: List[Document] = []\n\n            for doc in docs:\n                processed_sections = doc_to_processed_sections[doc]\n                if all(section in processed_sections for section in doc.sections):\n                    succeeded_docs.append(doc)\n                else:\n                    failed_docs.append(doc)\n                    failed_doc_ids.append(doc.idx)\n\n            message = (\n                \"spacy processing pipeline failed: docs that aren't fully processed: {failed_doc_ids}\\n\"\n                + traceback.format_exc()\n            )\n            for doc in failed_docs:\n                doc.metadata[PROCESSING_EXCEPTION] = message\n\n            return [], failed_docs\n",
+      "total_lines": 157,
+      "ref": "79f8381fc690c0ee266f5c8c5636a8fc9a5ef5ca"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "build_pipeline",
+      "class_name": "RuleBasedNerAndLinkingStep",
+      "start_line": 68,
+      "end_line": 79,
+      "satd_line": 76,
+      "matched_by": "signature_or_comment",
+      "source": "    def build_pipeline(\n        path: PathLike, synonym_table_cache: SynonymTableCache, labels: List[str]\n    ) -> spacy.language.Language:\n        synonym_table_paths = synonym_table_cache.get_synonym_table_paths()\n        return assemble_pipeline(\n            parquet_files=synonym_table_paths,\n            # TODO: just use the list all the way through\n            labels=\",\".join(labels),\n            # TODO: take this from config\n            span_key=\"span_key\",\n            output_dir=path,\n        )",
+      "calls": [
+        "assemble_pipeline"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "List",
+        "PathLike",
+        "SynonymTableCache",
+        "assemble_pipeline",
+        "spacy"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "synonym_table_cache.get_synonym_table_paths",
+        "assemble_pipeline"
+      ],
+      "reason": "Both methods are integral to the pipeline construction process, and understanding them is necessary to effectively address the SATD related to configuration."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "SynonymTableCache.get_synonym_table_paths",
+        "path": "kazu/utils/caching.py",
+        "class_name": "SynonymTableCache",
+        "start_line": 77,
+        "end_line": 104,
+        "source": "def get_synonym_table_paths(self) -> List[Path]:\n        \"\"\"\n        for each parser in self.parsers, create a synonym table. If a cached version is available, load it instead\n        :return:\n        \"\"\"\n        synonym_table_paths: List[Path] = []\n        for parser in self.parsers:\n            cache_dir = get_cache_dir(\n                parser.in_path, prefix=\"synonym_table\", create_if_not_exist=False\n            )\n            cache_path = self._get_synonym_cache_path(cache_dir, parser)\n\n            if self.rebuild_cache:\n                logger.info(\"forcing a rebuild of the synonym table cache\")\n                if cache_dir.exists():\n                    shutil.rmtree(cache_dir)\n                cache_dir.mkdir()\n                self.build_synonym_table_cache(cache_path, parser)\n            elif cache_dir.exists() and cache_path.exists():\n                logger.info(f\"using cached synonym table file from {cache_path}\")\n            else:\n                logger.info(\"No synonym table cache file found. Building a new one\")\n                cache_dir.mkdir(exist_ok=True)\n                self.build_synonym_table_cache(cache_dir, parser)\n\n            synonym_table_paths.append(cache_path)\n\n        return synonym_table_paths",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "assemble_pipeline"
+    ]
+  },
+  "review_context": {}
+}

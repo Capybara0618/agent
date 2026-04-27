@@ -1,0 +1,115 @@
+{
+  "task_id": "73",
+  "repo_owner": "internetarchive",
+  "repo_name": "brozzler",
+  "file_path": "brozzler/worker.py",
+  "commit": "8366bd2d66fc8ace415236e20d0cff51525d6a17",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T15:25:42+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "8366bd2d66fc8ace415236e20d0cff51525d6a17",
+    "symbol_name": "run",
+    "satd_line": 174,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 1,
+    "same_class_methods_count": 1,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 2,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 2,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T15:25:42+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 3,
+    "retrieved_method_count": 1,
+    "missing_method_count": 2,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "brozzler/worker.py",
+    "original_signature": "def run(self):",
+    "target_file": {
+      "ok": true,
+      "path": "brozzler/worker.py",
+      "sha": "95b6cda3f53fc2ae324c4961098ab269b9b54a75",
+      "download_url": "https://raw.githubusercontent.com/internetarchive/brozzler/8366bd2d66fc8ace415236e20d0cff51525d6a17/brozzler/worker.py",
+      "content_excerpt": "# vim: set sw=4 et:\n\nimport os\nimport logging\nimport brozzler\nimport threading\nimport time\nimport signal\nimport kombu\nimport brozzler.hq\nimport youtube_dl\nimport urllib.request\nimport json\n\nclass BrozzlerWorker:\n    logger = logging.getLogger(__module__ + \".\" + __qualname__)\n\n    def __init__(self, amqp_url=\"amqp://guest:guest@localhost:5672/%2f\",\n            max_browsers=1, chrome_exe=\"chromium-browser\"):\n        self._amqp_url = amqp_url\n        self._max_browsers = max_browsers\n        self._browser_pool = brozzler.browser.BrowserPool(max_browsers,\n                chrome_exe=chrome_exe, ignore_cert_errors=True)\n        self._shutdown_requested = threading.Event()\n\n    def _youtube_dl(self, site):\n        ydl_opts = {\n            \"outtmpl\": \"/dev/null\",\n            \"verbose\": False,\n            \"retries\": 1,\n            \"logger\": logging.getLogger(\"youtube_dl\"),\n            \"nocheckcertificate\": True,\n            \"hls_prefer_native\": True,\n            \"noprogress\": True,\n            \"nopart\": True,\n            \"no_color\": True,\n        }\n        if site.extra_headers:\n            ydl_opts[\"extra_http_headers\"] = site.extra_headers\n        if site.proxy:\n            ydl_opts[\"proxy\"] = \"http://{}\".format(site.proxy)\n            ## XXX (sometimes?) causes chrome debug websocket to go through\n            ## proxy. Maybe not needed thanks to hls_prefer_native.\n            ## # see https://github.com/rg3/youtube-dl/issues/6087\n            ## os.environ[\"http_proxy\"] = \"http://{}\".format(site.proxy)\n        return youtube_dl.YoutubeDL(ydl_opts)\n\n    def _next_page(self, site):\n        \"\"\"Raises kombu.simple.Empty if queue is empty\"\"\"\n        with kombu.Connection(self._amqp_url) as conn:\n            q = conn.SimpleQueue(\"brozzler.sites.{}.pages\".format(site.id))\n            msg = q.get(block=True, timeout=0.5)\n            page_dict = msg.payload\n            page = brozzler.Page(**page_dict)\n            msg.ack()\n            return page\n\n    def _completed_page(self, site, page):\n        with kombu.Connection(self._amqp_url) as conn:\n            q = conn.SimpleQueue(\"brozzler.sites.{}.completed_pages\".format(site.id))\n            self.logger.info(\"feeding {} to {}\".format(page, q.queue.name))\n            q.put(page.to_dict())\n\n    def _disclaim_site(self, site, page=None):\n        with kombu.Connection(self._amqp_url) as conn:\n            q = conn.SimpleQueue(\"brozzler.sites.disclaimed\".format(site.id))\n            self.logger.info(\"feeding {} to {}\".format(site, q.queue.name))\n            q.put(site.to_dict())\n            if page:\n                q = conn.SimpleQueue(\"brozzler.sites.{}.pages\".format(site.id))\n                self.logger.info(\"feeding unfinished page {} to {}\".format(page, q.queue.name))\n                q.put(page.to_dict())\n\n    def _putmeta(self, warcprox_address, url, content_type, payload, extra_headers=None):\n        headers = {\"Content-Type\":content_type}\n        if extra_headers:\n            headers.update(extra_headers)\n        request = urllib.request.Request(url, method=\"PUTMETA\",\n                headers=headers, data=payload)\n\n        # XXX setting request.type=\"http\" is a hack to stop urllib from trying\n        # to tunnel if url is https\n        request.type = \"http\"\n        request.set_proxy(warcprox_address, \"http\")\n\n        try:\n            with urllib.request.urlopen(request) as response:\n                if response.status != 204:\n                    self.logger.warn(\"\"\"got \"{} {}\" response on warcprox PUTMETA request (expected 204)\"\"\".format(response.status, response.reason))\n        except urllib.error.HTTPError as e:\n            self.logger.warn(\"\"\"got \"{} {}\" response on warcprox PUTMETA request (expected 204)\"\"\".format(e.getcode(), e.info()))\n\n    def _try_youtube_dl(self, ydl, site, page):\n        try:\n            self.logger.info(\"trying youtube-dl on {}\".format(page))\n            info = ydl.extract_info(page.url)\n            if site.proxy and site.enable_warcprox_features:\n                info_json = json.dumps(info, sort_keys=True, indent=4)\n                self.logger.info(\"sending PUTMETA request to warcprox with youtube-dl json for {}\".format(page))\n                self._putmeta(warcprox_address=site.proxy, url=page.url,\n                        content_type=\"application/vnd.youtube-dl_formats+json;charset=utf-8\",\n                        payload=info_json.encode(\"utf-8\"),\n                        extra_headers=site.extra_headers)\n        except BaseException as e:\n            if hasattr(e, \"exc_info\") and youtube_dl.utils.UnsupportedError in e.exc_info:\n                pass\n            else:\n                raise\n\n    def _brozzle_page(self, browser, ydl, site, page):\n        def on_screenshot(screenshot_png):\n            if site.proxy and site.enable_warcprox_features:\n                self.logger.info(\"sending PUTMETA request to warcprox with screenshot for {}\".format(page))\n                self._putmeta(warcprox_address=site.proxy, url=page.url,\n                        content_type=\"image/png\", payload=screenshot_png,\n                        extra_headers=site.extra_headers)\n\n        self.logger.info(\"brozzling {}\".format(page))\n        try:\n            self._try_youtube_dl(ydl, site, page)\n        except:\n            self.logger.error(\"youtube_dl raised unexpected exception on {}\".format(page), exc_info=True)\n\n        page.outlinks = browser.browse_page(page.url,\n                extra_headers=site.extra_headers,\n                on_screenshot=on_screenshot,\n                on_url_change=page.note_redirect)\n\n    def _brozzle_site(self, browser, ydl, site):\n        start = time.time()\n        page = None\n        try:\n            browser.start(proxy=site.proxy)\n            while not self._shutdown_requested.is_set() and time.time() - start < 60:\n                try:\n                    page = self._next_page(site)\n                    self._brozzle_page(browser, ydl, site, page)\n                    self._completed_page(site, page)\n                    page = None\n                except kombu.simple.Empty:\n                    # if some timeout reached, re-raise?\n                    pass\n        # except kombu.simple.Empty:\n        #     self.logger.info(\"finished {} (queue is empty)\".format(site))\n        except brozzler.browser.BrowsingAborted:\n            self.logger.info(\"{} shut down\".format(browser))\n        finally:\n            browser.stop()\n            self._disclaim_site(site, page)\n            self._browser_pool.release(browser)\n\n    def _claim_site(self, q):\n        \"\"\"Reads message from SimpleQueue q, fires off thread to brozzle the\n        site. Raises KeyError if no browsers are available, kombu.simple.Empty\n        if queue is empty.\"\"\"\n        browser = self._browser_pool.acquire()\n        try:\n            msg = q.get(block=True, timeout=0.5)\n            site = brozzler.Site(**msg.payload)\n            msg.ack()\n            self.logger.info(\"brozzling site {}\".format(site))\n            ydl = self._youtube_dl(site)\n            th = threading.Thread(target=lambda: self._brozzle_site(browser, ydl, site),\n                    name=\"BrowsingThread-{}\".format(site.scope_surt))\n            th.start()\n        except:\n            self._browser_pool.release(browser)\n            raise\n\n    def run(self):\n        latest_state = None\n        while not self._shutdown_requested.is_set():\n            try:\n                # XXX too much connecting and disconnecting from rabbitmq\n                with kombu.Connection(self._amqp_url) as conn:\n                    q = conn.SimpleQueue(\"brozzler.sites.unclaimed\")\n                    q_empty = False\n                    if len(q) > 0:\n                        try:\n                            self._claim_site(q)\n                        except kombu.simple.Empty:\n                            q_empty = True\n                        except KeyError:\n                            if latest_state != \"browsers-busy\":\n                                self.logger.info(\"all {} browsers are busy\".format(self._max_browsers))\n                                latest_state = \"browsers-busy\"\n                    else:\n                        q_empty = True\n\n                    if q_empty:\n                        if latest_state != \"no-unclaimed-sites\":\n                            self.logger.info(\"no unclaimed sites to browse\")\n                            latest_state = \"no-unclaimed-sites\"\n                time.sleep(0.5)\n            except OSError as e:\n                self.logger.warn(\"continuing after i/o exception (from rabbitmq?)\", exc_info=True)\n\n    def start(self):\n        th = threading.Thread(target=self.run, name=\"BrozzlerWorker\")\n        th.start()\n\n    def shutdown_now(self):\n        self.logger.info(\"brozzler worker shutting down\")\n        self._shutdown_requested.set()\n        self._browser_pool.shutdown_now()\n\n",
+      "total_lines": 206,
+      "ref": "8366bd2d66fc8ace415236e20d0cff51525d6a17"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "run",
+      "class_name": "BrozzlerWorker",
+      "start_line": 170,
+      "end_line": 196,
+      "satd_line": 174,
+      "matched_by": "signature_or_comment",
+      "source": "    def run(self):\n        latest_state = None\n        while not self._shutdown_requested.is_set():\n            try:\n                # XXX too much connecting and disconnecting from rabbitmq\n                with kombu.Connection(self._amqp_url) as conn:\n                    q = conn.SimpleQueue(\"brozzler.sites.unclaimed\")\n                    q_empty = False\n                    if len(q) > 0:\n                        try:\n                            self._claim_site(q)\n                        except kombu.simple.Empty:\n                            q_empty = True\n                        except KeyError:\n                            if latest_state != \"browsers-busy\":\n                                self.logger.info(\"all {} browsers are busy\".format(self._max_browsers))\n                                latest_state = \"browsers-busy\"\n                    else:\n                        q_empty = True\n\n                    if q_empty:\n                        if latest_state != \"no-unclaimed-sites\":\n                            self.logger.info(\"no unclaimed sites to browse\")\n                            latest_state = \"no-unclaimed-sites\"\n                time.sleep(0.5)\n            except OSError as e:\n                self.logger.warn(\"continuing after i/o exception (from rabbitmq?)\", exc_info=True)",
+      "calls": [
+        "len"
+      ],
+      "self_calls": [
+        "_claim_site"
+      ],
+      "self_attrs": [
+        "_amqp_url",
+        "_claim_site",
+        "_max_browsers",
+        "_shutdown_requested",
+        "logger"
+      ],
+      "global_uses": [
+        "kombu",
+        "time"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "kombu.Connection",
+        "conn.SimpleQueue",
+        "_claim_site"
+      ],
+      "reason": "These methods are essential for understanding the connection management with RabbitMQ, which is the focus of the SATD."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "BrozzlerWorker._claim_site",
+        "path": "brozzler/worker.py",
+        "class_name": "BrozzlerWorker",
+        "start_line": 152,
+        "end_line": 168,
+        "source": "def _claim_site(self, q):\n        \"\"\"Reads message from SimpleQueue q, fires off thread to brozzle the\n        site. Raises KeyError if no browsers are available, kombu.simple.Empty\n        if queue is empty.\"\"\"\n        browser = self._browser_pool.acquire()\n        try:\n            msg = q.get(block=True, timeout=0.5)\n            site = brozzler.Site(**msg.payload)\n            msg.ack()\n            self.logger.info(\"brozzling site {}\".format(site))\n            ydl = self._youtube_dl(site)\n            th = threading.Thread(target=lambda: self._brozzle_site(browser, ydl, site),\n                    name=\"BrowsingThread-{}\".format(site.scope_surt))\n            th.start()\n        except:\n            self._browser_pool.release(browser)\n            raise",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "kombu.Connection",
+      "conn.SimpleQueue"
+    ]
+  },
+  "review_context": {}
+}

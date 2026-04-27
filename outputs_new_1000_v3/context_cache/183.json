@@ -1,0 +1,118 @@
+{
+  "task_id": "183",
+  "repo_owner": "tatuylonen",
+  "repo_name": "wikitextprocessor",
+  "file_path": "wikitextprocessor/core.py",
+  "commit": "caf9606c5669f52ee27d4807b389b091f368f8dd",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T15:49:35+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "caf9606c5669f52ee27d4807b389b091f368f8dd",
+    "symbol_name": "__init__",
+    "satd_line": 120,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 1,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T15:49:35+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 2,
+    "retrieved_method_count": 0,
+    "missing_method_count": 2
+  },
+  "base_context": {
+    "file_path": "wikitextprocessor/core.py",
+    "original_signature": "def __init__(self, quiet=False, num_threads=None, cache_file=None):",
+    "target_file": {
+      "ok": true,
+      "path": "wikitextprocessor/core.py",
+      "sha": "9fc209383d7a2c3ef6d959439d726cff980603a8",
+      "download_url": "https://raw.githubusercontent.com/tatuylonen/wikitextprocessor/caf9606c5669f52ee27d4807b389b091f368f8dd/wikitextprocessor/core.py",
+      "content_excerpt": "# Definition of the processing context for Wikitext processing, and code for\n# expanding templates, parser functions, and Lua macros.\n#\n# Copyright (c) 2020 Tatu Ylonen.  See file LICENSE and https://ylonen.org\n\nimport os\nimport re\nimport sys\nimport html\nimport tempfile\nimport traceback\nimport collections\nimport html.entities\nimport multiprocessing\nfrom .parserfns import (PARSER_FUNCTIONS, call_parser_function, tag_fn)\nfrom .wikihtml import ALLOWED_HTML_TAGS\nfrom .luaexec import call_lua_sandbox\nfrom .parser import parse_encoded, NodeKind\nfrom .common import (MAGIC_FIRST, MAGIC_LAST, MAX_MAGICS, MAGIC_NOWIKI_CHAR,\n                     preprocess_text)\nfrom .dumpparser import process_dump\n\n# Set of HTML tags that need an explicit end tag.\nPAIRED_HTML_TAGS = set(k for k, v in ALLOWED_HTML_TAGS.items()\n                       if not v.get(\"no-end-tag\"))\n\n# Warning: this function is not re-entrant.  We store ctx and page_handler\n# in global variables during dump processing, because they may not be\n# pickleable.\n_global_ctx = None\n_global_page_handler = None\n\ndef phase2_page_handler(dt):\n    \"\"\"Helper function for calling the Phase2 page handler (see\n    reprocess()).  This is a global function in order to make this\n    pickleable.  The implication is that process() and reprocess() are not\n    re-entrant (i.e., cannot be called safely from multiple threads or\n    recursively)\"\"\"\n    ctx = _global_ctx\n    model, title = dt\n    ctx.start_page(title)\n    data = ctx.read_by_title(title)\n    try:\n        assert isinstance(data, str)\n        ret = _global_page_handler(model, title, data)\n        return True, ret\n    except Exception as e:\n        lst = traceback.format_exception(etype=type(e), value=e,\n                                         tb=e.__traceback__)\n\n        return False, \"=== EXCEPTION:\\n\" + \"\".join(lst)\n\n\nclass Wtp(object):\n    \"\"\"Context used for processing wikitext and for expanding templates,\n    parser functions and Lua macros.  The indended usage pattern is to\n    initialize this context once (this holds template and module definitions),\n    and then using the context for processing many pages.\"\"\"\n    __slots__ = (\n        \"buf\",\t\t # Buffer for reading/writing tmp_file\n        \"buf_ofs\",\t # Offset into buf\n        \"buf_used\",\t # Number of bytes in the buffer when reading\n        \"buf_size\",      # Allocated size of buf, in bytes\n        \"cache_file\",\t # Prefix to cache files (instead of temporary file)\n        \"cache_file_old\",  # Using pre-existing cache file\n        \"cookies\",\t # Mapping from magic cookie -> expansion data\n        \"errors\",\t # List of error messages (cleared for each new page)\n        \"fullpage\",\t # The unprocessed text of the current page (or None)\n        \"lua\",\t\t # Lua runtime or None if not yet initialized\n        \"lua_path\",\t # Path to Lua modules\n        \"modules\",\t # Lua code for defined Lua modules\n        \"need_pre_expand\",  # Set of template names to be expanded before parse\n        \"num_threads\",   # Number of parallel threads to use\n        \"page_contents\",  # Full content for selected pages (e.g., Thesaurus)\n        \"page_seq\",\t # All content pages (title, model, ofs, len) in order\n        \"quiet\",\t # If True, don't print any messages during processing\n        \"redirects\",\t # Redirects in the wikimedia project\n        \"rev_ht\",\t # Mapping from text to magic cookie\n        \"expand_stack\",\t # Saved stack before calling Lua function\n        \"template_name\", # name of template currently being expanded\n        \"templates\",     # dict temlate name -> definition\n        \"title\",         # current page title\n        \"tmp_file\",\t # Temporary file used to store templates and pages\n        \"tmp_ofs\",\t # Next write offset\n        \"warnings\",\t # List of warning messages (cleared for each new page)\n        # Data for parsing\n        \"beginning_of_line\", # Parser at beginning of line\n        \"linenum\",\t # Current line number\n        \"pre_parse\",\t # XXX is pre-parsing still needed?\n        \"parser_stack\",\t # Parser stack\n        \"suppress_special\",  # XXX never set to True???\n    )\n    def __init__(self, quiet=False, num_threads=None, cache_file=None):\n        self.buf_ofs = 0\n        self.buf_size = 4 * 1024 * 1024\n        self.buf = bytearray(self.buf_size)\n        self.cache_file = cache_file\n        self.cache_file_old = False\n        self.cookies = []\n        self.errors = []\n        self.warnings = []\n        self.lua = None\n        self.page_contents = {}\n        self.page_seq = []\n        self.quiet = quiet\n        self.rev_ht = {}\n        self.expand_stack = []\n        self.num_threads = num_threads\n        self.templates = {}\n        # Some predefined templates\n        self.templates[\"!\"] = \"&vert;\"\n        self.templates[\"%28%28\"] = \"&lbrace;&lbrace;\"  # {{((}}\n        self.templates[\"%29%29\"] = \"&rbrace;&rbrace;\"  # {{))}}\n        self.need_pre_expand = set()\n        self.redirects = {}\n        if self.cache_file:\n            try:\n                # Load self.templates, self.page_contents, self.page_seq,\n                # self.redirects\n                # XXX\n                self.tmp_file = open(self.cache_file, \"rb\", buffering=0)\n                self.cache_file_old = True\n            except FileNotFoundException:\n                self.tmp_file = open(self.cache_file, \"w+b\", buffering=0)\n        else:\n            self.tmp_file = tempfile.TemporaryFile(mode=\"w+b\", buffering=0)\n        self.tmp_ofs = 0\n        self.buf_ofs = 0\n\n    def error(self, msg, trace=None):\n        \"\"\"Prints an error message to stdout.  The error is also saved in\n        self.errors.\"\"\"\n        assert isinstance(msg, str)\n        assert isinstance(trace, (str, type(None)))\n        self.errors.append({\"msg\": msg, \"trace\": trace,\n                            \"path\": tuple(self.expand_stack)})\n        if self.expand_stack:\n            msg += \" at {}\".format(self.expand_stack)\n        if trace:\n            msg += \"\\n\" + trace\n        print(\"{}: ERROR: {}\".format(self.title, msg))\n        sys.stdout.flush()\n\n    def warning(self, msg, trace=None):\n        \"\"\"Prints a warning message to stdout.  The error is also saved in\n        self.warnings.\"\"\"\n        assert isinstance(msg, str)\n        assert isinstance(trace, (str, type(None)))\n        self.warnings.append({\"msg\": msg, \"trace\": trace,\n                              \"path\": tuple(self.expand_stack)})\n        if self.expand_stack:\n            msg += \" at {}\".format(self.expand_stack)\n        if trace:\n            msg += \"\\n\" + trace\n        print(\"{}: {}\".format(self.title, msg))\n        sys.stdout.flush()\n\n    def _canonicalize_template_name(self, name):\n        \"\"\"Canonicalizes a template name by making its first character\n        uppercase and replacing underscores by spaces and sequences of\n        whitespace by a single whitespace.\"\"\"\n        assert isinstance(name, str)\n        if name[:9] == \"Template:\":\n            name = name[9:]\n        name = re.sub(r\"_\", \" \", name)\n        name = re.sub(r\"\\s+\", \" \", name)\n        name = re.sub(r\"\\(\", \"%28\", name)\n        name = re.sub(r\"\\)\", \"%29\", name)\n        name = re.sub(r\"&\", \"%26\", name)\n        name = re.sub(r\"\\+\", \"%2B\", name)\n        name = name.strip()\n        #if name:\n        #    name = name[0].upper() + name[1:]\n        return name\n\n\n    def _canonicalize_parserfn_name(self, name):\n        \"\"\"Canonicalizes a parser function name by making its first character\n        uppercase and replacing underscores by spaces and sequences of\n        whitespace by a single whitespace.\"\"\"\n        assert isinstance(name, str)\n        name = re.sub(r\"_\", \" \", name)\n        name = re.sub(r\"\\s+\", \" \", name)\n        name = name.strip()\n        if name not in PARSER_FUNCTIONS:\n            name = name.lower()  # Parser function names are case-insensitive\n        return name\n\n    def _save_value(self, kind, args, nowiki):\n        \"\"\"Saves a value of a particular kind and returns a unique magic\n        cookie for it.\"\"\"\n        assert kind in (\"T\", \"A\", \"L\")  # Template/parserfn, arg, link\n        assert isinstance(args, (list, tuple))\n        assert nowiki in (True, False)\n        # print(\"save_value\", kind, args, nowiki)\n        args = tuple(args)\n        v = (kind, args, nowiki)\n        if v in self.rev_ht:\n            return self.rev_ht[v]\n        idx = len(self.cookies)\n        if idx >= MAX_MAGICS:\n            ctx.error(\"too many templates, arguments, or parser function calls\")\n            return \"\"\n        self.cookies.append(v)\n        ch = chr(MAGIC_FIRST + idx)\n        self.rev_ht[v] = ch\n        ret = ch\n        return ret\n\n    def _encode(self, text):\n        \"\"\"Encode all templates, template arguments, and parser function calls\n        in the text, from innermost to outermost.\"\"\"\n\n        def repl_arg(m):\n            \"\"\"Replacement function for template arguments.\"\"\"\n            nowiki = m.group(0).find(MAGIC_NOWIKI_CHAR) >= 0\n            orig = m.group(1)\n            args = orig.split(\"|\")\n            return self._save_value(\"A\", args, nowiki)\n\n        def repl_templ(m):\n            \"\"\"Replacement function for templates {{name|...}} and parser\n            functions.\"\"\"\n            nowiki = m.group(0).find(MAGIC_NOWIKI_CHAR) >= 0\n            args = m.group(1).split(\"|\")\n            return self._save_value(\"T\", args, nowiki)\n\n        def repl_link(m):\n            \"\"\"Replacement function for links [[...]].\"\"\"\n            nowiki = m.group(0).find(MAGIC_NOWIKI_CHAR) >= 0\n            orig = m.group(1)\n            return self._save_value(\"L\", (orig,), nowiki)\n\n        # As a preprocessing step, remove comments from the text\n        text = re.sub(r\"(?s)<!\\s*--.*?--\\s*>\", \"\", text)\n\n        # Main loop of encoding.  We encode repeatedly, always the innermost\n        # template, argument, or parser function call first.  We also encode\n        # links as they affect the interpretation of templates.\n        while True:\n            prev = text\n            # Encode links.\n            text = re.sub(r\"\\[\" + MAGIC_NOWIKI_CHAR +\n                          r\"?\\[(([^][{}]|\\[[^][{}]*\\])+)\\]\" +\n                          # XXXremove: r\"?\\[(([^][{}]|\\[[^]]*\\])+)\\]\" +\n                          MAGIC_NOWIKI_CHAR + r\"?\\]\",\n                          repl_link, text)\n            # Encode template arguments.  We repeat this until there are\n            # no more matches, because otherwise we could encode the two\n            # innermost braces as a template transclusion.\n            while True:\n                prev2 = text\n                text = re.sub(r\"(?s)\\{\" + MAGIC_NOWIKI_CHAR +\n                              r\"?\\{\" + MAGIC_NOWIKI_CHAR +\n                              r\"?\\{([^{}]*?)\\}\" +\n                              MAGIC_NOWIKI_CHAR + r\"?\\}\" +\n                              MAGIC_NOWIKI_CHAR + r\"?\\}\",\n                              repl_arg, text)\n                if text == prev2:\n                    break\n            # Handle template arguments that were INCORRECTLY closed by\n            # a double brace instead of a triple brace.  There seem to be\n            # annoyingly common.\n            # while True:\n            #     prev2 = text\n            #     # Note: intentionally only two closing braces here!\n            #     text = re.sub(r\"(?s)\\{\" + MAGIC_NOWIKI_CHAR +\n            #                   r\"?\\{\" + MAGIC_NOWIKI_CHAR +\n            #                   r\"?\\{([^{}]*?)\\}\" +\n            #                   MAGIC_NOWIKI_CHAR + r\"?\\}\",\n            #                   repl_arg, text)\n            #     # XXX should report error/warning, need separate repl function\n            #     if text == prev2:\n            #         break\n            # Encode templates\n            text = re.sub(r\"(?s)\\{\" + MAGIC_NOWIKI_CHAR +\n                          r\"?\\{(([^{}]|\\}[^{}])+?)\\}\" +\n                          MAGIC_NOWIKI_CHAR + r\"?\\}\",\n                          repl_templ, text)\n            # We keep looping until there is no change during the iteration\n            if text == prev:\n                break\n        ",
+      "total_lines": 1081,
+      "ref": "caf9606c5669f52ee27d4807b389b091f368f8dd"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "__init__",
+      "class_name": "Wtp",
+      "start_line": 93,
+      "end_line": 128,
+      "satd_line": 120,
+      "matched_by": "signature_or_comment",
+      "source": "    def __init__(self, quiet=False, num_threads=None, cache_file=None):\n        self.buf_ofs = 0\n        self.buf_size = 4 * 1024 * 1024\n        self.buf = bytearray(self.buf_size)\n        self.cache_file = cache_file\n        self.cache_file_old = False\n        self.cookies = []\n        self.errors = []\n        self.warnings = []\n        self.lua = None\n        self.page_contents = {}\n        self.page_seq = []\n        self.quiet = quiet\n        self.rev_ht = {}\n        self.expand_stack = []\n        self.num_threads = num_threads\n        self.templates = {}\n        # Some predefined templates\n        self.templates[\"!\"] = \"&vert;\"\n        self.templates[\"%28%28\"] = \"&lbrace;&lbrace;\"  # {{((}}\n        self.templates[\"%29%29\"] = \"&rbrace;&rbrace;\"  # {{))}}\n        self.need_pre_expand = set()\n        self.redirects = {}\n        if self.cache_file:\n            try:\n                # Load self.templates, self.page_contents, self.page_seq,\n                # self.redirects\n                # XXX\n                self.tmp_file = open(self.cache_file, \"rb\", buffering=0)\n                self.cache_file_old = True\n            except FileNotFoundException:\n                self.tmp_file = open(self.cache_file, \"w+b\", buffering=0)\n        else:\n            self.tmp_file = tempfile.TemporaryFile(mode=\"w+b\", buffering=0)\n        self.tmp_ofs = 0\n        self.buf_ofs = 0",
+      "calls": [
+        "bytearray",
+        "open",
+        "set"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "buf",
+        "buf_ofs",
+        "buf_size",
+        "cache_file",
+        "cache_file_old",
+        "cookies",
+        "errors",
+        "expand_stack",
+        "lua",
+        "need_pre_expand",
+        "num_threads",
+        "page_contents",
+        "page_seq",
+        "quiet",
+        "redirects",
+        "rev_ht",
+        "templates",
+        "tmp_file",
+        "tmp_ofs",
+        "warnings"
+      ],
+      "global_uses": [
+        "FileNotFoundException",
+        "tempfile"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "json.load",
+        "tempfile.TemporaryFile"
+      ],
+      "reason": "Understanding these methods is essential for repairing the SATD, as they directly relate to data loading and file management in the constructor."
+    },
+    "retrieved_methods": [],
+    "missing_method_names": [
+      "load",
+      "tempfile.TemporaryFile"
+    ]
+  },
+  "review_context": {}
+}

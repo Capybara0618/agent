@@ -1485,6 +1485,13 @@ class OpenAIAnalyzer:
             local_scope=local_scope,
             end_state_clear=end_state_clear,
         )
+        preserve_grounded_target = self._should_preserve_grounded_local_target(
+            state=state,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
+        )
         strict_drop_reason = self._strict_generic_drop_reason(
             state=state,
             operation_concrete=operation_concrete,
@@ -1503,6 +1510,13 @@ class OpenAIAnalyzer:
             elif strict_drop_reason == "target_not_localizable":
                 localizable = "low"
             notes = self._append_analysis_note(notes, f"Analyzer strict drop: {strict_drop_reason}.")
+        elif decision == "drop" and preserve_grounded_target:
+            decision = "uncertain"
+            if localizable == "low":
+                localizable = "partial"
+            if local_scope == "low":
+                local_scope = "partial"
+            notes = self._append_analysis_note(notes, "Analyzer kept item: grounded_local_target.")
         return self._build_result(
             decision=decision,
             confidence=confidence,
@@ -1532,6 +1546,14 @@ class OpenAIAnalyzer:
         comment = str(state.get("satd_comment") or "")
         code = str(state.get("original_code") or "")
         open_ended_comment = self._looks_open_ended_task(comment)
+        if self._should_preserve_grounded_local_target(
+            state=state,
+            operation_concrete=operation_concrete,
+            localizable=localizable,
+            local_scope=local_scope,
+            end_state_clear=end_state_clear,
+        ):
+            return ""
         if operation_concrete == "low" and end_state_clear == "low":
             return "unclear_operation_and_end_state"
         if localizable == "low" and (
@@ -1545,6 +1567,239 @@ class OpenAIAnalyzer:
         if open_ended_comment and not self._has_strong_local_edit_signal(comment, code):
             return "open_ended_without_specific_local_edit"
         return ""
+
+    def _should_preserve_grounded_local_target(
+        self,
+        *,
+        state: GraphState,
+        operation_concrete: str | None,
+        localizable: str | None,
+        local_scope: str | None,
+        end_state_clear: str | None,
+    ) -> bool:
+        if str(state.get("satd_route_type") or "generic").strip().lower() != "generic":
+            return False
+        comment = str(state.get("satd_comment") or "")
+        code = str(state.get("original_code") or "")
+        if not self._grounded_override_action_allowed(comment):
+            return False
+        if not self._has_grounded_local_target(state, comment, code):
+            return False
+        if local_scope == "low" and localizable == "low" and operation_concrete == "low" and end_state_clear == "low":
+            return True
+        if localizable in {"high", "partial"} and local_scope in {"high", "partial"}:
+            return True
+        return operation_concrete == "low" and end_state_clear == "low"
+
+    def _grounded_override_action_allowed(self, comment: str) -> bool:
+        lowered = (comment or "").lower()
+        if not lowered.strip():
+            return False
+        broad_blockers = [
+            r"\bdecide\b",
+            r"\bshould\s+we\b",
+            r"\bfigure out\b",
+            r"\binvestigat",
+            r"\blook into\b",
+            r"\brewrite\b",
+            r"\brefactor\b",
+            r"\bredesign\b",
+            r"\boptimi[sz]e\b",
+            r"\bperformance\b",
+            r"\barchitecture\b",
+            r"\bglobal\b",
+            r"\bclean up\b",
+            r"\bimprove\b",
+        ]
+        if any(re.search(pattern, lowered) for pattern in broad_blockers):
+            return False
+        broad_action_patterns = [
+            r"\bdeprecat",
+            r"\bprevent\b",
+            r"\bset\b.{0,40}\bdefault\b",
+            r"\bdefault\b.{0,40}\bto\b",
+            r"\bhonor\b",
+            r"\breturn\b",
+            r"\braise\b",
+        ]
+        if any(re.search(pattern, lowered) for pattern in broad_action_patterns):
+            return True
+        symbol_required_patterns = [
+            r"\bimplement\b",
+            r"\badd\b",
+            r"\buncomment\b",
+            r"\bhandle\b",
+            r"\bparse\b",
+            r"\bcheck\b",
+        ]
+        return (
+            any(re.search(pattern, lowered) for pattern in symbol_required_patterns)
+            and self._has_explicit_symbolic_target(comment)
+        )
+
+    def _has_explicit_symbolic_target(self, comment: str) -> bool:
+        text = str(comment or "")
+        if re.search(r"`[^`]{2,80}`|['\"][A-Za-z_][A-Za-z0-9_.-]{2,}['\"]", text):
+            return True
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[._][A-Za-z_][A-Za-z0-9_]*)+\b", text):
+            return True
+        if re.search(r"\b[a-z][a-z0-9]*_[a-zA-Z0-9_]+\b", text):
+            return True
+        ignored = self._generic_target_terms() | {
+            "to",
+            "todo",
+            "fixme",
+            "xxx",
+            "implement",
+            "uncomment",
+            "handle",
+            "check",
+            "parse",
+            "add",
+            "prevent",
+            "deprecate",
+            "when",
+            "once",
+        }
+        for match in re.finditer(r"\b[A-Z][a-z][A-Za-z0-9_]{2,}\b", text):
+            token = match.group(0).lower()
+            if token not in ignored:
+                return True
+        return False
+
+    def _has_grounded_local_target(self, state: GraphState, comment: str, code: str) -> bool:
+        terms = self._local_target_terms_from_comment(comment)
+        if not terms:
+            return False
+        evidence = self._local_target_evidence_text(state, code)
+        if not evidence.strip():
+            return False
+        lowered_evidence = evidence.lower()
+        for term in terms:
+            normalized = self._normalize_target_term(term)
+            if not normalized or normalized in self._generic_target_terms():
+                continue
+            variants = {
+                normalized,
+                normalized.replace(" ", "_"),
+                normalized.replace("_", " "),
+                normalized.replace("-", "_"),
+            }
+            for variant in variants:
+                if len(variant.strip("_ ")) < 3:
+                    continue
+                pattern = r"(?<![A-Za-z0-9_])" + re.escape(variant.lower()) + r"(?![A-Za-z0-9_])"
+                if re.search(pattern, lowered_evidence):
+                    return True
+        return False
+
+    def _local_target_terms_from_comment(self, comment: str) -> set[str]:
+        text = str(comment or "")
+        terms: set[str] = set()
+        for match in re.finditer(r"`([^`]{2,80})`|['\"]([^'\"]{2,80})['\"]", text):
+            terms.add(match.group(1) or match.group(2) or "")
+        for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[._][A-Za-z_][A-Za-z0-9_]*)+\b", text):
+            terms.add(match.group(0))
+        for match in re.finditer(r"\b[A-Z][A-Za-z0-9_]{2,}\b", text):
+            terms.add(match.group(0))
+        for match in re.finditer(r"\b[a-z][a-z0-9]*_[a-zA-Z0-9_]+\b", text):
+            terms.add(match.group(0))
+        target_nouns = (
+            "column",
+            "field",
+            "key",
+            "argument",
+            "parameter",
+            "param",
+            "method",
+            "function",
+            "class",
+            "attribute",
+            "variable",
+            "option",
+            "setting",
+            "flag",
+            "encoding",
+            "url",
+            "name",
+            "symbol",
+            "structure",
+        )
+        noun_pattern = "|".join(target_nouns)
+        for match in re.finditer(rf"\b([A-Za-z][A-Za-z0-9_-]{{2,}}(?:\s+[A-Za-z][A-Za-z0-9_-]{{2,}}){{0,2}})\s+({noun_pattern})\b", text, flags=re.IGNORECASE):
+            phrase = " ".join(part for part in match.groups() if part)
+            terms.add(phrase)
+            terms.add(match.group(1))
+            preceding_words = match.group(1).split()
+            if preceding_words:
+                terms.add(f"{preceding_words[-1]} {match.group(2)}")
+        action_pattern = r"\b(?:implement|add|prevent|deprecat\w*|honor|handle|parse|uncomment|return|raise|check)\s+(?:the\s+|a\s+|an\s+)?([A-Za-z_][A-Za-z0-9_]{2,})\b"
+        for match in re.finditer(action_pattern, text, flags=re.IGNORECASE):
+            terms.add(match.group(1))
+        return {
+            normalized
+            for normalized in (self._normalize_target_term(term) for term in terms)
+            if normalized and normalized not in self._generic_target_terms()
+        }
+
+    def _local_target_evidence_text(self, state: GraphState, code: str) -> str:
+        parts = [str(code or "")]
+        method_inquiry = state.get("method_inquiry")
+        if isinstance(method_inquiry, MethodInquiryResult):
+            parts.extend(str(name) for name in method_inquiry.required_methods or [])
+        for item in state.get("retrieved_method_contexts") or []:
+            if isinstance(item, RetrievedMethodContext):
+                parts.extend(
+                    [
+                        item.method_name,
+                        item.signature,
+                        item.source,
+                        item.callsite_slice,
+                        item.evidence_slice,
+                    ]
+                )
+            elif isinstance(item, dict):
+                parts.extend(str(item.get(key) or "") for key in ("method_name", "signature", "source", "callsite_slice", "evidence_slice"))
+        return "\n".join(part for part in parts if part)
+
+    def _normalize_target_term(self, value: str) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().strip("`'\"")).lower()
+        text = re.sub(r"[^a-z0-9_.\-\s]", "", text)
+        return text.strip(" ._-")
+
+    def _generic_target_terms(self) -> set[str]:
+        return {
+            "todo",
+            "fixme",
+            "xxx",
+            "implement",
+            "implementation",
+            "add",
+            "prevent",
+            "check",
+            "parse",
+            "handle",
+            "for",
+            "into",
+            "have",
+            "this",
+            "that",
+            "these",
+            "those",
+            "it",
+            "this function",
+            "function",
+            "method",
+            "class",
+            "code",
+            "support",
+            "default",
+            "value",
+            "values",
+            "data",
+            "api",
+            "sdk",
+        }
 
     def _has_strong_local_edit_signal(self, comment: str, code: str) -> bool:
         lowered = (comment or "").lower()

@@ -1,0 +1,152 @@
+{
+  "task_id": "315",
+  "repo_owner": "andikleen",
+  "repo_name": "pmu-tools",
+  "file_path": "toplev.py",
+  "commit": "7fe8b03f0736a75b6eda6d2d02a26b7812c44d90",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T16:19:05+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "7fe8b03f0736a75b6eda6d2d02a26b7812c44d90",
+    "symbol_name": "do_sample",
+    "satd_line": 2129,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 3,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 3,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "strong",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "high",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-26T16:19:05+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 7,
+    "retrieved_method_count": 2,
+    "missing_method_count": 2,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "toplev.py",
+    "original_signature": "def do_sample(sample_obj, rest, count, full_olist):",
+    "target_file": {
+      "ok": true,
+      "path": "toplev.py",
+      "sha": "377c43ad72971ef42cad66e26a0a20ae0f3a40d1",
+      "download_url": "https://raw.githubusercontent.com/andikleen/pmu-tools/7fe8b03f0736a75b6eda6d2d02a26b7812c44d90/toplev.py",
+      "content_excerpt": "#!/usr/bin/env python2\n# Copyright (c) 2012-2016, Intel Corporation\n# Author: Andi Kleen\n#\n# This program is free software; you can redistribute it and/or modify it\n# under the terms and conditions of the GNU General Public License,\n# version 2, as published by the Free Software Foundation.\n#\n# This program is distributed in the hope it will be useful, but WITHOUT\n# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or\n# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for\n# more details.\n#\n# Measure a workload using the topdown performance model:\n# estimate on which part of the CPU pipeline it bottlenecks.\n#\n# Must find ocperf in python module path.\n# Handles a variety of perf and kernel versions, but older ones have various\n# limitations.\n\nfrom __future__ import print_function\nimport sys, os, re, itertools, textwrap, platform, pty, subprocess\nimport argparse, time, types, fnmatch, csv, copy\nfrom collections import defaultdict, Counter\n\nfrom tl_stat import ComputeStat, ValStat, deprecated_combine_valstat\nimport tl_cpu\nimport tl_output\nimport ocperf\nimport event_download\nfrom tl_uval import UVal\nfrom tl_io import flex_open_r, flex_open_w, popentext\n\nknown_cpus = (\n    (\"snb\", (42, )),\n    (\"jkt\", (45, )),\n    (\"ivb\", (58, )),\n    (\"ivt\", (62, )),\n    (\"hsw\", (60, 70, 69 )),\n    (\"hsx\", (63, )),\n    (\"slm\", (55, 77, 76, )),\n    (\"bdw\", (61, 71, )),\n    (\"bdx\", (79, 86, )),\n    (\"simple\", ()),\n    (\"skl\", (94, 78, 142, 158, )),\n    (\"knl\", (87, )),\n    (\"skx\", ((85, 4,), )),\n    (\"clx\", ((85, 5,), (85, 6,), (85, 7,), )),\n    (\"icl\", (126, )),\n)\n\ntsx_cpus = (\"hsw\", \"hsx\", \"bdw\", \"skl\", \"skx\", \"clx\", \"icl\")\n\nfixed_to_num = {\n    \"instructions\": 0,\n    \"cycles\": 1,\n    \"cpu/event=0x3c,umask=0x00,any=1/\": 1,\n    \"cpu/event=0x3c,umask=0x0,any=1/\": 1,\n    \"ref-cycles\": 2,\n    \"cpu/event=0x0,umask=0x3/\": 2,\n    \"cpu/event=0x0,umask=0x3,any=1/\": 2,\n    \"slots\": 3,\n    \"topdown-fe-bound\": 100,\n    \"topdown-be-bound\": 101,\n    \"topdown-bad-spec\": 102,\n    \"topdown-retiring\": 103,\n}\n\n# handle kernels that don't support all events\nunsup_pebs = (\n    (\"BR_MISP_RETIRED.ALL_BRANCHES:pp\", ((\"hsw\",), (3, 18), None)),\n    (\"MEM_LOAD_UOPS_L3_HIT_RETIRED.XSNP_HITM:pp\", ((\"hsw\",), (3, 18), None)),\n    (\"MEM_LOAD_UOPS_RETIRED.L3_MISS:pp\", ((\"hsw\",), (3, 18), None)),\n)\n\nivb_ht_39 = ((\"ivb\", \"ivt\"), (4, 1), (3, 9))\n# uncomment if you removed commit 741a698f420c3 from kernel\n#ivb_ht_39 = ((), None, None)\n\n# both kernel bugs and first time a core was supported\n# disable events if the kernel does not support them properly\n# this does not handle backports (override with --force-events)\nunsup_events = (\n    # commit 36bbb2f2988a29\n    (\"OFFCORE_RESPONSE.DEMAND_RFO.L3_HIT.HITM_OTHER_CORE\", ((\"hsw\", \"hsx\"), (3, 18), None)),\n    # commit 741a698f420c3 broke it, commit e979121b1b and later fixed it\n    (\"MEM_LOAD_UOPS_L*_HIT_RETIRED.*\", ivb_ht_39),\n    (\"MEM_LOAD_UOPS_RETIRED.*\", ivb_ht_39),\n    (\"MEM_LOAD_UOPS_L*_MISS_RETIRED.*\", ivb_ht_39),\n    (\"MEM_UOPS_RETIRED.*\", ivb_ht_39),\n    # commit 5e176213a6b2bc\n    # the event works, but it cannot put into the same group as\n    # any other CYCLE_ACTIVITY.* event. For now black list, but\n    # could also special case this in the group scheduler.\n    (\"CYCLE_ACTIVITY.STALLS_TOTAL\", ((\"bdw\", (4, 4), None))),\n    # commit 91f1b70582c62576\n    (\"CYCLE_ACTIVITY.*\", ((\"bdw\"), (4, 1), None)),\n    (\"L1D_PEND_MISS.PENDING\", ((\"bdw\"), (4, 1), None)),\n    # commit 6113af14c8\n    (\"CYCLE_ACTIVITY:CYCLES_LDM_PENDING\", ((\"ivb\", \"ivt\"), (3, 12), None)),\n    # commit f8378f52596477\n    (\"CYCLE_ACTIVITY.*\", ((\"snb\", \"jkt\"), (3, 9), None)),\n    # commit 0499bd867bd17c (ULT) or commit 3a632cb229bfb18 (other)\n    # technically most haswells are 3.10, but ULT is 3.11\n    (\"L1D_PEND_MISS.PENDING\", ((\"hsw\",), (3, 11), None)),\n    (\"L1D_PEND_MISS.PENDING\", ((\"hsx\"), (3, 10), None)),\n    # commit c420f19b9cdc\n    (\"CYCLE_ACTIVITY.*_L1D_PENDING\", ((\"hsw\", \"hsx\"), (4, 1), None)),\n    (\"CYCLE_ACTIVITY.CYCLES_NO_EXECUTE\", ((\"hsw\", \"hsx\"), (4, 1), None)),\n    # commit 3a632cb229b\n    (\"CYCLE_ACTIVITY.*\", ((\"hsw\", \"hsx\"), (3, 11), None)))\n\nevent_nocheck = False\nimport_mode = False\n\nerrata_whitelist = []\n\ningroup_events = frozenset(fixed_to_num.keys())\n\noutgroup_events = set([\"dummy\"])\n\nnonperf_events = set([\"interval-ns\", \"interval-s\", \"interval-ms\", \"mux\"])\n\n# workaround for broken event files for now\nevent_fixes = {\n    \"UOPS_EXECUTED.CYCLES_GE_1_UOPS_EXEC\": \"UOPS_EXECUTED.CYCLES_GE_1_UOP_EXEC\",\n    \"UOPS_EXECUTED.CYCLES_GE_1_UOP_EXEC\": \"UOPS_EXECUTED.CYCLES_GE_1_UOPS_EXEC\"\n}\n\ncore_domains = set([\"Slots\", \"CoreClocks\", \"CoreMetric\"])\n\nlimited_counters = {\n    \"cpu/cycles-ct/\": 2,\n}\nlimited_set = set(limited_counters.keys())\n\nsmt_mode = False\n\nerrata_events = dict()\nerrata_warn_events = dict()\n\nperf = os.getenv(\"PERF\")\nif not perf:\n    perf = \"perf\"\n\nwarned = set()\n\ndef warn_once(msg):\n    if msg not in warned:\n        print(msg, file=sys.stderr)\n        warned.add(msg)\n\ndef works(x):\n    return os.system(x + \" >/dev/null 2>/dev/null\") == 0\n\nclass PerfFeatures:\n    \"\"\"Adapt to the quirks of various perf versions.\"\"\"\n    def __init__(self, args):\n        self.logfd_supported = works(perf + \" stat --log-fd 3 3>/dev/null true\")\n        if not self.logfd_supported:\n            sys.exit(\"perf binary is too old or perf is disabled in /proc/sys/kernel/perf_event_paranoid\")\n        self.supports_power = (\n                not args.no_uncore\n                and not args.force_hypervisor\n                and works(perf + \" stat -e power/energy-cores/ -a true\"))\n        # guests don't support offcore response\n        if event_nocheck:\n            self.supports_ocr = True\n            self.has_max_precise = True\n            self.max_precise = 3\n        else:\n            self.supports_ocr = works(perf + \" stat -e '{cpu/event=0xb7,umask=1,offcore_rsp=0x123/,instructions}' true\")\n            self.has_max_precise = os.path.exists(\"/sys/devices/cpu/caps/max_precise\")\n            if self.has_max_precise:\n                self.max_precise = int(open(\"/sys/devices/cpu/caps/max_precise\").read())\n\ndef kv_to_key(v):\n    return v[0] * 100 + v[1]\n\ndef unsup_event(e, table, min_kernel=None):\n    if \":\" in e:\n        e = e[:e.find(\":\")]\n    for j in table:\n        if fnmatch.fnmatch(e, j[0]) and cpu.realcpu in j[1][0]:\n            break\n    else:\n        return False\n    v = j[1]\n    if v[1] and kv_to_key(kernel_version) < kv_to_key(v[1]):\n        if min_kernel:\n            min_kernel.append(v[1])\n        return True\n    if v[2] and kv_to_key(kernel_version) >= kv_to_key(v[2]):\n        return False\n    return False\n\ndef remove_qual(ev):\n    return re.sub(r':[ku]', '', re.sub(r'/[ku+]', '/', ev))\n\ndef fixed_overflow(evlist):\n    assigned = Counter([fixed_to_num[x] for x in evlist if x in fixed_to_num]).values()\n    return any([x > 1 for x in assigned])\n\ndef is_limited(x):\n    return x.startswith(\"cpu/cycles-ct/\")\n\ndef limit_overflow(evlist):\n    assigned = Counter([limited_counters[x] for x in evlist if is_limited(x)]).values()\n    # 0..1 counter is ok\n    # >1   counter is over subscribed\n    return sum([x - 1 for x in assigned if x > 1])\n\n# limited to first four counters\ndef limit4_overflow(evlist):\n    # hardcoded for ICL (XXX)\n    if cpu.cpu == \"icl\":\n        limit4 = [x for x in evlist if fnmatch.fnmatch(x, \"cpu/event=0xd[0123],*\")]\n        return len(limit4)\n    return 0\n\ndef ismetric(x):\n    return re.match(r\"cpu/event=0x0,umask=0x(1[0123]|4)/\", x) is not None\n\nresources = (\"frontend=\", \"offcore_rsp=\", \"ldlat=\", \"in_tx_cp=\")\n\ndef event_to_resource(ev):\n    for j in resources:\n        if j in ev:\n            return j\n    return \"\"\n\ndef resource_split(evlist):\n    r = Counter(map(event_to_resource, evlist))\n    for j in r.keys():\n        if j == \"\":\n            continue\n        if j == \"offcore_rsp=\":\n            if r[j] > 2:\n                return True\n        elif r[j] > 1:\n            return True\n    return False\n\ndef needed_counters(evlist, nolimit=False):\n    evlist = list(set(evlist)) # remove duplicates first\n    evlist = list(map(remove_qual, evlist))\n    evlist = [x for x in evlist if not ismetric(x)] # XXX fixme ignore metrics for now\n    evset = set(evlist)\n    num = len(evset - ingroup_events)\n\n    # split if any resource is oversubscribed\n    if resource_split(evlist):\n        return 100\n\n    # force split if we overflow fixed or limit4\n    # some fixed could be promoted to generic, but that doesn't work\n    # with ref-cycles.\n    if not nolimit and (fixed_overflow(evlist) or limit4_overflow(evlist) > 4):\n        return 100\n\n    # account events that only schedule on one of the generic counters\n\n    # first allocate the limited counters that are not oversubscribed\n    num_limit = limit_overflow(evlist)\n    num += len(evset & limited_set) - num_limit\n\n    # if we need more than one of a limited counter make it look\n    # like it fills the group to limit first before adding them to force\n    # a split\n    if num_limit > 0 and not nolimit:\n        num = max(num, cpu.counters) + num_limit\n\n    return num\n\ndef event_group(evlist):\n    evlist = add_filter(evlist)\n    # keep uncore events outside groups for now\n    def notuncore(ev):\n        return not ev.startswith(\"uncore_\")\n    l = []\n    while len(evlist) > 0:\n        if not notuncore(evlist[0]):\n            l.append(evlist[0])\n            evlist = evlist[1:]\n            continue\n        g = list(itertools.takewhile(notuncore, evlist))\n        e = \",\".join(g)\n        if not args.no_group and needed_counters(g) <= cpu.counters and len(g) > 1:\n            e = \"{%s}\" % e\n        l.append(e)\n        evlist = evlist[len(g):]\n    return \",\".join(l)\n\ndef exe_dir():\n    d = os.path.dirname(sys.argv[0])\n    if d:\n        return d\n    return \".\"\n\np = argparse.ArgumentParser(usage='toplev [options] perf-arguments',\ndescription='''\nEstimate on which part of the CPU pipeline a workload bottlenecks using the TopDown model.\nThe bottlenecks are expressed as a tree with different levels.\nRequires a modern Intel CPU.\n\nExamples:\ntoplev.py -l2 program\nmeasure whole system in level 2 while program is running\n\ntoplev.py -l1 --single-thread program\nmeasure single threaded program. system must be idle.\n\ntoplev.py -l3 --no-desc -I 100 -x, sleep X\nmeasure whole system for X seconds every 100ms, outputting in CSV format.\n\ntoplev.py --all --core C0 taskset -c 0,1 program\nMeasure program running on core 0 with all nodes and metrics enables\n''', epilog='''\nOther perf arguments allowed (see the perf documentation)\nAfter -- perf arguments conflicting with toplev can be used.\n\nSome caveats:\n\ntoplev defaults to measuring the full system and show data\nfor all CPUs. Use taskset to limit the workload to known CPUs if needed.\nIn some cases (idle system, single threaded workload) --single-thread\ncan also be used.\n\nThe lower levels of the measurement tree are less reliable\nthan the higher levels.  They also rely on counter multi-plexing,\nand can not run each equation in a single group, which can cause larger\nmeasurement errors with non steady state workloads\n\n(If you don't understand this terminology; it means measurements\nin higher levels are less accurate and it works best with programs that primarily\ndo the same thing over and over)\n\nIf the program is very reproducible -- such as a simple kernel --\nit is also possible to use --no-multiplex. In this case the\nworkload is rerun multiple times until all data is collected.\nDo not use together with sleep.\n\ntoplev needs a new enough perf tool and has specific requirements on\nthe kernel. See http://github.com/andikleen/pmu-tools/wiki/toplev-kernel-support\n\nOther CPUs can be forced with FORCECPU=name\nThis usually requires setting the correct event map with EVENTMAP=...\nThe topology can be overriden with TOPOLOGY=file (sysfs filenames) and CPUINFO=file\n(/proc/cpuinfo replacement)\nValid CPU names: ''' + \" \".join([x[0] for x in known_cpus]),\nformatter_class=argparse.RawDescriptionHelpFormatter)\ng = p.add_argument_gr",
+      "total_lines": 2441,
+      "ref": "7fe8b03f0736a75b6eda6d2d02a26b7812c44d90"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "do_sample",
+      "class_name": null,
+      "start_line": 2116,
+      "end_line": 2173,
+      "satd_line": 2129,
+      "matched_by": "normalized_source",
+      "source": "def do_sample(sample_obj, rest, count, full_olist):\n    samples = [(\"cycles:pp\", \"Precise cycles\", )]\n\n    def sample_list(obj):\n        return [(s, obj.name) for s in obj.sample]\n\n    for obj in sample_obj:\n        if len(obj.sample) == 0:\n            m = full_name(obj) + \"*\"\n            csamples = flatten([sample_list(o)\n                                    for o in full_olist\n                                    if fnmatch.fnmatch(full_name(o), m) and o.level <= obj.level + SAMPLE_EXTEND])\n            if len(csamples) > 2:\n                # XXX should print recipe that only extends nodes by SAMPLE_EXTEND levels\n                print(\"Many possible sample events in deeper nodes.\")\n                print(\"Consider remeasuring with --nodes '+%s*' to narrow down\" % obj.name)\n            samples += csamples\n            continue\n        for s in obj.sample:\n            samples.append((s, obj.name))\n    nsamp = [x for x in samples if not unsup_event(x[0], unsup_events)]\n    nsamp = [(remove_pp(x[0]), x[1])\n             if unsup_event(x[0], unsup_pebs) else x\n             for x in nsamp]\n    if nsamp != samples:\n        missing = [x[0] for x in set(samples) - set(nsamp)]\n        if not args.quiet:\n            print(\"warning: update kernel to handle sample events:\", file=sys.stderr)\n            print(\"\\n\".join(missing), file=sys.stderr)\n\n    def force_pebs(ev):\n        return ev.startswith(\"FRONTEND_\") or (\"PREC_DIST\" in ev)\n\n    no_pebs = not supports_pebs()\n    if no_pebs:\n        nsamp = [x for x in nsamp if not force_pebs(x[0])]\n    sl = [raw_event(s[0], s[1] + \"_\" + clean_event(s[0]), period=True, nopebs=False) for s in nsamp]\n    sl = add_filter(sl)\n    sample = \",\".join([x for x in sl if x])\n    if no_pebs:\n        sample = re.sub(r'/p+', '/', sample)\n        sample = re.sub(r':p+', '', sample)\n    print(\"Sampling:\")\n    extra_args = args.sample_args.replace(\"+\", \"-\").split()\n    perf_data = args.sample_basename\n    if count:\n        perf_data += \".%d\" % count\n    sperf = [perf, \"record\"] + extra_args + [\"-e\", sample, \"-o\", perf_data] + [x for x in rest if x != \"-A\"]\n    print(\" \".join(sperf))\n    if args.run_sample:\n        ret = os.system(\" \".join(sperf))\n        if ret:\n            print(\"Sampling failed\")\n            sys.exit(1)\n        if not args.quiet:\n            print(\"Run `\" + perf + \" report %s%s' to show the sampling results\" % (\n                (\"-i %s\" % perf_data) if perf_data != \"perf_data\" else \"\",\n                \" --no-branch-history\" if \"-b\" in extra_args else \"\"))",
+      "calls": [
+        "add_filter",
+        "clean_event",
+        "flatten",
+        "force_pebs",
+        "full_name",
+        "len",
+        "print",
+        "raw_event",
+        "remove_pp",
+        "sample_list",
+        "set",
+        "supports_pebs",
+        "unsup_event"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "SAMPLE_EXTEND",
+        "add_filter",
+        "args",
+        "clean_event",
+        "ev",
+        "flatten",
+        "fnmatch",
+        "force_pebs",
+        "full_name",
+        "o",
+        "os",
+        "perf",
+        "raw_event",
+        "re",
+        "remove_pp",
+        "sample_list",
+        "supports_pebs",
+        "sys",
+        "unsup_event",
+        "unsup_events",
+        "unsup_pebs",
+        "x"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "full_name",
+        "flatten",
+        "sample_list",
+        "fnmatch.fnmatch",
+        "remove_pp",
+        "add_filter",
+        "re.sub"
+      ],
+      "reason": "These methods are essential for understanding how samples are generated, filtered, and formatted, which is directly related to the repair of the SATD regarding the printing of recipes that extend nodes by SAMPLE_EXTEND levels."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "full_name",
+        "path": "toplev.py",
+        "class_name": null,
+        "start_line": 1507,
+        "end_line": 1512,
+        "source": "def full_name(obj):\n    name = obj.name\n    while 'parent' in obj.__dict__ and obj.parent:\n        obj = obj.parent\n        name = obj.name + \".\" + name\n    return name",
+        "found": true
+      },
+      {
+        "method_name": "flatten",
+        "path": "toplev.py",
+        "class_name": null,
+        "start_line": 761,
+        "end_line": 762,
+        "source": "def flatten(x):\n    return list(itertools.chain(*x))",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "fnmatch.fnmatch",
+      "re.sub"
+    ]
+  },
+  "review_context": {}
+}

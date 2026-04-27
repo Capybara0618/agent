@@ -1,0 +1,100 @@
+{
+  "task_id": "93",
+  "repo_owner": "2i2c-org",
+  "repo_name": "infrastructure",
+  "file_path": "deployer/cluster.py",
+  "commit": "3ca8e615c2ce010efd7ef5422e2b4221258fd848",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-26T11:15:14+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "3ca8e615c2ce010efd7ef5422e2b4221258fd848",
+    "symbol_name": "deploy_support",
+    "satd_line": 64,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 0,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-26T11:15:20+00:00",
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "deployer/cluster.py",
+    "original_signature": "def deploy_support(self, cert_manager_version):",
+    "target_file": {
+      "ok": true,
+      "path": "deployer/cluster.py",
+      "sha": "9f42233d31566e101ae296fb5bfc9d9bba50a4ae",
+      "download_url": "https://raw.githubusercontent.com/2i2c-org/infrastructure/3ca8e615c2ce010efd7ef5422e2b4221258fd848/deployer/cluster.py",
+      "content_excerpt": "import json\nimport os\nimport subprocess\nimport tempfile\nfrom contextlib import contextmanager\nfrom pathlib import Path\n\nfrom .file_acquisition import get_decrypted_file, get_decrypted_files\nfrom .hub import Hub\nfrom .utils import print_colour, unset_env_vars\n\n\nclass Cluster:\n    \"\"\"\n    A single k8s cluster we can deploy to\n    \"\"\"\n\n    def __init__(self, spec, config_path):\n        self.spec = spec\n        self.config_path = config_path\n        self.hubs = [Hub(self, hub_spec) for hub_spec in self.spec.get(\"hubs\", [])]\n        self.support = self.spec.get(\"support\", {})\n\n    @contextmanager\n    def auth(self):\n        if self.spec[\"provider\"] == \"gcp\":\n            yield from self.auth_gcp()\n        elif self.spec[\"provider\"] == \"aws\":\n            yield from self.auth_aws()\n        elif self.spec[\"provider\"] == \"azure\":\n            yield from self.auth_azure()\n        elif self.spec[\"provider\"] == \"kubeconfig\":\n            yield from self.auth_kubeconfig()\n        else:\n            raise ValueError(f'Provider {self.spec[\"provider\"]} not supported')\n\n    def deploy_support(self, cert_manager_version):\n        cert_manager_url = \"https://charts.jetstack.io\"\n\n        print_colour(\"Provisioning cert-manager...\")\n        subprocess.check_call(\n            [\n                \"kubectl\",\n                \"apply\",\n                \"-f\",\n                f\"https://github.com/cert-manager/cert-manager/releases/download/{cert_manager_version}/cert-manager.crds.yaml\",\n            ]\n        )\n        subprocess.check_call(\n            [\n                \"helm\",\n                \"upgrade\",\n                \"cert-manager\",  # given release name (aka. installation name)\n                \"cert-manager\",  # helm chart to install\n                f\"--repo={cert_manager_url}\",\n                \"--install\",\n                \"--create-namespace\",\n                \"--namespace=cert-manager\",\n                f\"--version={cert_manager_version}\",\n            ]\n        )\n        print_colour(\"Done!\")\n\n        # FIXME: Revert this addition after one upgrade is made\n        print_colour(\"Fixing prometheus v22 migration...\")\n        subprocess.check_call(\n            [\n                \"kubectl\",\n                \"delete\",\n                \"--namespace=support\",\n                \"deploy/support-prometheus-server\",\n            ]\n        )\n        print_colour(\"Done!\")\n\n        print_colour(\"Provisioning support charts...\")\n\n        support_dir = (Path(__file__).parent.parent).joinpath(\"helm-charts\", \"support\")\n        subprocess.check_call([\"helm\", \"dep\", \"up\", support_dir])\n\n        # contains both encrypted and unencrypted values files\n        values_file_paths = [support_dir.joinpath(\"enc-support.secret.values.yaml\")] + [\n            self.config_path.joinpath(p)\n            for p in self.support[\"helm_chart_values_files\"]\n        ]\n\n        with get_decrypted_files(values_file_paths) as values_files:\n            cmd = [\n                \"helm\",\n                \"upgrade\",\n                \"--install\",\n                \"--create-namespace\",\n                \"--namespace=support\",\n                \"--wait\",\n                \"support\",\n                str(support_dir),\n            ]\n\n            for values_file in values_files:\n                cmd.append(f\"--values={values_file}\")\n\n            print_colour(f\"Running {' '.join([str(c) for c in cmd])}\")\n            subprocess.check_call(cmd)\n\n        print_colour(\"Done!\")\n\n    def auth_kubeconfig(self):\n        \"\"\"\n        Context manager for authenticating with just a kubeconfig file\n\n        For the duration of the contextmanager, we:\n        1. Decrypt the file specified in kubeconfig.file with sops\n        2. Set `KUBECONFIG` env var to our decrypted file path, so applications\n           we call (primarily helm) will use that as config\n        \"\"\"\n        config = self.spec[\"kubeconfig\"]\n        config_path = self.config_path.joinpath(config[\"file\"])\n\n        with get_decrypted_file(config_path) as decrypted_key_path, unset_env_vars(\n            [\"KUBECONFIG\"]\n        ):\n            os.environ[\"KUBECONFIG\"] = decrypted_key_path\n            yield\n\n    def auth_aws(self):\n        \"\"\"\n        Reads `aws` nested config and temporarily sets environment variables\n        like `KUBECONFIG`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`\n        before trying to authenticate with the `aws eks update-kubeconfig` command.\n\n        Finally get those environment variables to the original values to prevent\n        side-effects on existing local configuration.\n        \"\"\"\n        config = self.spec[\"aws\"]\n        key_path = self.config_path.joinpath(config[\"key\"])\n        cluster_name = config[\"clusterName\"]\n        region = config[\"region\"]\n\n        # Unset all env vars that start with AWS_, as that might affect the aws\n        # commandline we call. This could make some weird error messages.\n        unset_envs = [\"KUBECONFIG\"] + [k for k in os.environ if k.startswith(\"AWS_\")]\n\n        with tempfile.NamedTemporaryFile() as kubeconfig, unset_env_vars(unset_envs):\n            with get_decrypted_file(key_path) as decrypted_key_path:\n                decrypted_key_abspath = os.path.abspath(decrypted_key_path)\n                if not os.path.isfile(decrypted_key_abspath):\n                    raise FileNotFoundError(\"The decrypted key file does not exist\")\n                with open(decrypted_key_abspath) as f:\n                    creds = json.load(f)\n\n                os.environ[\"AWS_ACCESS_KEY_ID\"] = creds[\"AccessKey\"][\"AccessKeyId\"]\n                os.environ[\"AWS_SECRET_ACCESS_KEY\"] = creds[\"AccessKey\"][\n                    \"SecretAccessKey\"\n                ]\n\n            os.environ[\"KUBECONFIG\"] = kubeconfig.name\n\n            subprocess.check_call(\n                [\n                    \"aws\",\n                    \"eks\",\n                    \"update-kubeconfig\",\n                    f\"--name={cluster_name}\",\n                    f\"--region={region}\",\n                ]\n            )\n\n            yield\n\n    def auth_azure(self):\n        \"\"\"\n        Read `azure` nested config, login to Azure with a Service Principal,\n        activate the appropriate subscription, then authenticate against the\n        cluster using `az aks get-credentials`.\n        \"\"\"\n        config = self.spect[\"azure\"]\n        key_path = self.config_path.joinpath(config[\"key\"])\n        cluster = config[\"cluster\"]\n        resource_group = config[\"resource_group\"]\n\n        with tempfile.NamedTemporaryFile() as kubeconfig, unset_env_vars(\n            [\"KUBECONFIG\"]\n        ):\n            os.environ[\"KUBECONFIG\"] = kubeconfig.name\n\n            with get_decrypted_file(key_path) as decrypted_key_path:\n                decrypted_key_abspath = os.path.abspath(decrypted_key_path)\n                if not os.path.isfile(decrypted_key_abspath):\n                    raise FileNotFoundError(\"The decrypted key file does not exist\")\n\n                with open(decrypted_key_path) as f:\n                    service_principal = json.load(f)\n\n            # Login to Azure\n            subprocess.check_call(\n                [\n                    \"az\",\n                    \"login\",\n                    \"--service-principal\",\n                    f\"--username={service_principal['service_principal_id']}\",\n                    f\"--password={service_principal['service_principal_password']}\",\n                    f\"--tenant={service_principal['tenant_id']}\",\n                ]\n            )\n\n            # Set the Azure subscription\n            subprocess.check_call(\n                [\n                    \"az\",\n                    \"account\",\n                    \"set\",\n                    f\"--subscription={service_principal['subscription_id']}\",\n                ]\n            )\n\n            # Get cluster creds\n            subprocess.check_call(\n                [\n                    \"az\",\n                    \"aks\",\n                    \"get-credentials\",\n                    f\"--name={cluster}\",\n                    f\"--resource-group={resource_group}\",\n                ]\n            )\n\n            yield\n\n    def auth_gcp(self):\n        config = self.spec[\"gcp\"]\n        key_path = self.config_path.joinpath(config[\"key\"])\n        project = config[\"project\"]\n        # If cluster is regional, it'll have a `region` key set.\n        # Else, it'll just have a `zone` key set. Let's respect either.\n        location = config.get(\"zone\", config.get(\"region\"))\n        cluster = config[\"cluster\"]\n        with tempfile.NamedTemporaryFile() as kubeconfig:\n            # CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE is removed as the action of\n            # \"gcloud auth activate-server-account\" will be secondary to it\n            # otherwise, and this env var can be set by GitHub Actions we use\n            # before using this deployer script to deploy hubs to clusters.\n            orig_cloudsdk_auth_credential_file_override = os.environ.pop(\n                \"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE\", None\n            )\n            orig_kubeconfig = os.environ.get(\"KUBECONFIG\")\n            try:\n                os.environ[\"KUBECONFIG\"] = kubeconfig.name\n                with get_decrypted_file(key_path) as decrypted_key_path:\n                    subprocess.check_call(\n                        [\n                            \"gcloud\",\n                            \"auth\",\n                            \"activate-service-account\",\n                            f\"--key-file={os.path.abspath(decrypted_key_path)}\",\n                        ]\n                    )\n\n                subprocess.check_call(\n                    [\n                        \"gcloud\",\n                        \"container\",\n                        \"clusters\",\n                        # --zone works with regions too\n                        f\"--zone={location}\",\n                        f\"--project={project}\",\n                        \"get-credentials\",\n                        cluster,\n                    ]\n                )\n\n                yield\n            finally:\n                if orig_kubeconfig is not None:\n                    os.environ[\"KUBECONFIG\"] = orig_kubeconfig\n                if orig_cloudsdk_auth_credential_file_override is not None:\n                    os.environ[\n                        \"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE\"\n                    ] = orig_cloudsdk_auth_credential_file_override\n",
+      "total_lines": 278,
+      "ref": "3ca8e615c2ce010efd7ef5422e2b4221258fd848"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "deploy_support",
+      "class_name": "Cluster",
+      "start_line": 37,
+      "end_line": 105,
+      "satd_line": 64,
+      "matched_by": "normalized_source",
+      "source": "    def deploy_support(self, cert_manager_version):\n        cert_manager_url = \"https://charts.jetstack.io\"\n\n        print_colour(\"Provisioning cert-manager...\")\n        subprocess.check_call(\n            [\n                \"kubectl\",\n                \"apply\",\n                \"-f\",\n                f\"https://github.com/cert-manager/cert-manager/releases/download/{cert_manager_version}/cert-manager.crds.yaml\",\n            ]\n        )\n        subprocess.check_call(\n            [\n                \"helm\",\n                \"upgrade\",\n                \"cert-manager\",  # given release name (aka. installation name)\n                \"cert-manager\",  # helm chart to install\n                f\"--repo={cert_manager_url}\",\n                \"--install\",\n                \"--create-namespace\",\n                \"--namespace=cert-manager\",\n                f\"--version={cert_manager_version}\",\n            ]\n        )\n        print_colour(\"Done!\")\n\n        # FIXME: Revert this addition after one upgrade is made\n        print_colour(\"Fixing prometheus v22 migration...\")\n        subprocess.check_call(\n            [\n                \"kubectl\",\n                \"delete\",\n                \"--namespace=support\",\n                \"deploy/support-prometheus-server\",\n            ]\n        )\n        print_colour(\"Done!\")\n\n        print_colour(\"Provisioning support charts...\")\n\n        support_dir = (Path(__file__).parent.parent).joinpath(\"helm-charts\", \"support\")\n        subprocess.check_call([\"helm\", \"dep\", \"up\", support_dir])\n\n        # contains both encrypted and unencrypted values files\n        values_file_paths = [support_dir.joinpath(\"enc-support.secret.values.yaml\")] + [\n            self.config_path.joinpath(p)\n            for p in self.support[\"helm_chart_values_files\"]\n        ]\n\n        with get_decrypted_files(values_file_paths) as values_files:\n            cmd = [\n                \"helm\",\n                \"upgrade\",\n                \"--install\",\n                \"--create-namespace\",\n                \"--namespace=support\",\n                \"--wait\",\n                \"support\",\n                str(support_dir),\n            ]\n\n            for values_file in values_files:\n                cmd.append(f\"--values={values_file}\")\n\n            print_colour(f\"Running {' '.join([str(c) for c in cmd])}\")\n            subprocess.check_call(cmd)\n\n        print_colour(\"Done!\")",
+      "calls": [
+        "Path",
+        "get_decrypted_files",
+        "print_colour",
+        "str"
+      ],
+      "self_calls": [],
+      "self_attrs": [
+        "config_path",
+        "support"
+      ],
+      "global_uses": [
+        "Path",
+        "__file__",
+        "c",
+        "get_decrypted_files",
+        "p",
+        "print_colour",
+        "subprocess"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "analyzer_method_context_not_run"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

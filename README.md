@@ -2,12 +2,12 @@
 
 This workspace contains a LangGraph-based SATD workflow for SATD CSV datasets such as `code.csv` and `random_code.csv`.
 
-The workflow now defaults to a repair-only method-context pipeline with a lightweight compatibility shell around the old graph:
+The current retained implementation targets the final three-agent experiment (`outputs_three_agent`), which produced 633 workflow outputs and 120 exact-match repairs. Older compatibility code has been trimmed so the active path is:
 
 - analyzer node: disabled by default and bypassed with a heuristic pass-through result
 - fixer node: first asks the model which methods must be understood, then strictly retrieves those methods from the target commit, then performs a single repair
 - reviewer node: disabled by default and bypassed to accept the fixer output directly
-- selector: disabled by default; only a single repair candidate is produced
+- selector: removed from the runtime; candidate choice is deterministic because only a single repair candidate is produced
 - loop limit: 2 rounds remain available for compatibility, but the default experiment is a single repair path
 - evaluation: compares the final repaired code with `manual_code` only after the workflow finishes
 - all stages use the same OpenAI-compatible `gpt-4o-mini` interface
@@ -47,7 +47,7 @@ Layers:
 
 Workflow behavior:
 
-- every SATD builds or loads `base_context` before analyze
+- every SATD stores only lightweight local metadata before analyze
 - repair writes method-query retrieval results into `repair_context`
 - review reuses the existing context bundle when reviewer bypass is active
 - all layers are saved to disk and reused on reruns
@@ -92,7 +92,7 @@ Display rules are now:
 - `satd_langgraph/schema.py`: dataset records, preprocessing, graph state, and output models
 - `satd_langgraph/csv_loader.py`: `code.csv` reader and normalizer
 - `satd_langgraph/github_tools.py`: GitHub retrieval and local context extraction tools
-- `satd_langgraph/agents.py`: analyzer, fixer, reviewer, and layered context manager
+- `satd_langgraph/agents.py`: OpenAI-compatible client plus analyzer, fixer, and reviewer agents
 - `satd_langgraph/workflow.py`: LangGraph state graph, cache persistence, and CSV writers
 - `run_langgraph_workflow.py`: command-line entry point for the CSV experiment
 - `code.csv`: original SATD dataset

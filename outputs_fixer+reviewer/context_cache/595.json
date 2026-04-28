@@ -1,0 +1,101 @@
+{
+  "task_id": "595",
+  "repo_owner": "wandb",
+  "repo_name": "wandb",
+  "file_path": "wandb/file_pusher.py",
+  "commit": "68b4fbc96a9e30f9808a991cf7c63baffd818c61",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-27T05:14:07+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "68b4fbc96a9e30f9808a991cf7c63baffd818c61",
+    "symbol_name": "__init__",
+    "satd_line": 77,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 3,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-27T05:14:07+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "wandb/file_pusher.py",
+    "original_signature": "def __init__(self, api, file_stream, silent=False):",
+    "target_file": {
+      "ok": true,
+      "path": "wandb/file_pusher.py",
+      "sha": "bb562d9ebb7432e965ddef5fcd9d4176e27fad16",
+      "download_url": "https://raw.githubusercontent.com/wandb/wandb/68b4fbc96a9e30f9808a991cf7c63baffd818c61/wandb/file_pusher.py",
+      "content_excerpt": "# -*- coding: utf-8 -*-\n# Potential improvements:\n#   - when add to pending_jobs, we should look and see if we already have a job\n#     for this file, if so, don't bother adding it. We don't need more than\n#     one pending\nimport collections\nimport os\nimport shutil\nimport tempfile as builtin_tempfile\nimport threading\nimport time\nfrom six.moves import queue\nimport warnings\nimport tarfile\nimport multiprocessing\n\nimport wandb\nimport wandb.util\nfrom wandb.compat import tempfile\n\nfrom wandb.filesync import stats\nfrom wandb.filesync import step_checksum\nfrom wandb.filesync import step_prepare\nfrom wandb.filesync import step_upload\n\n\ndef resolve_path(path):\n    try:\n        from pathlib import Path\n        return str(Path(path).resolve())\n    except:\n        # Pathlib isn't present for python versions earlier than 3.3\n        return os.path.realpath(path)\n\n\n# Get rid of cleanup warnings in Python 2.7.\nwarnings.filterwarnings('ignore', 'Implicitly cleaning up', RuntimeWarning, 'wandb.compat.tempfile')\n\n\n# Temporary directory for copies we make of some file types to\n# reduce the probability that the file gets changed while we're\n# uploading it.\nTMP_DIR = tempfile.TemporaryDirectory('wandb')\n\n\nclass FilePusher(object):\n    \"\"\"Parallel file upload class.\n\n    This manages uploading multiple files in parallel. It will restart a given file's\n    upload job if it receives a notification that that file has been modified.\n    The finish() method will block until all events have been processed and all\n    uploads are complete.\n    \"\"\"\n\n    MAX_UPLOAD_JOBS = 64\n\n    def __init__(self, api):\n        self._api = api\n\n        self._tempdir = tempfile.TemporaryDirectory('wandb')\n\n        self._stats = stats.Stats()\n\n        self._incoming_queue = queue.Queue()\n        self._event_queue = queue.Queue()\n\n        self._step_checksum = step_checksum.StepChecksum(\n            self._api, self._tempdir, self._incoming_queue, self._event_queue, self._stats)\n        self._step_checksum.start()\n\n        self._step_upload = step_upload.StepUpload(\n            self._api, self._stats, self._event_queue, self.MAX_UPLOAD_JOBS)\n        self._step_upload.start()\n\n        # Holds refs to tempfiles if users need to make a temporary file that\n        # stays around long enough for file pusher to sync\n        # TODO(artifacts): maybe don't do this\n        self._temp_file_refs = []\n\n\n    def print_status(self):\n        step = 0\n        spinner_states = ['-', '\\\\', '|', '/']\n        stop = False\n        while True:\n            if not self.is_alive():\n                stop = True\n            summary = self._stats.summary()\n            line = ' %.2fMB of %.2fMB uploaded (%.2fMB deduped)\\r' % (\n                summary['uploaded_bytes'] / 1048576.0,\n                summary['total_bytes'] / 1048576.0,\n                summary['deduped_bytes'] / 1048576.0)\n            line = spinner_states[step % 4] + line\n            step += 1\n            wandb.termlog(line, newline=False)\n            if stop:\n                break\n            time.sleep(0.25)\n        dedupe_fraction = summary['deduped_bytes'] / float(summary['total_bytes'])\n        if dedupe_fraction > 0.01:\n            wandb.termlog('✨ W&B sync reduced upload amount by %.1f%%             ' %\n                          (dedupe_fraction * 100))\n        # clear progress line.\n        wandb.termlog(' ' * 79)\n\n    def file_counts_by_category(self):\n        return self._stats.file_counts_by_category()\n\n    def file_changed(self, save_name, path, artifact_id=None, copy=True, use_prepare_flow=False, save_fn=None, digest=None):\n        \"\"\"Tell the file pusher that a file's changed and should be uploaded.\n\n        Arguments:\n            save_name: string logical location of the file relative to the run\n                directory.\n            path: actual string path of the file to upload on the filesystem.\n        \"\"\"\n        # Tests in linux were failing because wandb-events.jsonl didn't exist\n        if not os.path.exists(path) or not os.path.isfile(path):\n            return\n        if os.path.getsize(path) == 0:\n            return\n\n        event = step_checksum.RequestUpload(path, save_name, artifact_id, copy, use_prepare_flow, save_fn, digest)\n        self._incoming_queue.put(event)\n\n    def store_manifest_files(self, manifest, artifact_id, save_fn):\n        event = step_checksum.RequestStoreManifestFiles(manifest, artifact_id, save_fn)\n        self._incoming_queue.put(event)\n\n    def named_temp_file(self, mode='w+b'):\n        # get a named temp file that the file pusher with hold a reference to so it\n        # doesn't get gc'd. Obviously, we shouldn't do this very much :). It's currently\n        # used for artifact metadata.\n        f = builtin_tempfile.NamedTemporaryFile(mode=mode, delete=False)\n        self._temp_file_refs.append(f)\n        return f\n\n    def commit_artifact(self, artifact_id, on_commit=None):\n        event = step_checksum.RequestCommitArtifact(artifact_id, on_commit)\n        self._incoming_queue.put(event)\n\n    def finish(self):\n        self._incoming_queue.put(step_checksum.RequestFinish())\n\n    def is_alive(self):\n        return (self._step_checksum.is_alive()\n            or self._step_upload.is_alive())\n",
+      "total_lines": 147,
+      "ref": "68b4fbc96a9e30f9808a991cf7c63baffd818c61"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "__init__",
+      "class_name": "FilePusher",
+      "start_line": 57,
+      "end_line": 78,
+      "satd_line": 77,
+      "matched_by": "signature_or_comment",
+      "source": "    def __init__(self, api):\n        self._api = api\n\n        self._tempdir = tempfile.TemporaryDirectory('wandb')\n\n        self._stats = stats.Stats()\n\n        self._incoming_queue = queue.Queue()\n        self._event_queue = queue.Queue()\n\n        self._step_checksum = step_checksum.StepChecksum(\n            self._api, self._tempdir, self._incoming_queue, self._event_queue, self._stats)\n        self._step_checksum.start()\n\n        self._step_upload = step_upload.StepUpload(\n            self._api, self._stats, self._event_queue, self.MAX_UPLOAD_JOBS)\n        self._step_upload.start()\n\n        # Holds refs to tempfiles if users need to make a temporary file that\n        # stays around long enough for file pusher to sync\n        # TODO(artifacts): maybe don't do this\n        self._temp_file_refs = []",
+      "calls": [],
+      "self_calls": [],
+      "self_attrs": [
+        "MAX_UPLOAD_JOBS",
+        "_api",
+        "_event_queue",
+        "_incoming_queue",
+        "_stats",
+        "_step_checksum",
+        "_step_upload",
+        "_temp_file_refs",
+        "_tempdir"
+      ],
+      "global_uses": [
+        "queue",
+        "stats",
+        "step_checksum",
+        "step_upload",
+        "tempfile"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "analyzer_method_context_not_run"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

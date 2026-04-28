@@ -14,7 +14,7 @@ bootstrap_vendor()
 
 from langgraph.graph import END, START, StateGraph
 
-from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer, OpenAISelector
+from .agents import OpenAIAnalyzer, OpenAICompatClient, OpenAIFixer, OpenAIReviewer
 from .csv_loader import load_satd_csv
 from .schema import (
     AnalysisResult,
@@ -68,7 +68,6 @@ class LangGraphSATDWorkflow:
             logger=self._log,
             checkpoint_callback=self._record_repair_debug_checkpoint,
         )
-        self.selector = OpenAISelector(client)
         self.reviewer = OpenAIReviewer(client)
         self.graph = self._build_graph()
         self._current_output_dir: Path | None = None
@@ -506,36 +505,17 @@ class LangGraphSATDWorkflow:
                 rationale="No candidates available.",
                 candidate_scores=[],
             )
-        if not self.use_selector:
-            selected = self._select_candidate_without_selector(candidates)
-            index = max(0, next((i for i, item in enumerate(candidates) if item is selected), 0))
-            return SelectorDecision(
-                round_id=selected.round_id,
-                satd_route_type=str(state.get("satd_route_type") or "generic"),
-                selected_candidate_mode=selected.candidate_mode,
-                selected_index=index,
-                confidence=max(0.45, selected.confidence),
-                rationale="Selector disabled; using workflow fallback candidate ordering.",
-                candidate_scores=[{"index": i, "candidate_mode": item.candidate_mode, "score": item.confidence} for i, item in enumerate(candidates)],
-            )
-        try:
-            return self.selector.run({**state, "repair_candidates": candidates})
-        except Exception as exc:
-            if self.context_client._is_content_filter_error(exc):
-                self._log(f"{self._task_label(state)} selector content-filtered; using fallback selection")
-            else:
-                self._log(f"{self._task_label(state)} selector exception type={type(exc).__name__}; using fallback selection")
-            selected = self._select_candidate_without_selector(candidates)
-            index = max(0, next((i for i, item in enumerate(candidates) if item is selected), 0))
-            return SelectorDecision(
-                round_id=selected.round_id,
-                satd_route_type=str(state.get("satd_route_type") or "generic"),
-                selected_candidate_mode=selected.candidate_mode,
-                selected_index=index,
-                confidence=max(0.45, selected.confidence),
-                rationale=f"Fallback selector used because selector request failed ({type(exc).__name__}).",
-                candidate_scores=[{"index": i, "candidate_mode": item.candidate_mode, "score": item.confidence} for i, item in enumerate(candidates)],
-            )
+        selected = self._select_candidate_without_selector(candidates)
+        index = max(0, next((i for i, item in enumerate(candidates) if item is selected), 0))
+        return SelectorDecision(
+            round_id=selected.round_id,
+            satd_route_type=str(state.get("satd_route_type") or "generic"),
+            selected_candidate_mode=selected.candidate_mode,
+            selected_index=index,
+            confidence=max(0.45, selected.confidence),
+            rationale="Selected by deterministic workflow ordering.",
+            candidate_scores=[{"index": i, "candidate_mode": item.candidate_mode, "score": item.confidence} for i, item in enumerate(candidates)],
+        )
 
     def _select_repair_from_decision(self, candidates: list[RepairAttempt], decision: SelectorDecision) -> RepairAttempt:
         if not candidates:
@@ -1489,18 +1469,19 @@ class LangGraphSATDWorkflow:
 
     def _load_or_build_base_context(self, state: GraphState) -> dict:
         cached = self._load_context_cache(state["task_id"])
+        active_commit = (state.get("commit") or "").strip()
         if cached and (cached.get("metadata") or {}).get("base_cached"):
-            cached.setdefault("metadata", {})["base_cache_source"] = "disk_cache"
-            cached = self.context_client.build_base_context(state, cached)
-            self._persist_context_cache(state["task_id"], cached)
-            return cached
-        built = self.context_client.build_base_context(state, cached)
+            metadata = cached.setdefault("metadata", {})
+            cached_commit = str(metadata.get("context_commit") or cached.get("commit") or "").strip()
+            if cached_commit == active_commit:
+                metadata["base_cache_source"] = metadata.get("base_cache_source") or "disk_cache"
+                return cached
+        built = self._new_context_bundle(state, cached)
         self._persist_context_cache(state["task_id"], built)
         return built
 
     def _load_or_build_shared_context(self, state: GraphState) -> dict:
         bundle = state.get("github_context") or self._load_or_build_base_context(state)
-        bundle = self.context_client.ensure_repair_context(state, bundle)
         bundle.setdefault("metadata", {})["shared_context_mode"] = True
         self._persist_context_cache(state["task_id"], bundle)
         return bundle
@@ -1512,9 +1493,56 @@ class LangGraphSATDWorkflow:
 
     def _ensure_review_context_cache(self, state: GraphState) -> dict:
         bundle = state.get("github_context") or self._load_or_build_base_context(state)
-        bundle.setdefault("metadata", {})["review_cache_source"] = "shared_context"
+        metadata = bundle.setdefault("metadata", {})
+        bundle.setdefault("review_context", {})
+        metadata["review_cached"] = True
+        metadata["review_cache_source"] = "shared_context"
+        metadata["review_context_fetched_at"] = metadata.get("review_context_fetched_at") or self.context_client._timestamp()
         self._persist_context_cache(state["task_id"], bundle)
         return bundle
+
+    def _new_context_bundle(self, state: GraphState, existing_bundle: dict | None = None) -> dict:
+        bundle = dict(existing_bundle or {})
+        metadata = dict(bundle.get("metadata") or {})
+        original_signature = self._first_signature_line(state.get("original_code") or "")
+        bundle.update(
+            {
+                "task_id": state["task_id"],
+                "repo_owner": state["user"],
+                "repo_name": state["project"],
+                "file_path": state["file_path"],
+                "commit": state.get("commit") or "",
+                "base_context": {
+                    "file_path": state["file_path"],
+                    "original_signature": original_signature,
+                },
+            }
+        )
+        bundle.setdefault("repair_context", {})
+        bundle.setdefault("review_context", {})
+        metadata.update(
+            {
+                "base_cached": True,
+                "base_cache_source": "local_metadata",
+                "base_context_fetched_at": metadata.get("base_context_fetched_at") or self.context_client._timestamp(),
+                "context_commit": state.get("commit") or "",
+                "context_strategy": self.repair_context_mode,
+                "target_file_ok": None,
+                "target_function_found": None,
+                "github_evidence_strength": "method_context_only",
+                "snapshot_alignment_status": "not_checked",
+                "historical_snapshot_mismatch": False,
+            }
+        )
+        bundle["metadata"] = metadata
+        return bundle
+
+    def _first_signature_line(self, code: str) -> str:
+        for line in (code or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("def ", "async def ", "class ")):
+                return stripped
+        return ""
 
     def _attach_method_context(
         self,

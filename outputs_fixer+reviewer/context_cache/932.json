@@ -1,0 +1,95 @@
+{
+  "task_id": "932",
+  "repo_owner": "ray-project",
+  "repo_name": "ray",
+  "file_path": "docker/kuberay-autoscaler/autoscaling_config.py",
+  "commit": "a402e956a4e1ebe9bc4e2b404536466967c497af",
+  "metadata": {
+    "base_cached": true,
+    "base_context_fetched_at": "2026-04-27T06:06:03+00:00",
+    "base_cache_source": "github_fetch",
+    "context_commit": "a402e956a4e1ebe9bc4e2b404536466967c497af",
+    "symbol_name": "_get_num_gpus",
+    "satd_line": 262,
+    "target_file_ok": true,
+    "context_strategy": "clone_treesitter",
+    "target_function_found": true,
+    "same_file_helpers_count": 0,
+    "same_class_methods_count": 0,
+    "same_class_attributes_count": 0,
+    "module_symbols_count": 3,
+    "same_file_pattern_count": 0,
+    "decisive_external_evidence_count": 0,
+    "targeted_test_snippet_count": 0,
+    "targeted_callsite_snippet_count": 0,
+    "satd_window_found": false,
+    "enclosing_symbol_found": true,
+    "related_tests_count": 0,
+    "call_sites_count": 0,
+    "commits_count": 0,
+    "similar_history_count": 0,
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "snapshot_alignment_status": "aligned",
+    "repair_evidence_mode": "weak",
+    "historical_snapshot_mismatch": false,
+    "github_evidence_strength": "medium",
+    "repair_cached": true,
+    "review_cached": false,
+    "repair_context_fetched_at": "2026-04-27T06:06:03+00:00",
+    "repair_cache_source": "clone_treesitter",
+    "shared_context_mode": true,
+    "identified_method_count": 0,
+    "retrieved_method_count": 0,
+    "missing_method_count": 0,
+    "review_cache_source": "shared_context"
+  },
+  "base_context": {
+    "file_path": "docker/kuberay-autoscaler/autoscaling_config.py",
+    "original_signature": "def _get_num_gpus(",
+    "target_file": {
+      "ok": true,
+      "path": "docker/kuberay-autoscaler/autoscaling_config.py",
+      "sha": "45583913fad8c99f89ba048c97b8222e3c75bd4e",
+      "download_url": "https://raw.githubusercontent.com/ray-project/ray/a402e956a4e1ebe9bc4e2b404536466967c497af/docker/kuberay-autoscaler/autoscaling_config.py",
+      "content_excerpt": "from contextlib import suppress\nimport logging\nimport math\nimport requests\nfrom typing import Any, Dict, Optional\n\nimport json\n\nfrom ray.autoscaler._private.kuberay import node_provider\nfrom ray.autoscaler._private.util import validate_config\n\nlogger = logging.getLogger(__name__)\n\n\n# Logical group name for the KubeRay head group.\n# Used as the name of the \"head node type\" by the autoscaler.\n_HEAD_GROUP_NAME = \"head-group\"\n\n_GPU_WARNING_LOGGED = False\n\n\nclass AutoscalingConfigProducer:\n    \"\"\"Produces an autoscaling config by reading data from the RayCluster CR.\n\n    Used to fetch the autoscaling config at the beginning of each autoscaler iteration.\n\n    In the context of Ray deployment on Kubernetes, the autoscaling config is an\n    internal interface.\n\n    The autoscaling config carries the strict subset of RayCluster CR data required by\n    the autoscaler to make scaling decisions; in particular, the autoscaling config does\n    not carry pod configuration data.\n\n    This class is the only public object in this file.\n    \"\"\"\n\n    def __init__(self, ray_cluster_name, ray_cluster_namespace):\n        self._headers, self._verify = node_provider.load_k8s_secrets()\n        self._ray_cr_url = node_provider.url_from_resource(\n            namespace=ray_cluster_namespace, path=f\"rayclusters/{ray_cluster_name}\"\n        )\n\n    def __call__(self):\n        ray_cr = self._fetch_ray_cr_from_k8s()\n        autoscaling_config = _derive_autoscaling_config_from_ray_cr(ray_cr)\n        return autoscaling_config\n\n    def _fetch_ray_cr_from_k8s(self) -> Dict[str, Any]:\n        result = requests.get(\n            self._ray_cr_url, headers=self._headers, verify=self._verify\n        )\n        assert result.status_code == 200\n        ray_cr = result.json()\n        return ray_cr\n\n\ndef _derive_autoscaling_config_from_ray_cr(ray_cr: Dict[str, Any]) -> Dict[str, Any]:\n    provider_config = _generate_provider_config(ray_cr[\"metadata\"][\"namespace\"])\n\n    available_node_types = _generate_available_node_types_from_ray_cr_spec(\n        ray_cr[\"spec\"]\n    )\n\n    # The autoscaler expects a global max workers field. We set it to the sum of\n    # node type max workers.\n    global_max_workers = sum(\n        node_type[\"max_workers\"] for node_type in available_node_types.values()\n    )\n\n    # Legacy autoscaling fields carry no information but are required for compatibility.\n    legacy_autoscaling_fields = _generate_legacy_autoscaling_config_fields()\n\n    autoscaling_config = {\n        \"provider\": provider_config,\n        \"cluster_name\": ray_cr[\"metadata\"][\"name\"],\n        \"head_node_type\": _HEAD_GROUP_NAME,\n        \"available_node_types\": available_node_types,\n        \"max_workers\": global_max_workers,\n        # Should consider exposing `idleTimeoutMinutes` in the RayCluster CRD,\n        # under an `autoscaling` field.\n        \"idle_timeout_minutes\": 5,\n        # Should consider exposing `upscalingSpeed` in the RayCluster CRD,\n        # under an `autoscaling` field.\n        \"upscaling_speed\": 1,\n        **legacy_autoscaling_fields,\n    }\n\n    # Make sure the config is readable by the autoscaler.\n    validate_config(autoscaling_config)\n\n    return autoscaling_config\n\n\ndef _generate_provider_config(ray_cluster_namespace: str) -> Dict[str, Any]:\n    \"\"\"Generates the `provider` field of the autoscaling config, which carries data\n    required to instantiate the KubeRay node provider.\n    \"\"\"\n    return {\n        \"type\": \"kuberay\",\n        \"namespace\": ray_cluster_namespace,\n        \"disable_node_updaters\": True,\n        \"disable_launch_config_check\": True,\n    }\n\n\ndef _generate_legacy_autoscaling_config_fields() -> Dict[str, Any]:\n    \"\"\"Generates legacy autoscaling config fields required for compatibiliy.\"\"\"\n    return {\n        \"file_mounts\": {},\n        \"cluster_synced_files\": [],\n        \"file_mounts_sync_continuously\": False,\n        \"initialization_commands\": [],\n        \"setup_commands\": [],\n        \"head_setup_commands\": [],\n        \"worker_setup_commands\": [],\n        \"head_start_ray_commands\": [],\n        \"worker_start_ray_commands\": [],\n        \"auth\": {},\n        \"head_node\": {},\n        \"worker_nodes\": {},\n    }\n\n\ndef _generate_available_node_types_from_ray_cr_spec(\n    ray_cr_spec: Dict[str, Any]\n) -> Dict[str, Any]:\n    \"\"\"Formats autoscaler \"available_node_types\" field based on the Ray CR's group\n    specs.\n    \"\"\"\n    headGroupSpec = ray_cr_spec[\"headGroupSpec\"]\n    return {\n        _HEAD_GROUP_NAME: _node_type_from_group_spec(headGroupSpec, is_head=True),\n        **{\n            worker_group_spec[\"groupName\"]: _node_type_from_group_spec(\n                worker_group_spec, is_head=False\n            )\n            for worker_group_spec in ray_cr_spec[\"workerGroupSpecs\"]\n        },\n    }\n\n\ndef _node_type_from_group_spec(\n    group_spec: Dict[str, Any], is_head: bool\n) -> Dict[str, Any]:\n    \"\"\"Converts CR group spec to autoscaler node type.\"\"\"\n    if is_head:\n        # The head node type has no workers because the head is not a worker.\n        min_workers = max_workers = 0\n    else:\n        # `minReplicas` and `maxReplicas` are required fields for each workerGroupSpec\n        min_workers = group_spec[\"minReplicas\"]\n        max_workers = group_spec[\"maxReplicas\"]\n\n    resources = _get_ray_resources_from_group_spec(group_spec, is_head)\n\n    return {\n        \"min_workers\": min_workers,\n        \"max_workers\": max_workers,\n        # `node_config` is a legacy field required for compatibility.\n        # Pod config data is required by the operator but not by the autoscaler.\n        \"node_config\": {},\n        \"resources\": resources,\n    }\n\n\ndef _get_ray_resources_from_group_spec(\n    group_spec: Dict[str, Any], is_head: bool\n) -> Dict[str, int]:\n    \"\"\"\n    Infers Ray resources from rayStartCommands and K8s limits.\n    The resources extracted are used in autoscaling calculations.\n\n    TODO: Expose a better interface in the RayCluster CRD for Ray resource annotations.\n    For now, we take the rayStartParams as the primary source of truth.\n    \"\"\"\n    ray_start_params = group_spec[\"rayStartParams\"]\n    # This assumes the Ray container is the first.\n    # TODO. Clearly warn users to put the Ray container first when using sidecars.\n    k8s_resource_limits = (\n        group_spec[\"template\"][\"spec\"][\"containers\"][0]\n        .get(\"resources\", {})\n        .get(\"limits\", {})\n    )\n    group_name = _HEAD_GROUP_NAME if is_head else group_spec[\"groupName\"]\n\n    num_cpus = _get_num_cpus(ray_start_params, k8s_resource_limits, group_name)\n    num_gpus = _get_num_gpus(ray_start_params, k8s_resource_limits, group_name)\n    custom_resource_dict = _get_custom_resources(ray_start_params, group_name)\n    memory = _get_memory(ray_start_params, k8s_resource_limits)\n\n    # It's not allowed to use object store memory as a resource request, so we don't\n    # add that to the autoscaler's resources annotations.\n\n    resources = {}\n\n    assert isinstance(num_cpus, int)\n    resources[\"CPU\"] = num_cpus\n\n    if num_gpus is not None:\n        resources[\"GPU\"] = num_gpus\n\n    if memory is not None:\n        resources[\"memory\"] = memory\n\n    resources.update(custom_resource_dict)\n\n    return resources\n\n\ndef _get_num_cpus(\n    ray_start_params: Dict[str, str],\n    k8s_resource_limits: Dict[str, str],\n    group_name: str,\n) -> int:\n    if \"num_cpus\" in ray_start_params:\n        return int(ray_start_params[\"num_cpus\"])\n    elif \"cpu\" in k8s_resource_limits:\n        cpu_str = str(k8s_resource_limits[\"cpu\"])\n        if cpu_str[-1] == \"m\":\n            # For example, '500m' rounds up to 1.\n            return math.ceil(int(cpu_str[:-1]) / 1000)\n        else:\n            return int(cpu_str)\n    else:\n        # Getting the number of CPUs is important, so raise an error if we can't do it.\n        raise ValueError(\n            f\"Autoscaler failed to detect `CPU` resources for group {group_name}.\"\n            \"\\nSet the `--num-cpus` rayStartParam and/or \"\n            \"the CPU resource limit for the Ray container.\"\n        )\n\n\ndef _get_memory(\n    ray_start_params: Dict[str, str], k8s_resource_limits: Dict[str, Any]\n) -> Optional[int]:\n    \"\"\"Get memory resource annotation from ray_start_params, if it is set there.\n\n    TODO, maybe: Consider container resource limits as in\n    https://github.com/ray-project/ray/pull/14567/files\n    \"\"\"\n    if \"memory\" in ray_start_params:\n        return int(ray_start_params[\"memory\"])\n    return None\n\n\ndef _get_num_gpus(\n    ray_start_params: Dict[str, str],\n    k8s_resource_limits: Dict[str, Any],\n    group_name: str,\n) -> Optional[int]:\n    \"\"\"Read the number of GPUs from the Ray start params.\n\n    Potential TODO: Read GPU info from the container spec, here and in the\n    Ray Operator.\n    \"\"\"\n\n    if \"num_gpus\" in ray_start_params:\n        return int(ray_start_params[\"num_gpus\"])\n\n    # Issue a warning if GPUs are present in the container spec but not in the\n    # ray start params.\n    # TODO: Consider reading GPU info from container spec.\n    for key in k8s_resource_limits:\n        global _GPU_WARNING_LOGGED\n        if \"gpu\" in key and not _GPU_WARNING_LOGGED:\n            with suppress(Exception):\n                if int(k8s_resource_limits[key]) > 0:\n                    logger.warning(\n                        f\"Detected GPUs in container resources for group {group_name}.\"\n                        \"To ensure Ray and the autoscaler are aware of the GPUs,\"\n                        \" set the `--num-gpus` rayStartParam.\"\n                    )\n                    _GPU_WARNING_LOGGED = True\n            break\n\n    return None\n\n\ndef _get_custom_resources(\n    ray_start_params: Dict[str, Any], group_name: str\n) -> Dict[str, int]:\n    \"\"\"Format custom resources based on the `resources` Ray start param.\n\n    For the current prototype, the value of the `resources` field must\n    be formatted as follows:\n    '\"{\\\"Custom1\\\": 1, \\\"Custom2\\\": 5}\"'.\n\n    We intend to provide a better interface soon.\n\n    This method first converts the input to a correctly formatted\n    json string and then loads that json string to a dict.\n    \"\"\"\n    if \"resources\" not in ray_start_params:\n        return {}\n    resources_string = ray_start_params[\"resources\"]\n    try:\n        # Drop the extra pair of quotes and remove the backslash escapes.\n        # resources_json should be a json string.\n        resources_json = resources_string[1:-1].replace(\"\\\\\", \"\")\n        # Load a dict from the json string.\n        resources = json.loads(resources_json)\n        assert isinstance(resources, dict)\n        for key, value in resources.items():\n            assert isinstance(key, str)\n            assert isinstance(value, int)\n    except Exception as e:\n        logger.error(\n            f\"Error reading `resource` rayStartParam for group {group_name}.\"\n            \" For the correct format, refer to example configuration at \"\n            \"https://github.com/ray-project/ray/blob/master/python/\"\n            \"ray/autoscaler/kuberay/ray-cluster.complete.yaml.\"\n        )\n        raise e\n    return resources\n",
+      "total_lines": 314,
+      "ref": "a402e956a4e1ebe9bc4e2b404536466967c497af"
+    },
+    "target_function": {
+      "found": true,
+      "symbol_name": "_get_num_gpus",
+      "class_name": null,
+      "start_line": 246,
+      "end_line": 276,
+      "satd_line": 262,
+      "matched_by": "signature_or_comment",
+      "source": "def _get_num_gpus(\n    ray_start_params: Dict[str, str],\n    k8s_resource_limits: Dict[str, Any],\n    group_name: str,\n) -> Optional[int]:\n    \"\"\"Read the number of GPUs from the Ray start params.\n\n    Potential TODO: Read GPU info from the container spec, here and in the\n    Ray Operator.\n    \"\"\"\n\n    if \"num_gpus\" in ray_start_params:\n        return int(ray_start_params[\"num_gpus\"])\n\n    # Issue a warning if GPUs are present in the container spec but not in the\n    # ray start params.\n    # TODO: Consider reading GPU info from container spec.\n    for key in k8s_resource_limits:\n        global _GPU_WARNING_LOGGED\n        if \"gpu\" in key and not _GPU_WARNING_LOGGED:\n            with suppress(Exception):\n                if int(k8s_resource_limits[key]) > 0:\n                    logger.warning(\n                        f\"Detected GPUs in container resources for group {group_name}.\"\n                        \"To ensure Ray and the autoscaler are aware of the GPUs,\"\n                        \" set the `--num-gpus` rayStartParam.\"\n                    )\n                    _GPU_WARNING_LOGGED = True\n            break\n\n    return None",
+      "calls": [
+        "int",
+        "suppress"
+      ],
+      "self_calls": [],
+      "self_attrs": [],
+      "global_uses": [
+        "Any",
+        "Dict",
+        "Optional",
+        "_GPU_WARNING_LOGGED",
+        "logger",
+        "suppress"
+      ]
+    }
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [],
+      "reason": "analyzer_method_context_not_run"
+    },
+    "retrieved_methods": [],
+    "missing_method_names": []
+  },
+  "review_context": {}
+}

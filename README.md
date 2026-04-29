@@ -4,11 +4,12 @@ This workspace contains a LangGraph-based SATD workflow for SATD CSV datasets su
 
 The current retained implementation targets the final three-agent experiment (`outputs_three_agent`), which produced 633 workflow outputs and 120 exact-match repairs. Older compatibility code has been trimmed so the active path is:
 
-- analyzer node: disabled by default and bypassed with a heuristic pass-through result
-- fixer node: first asks the model which methods must be understood, then strictly retrieves those methods from the target commit, then performs a single repair
-- reviewer node: disabled by default and bypassed to accept the fixer output directly
-- selector: removed from the runtime; candidate choice is deterministic because only a single repair candidate is produced
-- loop limit: 2 rounds remain available for compatibility, but the default experiment is a single repair path
+- context router node: runs first and decides whether each SATD needs repository context
+- analyzer node: runs only for `context_required` items and decides whether to filter before repair
+- fixer node: `no_context` items go straight to concise repair; `context_required` items reuse prepared method context and perform context-injected repair
+- reviewer node: gates the fixer output after repair
+- repair path: the fixer runs once per round on the active route
+- loop limit: review rejection sends the task back to fixer once; a second rejection drops the task
 - evaluation: compares the final repaired code with `manual_code` only after the workflow finishes
 - all stages use the same OpenAI-compatible `gpt-4o-mini` interface
 
@@ -17,18 +18,27 @@ The final comparison is done offline after preprocessing both sides.
 
 ## Repair Pipeline
 
-Each SATD now follows three repair steps:
+Each SATD now follows a context-routed repair path:
 
-1. Method inquiry
+1. Context need routing
    - send `SATD comment + original_code` to the model
-   - ask which called methods/functions must be understood before repair
-2. Strict method retrieval
-   - retrieve only the named methods from the target `commit`
+   - ask whether the repair is reliable from the snippet alone or needs external method/symbol context
+   - route uncertain or low-confidence decisions to the context-required path
+2. Concise no-context repair
+   - for `no_context` items, repair directly from `SATD comment + original_code`
+   - skip analyzer, repository context retrieval, and special SATD class rules
+3. Context-required analyzer gate
+   - for `context_required` items, the method-context tool asks which called methods/functions must be understood before filtering/repair
+   - the tool retrieves only the named methods from the target `commit`
    - search current file first, then the historical repo tree
    - if a named method is missing, record it explicitly and do not broaden retrieval
-3. Context-injected repair
+   - analyzer receives only retrieved context and decides whether to filter the item
+4. Context-injected repair
    - inject only the retrieved method implementations plus the missing-method list
-   - generate one repair candidate
+   - generate one repair for the current round
+5. Review and retry
+   - approve the first-round repair and output it, or send reviewer feedback back to fixer
+   - approve the second-round repair and output it, or drop the task after the second review
 
 Each SATD still gets a persistent per-task context bundle under `context_cache/`.
 
@@ -43,25 +53,25 @@ Layers:
   - retrieved method implementations
   - missing method names
 - `review_context`
-  - compatibility shell for the bypassed reviewer stage
+  - reviewer evidence bundle
 
 Workflow behavior:
 
-- every SATD stores only lightweight local metadata before analyze
-- repair writes method-query retrieval results into `repair_context`
-- review reuses the existing context bundle when reviewer bypass is active
+- every SATD is routed before analyzer or repair
+- repair writes context routing and method-query retrieval results into `repair_context`
+- review reuses the existing context bundle when checking the fixer output
 - all layers are saved to disk and reused on reruns
 
 ## Default Experiment Mode
 
 The default CLI configuration is now:
 
-- `analyzer` disabled
-- `reviewer` disabled
-- `selector` disabled
-- single repair candidate
+- `analyzer` always runs for `context_required` items
+- `reviewer` always runs after each repair round
+- no-context items skip analyzer and repository retrieval
 - `repair_context_mode=clone_treesitter`
-- `max_method_contexts=5`
+- `max_method_contexts=2`
+- LLM context router enabled before analyzer/repair
 
 Clone/fetch acceleration options:
 
@@ -91,8 +101,12 @@ Display rules are now:
 
 - `satd_langgraph/schema.py`: dataset records, preprocessing, graph state, and output models
 - `satd_langgraph/csv_loader.py`: `code.csv` reader and normalizer
-- `satd_langgraph/github_tools.py`: GitHub retrieval and local context extraction tools
-- `satd_langgraph/agents.py`: OpenAI-compatible client plus analyzer, fixer, and reviewer agents
+- `satd_langgraph/tools/`: tool classes for GitHub downloads, method retrieval, method-context preparation, similar-code rules, and reviewer structural summaries
+- `satd_langgraph/openai_client.py`: OpenAI-compatible JSON client
+- `satd_langgraph/analyzer_agent.py`: analyzer filter prompt
+- `satd_langgraph/fixer_agent.py`: concise and context-injected repair prompts
+- `satd_langgraph/reviewer_agent.py`: reviewer prompt and gate logic
+- `satd_langgraph/agents.py`: compatibility exports for the agent classes
 - `satd_langgraph/workflow.py`: LangGraph state graph, cache persistence, and CSV writers
 - `run_langgraph_workflow.py`: command-line entry point for the CSV experiment
 - `code.csv`: original SATD dataset
@@ -155,7 +169,8 @@ The main file to inspect is:
 
 It gives one row per SATD and includes:
 
-- analyzer decision, score, scope, validation signals, context gaps, and drop reason
+- analyzer filter decision, confidence, and reason
+- context route, whether context was required, router confidence, reason, and blocking unknowns
 - identified method names, retrieved method names, missing method names, and retrieved method count
 - whether repair method context was actually used
 - the strict review gate result
@@ -173,7 +188,6 @@ Other files:
 - `summary.csv`: dataset-level metrics
 - `results.csv`: task-level compact result table
 - `repairs.csv`: per-repair detail table
-- `repair_candidates.csv`: repair candidate table; default experiment writes one candidate per task
 - `reviews.csv`: per-review detail table
 - `github_context.csv`: flattened context content including `method_context_json`
 - `context_cache.csv`: context cache index with cache status/source/timestamps

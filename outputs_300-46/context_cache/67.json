@@ -1,0 +1,77 @@
+{
+  "task_id": "67",
+  "repo_owner": "open-io",
+  "repo_name": "oio-sds",
+  "file_path": "oio/api/ec.py",
+  "commit": "5b1f8bf145d22755944840663aca5366cff4b022",
+  "base_context": {
+    "file_path": "oio/api/ec.py",
+    "original_signature": "def _get_fragment(self, chunk_iter, storage_method):"
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "io.ChunkReader",
+        "reader.get_iter"
+      ],
+      "reason": "Both methods are essential for understanding how the headers impact the functionality of the code, which is necessary for generating the proper headers as indicated in the TODO comment."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "ChunkReader.get_iter",
+        "path": "oio/api/io.py",
+        "class_name": "ChunkReader",
+        "start_line": 209,
+        "end_line": 213,
+        "source": "def get_iter(self):\n        source, chunk = self._get_source()\n        if source:\n            return self._get_iter(chunk, source)\n        return None",
+        "found": true
+      },
+      {
+        "method_name": "ChunkReader",
+        "path": "oio/api/io.py",
+        "class_name": null,
+        "start_line": 111,
+        "end_line": 374,
+        "source": "class ChunkReader(object):\n    \"\"\"\n    Reads a chunk\n    \"\"\"\n    def __init__(self, chunk_iter, buf_size, headers,\n                 connection_timeout=None, response_timeout=None,\n                 read_timeout=None):\n        self.chunk_iter = chunk_iter\n        self.source = None\n        # TODO deal with provided headers\n        self._headers = None\n        self.request_headers = headers\n        self.sources = []\n        self.status = None\n        # buf size indicates the amount we data we yield\n        self.buf_size = buf_size\n        self.discard_bytes = 0\n        self.connection_timeout = connection_timeout or CONNECTION_TIMEOUT\n        self.response_timeout = response_timeout or CHUNK_TIMEOUT\n        self.read_timeout = read_timeout or CHUNK_TIMEOUT\n\n    def recover(self, nb_bytes):\n        \"\"\"\n        Recover the request.\n\n        :params nb_bytes: number of bytes already consumed that we need to\n                          discard if we perform a recovery from another source.\n\n        :raises ValueError: if range header is not valid\n        :raises UnsatisfiableRange\n        :raises EmptyByteRange\n        \"\"\"\n        if 'Range' in self.request_headers:\n            request_range = ranges_from_http_header(\n                self.request_headers['Range'])\n            start, end = request_range[0]\n            if start is None:\n                # suffix byte range\n                end -= nb_bytes\n            else:\n                start += nb_bytes\n            if end is not None:\n                if start == end + 1:\n                    # no more bytes to serve in the requested byte range\n                    raise exc.EmptyByteRange()\n                if start > end:\n                    # invalid range\n                    raise exc.UnsatisfiableRange()\n                if end and start:\n                    # full byte range\n                    request_range = [(start, end)] + request_range[1:]\n                else:\n                    # suffix byte range\n                    request_range = [(None, end)] + request_range[1:]\n            else:\n                # prefix byte range\n                request_range = [(start, None)] + request_range[1:]\n\n            self.request_headers['Range'] = http_header_from_ranges(\n                request_range)\n        else:\n            # just add an offset to the request\n            self.request_headers['Range'] = 'bytes=%d-' % nb_bytes\n\n    def _get_request(self, chunk):\n        # connect to chunk\n        try:\n            with ConnectionTimeout(self.connection_timeout):\n                raw_url = chunk[\"url\"]\n                parsed = urlparse(raw_url)\n                conn = http_connect(parsed.netloc, 'GET', parsed.path,\n                                    self.request_headers)\n            with Timeout(self.response_timeout):\n                source = conn.getresponse()\n                source.conn = conn\n        except (Exception, Timeout):\n            logger.exception('Connection failed to %s', chunk)\n            return False\n        if source.status in (200, 206):\n            self.status = source.status\n            self._headers = source.getheaders()\n            self.sources.append((source, chunk))\n            return True\n        else:\n            logger.warn(\"Invalid GET response from %s\", chunk)\n        return False\n\n    def _get_source(self):\n        for chunk in self.chunk_iter:\n            # continue to iterate until we find a valid source\n            if self._get_request(chunk):\n                break\n\n        if self.sources:\n            source, chunk = self.sources.pop()\n            return source, chunk\n        return None, None\n\n    def get_iter(self):\n        source, chunk = self._get_source()\n        if source:\n            return self._get_iter(chunk, source)\n        return None\n\n    def fill_ranges(self, start, end, length):\n        \"\"\"\n        Fill the request ranges.\n        \"\"\"\n        if length == 0:\n            return\n\n        if self.buf_size:\n            # discard bytes\n            # so we only yield complete EC segments\n            self.discard_bytes = discard_bytes(self.buf_size, start)\n\n        # change headers for efficient recovery\n        if 'Range' in self.request_headers:\n            try:\n                orig_ranges = ranges_from_http_header(\n                    self.request_headers['Range'])\n                new_ranges = [(start, end)] + orig_ranges[1:]\n            except ValueError:\n                new_ranges = [(start, end)]\n        else:\n            new_ranges = [(start, end)]\n\n        self.request_headers['Range'] = http_header_from_ranges(\n            new_ranges)\n\n    def _get_iter(self, chunk, source):\n        source = [source]\n\n        try:\n            read_size = self.buf_size\n            parts_iter = [make_iter_from_resp(source[0])]\n\n            def get_next_part():\n                \"\"\"\n                Gets next part of the body\n\n                NOTE: for the moment only return one part\n                      (single range only)\n                \"\"\"\n                while True:\n                    try:\n                        with ChunkReadTimeout(CHUNK_TIMEOUT):\n                            start, end, length, headers, part = next(\n                                parts_iter[0])\n                        return (start, end, length, headers, part)\n                    except ChunkReadTimeout:\n                        # TODO recover\n                        raise StopIteration()\n\n            def iter_from_resp(part):\n                bytes_consumed = 0\n                count = 0\n                buf = ''\n                while True:\n                    try:\n                        with ChunkReadTimeout(self.read_timeout):\n                            data = part.read(READ_CHUNK_SIZE)\n                            count += 1\n                            buf += data\n                    except ChunkReadTimeout:\n                        try:\n                            self.recover(bytes_consumed)\n                        except (exc.UnsatisfiableRange, ValueError):\n                            raise\n                        except exc.EmptyByteRange:\n                            # we are done already\n                            break\n                        buf = ''\n                        # find a new source to perform recovery\n                        new_source, new_chunk = self._get_source()\n                        if new_source:\n                            logger.warn(\"Retrying from another source\")\n                            close_source(source[0])\n                            # switch source\n                            source[0] = new_source\n                            parts_iter[0] = make_iter_from_resp(source[0])\n                            try:\n                                _j, _j, _j, _j, part = get_next_part()\n                            except StopIteration:\n                                # failed to recover\n                                # we did our best\n                                return\n\n                        else:\n                            # no valid source found to recover\n                            raise\n                    else:\n                        # discard bytes\n                        if buf and self.discard_bytes:\n                            if self.discard_bytes < len(buf):\n                                buf = buf[self.discard_bytes:]\n                                bytes_consumed += self.discard_bytes\n                                self.discard_bytes = 0\n                            else:\n                                self.discard_bytes -= len(buf)\n                                bytes_consumed += len(buf)\n                                buf = ''\n\n                        # no data returned\n                        # flush out buffer\n                        if not data:\n                            if buf:\n                                bytes_consumed += len(buf)\n                                yield buf\n                            buf = ''\n                            break\n\n                        # buffer to read_size\n                        if read_size is not None:\n                            while len(buf) >= read_size:\n                                read_d = buf[:read_size]\n                                buf = buf[read_size:]\n                                yield read_d\n                                bytes_consumed += len(read_d)\n                        else:\n                            yield buf\n                            bytes_consumed += len(buf)\n                            buf = ''\n\n                        # avoid starvation by forcing sleep()\n                        # every once in a while\n                        if count % 10 == 0:\n                            sleep()\n\n            body_iter = None\n            try:\n                while True:\n                    start, end, length, headers, part = get_next_part()\n                    self.fill_ranges(start, end, length)\n                    body_iter = iter_from_resp(part)\n                    result = {'start': start, 'end': end, 'length': length,\n                              'iter': body_iter, 'headers': headers}\n                    yield result\n            except StopIteration:\n                pass\n            finally:\n                if body_iter:\n                    body_iter.close()\n\n        except ChunkReadTimeout:\n            logger.exception(\"Failure during chunk read\")\n            raise\n        except GeneratorExit:\n            pass\n        except Exception:\n            logger.exception(\"Failure during read\")\n            raise\n        finally:\n            close_source(source[0])\n\n    @property\n    def headers(self):\n        return self._headers\n\n    def _create_iter(self, chunk, source):\n        parts_iter = self._get_iter(chunk, source)\n        for part in parts_iter:\n            for d in part['iter']:\n                yield d",
+        "found": true
+      }
+    ],
+    "missing_method_names": []
+  },
+  "review_context": {},
+  "metadata": {
+    "base_cached": true,
+    "base_cache_source": "local_metadata",
+    "base_context_fetched_at": "2026-04-28T05:35:10+00:00",
+    "context_commit": "5b1f8bf145d22755944840663aca5366cff4b022",
+    "context_strategy": "clone_treesitter",
+    "target_file_ok": null,
+    "target_function_found": null,
+    "github_evidence_strength": "method_context_only",
+    "snapshot_alignment_status": "not_checked",
+    "historical_snapshot_mismatch": false,
+    "shared_context_mode": true,
+    "repair_cached": true,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-28T05:35:14+00:00",
+    "identified_method_count": 2,
+    "retrieved_method_count": 2,
+    "missing_method_count": 0,
+    "repair_evidence_mode": "strong",
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "context_route": "context_required",
+    "context_required": true,
+    "context_confidence": 0.7,
+    "context_reason": "The proper headers to generate are not defined in the snippet, requiring knowledge of the broader codebase.",
+    "context_blocking_unknowns": [
+      "definition of self.headers",
+      "expected format of headers"
+    ],
+    "review_cached": true,
+    "review_cache_source": "shared_context",
+    "review_context_fetched_at": "2026-04-28T05:35:18+00:00"
+  }
+}

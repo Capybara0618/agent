@@ -1,0 +1,80 @@
+{
+  "task_id": "133",
+  "repo_owner": "c3nav",
+  "repo_name": "c3nav",
+  "file_path": "src/c3nav/mapdata/views.py",
+  "commit": "d025ffa1943ce90f0e5fd5f5e03d42b319bb828c",
+  "base_context": {
+    "file_path": "src/c3nav/mapdata/views.py",
+    "original_signature": "def preview_location(request, slug):"
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "CachePackage.open_cached",
+        "MapRenderer",
+        "HttpResponse"
+      ],
+      "reason": "These methods are crucial for understanding the caching mechanism and rendering process, which are directly related to the TODO comment about using a cache key."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "CachePackage.open_cached",
+        "path": "src/c3nav/mapdata/utils/cache/package.py",
+        "class_name": "CachePackage",
+        "start_line": 122,
+        "end_line": 132,
+        "source": "def open_cached(cls) -> Self:\n        from c3nav.mapdata.models import MapUpdate\n        cache_key = MapUpdate.current_processed_cache_key()\n        if getattr(cls.cached, 'key', None) != cache_key:\n            cls.cached.key = cache_key\n            cls.cached.data = None\n\n        if cls.cached.data is None:\n            cls.cached.data = cls.open()\n\n        return cls.cached.data",
+        "found": true
+      },
+      {
+        "method_name": "MapRenderer",
+        "path": "src/c3nav/mapdata/render/renderer.py",
+        "class_name": null,
+        "start_line": 21,
+        "end_line": 178,
+        "source": "class MapRenderer:\n    def __init__(self, level, minx, miny, maxx, maxy, scale=1, access_permissions=None, full_levels=False,\n                 min_width=None):\n        self.level = level.pk if isinstance(level, Level) else level\n        self.minx = minx\n        self.miny = miny\n        self.maxx = maxx\n        self.maxy = maxy\n        self.scale = scale\n        self.access_permissions = set(access_permissions) if access_permissions else set()\n        self.full_levels = full_levels\n        self.min_width = min_width/self.scale if min_width else None\n\n        self.width = int(round((maxx - minx) * scale))\n        self.height = int(round((maxy - miny) * scale))\n\n    @cached_property\n    def bbox(self):\n        return box(self.minx-1, self.miny-1, self.maxx+1, self.maxy+1)\n\n    def render(self, engine_cls, center=True):\n        # add no access restriction to “unlocked“ access restrictions so lookup gets easier\n        access_permissions = self.access_permissions | {None}\n\n        bbox = prepared.prep(self.bbox)\n\n        level_render_data = LevelRenderData.get(self.level)\n\n        engine = engine_cls(self.width, self.height, self.minx, self.miny, float(level_render_data.base_altitude),\n                            scale=self.scale, buffer=1, background=RENDER_COLOR_BACKGROUND,\n                            center=center, min_width=self.min_width)\n\n        if hasattr(engine, 'custom_render'):\n            engine.custom_render(level_render_data, access_permissions, self.full_levels)\n            return engine\n\n        if self.full_levels:\n            levels = get_full_levels(level_render_data)\n        else:\n            levels = level_render_data.levels\n\n        min_altitude = get_min_altitude(levels, default=level_render_data.base_altitude)\n\n        not_full_levels = engine.is_3d  # always do non-full-levels until after the first primary level\n        full_levels = self.full_levels and engine.is_3d\n        for geoms in levels:\n            engine.add_group('level_%s' % geoms.short_label)\n\n            if geoms.pk == level_render_data.lowest_important_level:\n                engine.darken(level_render_data.darken_area)\n\n            if not bbox.intersects(geoms.affected_area):\n                continue\n\n            # hide indoor and outdoor rooms if their access restriction was not unlocked\n            add_walls = hybrid_union(tuple(area for access_restriction, area in geoms.restricted_spaces_indoors.items()\n                                           if access_restriction not in access_permissions))\n            crop_areas = hybrid_union(\n                tuple(area for access_restriction, area in geoms.restricted_spaces_outdoors.items()\n                      if access_restriction not in access_permissions)\n            ).union(add_walls)\n\n            if not_full_levels:\n                engine.add_geometry(geoms.walls_base, fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='walls')\n                engine.add_geometry(geoms.walls_bottom.fit(scale=geoms.min_altitude-min_altitude,\n                                                           offset=min_altitude-int(0.7*1000)),\n                                    fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='walls')\n                for i, altitudearea in enumerate(geoms.altitudeareas):\n                    base = altitudearea.base.difference(crop_areas)\n                    bottom = altitudearea.bottom.difference(crop_areas)\n                    engine.add_geometry(base, fill=FillAttribs(RENDER_COLOR_GROUND_FILL), category='ground', item=i)\n                    engine.add_geometry(bottom.fit(scale=geoms.min_altitude - min_altitude,\n                                                   offset=min_altitude - int(0.7 * 1000)),\n                                        fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='ground')\n\n            # render altitude areas in default ground color and add ground colors to each one afterwards\n            # shadows are directly calculated and added by the engine\n            for i, altitudearea in enumerate(geoms.altitudeareas):\n                geometry = altitudearea.geometry.difference(crop_areas)\n                if not_full_levels:\n                    geometry = geometry.filter(bottom=False)\n                engine.add_geometry(geometry, altitude=altitudearea.altitude,\n                                    fill=FillAttribs(RENDER_COLOR_GROUND_FILL), category='ground', item=i)\n\n                j = 0\n                for (order, color), areas in altitudearea.colors.items():\n                    # only select ground colors if their access restriction is unlocked\n                    areas = tuple(area for access_restriction, area in areas.items()\n                                  if access_restriction in access_permissions)\n                    if areas:\n                        j += 1\n                        hexcolor = ''.join(hex(int(i*255))[2:].zfill(2) for i in engine.color_to_rgb(color)).upper()\n                        engine.add_geometry(hybrid_union(areas), fill=FillAttribs(color),\n                                            category='ground_%s' % hexcolor, item=j)\n\n            # add obstacles after everything related to ground for the nice right order\n            for i, altitudearea in enumerate(geoms.altitudeareas):\n                for height, height_obstacles in altitudearea.obstacles.items():\n                    for color, color_obstacles in height_obstacles.items():\n                        for obstacle in color_obstacles:\n                            obstacle_geom = obstacle.difference(crop_areas)\n                            if color:\n                                fill_rgb = color_to_rgb(color)\n                                stroke_color = rgb_to_color((*((0.75*i) for i in fill_rgb[:3]), fill_rgb[3]))\n                                engine.add_geometry(\n                                    obstacle_geom,\n                                    fill=FillAttribs(color),\n                                    stroke=StrokeAttribs(stroke_color, 0.05, min_px=0.2),\n                                    category='obstacles'\n                                )\n                            else:\n                                engine.add_geometry(\n                                    obstacle_geom,\n                                    fill=FillAttribs(RENDER_COLOR_OBSTACLES_DEFAULT_FILL),\n                                    stroke=StrokeAttribs(RENDER_COLOR_OBSTACLES_DEFAULT_BORDER, 0.05, min_px=0.2),\n                                    category='obstacles'\n                                )\n\n            # add walls, stroke_px makes sure that all walls are at least 1px thick on all zoom levels,\n            walls = None\n            # we use all_walls instead of walls, because the short wall rendering stuff doesn't work\n            if not add_walls.is_empty or not geoms.all_walls.is_empty:\n                walls = geoms.all_walls.union(add_walls)\n\n            walls_extended = geoms.walls_extended and full_levels\n            if walls is not None:\n                engine.add_geometry(\n                    walls.filter(bottom=not not_full_levels,\n                                 top=not walls_extended),\n                    height=geoms.default_height, fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='walls'\n                )\n\n            for short_wall in geoms.short_walls:\n                engine.add_geometry(short_wall.filter(bottom=not not_full_levels),\n                                    fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='walls')\n\n            if walls_extended:\n                engine.add_geometry(geoms.walls_extended, fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='walls')\n\n            doors_extended = geoms.doors_extended and full_levels\n            if not geoms.doors.is_empty:\n                engine.add_geometry(geoms.doors.difference(add_walls).filter(top=not doors_extended),\n                                    fill=FillAttribs(RENDER_COLOR_DOOR_FILL),\n                                    stroke=StrokeAttribs(RENDER_COLOR_DOOR_FILL, 0.05, min_px=0.2),\n                                    category='doors')\n\n            if doors_extended:\n                engine.add_geometry(geoms.doors_extended, fill=FillAttribs(RENDER_COLOR_WALL_FILL), category='doors')\n\n            if walls is not None:\n                engine.add_geometry(walls,\n                                    stroke=StrokeAttribs(RENDER_COLOR_WALL_BORDER, 0.1, min_px=1),\n                                    category='walls')\n\n            if geoms.on_top_of_id is None:\n                not_full_levels = not self.full_levels and engine.is_3d\n\n        return engine",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "HttpResponse"
+    ]
+  },
+  "review_context": {},
+  "metadata": {
+    "base_cached": true,
+    "base_cache_source": "local_metadata",
+    "base_context_fetched_at": "2026-04-28T05:49:42+00:00",
+    "context_commit": "d025ffa1943ce90f0e5fd5f5e03d42b319bb828c",
+    "context_strategy": "clone_treesitter",
+    "target_file_ok": null,
+    "target_function_found": null,
+    "github_evidence_strength": "method_context_only",
+    "snapshot_alignment_status": "not_checked",
+    "historical_snapshot_mismatch": false,
+    "shared_context_mode": true,
+    "repair_cached": true,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-28T05:49:50+00:00",
+    "identified_method_count": 3,
+    "retrieved_method_count": 2,
+    "missing_method_count": 1,
+    "repair_evidence_mode": "strong",
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "context_route": "context_required",
+    "context_required": true,
+    "context_confidence": 0.7,
+    "context_reason": "The comment refers to a cache key and routing option that are not defined in the snippet, requiring knowledge of the broader codebase.",
+    "context_blocking_unknowns": [
+      "tile render function",
+      "routing option"
+    ],
+    "review_cached": true,
+    "review_cache_source": "shared_context",
+    "review_context_fetched_at": "2026-04-28T05:49:59+00:00"
+  }
+}

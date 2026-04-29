@@ -1,0 +1,80 @@
+{
+  "task_id": "255",
+  "repo_owner": "seagate",
+  "repo_name": "cortx-hare",
+  "file_path": "hax/hax/server.py",
+  "commit": "ea6d5416234bf17ce73148ae1158a9d467b99f53",
+  "base_context": {
+    "file_path": "hax/hax/server.py",
+    "original_signature": "def run_server("
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "WorkPlanner",
+        "thread.stop",
+        "thread.join"
+      ],
+      "reason": "These methods are directly related to the implementation of the shutdown functionality in the WorkPlanner, which is the focus of the SATD."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "WorkPlanner",
+        "path": "hax/hax/motr/planner.py",
+        "class_name": null,
+        "start_line": 50,
+        "end_line": 190,
+        "source": "class WorkPlanner:\n    \"\"\"\n    Thread synchronizing block that is used as a work planner for Motr-aware\n    threads (see ConsumerThread). This synchronizing primitive guarantees that\n\n    1. The messages can be processed by an arbitrary number of ConsumerThread\n       threads.\n\n    2. The parallelism doesn't break semantics (some messages can be processed\n       in parallel to others, while some other not; the ConsumerThread's don't\n       need to worry about that).\n    \"\"\"\n    def __init__(self):\n        self.state = State(next_group_id=0,\n                           active_commands=LinkedSet(),\n                           taken_commands=LinkedSet(),\n                           current_group_id=0,\n                           next_group_commands=LinkedSet())\n        self.backlog: Deque[BaseMessage] = deque()\n        self.b_lock = Condition()\n\n    def is_empty(self) -> bool:\n        with self.b_lock:\n            return not self.backlog\n\n    def add_command(self, command: BaseMessage) -> None:\n        LOG.log(TRACE, '[WP]Before add_command: %s', command)\n        with self.b_lock:\n            cmd = self._assign_group(command)\n            LOG.log(TRACE, '[WP]Cmd %s is added. Current state: %s', cmd,\n                    self.state)\n            self.backlog.append(cmd)\n            # Some threads may be waiting because of an empty backlog - let's\n            # notify them\n            self.b_lock.notifyAll()\n\n    def get_next_command(self) -> BaseMessage:\n        # TODO think of is_stopped and shutdown procedure\n        while True:\n            LOG.log(TRACE, '[WP]Trying to get new command')\n            with self.b_lock:\n                if self.backlog:\n                    cmd = self.backlog.popleft()\n                    LOG.log(TRACE, '[WP]Cmd %s taken!', cmd)\n                    self.state.taken_commands.add(cmd)\n                    return cmd\n                LOG.log(TRACE, '[WP]Blocking thread: no commands in backlog')\n                self.b_lock.wait()\n\n    def ensure_allowed(self, command: BaseMessage) -> None:\n        def is_current(cmd: BaseMessage, st: State) -> bool:\n            return cmd.group == st.current_group_id\n\n        while True:\n            with self.b_lock:\n                state = self.state\n                if is_current(command, state):\n                    state.taken_commands.remove(command)\n                    state.active_commands.add(command)\n                    return\n                LOG.log(TRACE, '[WP]Cmd %s not allowed for now.'\n                        ' Current state: %s', command, self.state)\n                self.b_lock.wait()\n\n    def _inc_group(self):\n        state = self.state\n        state.current_group_id += 1\n        if state.next_group_id < state.current_group_id:\n            state.next_group_id = state.current_group_id\n            state.next_group_commands = LinkedSet()\n\n    def notify_finished(self, command: BaseMessage) -> None:\n        with self.b_lock:\n            state = self.state\n            state.active_commands.remove(command)\n            LOG.log(TRACE, '[WP]Cmd %s removed. Current state: %s', command,\n                    state)\n\n            if state.active_commands:\n                return\n            for c in self.backlog:\n                if c.group == state.current_group_id:\n                    return\n            for c in state.taken_commands:\n                if c.group == state.current_group_id:\n                    return\n            # if we're here, command was the only one belonging to group\n            self._inc_group()\n            LOG.log(TRACE, '[WP]Active group changed to %s',\n                    state.current_group_id)\n            # The group changed, let's unblock those who are waiting for\n            # this group\n            self.b_lock.notifyAll()\n\n    def _should_increase_group(self, cmd: BaseMessage) -> bool:\n        def has(cmd_type: Type[BaseMessage]) -> bool:\n            ''' Checks if the group being currently formed (i.e. next_group)\n                contains a message of the given type.\n            '''\n            return cmd_type in self.state.next_group_commands\n\n        if not self.state.next_group_commands:\n            # current group is empty -> join it freely\n            return False\n        if isinstance(cmd, HaNvecGetEvent):\n            # HaNvecGetEvent can be done in parallel to any other commands.\n            # No need to form the new group for it.\n            return False\n        if isinstance(cmd, AnyEntrypointRequest):\n            # if the current group has a BroadcastHAStates request,\n            # then this entrypoint request should be placed to a next group.\n            return has(BroadcastHAStates)\n        if isinstance(cmd, BroadcastHAStates):\n            return True\n\n        if isinstance(cmd, SnsOperation):\n            # Start new group if there is another SNS operation within the\n            # current group.\n            return has(SnsOperation)\n        return False\n\n    def _assign_group(self, cmd: BaseMessage) -> BaseMessage:\n        ''' Sets the correct group_id to the command.\n            Must be invoked with b_lock acquired.\n        '''\n        def join_group(cmd: BaseMessage) -> BaseMessage:\n            cmd.group = self.state.next_group_id\n            self.state.next_group_commands.add(type(cmd))\n            return cmd\n\n        def inc_group() -> None:\n            self.state.next_group_commands = LinkedSet()\n            self.state.next_group_id += 1\n\n        if isinstance(cmd, Die):\n            return join_group(cmd)\n\n        if self._should_increase_group(cmd):\n            inc_group()\n\n        return join_group(cmd)",
+        "found": true
+      },
+      {
+        "method_name": "FsStatsUpdater.stop",
+        "path": "hax/hax/filestats.py",
+        "class_name": "FsStatsUpdater",
+        "start_line": 41,
+        "end_line": 44,
+        "source": "def stop(self) -> None:\n        LOG.debug('Stop signal received')\n        self.stopped = True\n        self.event.set()",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "thread.join"
+    ]
+  },
+  "review_context": {},
+  "metadata": {
+    "base_cached": true,
+    "base_cache_source": "local_metadata",
+    "base_context_fetched_at": "2026-04-28T06:21:16+00:00",
+    "context_commit": "ea6d5416234bf17ce73148ae1158a9d467b99f53",
+    "context_strategy": "clone_treesitter",
+    "target_file_ok": null,
+    "target_function_found": null,
+    "github_evidence_strength": "method_context_only",
+    "snapshot_alignment_status": "not_checked",
+    "historical_snapshot_mismatch": false,
+    "shared_context_mode": true,
+    "repair_cached": true,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-28T06:21:22+00:00",
+    "identified_method_count": 3,
+    "retrieved_method_count": 2,
+    "missing_method_count": 1,
+    "repair_evidence_mode": "strong",
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "context_route": "context_required",
+    "context_required": true,
+    "context_confidence": 0.7,
+    "context_reason": "The implementation of shutdown in WorkPlanner is unclear without additional context on its expected behavior.",
+    "context_blocking_unknowns": [
+      "WorkPlanner class implementation",
+      "shutdown method details"
+    ],
+    "review_cached": true,
+    "review_cache_source": "shared_context",
+    "review_context_fetched_at": "2026-04-28T06:21:28+00:00"
+  }
+}

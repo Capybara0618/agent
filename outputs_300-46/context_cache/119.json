@@ -1,0 +1,81 @@
+{
+  "task_id": "119",
+  "repo_owner": "elastic",
+  "repo_name": "rally",
+  "file_path": "tests/driver/runner_test.py",
+  "commit": "72e9714c9f4236206fc9c07e34c6c9f658f07f4a",
+  "base_context": {
+    "file_path": "tests/driver/runner_test.py",
+    "original_signature": "async def test_bulk_index_error(self, es):"
+  },
+  "repair_context": {
+    "context_strategy": "clone_treesitter",
+    "method_inquiry": {
+      "required_methods": [
+        "runner.BulkIndex",
+        "_build_bulk_body",
+        "result.pop",
+        "es.bulk.assert_awaited_with"
+      ],
+      "reason": "These methods are essential for understanding the bulk indexing operation and the manipulation of its results, which are directly related to the non-deterministic behavior mentioned in the SATD."
+    },
+    "retrieved_methods": [
+      {
+        "method_name": "_build_bulk_body",
+        "path": "tests/driver/runner_test.py",
+        "class_name": null,
+        "start_line": 341,
+        "end_line": 342,
+        "source": "def _build_bulk_body(*lines):\n    return \"\".join(line + \"\\n\" for line in lines)",
+        "found": true
+      },
+      {
+        "method_name": "BulkIndex",
+        "path": "esrally/driver/runner.py",
+        "class_name": null,
+        "start_line": 441,
+        "end_line": 635,
+        "source": "class BulkIndex(Runner):\n    \"\"\"\n    Bulk indexes the given documents.\n    \"\"\"\n\n    async def __call__(self, es, params):\n        \"\"\"\n        Runs one bulk indexing operation.\n\n        :param es: The Elasticsearch client.\n        :param params: A hash with all parameters. See below for details.\n        :return: A hash with meta data for this bulk operation. See below for details.\n\n        It expects a parameter dict with the following mandatory keys:\n\n        * ``body``: containing all documents for the current bulk request.\n        * ``bulk-size``: An indication of the bulk size denoted in ``unit``.\n        * ``unit``: The name of the unit in which the bulk size is provided.\n        * ``action_metadata_present``: if ``True``, assume that an action and metadata line is present (meaning only half of the lines\n        contain actual documents to index)\n        * ``index``: The name of the affected index in case ``action_metadata_present`` is ``False``.\n        * ``type``: The name of the affected type in case ``action_metadata_present`` is ``False``.\n\n        The following keys are optional:\n\n        * ``pipeline``: If present, runs the the specified ingest pipeline for this bulk.\n        * ``detailed-results``: If ``True``, the runner will analyze the response and add detailed meta-data. Defaults to ``False``. Note\n        that this has a very significant impact on performance and will very likely cause a bottleneck in the benchmark driver so please\n        be very cautious enabling this feature. Our own measurements have shown a median overhead of several thousand times (execution time\n         is in the single digit microsecond range when this feature is disabled and in the single digit millisecond range when this feature\n         is enabled; numbers based on a bulk size of 500 elements and no errors). For details please refer to the respective benchmarks\n         in ``benchmarks/driver``.\n        * ``timeout``: a time unit value indicating the server-side timeout for the operation\n        * ``request-timeout``: a non-negative float indicating the client-side timeout for the operation.  If not present, defaults to\n         ``None`` and potentially falls back to the global timeout setting.\n        \"\"\"\n        detailed_results = params.get(\"detailed-results\", False)\n        api_kwargs = self._default_kw_params(params)\n\n        bulk_params = {}\n        if \"timeout\" in params:\n            bulk_params[\"timeout\"] = params[\"timeout\"]\n        if \"pipeline\" in params:\n            bulk_params[\"pipeline\"] = params[\"pipeline\"]\n\n        with_action_metadata = mandatory(params, \"action-metadata-present\", self)\n        bulk_size = mandatory(params, \"bulk-size\", self)\n        unit = mandatory(params, \"unit\", self)\n        # parse responses lazily in the standard case - responses might be large thus parsing skews results and if no\n        # errors have occurred we only need a small amount of information from the potentially large response.\n        if not detailed_results:\n            es.return_raw_response()\n\n        if with_action_metadata:\n            api_kwargs.pop(\"index\", None)\n            # only half of the lines are documents\n            response = await es.bulk(params=bulk_params, **api_kwargs)\n        else:\n            response = await es.bulk(doc_type=params.get(\"type\"), params=bulk_params, **api_kwargs)\n\n        stats = self.detailed_stats(params, response) if detailed_results else self.simple_stats(bulk_size, unit, response)\n\n        meta_data = {\n            \"index\": params.get(\"index\"),\n            \"weight\": bulk_size,\n            \"unit\": unit,\n        }\n        meta_data.update(stats)\n        if not stats[\"success\"]:\n            meta_data[\"error-type\"] = \"bulk\"\n        return meta_data\n\n    def detailed_stats(self, params, response):\n        def _utf8len(line):\n            if isinstance(line, bytes):\n                return len(line)\n            else:\n                return len(line.encode(\"utf-8\"))\n\n        ops = {}\n        shards_histogram = OrderedDict()\n        bulk_error_count = 0\n        bulk_success_count = 0\n        error_details = set()\n        bulk_request_size_bytes = 0\n        total_document_size_bytes = 0\n        with_action_metadata = mandatory(params, \"action-metadata-present\", self)\n\n        if isinstance(params[\"body\"], bytes):\n            bulk_lines = params[\"body\"].split(b\"\\n\")\n        elif isinstance(params[\"body\"], str):\n            bulk_lines = params[\"body\"].split(\"\\n\")\n        elif isinstance(params[\"body\"], list):\n            bulk_lines = params[\"body\"]\n        else:\n            raise exceptions.DataError(\"bulk body is not of type bytes, string, or list\")\n\n        for line_number, data in enumerate(bulk_lines):\n            line_size = _utf8len(data)\n            if with_action_metadata:\n                if line_number % 2 == 1:\n                    total_document_size_bytes += line_size\n            else:\n                total_document_size_bytes += line_size\n\n            bulk_request_size_bytes += line_size\n\n        for item in response[\"items\"]:\n            # there is only one (top-level) item\n            op, data = next(iter(item.items()))\n            if op not in ops:\n                ops[op] = Counter()\n            ops[op][\"item-count\"] += 1\n            if \"result\" in data:\n                ops[op][data[\"result\"]] += 1\n\n            if \"_shards\" in data:\n                s = data[\"_shards\"]\n                sk = \"%d-%d-%d\" % (s[\"total\"], s[\"successful\"], s[\"failed\"])\n                if sk not in shards_histogram:\n                    shards_histogram[sk] = {\"item-count\": 0, \"shards\": s}\n                shards_histogram[sk][\"item-count\"] += 1\n            if data[\"status\"] > 299 or (\"_shards\" in data and data[\"_shards\"][\"failed\"] > 0):\n                bulk_error_count += 1\n                self.extract_error_details(error_details, data)\n            else:\n                bulk_success_count += 1\n        stats = {\n            \"took\": response.get(\"took\"),\n            \"success\": bulk_error_count == 0,\n            \"success-count\": bulk_success_count,\n            \"error-count\": bulk_error_count,\n            \"ops\": ops,\n            \"shards_histogram\": list(shards_histogram.values()),\n            \"bulk-request-size-bytes\": bulk_request_size_bytes,\n            \"total-document-size-bytes\": total_document_size_bytes,\n        }\n        if bulk_error_count > 0:\n            stats[\"error-type\"] = \"bulk\"\n            stats[\"error-description\"] = self.error_description(error_details)\n            self.logger.warning(\"Bulk request failed: [%s]\", stats[\"error-description\"])\n        if \"ingest_took\" in response:\n            stats[\"ingest_took\"] = response[\"ingest_took\"]\n\n        return stats\n\n    def simple_stats(self, bulk_size, unit, response):\n        bulk_success_count = bulk_size if unit == \"docs\" else None\n        bulk_error_count = 0\n        error_details = set()\n        # parse lazily on the fast path\n        props = parse(response, [\"errors\", \"took\"])\n\n        if props.get(\"errors\", False):\n            # determine success count regardless of unit because we need to iterate through all items anyway\n            bulk_success_count = 0\n            # Reparse fully in case of errors - this will be slower\n            parsed_response = json.loads(response.getvalue())\n            for item in parsed_response[\"items\"]:\n                data = next(iter(item.values()))\n                if data[\"status\"] > 299 or (\"_shards\" in data and data[\"_shards\"][\"failed\"] > 0):\n                    bulk_error_count += 1\n                    self.extract_error_details(error_details, data)\n                else:\n                    bulk_success_count += 1\n        stats = {\n            \"took\": props.get(\"took\"),\n            \"success\": bulk_error_count == 0,\n            \"success-count\": bulk_success_count,\n            \"error-count\": bulk_error_count,\n        }\n        if bulk_error_count > 0:\n            stats[\"error-type\"] = \"bulk\"\n            stats[\"error-description\"] = self.error_description(error_details)\n        return stats\n\n    def extract_error_details(self, error_details, data):\n        error_data = data.get(\"error\", {})\n        error_reason = error_data.get(\"reason\") if isinstance(error_data, dict) else str(error_data)\n        if error_data:\n            error_details.add((data[\"status\"], error_reason))\n        else:\n            error_details.add((data[\"status\"], None))\n\n    def error_description(self, error_details):\n        error_description = \"\"\n        for status, reason in error_details:\n            if reason:\n                error_description += \"HTTP status: %s, message: %s\" % (str(status), reason)\n            else:\n                error_description += \"HTTP status: %s\" % str(status)\n        return error_description\n\n    def __repr__(self, *args, **kwargs):\n        return \"bulk-index\"",
+        "found": true
+      }
+    ],
+    "missing_method_names": [
+      "pop",
+      "BulkIndex.assert_awaited_with"
+    ]
+  },
+  "review_context": {},
+  "metadata": {
+    "base_cached": true,
+    "base_cache_source": "local_metadata",
+    "base_context_fetched_at": "2026-04-28T05:46:26+00:00",
+    "context_commit": "72e9714c9f4236206fc9c07e34c6c9f658f07f4a",
+    "context_strategy": "clone_treesitter",
+    "target_file_ok": null,
+    "target_function_found": null,
+    "github_evidence_strength": "method_context_only",
+    "snapshot_alignment_status": "not_checked",
+    "historical_snapshot_mismatch": false,
+    "shared_context_mode": true,
+    "repair_cached": true,
+    "repair_cache_source": "clone_treesitter",
+    "repair_context_fetched_at": "2026-04-28T05:46:42+00:00",
+    "identified_method_count": 4,
+    "retrieved_method_count": 2,
+    "missing_method_count": 2,
+    "repair_evidence_mode": "strong",
+    "retrieved_test_snippets_count": 0,
+    "retrieved_callsite_snippets_count": 0,
+    "retrieved_history_snippets_count": 0,
+    "context_route": "context_required",
+    "context_required": true,
+    "context_confidence": 0.7,
+    "context_reason": "The determination of what to replace 'error-description' with is unclear without additional context on the expected structure of 'result'.",
+    "context_blocking_unknowns": [
+      "expected structure of result after popping 'error-description'"
+    ],
+    "review_cached": true,
+    "review_cache_source": "shared_context",
+    "review_context_fetched_at": "2026-04-28T05:46:51+00:00"
+  }
+}

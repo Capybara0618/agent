@@ -26,21 +26,21 @@ class SATDRecord:
 class AnalysisResult:
     decision: str
     repairable: bool
-    repairability_score: float
-    intent_clarity: float
-    change_locality: float
-    semantic_risk: float
-    context_sufficiency: float
-    verifiability: float
-    analyze_score: float
     confidence: float
-    satd_type: str
     reason: str
-    evidence_summary: str
-    risk_level: str
-    context_score: float
-    clarity_score: float
-    scope_radius: str
+    repairability_score: float = 0.0
+    intent_clarity: float = 0.0
+    change_locality: float = 0.0
+    semantic_risk: float = 0.0
+    context_sufficiency: float = 0.0
+    verifiability: float = 0.0
+    analyze_score: float = 0.0
+    satd_type: str = ""
+    evidence_summary: str = ""
+    risk_level: str = ""
+    context_score: float = 0.0
+    clarity_score: float = 0.0
+    scope_radius: str = ""
     operation_concrete: str | None = None
     localizable: str | None = None
     local_scope: str | None = None
@@ -72,6 +72,15 @@ class MethodInquiryResult:
     reason: str = ""
     method_notes: list[dict[str, Any]] = field(default_factory=list)
     uncertainty_items: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class ContextNeedDecision:
+    route: str
+    context_required: bool
+    confidence: float
+    reason: str
+    blocking_unknowns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -126,32 +135,21 @@ class RetrievedMethodContext:
 class ReviewResult:
     round_id: int
     approved: bool
-    review_score: float
-    problem_alignment: float
-    minimality: float
-    semantic_preservation: float
-    internal_consistency: float
     issues: list[str]
-    revision_advice: str
-    reject_type: str | None
-    rationale: str
-    softened_gate_used: bool = False
     candidate_mode: str = "single"
+    review_score: float = 0.0
+    problem_alignment: float = 0.0
+    minimality: float = 0.0
+    semantic_preservation: float = 0.0
+    internal_consistency: float = 0.0
+    revision_advice: str = ""
+    reject_type: str | None = None
+    rationale: str = ""
+    softened_gate_used: bool = False
     failed_checks: list[str] = field(default_factory=list)
     repair_constraints: list[str] = field(default_factory=list)
     failure_anchor: str = ""
     retry_hint: str = ""
-
-
-@dataclass
-class SelectorDecision:
-    round_id: int
-    satd_route_type: str
-    selected_candidate_mode: str
-    selected_index: int
-    confidence: float
-    rationale: str
-    candidate_scores: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -171,6 +169,11 @@ class WorkflowTrace:
     review_strict_gate_result: str | None
     analysis: dict[str, Any] | None
     satd_route_type: str | None = None
+    context_route: str | None = None
+    context_required: bool | None = None
+    context_confidence: float | None = None
+    context_reason: str = ""
+    context_blocking_unknowns: list[str] = field(default_factory=list)
     method_inquiry: dict[str, Any] | None = None
     uncertainty_items: list[dict[str, Any]] = field(default_factory=list)
     edit_constraints: list[dict[str, Any]] = field(default_factory=list)
@@ -178,10 +181,6 @@ class WorkflowTrace:
     missing_method_names: list[str] = field(default_factory=list)
     repairs: list[dict[str, Any]] = field(default_factory=list)
     reviews: list[dict[str, Any]] = field(default_factory=list)
-    repair_candidates: list[dict[str, Any]] = field(default_factory=list)
-    candidate_repairs: list[dict[str, Any]] = field(default_factory=list)
-    candidate_reviews: list[dict[str, Any]] = field(default_factory=list)
-    selector_decisions: list[dict[str, Any]] = field(default_factory=list)
     processed_final_repaired_code: str | None = None
     em_label: str | None = None
     exact_match: bool | None = None
@@ -210,15 +209,12 @@ class GraphState(TypedDict):
     review_strict_gate_result: str | None
     analysis: AnalysisResult | None
     satd_route_type: str | None
+    context_decision: ContextNeedDecision | None
     method_inquiry: MethodInquiryResult | None
     uncertainty_items: list[UncertaintyItem]
     edit_constraints: list[EditConstraint]
     retrieved_method_contexts: list[RetrievedMethodContext]
     missing_method_names: list[str]
-    repair_candidates: list[RepairAttempt]
-    candidate_repairs: list[RepairAttempt]
-    candidate_reviews: list[ReviewResult]
-    selector_decisions: list[SelectorDecision]
     repairs: list[RepairAttempt]
     reviews: list[ReviewResult]
     latest_repair: RepairAttempt | None
@@ -276,15 +272,12 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         review_strict_gate_result=None,
         analysis=None,
         satd_route_type=None,
+        context_decision=None,
         method_inquiry=None,
         uncertainty_items=[],
         edit_constraints=[],
         retrieved_method_contexts=[],
         missing_method_names=[],
-        repair_candidates=[],
-        candidate_repairs=[],
-        candidate_reviews=[],
-        selector_decisions=[],
         repairs=[],
         reviews=[],
         latest_repair=None,
@@ -350,6 +343,7 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
     exact_match = None
     if processed_final_repaired_code is not None:
         exact_match = processed_final_repaired_code == processed_manual_code
+    context_decision = state.get("context_decision")
 
     return WorkflowTrace(
         task_id=state["task_id"],
@@ -367,15 +361,16 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         review_strict_gate_result=state["review_strict_gate_result"],
         analysis=asdict(state["analysis"]) if state["analysis"] else None,
         satd_route_type=state.get("satd_route_type"),
+        context_route=context_decision.route if context_decision else None,
+        context_required=context_decision.context_required if context_decision else None,
+        context_confidence=context_decision.confidence if context_decision else None,
+        context_reason=context_decision.reason if context_decision else "",
+        context_blocking_unknowns=list(context_decision.blocking_unknowns) if context_decision else [],
         method_inquiry=asdict(state["method_inquiry"]) if state.get("method_inquiry") else None,
         uncertainty_items=[asdict(item) for item in state.get("uncertainty_items", [])],
         edit_constraints=[asdict(item) for item in state.get("edit_constraints", [])],
         retrieved_method_contexts=[asdict(item) for item in state["retrieved_method_contexts"]],
         missing_method_names=list(state["missing_method_names"]),
-        repair_candidates=[asdict(item) for item in state["repair_candidates"]],
-        candidate_repairs=[asdict(item) for item in state["candidate_repairs"]],
-        candidate_reviews=[asdict(item) for item in state["candidate_reviews"]],
-        selector_decisions=[asdict(item) for item in state["selector_decisions"]],
         repairs=[asdict(item) for item in state["repairs"]],
         reviews=[asdict(item) for item in state["reviews"]],
         processed_final_repaired_code=processed_final_repaired_code,

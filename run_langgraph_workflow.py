@@ -28,6 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="Print per-task and per-stage progress logs while running.")
     parser.add_argument("--write-batch-size", type=int, default=10, help="Flush results to disk every N tasks.")
     parser.add_argument(
+        "--analysis-only",
+        action="store_true",
+        help="Run context routing and analyzer only, then stop before fixer/reviewer.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from an existing output directory by skipping task_ids already present in results.csv.",
@@ -84,10 +89,13 @@ def main() -> None:
         write_batch_size=args.write_batch_size,
         repair_context_mode=args.repair_context_mode,
         max_method_contexts=args.max_method_contexts,
+        analysis_only=args.analysis_only,
     )
     summary = workflow.run_csv(args.input, args.output_dir, limit=args.limit, resume=args.resume)
 
     print("LangGraph SATD workflow finished.")
+    print(f"Input path: {summary.get('input_path') or args.input}")
+    print(f"Input limit: {summary.get('input_limit')}")
     print(f"Agent mode: {summary['agent_mode']}")
     print(f"Model: {summary['model']}")
     print(f"Max rounds: {summary['max_rounds']}")
@@ -98,8 +106,12 @@ def main() -> None:
     print(f"Successful repair count: {summary['successful_repair_count']}")
     print(f"Precision: {summary['precision']}")
     print(f"Recall: {summary['recall']}")
+    print(f"Avg BLEU-diff: {summary.get('avg_BLEU_diff')}")
+    print(f"Avg CrystalBLEU-diff: {summary.get('avg_CrystalBLEU_diff')}")
+    print(f"Avg LEMOD: {summary.get('avg_LEMOD')}")
     print(f"Written tasks: {summary['written_tasks']}")
     print(f"Write batch size: {summary['write_batch_size']}")
+    print(f"Analysis only: {summary.get('analysis_only')}")
     print(f"Repair context mode: {summary.get('repair_context_mode')}")
     print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")
     print(f"Context router enabled: {summary.get('context_router_enabled')}")

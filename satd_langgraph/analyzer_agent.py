@@ -15,62 +15,48 @@ class OpenAIAnalyzer:
         method_inquiry = state.get("method_inquiry")
         required_methods = method_inquiry.required_methods if isinstance(method_inquiry, MethodInquiryResult) else []
         missing_method_names = [str(item) for item in (state.get("missing_method_names") or []) if str(item).strip()]
-        retrieved_method_count = len(state.get("retrieved_method_contexts") or [])
-        missing_method_count = len(missing_method_names)
-        edit_constraints = [
-            item for item in (state.get("edit_constraints") or []) if isinstance(item, EditConstraint)
-        ]
-        repair_evidence_mode = "strong" if retrieved_method_count else "weak"
+        target_grounding = self._target_grounding_profile(state)
+
         system_prompt = (
-            "You are the analyzer agent in a SATD repair workflow. "
-            "Return valid JSON only with keys: decision, confidence, operation_concrete, localizable, "
-            "local_scope, end_state_clear, context_sufficiency, method_context_used, drop_reason, "
-            "comment_evidence, code_evidence, notes. "
-            "Your job is to decide whether the SATD should enter the fixer agent. "
-            "Do not repair the code. Do not output repaired_code. Do not propose replacement code."
+            "You are the analyzer agent in a SATD repair workflow.\n"
+            "Decide whether this SATD item should enter the automatic fixer.\n"
+            "Act as a calibrated evidence gate, not as a brainstorming assistant.\n"
+            "Do not repair the code. Do not propose replacement code.\n"
+            "Use only the SATD comment, code snippet, and retrieved method context.\n"
+            "Return JSON only."
         )
         user_prompt = (
-            "Analyze whether the SATD is suitable for automatic local repair.\n\n"
-            f"### SATD comment:\n{state['satd_comment']}\n\n"
-            f"### Code:\n```python\n{state['original_code']}\n```\n\n"
-            f"### Required methods:\n{self._format_list(required_methods)}\n\n"
-            f"### Supporting evidence:\n{method_context_block or '[none]'}\n\n"
-            f"### Missing methods:\n{self._format_list(missing_method_names)}\n\n"
-            f"### Edit constraints:\n{self._format_analyzer_constraints(edit_constraints)}\n\n"
-            "### Context quality:\n"
-            f"retrieved_method_count: {retrieved_method_count}\n"
-            f"missing_method_count: {missing_method_count}\n"
-            f"repair_evidence_mode: {repair_evidence_mode}\n\n"
-            "### Hard rules:\n"
-            "- Return decision=\"pass\" when the SATD has a clear local repair target and the supporting evidence makes a small automatic repair plausible.\n"
-            "- Return decision=\"uncertain\" when the SATD may be repairable but the exact edit, target, or supporting method context is incomplete.\n"
-            "- Return decision=\"drop\" only when the SATD is clearly unsuitable for automatic local repair.\n"
-            "- Prefer uncertain over drop when evidence is mixed.\n"
-            "- Do not drop only because a method is missing.\n"
-            "- Do not drop only because the repair looks difficult.\n"
-            "- Drop broad, open-ended, architectural, migration, investigation, redesign, or product-decision tasks.\n"
-            "- Use supporting evidence only to judge target existence, locality, context sufficiency, and repairability.\n"
-            "- Do not let retrieved method context override an unclear SATD comment.\n"
-            "- If the SATD asks to decide, investigate, figure out, redesign, rewrite, refactor, implement an unspecified behavior, or optimize broadly, return decision=\"drop\" unless the code and evidence expose a specific small edit.\n"
-            "- Return decision=\"drop\" when both the requested operation and the desired end state are too unclear to write a local patch.\n"
-            "- Return decision=\"drop\" when supporting evidence only proves that related methods exist but does not identify what should change.\n"
-            "- For context-required SATD, pass requires both a concrete operation and a local target; method context alone is insufficient.\n"
-            "- Do not generate repaired code.\n"
-            "- Do not invent repository facts not present in the code or supporting evidence.\n\n"
-            "Return JSON with exactly:\n"
+            "Analyze this SATD:\n\n"
+            f"SATD comment:\n{state['satd_comment']}\n\n"
+            f"Code:\n```python\n{state['original_code']}\n```\n\n"
+            f"Required methods:\n{self._format_list(required_methods)}\n\n"
+            f"Retrieved method context:\n{method_context_block or '[none]'}\n\n"
+            f"Missing method context:\n{self._format_list(missing_method_names)}\n\n"
+            f"Target grounding evidence:\n{self._format_target_grounding(target_grounding)}\n\n"
+            "Use a precision-aware evidence gate.\n"
+            "Assess target_clarity, locality, outcome_clarity, and context_sufficiency.\n"
+            "Use \"uncertain\" as the default when evidence is mixed.\n"
+            "Choose \"pass\" only when the target, local edit region, and acceptable outcome are all determined by the input.\n"
+            "Choose \"uncertain\" when the target is local and a conservative attempt is plausible, but implementation details are incomplete.\n"
+            "Choose \"drop\" when the workflow would need to invent the target behavior, product/design choice, replacement API, timing decision, "
+            "future-version assumption, broad refactor, investigation result, performance strategy, or missing end state.\n"
+            "Do not treat a TODO/FIXME marker or nearby editable code as sufficient by itself; the SATD and code must constrain what should change.\n"
+            "Do not drop merely because retrieved method context is absent when the snippet itself gives a concrete local transformation.\n\n"
+            "Decision:\n"
+            '- "pass": the evidence determines a bounded repair target, local edit region, and acceptable outcome.\n'
+            '- "uncertain": a local target and conservative acceptable outcome are inferable, but implementation support is incomplete.\n'
+            '- "drop": the evidence does not determine the target or acceptable outcome, or the repair would require choosing policy, design, timing, external API behavior, or broad surrounding behavior not present in the input.\n\n'
+            "Return exactly:\n"
             "{\n"
             '  "decision": "pass" | "uncertain" | "drop",\n'
             '  "confidence": 0.0,\n'
-            '  "operation_concrete": "high" | "partial" | "low",\n'
-            '  "localizable": "high" | "partial" | "low",\n'
-            '  "local_scope": "high" | "partial" | "low",\n'
-            '  "end_state_clear": "high" | "partial" | "low",\n'
+            '  "target_clarity": "high" | "partial" | "low",\n'
+            '  "locality": "high" | "partial" | "low",\n'
+            '  "outcome_clarity": "high" | "partial" | "low",\n'
             '  "context_sufficiency": "high" | "partial" | "low",\n'
-            '  "method_context_used": true,\n'
-            '  "drop_reason": "",\n'
-            '  "comment_evidence": "short phrase from the SATD comment",\n'
-            '  "code_evidence": "short phrase from code or supporting evidence",\n'
-            '  "notes": "one short sentence"\n'
+            '  "comment_evidence": "short phrase from SATD comment",\n'
+            '  "code_evidence": "short phrase from code/context",\n'
+            '  "reason": "one short sentence"\n'
             "}\n"
         )
         payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"analyze:task_{state['task_id']}")
@@ -87,7 +73,7 @@ class OpenAIAnalyzer:
             context_sufficiency="low",
             notes=notes,
             comment_evidence="",
-            code_evidence="rule-based missing input",
+            code_evidence="invalid analyzer input",
             satd_type="context_required",
         )
 
@@ -116,68 +102,34 @@ class OpenAIAnalyzer:
     def _coerce_analysis(self, payload: dict[str, Any], state: GraphState) -> AnalysisResult:
         requested_decision = self._normalize_decision(payload.get("decision"))
         confidence = self._clamp_float(payload.get("confidence"), 0.0)
-        operation_concrete = self._normalize_level(payload.get("operation_concrete"))
-        localizable = self._normalize_level(payload.get("localizable"))
-        local_scope = self._normalize_level(payload.get("local_scope"))
-        end_state_clear = self._normalize_level(payload.get("end_state_clear"))
+        target_clarity = self._normalize_level(payload.get("target_clarity") or payload.get("operation_concrete"))
+        locality = self._normalize_level(payload.get("locality") or payload.get("local_scope") or payload.get("localizable"))
+        outcome_clarity = self._normalize_level(payload.get("outcome_clarity") or payload.get("end_state_clear"))
         context_sufficiency = self._normalize_level(payload.get("context_sufficiency"))
-        operation_concrete, localizable, local_scope, end_state_clear = self._apply_existing_target_floors(
-            state=state,
-            operation_concrete=operation_concrete,
-            localizable=localizable,
-            local_scope=local_scope,
-            end_state_clear=end_state_clear,
-        )
         notes = self._one_line(
-            payload.get("notes")
+            payload.get("reason")
+            or payload.get("notes")
             or payload.get("drop_reason")
-            or payload.get("reason")
             or payload.get("evidence_summary")
             or ""
         )
         comment_evidence = self._one_line(payload.get("comment_evidence"))
         code_evidence = self._one_line(payload.get("code_evidence"))
-        decision = self._decision_from_checks(
+        decision = self._calibrated_decision(
             requested_decision=requested_decision,
-            operation_concrete=operation_concrete,
-            localizable=localizable,
-            local_scope=local_scope,
-            end_state_clear=end_state_clear,
+            target_clarity=target_clarity,
+            locality=locality,
+            outcome_clarity=outcome_clarity,
+            context_sufficiency=context_sufficiency,
+            grounded_target=self._target_grounding_profile(state)["grounded_target"],
         )
-        strict_drop_reason = self._strict_drop_reason(
-            state=state,
-            operation_concrete=operation_concrete,
-            localizable=localizable,
-            local_scope=local_scope,
-            end_state_clear=end_state_clear,
-        )
-        if strict_drop_reason:
-            decision = "drop"
-            confidence = max(confidence, 0.70)
-            if strict_drop_reason == "unclear_operation_and_end_state":
-                operation_concrete = "low"
-                end_state_clear = "low"
-            elif strict_drop_reason == "target_not_localizable":
-                localizable = "low"
-            elif strict_drop_reason == "not_local_repair":
-                local_scope = "low"
-            notes = self._append_note(notes, f"Analyzer strict drop: {strict_drop_reason}.")
-        elif requested_decision == "drop" and self._should_keep_as_uncertain(
-            state=state,
-            operation_concrete=operation_concrete,
-            localizable=localizable,
-            local_scope=local_scope,
-            end_state_clear=end_state_clear,
-        ):
-            decision = "uncertain"
-            notes = self._append_note(notes, "Kept as uncertain because a local target signal exists.")
         return self._build_result(
             decision=decision,
             confidence=confidence,
-            operation_concrete=operation_concrete,
-            localizable=localizable,
-            local_scope=local_scope,
-            end_state_clear=end_state_clear,
+            operation_concrete=target_clarity,
+            localizable=locality,
+            local_scope=locality,
+            end_state_clear=outcome_clarity,
             context_sufficiency=context_sufficiency,
             notes=notes,
             comment_evidence=comment_evidence,
@@ -260,262 +212,101 @@ class OpenAIAnalyzer:
     def _level_score(self, value: str | None) -> float:
         return {"high": 0.8, "partial": 0.499, "low": 0.04}.get(value or "", 0.499)
 
-    def _decision_from_checks(
+    def _calibrated_decision(
         self,
         *,
         requested_decision: str,
-        operation_concrete: str | None,
-        localizable: str | None,
-        local_scope: str | None,
-        end_state_clear: str | None,
+        target_clarity: str | None,
+        locality: str | None,
+        outcome_clarity: str | None,
+        context_sufficiency: str | None,
+        grounded_target: bool = False,
     ) -> str:
-        checks = [operation_concrete, localizable, local_scope, end_state_clear]
-        known = [item for item in checks if item is not None]
-        low_count = sum(1 for item in known if item == "low")
-        high_count = sum(1 for item in known if item == "high")
-        if requested_decision == "drop" and low_count >= 2 and high_count == 0:
+        critical = [target_clarity, locality, outcome_clarity]
+        low_critical = sum(1 for item in critical if item == "low")
+        high_critical = sum(1 for item in critical if item == "high")
+        known_critical = [item for item in critical if item is not None]
+        avg_score = (
+            self._level_score(target_clarity)
+            + self._level_score(locality)
+            + self._level_score(outcome_clarity)
+            + self._level_score(context_sufficiency)
+        ) / 4
+
+        if target_clarity == "low" and outcome_clarity == "low" and not grounded_target:
             return "drop"
-        if localizable == "high" and local_scope == "high" and (
-            operation_concrete == "high" or end_state_clear == "high"
-        ):
+        if low_critical >= 2 and not grounded_target:
+            return "drop"
+        if requested_decision == "drop":
+            if grounded_target or (low_critical == 0 and high_critical >= 2):
+                return "uncertain"
+            return "drop"
+        if locality == "low" and (target_clarity == "low" or outcome_clarity == "low") and not grounded_target:
+            return "drop"
+        if requested_decision == "pass":
+            if low_critical == 1 or avg_score < 0.62:
+                return "uncertain"
             return "pass"
-        if operation_concrete == "low" and localizable == "low" and end_state_clear == "low":
-            return "drop"
-        if localizable == "low" and local_scope == "low" and end_state_clear == "low":
-            return "drop"
-        if low_count >= 3 and high_count == 0:
-            return "drop"
-        return "uncertain"
+        if requested_decision == "uncertain":
+            if len(known_critical) == 3 and high_critical == 3 and context_sufficiency != "low":
+                return "pass"
+            return "uncertain"
+        return requested_decision
 
-    def _apply_existing_target_floors(
-        self,
-        *,
-        state: GraphState,
-        operation_concrete: str | None,
-        localizable: str | None,
-        local_scope: str | None,
-        end_state_clear: str | None,
-    ) -> tuple[str | None, str | None, str | None, str | None]:
+    def _target_grounding_profile(self, state: GraphState) -> dict[str, Any]:
         comment = str(state.get("satd_comment") or "")
         code = str(state.get("original_code") or "")
-        if not self._has_existing_target_hint(comment, code):
-            return operation_concrete, localizable, local_scope, end_state_clear
-        if self._looks_open_ended_task(comment):
-            return operation_concrete, localizable, local_scope, end_state_clear
-        if localizable == "low":
-            localizable = "partial"
-        if operation_concrete == "low":
-            operation_concrete = "partial"
-        if end_state_clear == "low":
-            end_state_clear = "partial"
-        return operation_concrete, localizable, local_scope, end_state_clear
-
-    def _strict_drop_reason(
-        self,
-        *,
-        state: GraphState,
-        operation_concrete: str | None,
-        localizable: str | None,
-        local_scope: str | None,
-        end_state_clear: str | None,
-    ) -> str:
-        comment = str(state.get("satd_comment") or "")
-        code = str(state.get("original_code") or "")
-        open_ended_comment = self._looks_open_ended_task(comment)
-        if self._should_keep_as_uncertain(
-            state=state,
-            operation_concrete=operation_concrete,
-            localizable=localizable,
-            local_scope=local_scope,
-            end_state_clear=end_state_clear,
-        ):
-            return ""
-        if operation_concrete == "low" and end_state_clear == "low":
-            return "unclear_operation_and_end_state"
-        if localizable == "low" and (operation_concrete == "low" or end_state_clear == "low" or open_ended_comment):
-            return "target_not_localizable"
-        if local_scope == "low" and (operation_concrete == "low" or end_state_clear == "low" or open_ended_comment):
-            return "not_local_repair"
-        if open_ended_comment and not self._has_strong_local_edit_signal(comment, code):
-            return "open_ended_without_specific_local_edit"
-        return ""
-
-    def _has_local_target_signal(self, state: GraphState) -> bool:
-        comment = str(state.get("satd_comment") or "")
-        code = str(state.get("original_code") or "")
-        if not self._grounded_override_action_allowed(comment):
-            return False
-        if self._has_grounded_local_target(state, comment, code):
-            return True
-        tokens = {
-            token.lower()
-            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", comment)
-            if token.lower() not in {"todo", "fixme", "xxx", "this", "that", "with", "from", "after", "before"}
-        }
-        lowered_code = code.lower()
-        return any(token in lowered_code for token in tokens)
-
-    def _should_keep_as_uncertain(
-        self,
-        *,
-        state: GraphState,
-        operation_concrete: str | None,
-        localizable: str | None,
-        local_scope: str | None,
-        end_state_clear: str | None,
-    ) -> bool:
-        comment = str(state.get("satd_comment") or "")
-        code = str(state.get("original_code") or "")
-        if not self._grounded_override_action_allowed(comment):
-            return False
-        if not self._has_grounded_local_target(state, comment, code):
-            return False
-        if local_scope == "low" and localizable == "low" and operation_concrete == "low" and end_state_clear == "low":
-            return True
-        if localizable in {"high", "partial"} and local_scope in {"high", "partial"}:
-            return True
-        return operation_concrete == "low" and end_state_clear == "low"
-
-    def _has_satd_anchor_marker(self, code: str) -> bool:
-        return bool(re.search(r"\b(todo|fixme|xxx|hack|workaround|temporary|temp|obsolete|deprecated)\b", code or "", flags=re.IGNORECASE))
-
-    def _has_repair_action_hint(self, state: GraphState) -> bool:
-        comment = str(state.get("satd_comment") or "")
-        return bool(
-            re.search(
-                r"\b(remove|delete|drop|disable|revert|cleanup|replace|rename|change|use|return|raise|annotat|document|default|fix)\b",
-                comment,
-                flags=re.IGNORECASE,
-            )
-        )
-
-    def _grounded_override_action_allowed(self, comment: str) -> bool:
-        lowered = (comment or "").lower()
-        if not lowered.strip():
-            return False
-        broad_blockers = [
-            r"\bdecide\b",
-            r"\bshould\s+we\b",
-            r"\bfigure out\b",
-            r"\binvestigat",
-            r"\blook into\b",
-            r"\brewrite\b",
-            r"\brefactor\b",
-            r"\bredesign\b",
-            r"\boptimi[sz]e\b",
-            r"\bperformance\b",
-            r"\barchitecture\b",
-            r"\bglobal\b",
-            r"\bclean up\b",
-            r"\bimprove\b",
+        terms = self._target_terms_from_comment(comment)
+        evidence = self._target_evidence_text(state, code)
+        evidence_lower = evidence.lower()
+        grounded_terms = [
+            term
+            for term in terms
+            if self._term_in_evidence(term, evidence_lower)
         ]
-        if any(re.search(pattern, lowered) for pattern in broad_blockers):
-            return False
-        broad_action_patterns = [
-            r"\bdeprecat",
-            r"\bprevent\b",
-            r"\bset\b.{0,40}\bdefault\b",
-            r"\bdefault\b.{0,40}\bto\b",
-            r"\bhonor\b",
-            r"\breturn\b",
-            r"\braise\b",
-        ]
-        if any(re.search(pattern, lowered) for pattern in broad_action_patterns):
-            return True
-        symbol_required_patterns = [
-            r"\bimplement\b",
-            r"\badd\b",
-            r"\buncomment\b",
-            r"\bhandle\b",
-            r"\bparse\b",
-            r"\bcheck\b",
-            r"\bremove\b",
-            r"\bdelete\b",
-            r"\breplace\b",
-            r"\brename\b",
-        ]
-        return (
-            any(re.search(pattern, lowered) for pattern in symbol_required_patterns)
-            and self._has_explicit_symbolic_target(comment)
-        )
-
-    def _has_explicit_symbolic_target(self, comment: str) -> bool:
-        text = str(comment or "")
-        if re.search(r"`[^`]{2,80}`|['\"][A-Za-z_][A-Za-z0-9_.-]{2,}['\"]", text):
-            return True
-        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[._][A-Za-z_][A-Za-z0-9_]*)+\b", text):
-            return True
-        if re.search(r"\b[a-z][a-z0-9]*_[a-zA-Z0-9_]+\b", text):
-            return True
-        ignored = self._generic_target_terms() | {
-            "to",
-            "todo",
-            "fixme",
-            "xxx",
-            "implement",
-            "uncomment",
-            "handle",
-            "check",
-            "parse",
-            "add",
-            "prevent",
-            "deprecate",
-            "when",
-            "once",
-        }
-        for match in re.finditer(r"\b[A-Z][a-z][A-Za-z0-9_]{2,}\b", text):
-            token = match.group(0).lower()
-            if token not in ignored:
-                return True
-        return False
-
-    def _has_grounded_local_target(self, state: GraphState, comment: str, code: str) -> bool:
-        terms = self._local_target_terms_from_comment(comment)
-        if not terms:
-            return False
-        evidence = self._local_target_evidence_text(state, code)
-        if not evidence.strip():
-            return False
-        lowered_evidence = evidence.lower()
-        for term in terms:
-            normalized = self._normalize_target_term(term)
-            if not normalized or normalized in self._generic_target_terms():
-                continue
-            variants = {
-                normalized,
-                normalized.replace(" ", "_"),
-                normalized.replace("_", " "),
-                normalized.replace("-", "_"),
-            }
-            for variant in variants:
-                if len(variant.strip("_ ")) < 3:
-                    continue
-                pattern = r"(?<![A-Za-z0-9_])" + re.escape(variant.lower()) + r"(?![A-Za-z0-9_])"
-                if re.search(pattern, lowered_evidence):
-                    return True
-        return False
-
-    def _local_target_terms_from_comment(self, comment: str) -> set[str]:
-        text = str(comment or "")
-        terms: set[str] = set()
-        for match in re.finditer(r"`([^`]{2,80})`|['\"]([^'\"]{2,80})['\"]", text):
-            terms.add(match.group(1) or match.group(2) or "")
-        for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[._][A-Za-z_][A-Za-z0-9_]*)+\b", text):
-            terms.add(match.group(0))
-        for match in re.finditer(r"\b[A-Z][A-Za-z0-9_]{2,}\b", text):
-            terms.add(match.group(0))
-        for match in re.finditer(r"\b[a-z][a-z0-9]*_[a-zA-Z0-9_]+\b", text):
-            terms.add(match.group(0))
-        action_pattern = r"\b(?:implement|add|prevent|deprecat\w*|honor|handle|parse|uncomment|return|raise|check|remove|delete|replace|rename)\s+(?:the\s+|a\s+|an\s+)?([A-Za-z_][A-Za-z0-9_]{2,})\b"
-        for match in re.finditer(action_pattern, text, flags=re.IGNORECASE):
-            terms.add(match.group(1))
+        satd_anchor_present = self._satd_anchor_present(comment, code)
         return {
-            normalized
-            for normalized in (self._normalize_target_term(term) for term in terms)
-            if normalized and normalized not in self._generic_target_terms()
+            "target_terms": terms[:8],
+            "grounded_terms": grounded_terms[:8],
+            "satd_anchor_present": satd_anchor_present,
+            "grounded_target": bool(grounded_terms),
+            "retrieved_context_count": len(state.get("retrieved_method_contexts") or []),
         }
 
-    def _local_target_evidence_text(self, state: GraphState, code: str) -> str:
+    def _format_target_grounding(self, profile: dict[str, Any]) -> str:
+        target_terms = self._format_list(list(profile.get("target_terms") or []))
+        grounded_terms = self._format_list(list(profile.get("grounded_terms") or []))
+        return "\n".join(
+            [
+                f"target_terms: {target_terms}",
+                f"grounded_terms: {grounded_terms}",
+                f"satd_anchor_present: {bool(profile.get('satd_anchor_present'))}",
+                f"grounded_target: {bool(profile.get('grounded_target'))}",
+                f"retrieved_context_count: {int(profile.get('retrieved_context_count') or 0)}",
+            ]
+        )
+
+    def _target_terms_from_comment(self, comment: str) -> list[str]:
+        text = str(comment or "")
+        terms: list[str] = []
+        patterns = [
+            r"`([^`]{2,80})`",
+            r"['\"]([A-Za-z_][A-Za-z0-9_.-]{2,})['\"]",
+            r"\b[A-Za-z_][A-Za-z0-9_]*(?:[._][A-Za-z_][A-Za-z0-9_]*)+\b",
+            r"\b[a-z][a-z0-9]*_[A-Za-z0-9_]+\b",
+            r"\b[A-Z][A-Za-z0-9_]{2,}\b",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                value = next((group for group in match.groups() if group), match.group(0))
+                normalized = self._normalize_target_term(value)
+                if normalized and normalized not in self._generic_target_terms() and normalized not in terms:
+                    terms.append(normalized)
+                if len(terms) >= 12:
+                    return terms
+        return terms
+
+    def _target_evidence_text(self, state: GraphState, code: str) -> str:
         parts = [str(code or "")]
         method_inquiry = state.get("method_inquiry")
         if isinstance(method_inquiry, MethodInquiryResult):
@@ -524,8 +315,56 @@ class OpenAIAnalyzer:
             if isinstance(item, RetrievedMethodContext):
                 parts.extend([item.method_name, item.signature, item.source, item.callsite_slice, item.evidence_slice])
             elif isinstance(item, dict):
-                parts.extend(str(item.get(key) or "") for key in ("method_name", "signature", "source", "callsite_slice", "evidence_slice"))
+                parts.extend(
+                    str(item.get(key) or "")
+                    for key in ("method_name", "signature", "source", "callsite_slice", "evidence_slice")
+                )
         return "\n".join(part for part in parts if part)
+
+    def _term_in_evidence(self, term: str, evidence_lower: str) -> bool:
+        variants = {
+            term,
+            term.replace(" ", "_"),
+            term.replace("_", " "),
+            term.replace("-", "_"),
+            term.split(".")[-1],
+        }
+        for variant in variants:
+            cleaned = self._normalize_target_term(variant)
+            if len(cleaned) < 3:
+                continue
+            pattern = r"(?<![A-Za-z0-9_])" + re.escape(cleaned.lower()) + r"(?![A-Za-z0-9_])"
+            if re.search(pattern, evidence_lower):
+                return True
+        return False
+
+    def _satd_anchor_present(self, comment: str, code: str) -> bool:
+        lowered_code = str(code or "").lower()
+        normalized_comment = " ".join(str(comment or "").lower().split())
+        if normalized_comment and normalized_comment in " ".join(lowered_code.split()):
+            return True
+        comment_tokens = {
+            token
+            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", str(comment or "").lower())
+            if token not in self._generic_target_terms()
+        }
+        if not comment_tokens:
+            return False
+        anchor_pattern = re.compile(
+            r"\b(todo|fixme|xxx|hack|workaround|temporary|temp|obsolete|deprecated)\b",
+            flags=re.IGNORECASE,
+        )
+        for line in str(code or "").splitlines():
+            if not anchor_pattern.search(line):
+                continue
+            line_tokens = {
+                token
+                for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", line.lower())
+                if token not in self._generic_target_terms()
+            }
+            if comment_tokens & line_tokens:
+                return True
+        return False
 
     def _normalize_target_term(self, value: str) -> str:
         text = re.sub(r"\s+", " ", str(value or "").strip().strip("`'\"")).lower()
@@ -537,81 +376,20 @@ class OpenAIAnalyzer:
             "todo",
             "fixme",
             "xxx",
-            "implement",
-            "implementation",
-            "add",
-            "prevent",
-            "check",
-            "parse",
-            "handle",
-            "for",
-            "into",
-            "have",
             "this",
             "that",
             "these",
             "those",
-            "it",
-            "this function",
             "function",
             "method",
             "class",
             "code",
-            "support",
-            "default",
             "value",
             "values",
             "data",
             "api",
-            "sdk",
+            "implementation",
         }
-
-    def _has_existing_target_hint(self, comment: str, code: str) -> bool:
-        return self._has_strong_local_edit_signal(comment, code) or self._has_grounded_local_target({}, comment, code)
-
-    def _looks_open_ended_task(self, comment: str) -> bool:
-        lowered = (comment or "").lower()
-        return bool(
-            re.search(
-                r"\b(should we|would we|do we need|figure out|investigat|look into|rewrite|refactor|redesign|optimi[sz]e|performance|architecture|global|clean up|improve)\b",
-                lowered,
-            )
-        )
-
-    def _has_strong_local_edit_signal(self, comment: str, code: str) -> bool:
-        lowered = (comment or "").lower()
-        if not lowered.strip() or not (code or "").strip():
-            return False
-        strong_patterns = [
-            r"\bremove\b",
-            r"\bdelete\b",
-            r"\breplace\b",
-            r"\brename\b",
-            r"\bswitch to\b",
-            r"\buse .{1,80}\binstead\b",
-            r"\binstead of\b",
-            r"\bdeprecated\b.{0,80}\buse\b",
-            r"\bannotat",
-            r"\bdocument\b",
-            r"\bdocstring\b",
-            r"\bmissing doc\b",
-            r"\bupdate description\b",
-            r"\bchange (?:the )?(?:default|value|return|exception|error|message|type)\b",
-            r"\badd (?:a |an |the )?missing (?:argument|parameter|annotation|doc|string|check|guard)\b",
-            r"\bhandle (?:a |an |the )?(?:missing|none|null|empty|exception|error)\b",
-            r"\braise (?:a |an |the )?(?:specific )?(?:exception|error)\b",
-            r"\breturn (?:a |an |the )?(?:specific |default |empty |none|null|false|true)",
-        ]
-        return any(re.search(pattern, lowered) for pattern in strong_patterns)
-
-    def _append_note(self, notes: str, addition: str) -> str:
-        notes = self._one_line(notes)
-        addition = self._one_line(addition)
-        if not notes:
-            return addition
-        if addition in notes:
-            return notes
-        return self._one_line(f"{notes} {addition}")
 
     def _one_line(self, value: Any) -> str:
         return " ".join(str(value or "").split())[:240]

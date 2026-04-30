@@ -14,6 +14,13 @@ from .fixer_agent import OpenAIFixer
 from .openai_client import OpenAICompatClient
 from .reviewer_agent import OpenAIReviewer
 from .csv_loader import load_satd_csv
+from .repair_metrics import (
+    RepairMetricContext,
+    average_metric_rows,
+    build_metric_context,
+    calculate_repair_metrics,
+    metric_result_to_row,
+)
 from .schema import (
     AnalysisResult,
     ContextNeedDecision,
@@ -39,6 +46,7 @@ class LangGraphSATDWorkflow:
         write_batch_size: int = 10,
         repair_context_mode: str = "clone_treesitter",
         max_method_contexts: int = 2,
+        analysis_only: bool = False,
     ) -> None:
         self.max_rounds = max(2, int(max_rounds))
         self.model = model
@@ -46,6 +54,7 @@ class LangGraphSATDWorkflow:
         self.write_batch_size = write_batch_size
         self.repair_context_mode = repair_context_mode
         self.max_method_contexts = max(1, int(max_method_contexts))
+        self.analysis_only = analysis_only
 
         client = OpenAICompatClient(model=model, verbose=verbose)
         self.context_client = client
@@ -74,6 +83,7 @@ class LangGraphSATDWorkflow:
         )
         self.reviewer = OpenAIReviewer(client)
         self._current_output_dir: Path | None = None
+        self._metric_context: RepairMetricContext = build_metric_context([])
 
     def run_record(self, record: SATDRecord, task_index: int = 0, task_total: int = 0):
         state = record_to_graph_input(record, self.max_rounds)
@@ -97,6 +107,11 @@ class LangGraphSATDWorkflow:
         if not state["analysis"] or not state["analysis"].repairable:
             state["status"] = "dropped_by_analyzer"
             self._log(f"{self._task_label(state)} end status={state['status']}")
+            return trace_from_state(state, record.em_label)
+
+        if self.analysis_only:
+            state["status"] = "repairable"
+            self._log(f"{self._task_label(state)} end status={state['status']} analysis_only=True")
             return trace_from_state(state, record.em_label)
 
         state = self._run_repair_review_loop(state)
@@ -274,10 +289,12 @@ class LangGraphSATDWorkflow:
                 "Decide whether this SATD can be reliably repaired from the shown snippet alone.\n\n"
                 f"### SATD comment:\n{state['satd_comment']}\n\n"
                 f"### Code:\n```python\n{state['original_code']}\n```\n\n"
-                "Choose \"no_context\" when the snippet alone makes a local edit obvious, especially removing obsolete or temporary code, "
-                "updating documentation, adding simple type annotations, or making a clearly specified local rename/literal/default replacement.\n\n"
-                "Choose \"context_required\" only if reliable repair depends on external method behavior, missing symbols, "
-                "repository conventions, an external or unclear replacement API, broad refactor/optimization intent, or an unclear target/end state.\n\n"
+                "Route by evidence sufficiency for conservative local repair.\n\n"
+                "Choose \"no_context\" when the snippet alone makes a small local edit plausible, especially deleting obsolete "
+                "or temporary code, removing an obvious SATD anchor, updating documentation, adding simple annotations, "
+                "or making a clearly specified rename, literal, default, enable/disable, or local replacement.\n\n"
+                "Choose \"context_required\" when reliable repair depends on external method behavior, missing symbols, "
+                "repository conventions, an unclear replacement API, broad refactor or optimization intent, or an unclear target/end state.\n\n"
                 "Return JSON:\n"
                 "{\n"
                 '  "route": "no_context" or "context_required",\n'
@@ -343,6 +360,7 @@ class LangGraphSATDWorkflow:
 
     def run_csv(self, input_path: Path, output_dir: Path, limit: int | None = None, resume: bool = False) -> dict:
         records = load_satd_csv(input_path, limit=limit)
+        self._metric_context = build_metric_context(record.manual_code for record in records)
         total = len(records)
         summary: dict | None = None
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -356,6 +374,8 @@ class LangGraphSATDWorkflow:
                 self._write_task_progress_csv(output_dir / "task_progress.csv", [])
 
             existing_rows = self._load_existing_rows(output_dir) if resume else self._empty_existing_rows()
+            if resume:
+                existing_rows = self._backfill_existing_metric_columns(output_dir, existing_rows)
             completed_ids = {row.get("task_id") for row in existing_rows["results"] if row.get("task_id")}
             pending_records = [record for record in records if record.task_id not in completed_ids]
             new_traces = []
@@ -377,7 +397,11 @@ class LangGraphSATDWorkflow:
                     print(f"[progress] {overall_index}/{total} task_id={record.task_id} status={trace.status} rounds={trace.rounds_used} exact={trace.exact_match}")
 
                 if offset % self.write_batch_size == 0 or offset == len(pending_records):
-                    summary = self._with_summary_metadata(self._summarize_from_existing_and_new(existing_rows, new_traces))
+                    summary = self._with_summary_metadata(
+                        self._summarize_from_existing_and_new(existing_rows, new_traces),
+                        input_path=input_path,
+                        input_limit=limit,
+                    )
                     if resume and completed_ids:
                         self._append_outputs(output_dir, pending_flush_traces)
                     else:
@@ -388,7 +412,11 @@ class LangGraphSATDWorkflow:
                         print(f"[flush] wrote {len(completed_ids) + len(new_traces)}/{total} tasks to {output_dir}")
 
             if not pending_records:
-                summary = self._with_summary_metadata(self._summarize_from_existing_and_new(existing_rows, []))
+                summary = self._with_summary_metadata(
+                    self._summarize_from_existing_and_new(existing_rows, []),
+                    input_path=input_path,
+                    input_limit=limit,
+                )
                 self._write_summary_csv(output_dir / "summary.csv", summary)
 
             assert summary is not None
@@ -397,15 +425,24 @@ class LangGraphSATDWorkflow:
             self._current_output_dir = None
             self._release_run_lock(lock_path)
 
-    def _with_summary_metadata(self, summary: dict[str, Any]) -> dict[str, Any]:
+    def _with_summary_metadata(
+        self,
+        summary: dict[str, Any],
+        *,
+        input_path: Path | None = None,
+        input_limit: int | None = None,
+    ) -> dict[str, Any]:
+        if input_path is not None:
+            summary["input_path"] = str(input_path)
+        summary["input_limit"] = "" if input_limit is None else input_limit
         summary["agent_mode"] = "openai"
         summary["model"] = self.model
         summary["max_rounds"] = self.max_rounds
         summary["written_tasks"] = summary.get("input_satd_count", 0)
         summary["write_batch_size"] = self.write_batch_size
         summary["use_analyzer"] = True
-        summary["use_reviewer"] = True
-        summary["analysis_only"] = False
+        summary["use_reviewer"] = not self.analysis_only
+        summary["analysis_only"] = self.analysis_only
         summary["repair_prompt_mode"] = "lightweight"
         summary["repair_context_mode"] = self.repair_context_mode
         summary["max_method_contexts"] = self.max_method_contexts
@@ -423,24 +460,45 @@ class LangGraphSATDWorkflow:
             "trajectory": self._read_csv_rows(output_dir / "trajectory_overview.csv"),
         }
 
+    def _backfill_existing_metric_columns(
+        self,
+        output_dir: Path,
+        existing_rows: dict[str, list[dict[str, str]]],
+    ) -> dict[str, list[dict[str, str]]]:
+        result_rows = [self._ensure_metric_row(row) for row in existing_rows.get("results", [])]
+        trajectory_rows = [self._ensure_metric_row(row) for row in existing_rows.get("trajectory", [])]
+        if result_rows:
+            self._write_csv_rows(output_dir / "results.csv", self._results_fieldnames(), result_rows)
+        if trajectory_rows:
+            self._write_csv_rows(output_dir / "trajectory_overview.csv", self._trajectory_fieldnames(), trajectory_rows)
+        return {"results": result_rows, "trajectory": trajectory_rows}
+
     def _summarize_from_existing_and_new(self, existing_rows: dict[str, list[dict[str, str]]], new_traces: list) -> dict:
-        result_rows = [*existing_rows.get("results", []), *[self._results_row(trace) for trace in new_traces]]
+        result_rows = [
+            *[self._ensure_metric_row(row) for row in existing_rows.get("results", [])],
+            *[self._results_row(trace) for trace in new_traces],
+        ]
         total = len(result_rows)
         analyze_filtered_count = sum(1 for row in result_rows if row.get("status") == "dropped_by_analyzer")
+        analyzer_pass_count = sum(1 for row in result_rows if row.get("status") != "dropped_by_analyzer")
         review_rejected_count = sum(1 for row in result_rows if row.get("status") == "dropped_after_review")
         workflow_output_count = sum(1 for row in result_rows if row.get("status") == "accepted")
         successful_repair_count = sum(1 for row in result_rows if str(row.get("exact_match")).lower() == "true")
         precision = round(successful_repair_count / workflow_output_count, 4) if workflow_output_count else 0.0
         recall = round(successful_repair_count / total, 4) if total else 0.0
+        accepted_metrics = average_metric_rows(result_rows, accepted_only=True)
         return {
             "input_satd_count": total,
             "analyze_filtered_count": analyze_filtered_count,
-            "analyzer_pass_count": 0,
+            "analyzer_pass_count": analyzer_pass_count,
             "review_rejected_count": review_rejected_count,
             "workflow_output_count": workflow_output_count,
             "successful_repair_count": successful_repair_count,
             "precision": precision,
             "recall": recall,
+            "avg_BLEU_diff": accepted_metrics["avg_bleu_diff"],
+            "avg_CrystalBLEU_diff": accepted_metrics["avg_crystalbleu_diff"],
+            "avg_LEMOD": accepted_metrics["avg_lemod"],
         }
 
     def _write_outputs(self, output_dir: Path, traces: list, summary: dict) -> None:
@@ -463,6 +521,7 @@ class LangGraphSATDWorkflow:
     def _trajectory_fieldnames(self) -> list[str]:
         return [
             "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment", "satd_route_type", "context_route", "context_required", "context_confidence", "context_reason", "context_blocking_unknowns",
+            *self._metric_output_fields(),
             *self._analysis_output_fields("analysis_passed"),
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
@@ -474,12 +533,20 @@ class LangGraphSATDWorkflow:
     def _results_fieldnames(self) -> list[str]:
         return [
             "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match", "satd_route_type", "context_route", "context_required", "context_confidence", "context_reason", "context_blocking_unknowns",
+            *self._metric_output_fields(),
             *self._analysis_output_fields("analysis_repairable"),
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
             "identified_method_names", "retrieved_method_names", "missing_method_names", "retrieved_method_count", "method_context_json", "uncertainty_items_json", "edit_constraints_json",
             "repair_context_used", "review_strict_gate_result", "original_code", "processed_manual_code", "processed_final_repaired_code",
             *self._round_output_fields(1),
             *self._round_output_fields(2),
+        ]
+
+    def _metric_output_fields(self) -> list[str]:
+        return [
+            "BLEU_diff",
+            "CrystalBLEU_diff",
+            "LEMOD",
         ]
 
     def _analysis_output_fields(self, repairable_field: str) -> list[str]:
@@ -555,6 +622,16 @@ class LangGraphSATDWorkflow:
             "processed_manual_code": trace.processed_manual_code,
             "processed_final_repaired_code": trace.processed_final_repaired_code or "",
         }
+        row.update(
+            metric_result_to_row(
+                calculate_repair_metrics(
+                    trace.original_code,
+                    trace.processed_manual_code,
+                    trace.processed_final_repaired_code,
+                    self._metric_context,
+                )
+            )
+        )
         if include_workflow:
             row["workflow_output"] = "YES" if trace.status == "accepted" else "NO"
             row["drop_stage"] = self._drop_stage(trace)
@@ -565,6 +642,26 @@ class LangGraphSATDWorkflow:
             review = next((item for item in reviews if int(item.get("round_id") or 0) == round_id), None)
             row.update(self._round_row(round_id, repair, review))
         return row
+
+    def _ensure_metric_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        if (
+            row.get("BLEU_diff") not in (None, "")
+            and row.get("CrystalBLEU_diff") not in (None, "")
+            and row.get("LEMOD") not in (None, "")
+        ):
+            return row
+        updated = dict(row)
+        updated.update(
+            metric_result_to_row(
+                calculate_repair_metrics(
+                    updated.get("original_code"),
+                    updated.get("processed_manual_code"),
+                    updated.get("processed_final_repaired_code"),
+                    self._metric_context,
+                )
+            )
+        )
+        return updated
 
     def _merge_analysis_row(self, row: dict[str, Any], analysis: dict[str, Any], repairable_field: str) -> None:
         row.update(
@@ -755,7 +852,7 @@ class LangGraphSATDWorkflow:
         }
 
     def _write_summary_csv(self, path: Path, summary: dict) -> None:
-        fieldnames = ["input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled"]
+        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled"]
         self._write_csv_rows(path, fieldnames, [summary])
 
     def _write_task_progress_csv(self, path: Path, traces: list) -> None:

@@ -613,6 +613,7 @@ class LangGraphSATDWorkflow:
         precision = round(successful_repair_count / workflow_output_count, 4) if workflow_output_count else 0.0
         recall = round(successful_repair_count / total, 4) if total else 0.0
         accepted_metrics = average_metric_rows(result_rows, accepted_only=True)
+        llm_judge_stats = self._llm_judge_summary_stats(result_rows)
         return {
             "input_satd_count": total,
             "analyze_filtered_count": analyze_filtered_count,
@@ -626,6 +627,7 @@ class LangGraphSATDWorkflow:
             "avg_CrystalBLEU_diff": accepted_metrics["avg_crystalbleu_diff"],
             "avg_LEMOD": accepted_metrics["avg_lemod"],
             "avg_LLM_as_judge": accepted_metrics["avg_llm_as_judge"],
+            **llm_judge_stats,
         }
 
     def _write_outputs(self, output_dir: Path, traces: list, summary: dict) -> None:
@@ -1032,8 +1034,30 @@ class LangGraphSATDWorkflow:
         }
 
     def _write_summary_csv(self, path: Path, summary: dict) -> None:
-        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "avg_LLM_as_judge", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "fixer_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled", "force_route", "llm_judge_enabled", "judge_model"]
+        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "avg_LLM_as_judge", "llm_judge_count", "llm_judge_pass_count", "llm_judge_fail_count", "llm_judge_pass_rate", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "fixer_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled", "force_route", "llm_judge_enabled", "judge_model"]
         self._write_csv_rows(path, fieldnames, [summary])
+
+    def _llm_judge_summary_stats(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        judged_values: list[float] = []
+        for row in rows:
+            if row.get("status") != "accepted":
+                continue
+            value = row.get("LLM_as_judge")
+            if value in (None, ""):
+                continue
+            try:
+                judged_values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        pass_count = sum(1 for value in judged_values if value >= 0.5)
+        fail_count = len(judged_values) - pass_count
+        pass_rate = round(pass_count / len(judged_values), 6) if judged_values else 0.0
+        return {
+            "llm_judge_count": len(judged_values),
+            "llm_judge_pass_count": pass_count,
+            "llm_judge_fail_count": fail_count,
+            "llm_judge_pass_rate": pass_rate,
+        }
 
     def _write_task_progress_csv(self, path: Path, traces: list) -> None:
         fieldnames = ["task_id", "status", "rounds_used", "exact_match", "progress_index", "progress_total"]

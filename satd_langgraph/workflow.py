@@ -11,6 +11,7 @@ from typing import Any
 
 from .analyzer_agent import OpenAIAnalyzer
 from .fixer_agent import OpenAIFixer
+from .llm_judge import LLMRepairJudge, llm_judge_result_to_row
 from .openai_client import OpenAICompatClient
 from .reviewer_agent import OpenAIReviewer
 from .csv_loader import load_satd_csv
@@ -47,6 +48,10 @@ class LangGraphSATDWorkflow:
         repair_context_mode: str = "clone_treesitter",
         max_method_contexts: int = 2,
         analysis_only: bool = False,
+        fixer_only: bool = False,
+        force_route: str | None = None,
+        enable_llm_judge: bool = True,
+        judge_model: str | None = None,
     ) -> None:
         self.max_rounds = max(2, int(max_rounds))
         self.model = model
@@ -55,6 +60,10 @@ class LangGraphSATDWorkflow:
         self.repair_context_mode = repair_context_mode
         self.max_method_contexts = max(1, int(max_method_contexts))
         self.analysis_only = analysis_only
+        self.fixer_only = fixer_only
+        self.force_route = self._normalize_force_route(force_route)
+        self.enable_llm_judge = bool(enable_llm_judge)
+        self.judge_model = (judge_model or model or "gpt-4o-mini").strip()
 
         client = OpenAICompatClient(model=model, verbose=verbose)
         self.context_client = client
@@ -82,6 +91,12 @@ class LangGraphSATDWorkflow:
             checkpoint_callback=self._record_repair_debug_checkpoint,
         )
         self.reviewer = OpenAIReviewer(client)
+        self.llm_judge = (
+            LLMRepairJudge(OpenAICompatClient(model=self.judge_model, verbose=verbose))
+            if self.enable_llm_judge
+            else None
+        )
+        self._llm_judge_cache: dict[tuple[str, str], Any] = {}
         self._current_output_dir: Path | None = None
         self._metric_context: RepairMetricContext = build_metric_context([])
 
@@ -97,6 +112,11 @@ class LangGraphSATDWorkflow:
         context_decision = self._route_context_need(state)
         state["context_decision"] = context_decision
         state["satd_route_type"] = context_decision.route
+
+        if self.fixer_only:
+            state = self._run_fixer_only(state)
+            self._log(f"{self._task_label(state)} end status={state['status']} fixer_only=True")
+            return trace_from_state(state, record.em_label)
 
         if context_decision.route == "no_context":
             state["analysis"] = self._bypass_analysis(state, "no_context", "context_router_no_context | analyzer_skipped")
@@ -181,6 +201,87 @@ class LangGraphSATDWorkflow:
             f"repairable={analysis.repairable} score={analysis.repairability_score:.2f}"
         )
         return updated
+
+    def _run_fixer_only(self, state: GraphState) -> GraphState:
+        route = str(state.get("satd_route_type") or "context_required")
+        self._log(f"{self._task_label(state)} fixer-only context start route={route}")
+        context_bundle = self._load_or_build_base_context(state)
+        method_inquiry = MethodInquiryResult(reason="fixer_only_context_not_required")
+        retrieved_method_contexts: list[RetrievedMethodContext] = []
+        missing_method_names: list[str] = []
+        uncertainty_items = []
+        edit_constraints = []
+
+        if route != "no_context":
+            try:
+                (
+                    method_inquiry,
+                    retrieved_method_contexts,
+                    missing_method_names,
+                    uncertainty_items,
+                    edit_constraints,
+                    _method_context_block,
+                ) = self.method_context_tool.prepare_method_context(state, candidate_mode="baseline_context")
+            except Exception as exc:
+                reason = (
+                    "fixer_only_context_content_filter"
+                    if self.context_client._is_content_filter_error(exc)
+                    else f"fixer_only_context_exception:{type(exc).__name__}"
+                )
+                self._log(f"{self._task_label(state)} fixer-only context failed reason={reason}; continuing snippet-only")
+                method_inquiry = MethodInquiryResult(reason=reason)
+
+        context_bundle = self._attach_method_context(
+            context_bundle,
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=retrieved_method_contexts,
+            missing_method_names=missing_method_names,
+        )
+        analysis = self._bypass_analysis(state, route, "fixer_only_analyzer_skipped")
+        repair_state = {
+            **state,
+            "analysis": analysis,
+            "github_context": context_bundle,
+            "method_inquiry": method_inquiry,
+            "retrieved_method_contexts": retrieved_method_contexts,
+            "missing_method_names": missing_method_names,
+            "uncertainty_items": uncertainty_items,
+            "edit_constraints": edit_constraints,
+            "status": "repairable",
+        }
+
+        candidate_mode = "baseline_no_context" if route == "no_context" else "baseline_context"
+        self._log(f"{self._task_label(repair_state)} fixer-only repair start mode={candidate_mode}")
+        repair, method_inquiry, contexts, missing, uncertainty_items, edit_constraints = self._run_repair(
+            repair_state,
+            1,
+            candidate_mode,
+        )
+        context_bundle = self._attach_method_context(
+            repair_state.get("github_context") or self._load_or_build_base_context(repair_state),
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=contexts,
+            missing_method_names=missing,
+        )
+        return {
+            **repair_state,
+            "github_context": context_bundle,
+            "method_inquiry": method_inquiry,
+            "retrieved_method_contexts": contexts,
+            "missing_method_names": missing,
+            "uncertainty_items": uncertainty_items,
+            "edit_constraints": edit_constraints,
+            "repair_context_used": self._repair_attempt_uses_method_evidence(repair, contexts),
+            "round_id": repair.round_id,
+            "latest_repair": repair,
+            "latest_review": None,
+            "repair_feedback": None,
+            "review_strict_gate_result": "skipped_fixer_only",
+            "repairs": [*repair_state["repairs"], repair],
+            "reviews": repair_state["reviews"],
+            "status": "accepted",
+            "final_repaired_code": repair.repaired_code,
+        }
 
     def _run_repair_review_loop(self, state: GraphState) -> GraphState:
         while state["round_id"] < min(state["max_rounds"], self.max_rounds):
@@ -278,6 +379,19 @@ class LangGraphSATDWorkflow:
             return self._fallback_review(state, reason=reason)
 
     def _route_context_need(self, state: GraphState) -> ContextNeedDecision:
+        if self.force_route:
+            decision = ContextNeedDecision(
+                route=self.force_route,
+                context_required=self.force_route == "context_required",
+                confidence=1.0,
+                reason=f"forced_route:{self.force_route}",
+                blocking_unknowns=[],
+            )
+            self._log(
+                f"{self._task_label(state)} context routing forced route={decision.route} "
+                f"confidence={decision.confidence:.2f}"
+            )
+            return decision
         self._log(f"{self._task_label(state)} context routing start")
         try:
             system_prompt = (
@@ -357,6 +471,14 @@ class LangGraphSATDWorkflow:
             reason=reason,
             blocking_unknowns=blocking_unknowns,
         )
+
+    def _normalize_force_route(self, value: str | None) -> str | None:
+        route = str(value or "").strip().lower()
+        if not route:
+            return None
+        if route not in {"no_context", "context_required"}:
+            raise ValueError("force_route must be 'no_context', 'context_required', or empty.")
+        return route
 
     def run_csv(self, input_path: Path, output_dir: Path, limit: int | None = None, resume: bool = False) -> dict:
         records = load_satd_csv(input_path, limit=limit)
@@ -440,15 +562,19 @@ class LangGraphSATDWorkflow:
         summary["max_rounds"] = self.max_rounds
         summary["written_tasks"] = summary.get("input_satd_count", 0)
         summary["write_batch_size"] = self.write_batch_size
-        summary["use_analyzer"] = True
-        summary["use_reviewer"] = not self.analysis_only
+        summary["use_analyzer"] = not self.fixer_only
+        summary["use_reviewer"] = not self.analysis_only and not self.fixer_only
         summary["analysis_only"] = self.analysis_only
+        summary["fixer_only"] = self.fixer_only
         summary["repair_prompt_mode"] = "lightweight"
         summary["repair_context_mode"] = self.repair_context_mode
         summary["max_method_contexts"] = self.max_method_contexts
         summary["single_repair_path"] = True
         summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
-        summary["context_router_enabled"] = True
+        summary["context_router_enabled"] = self.force_route is None
+        summary["force_route"] = self.force_route or ""
+        summary["llm_judge_enabled"] = self.enable_llm_judge
+        summary["judge_model"] = self.judge_model if self.enable_llm_judge else ""
         return summary
 
     def _empty_existing_rows(self) -> dict[str, list[dict[str, str]]]:
@@ -499,6 +625,7 @@ class LangGraphSATDWorkflow:
             "avg_BLEU_diff": accepted_metrics["avg_bleu_diff"],
             "avg_CrystalBLEU_diff": accepted_metrics["avg_crystalbleu_diff"],
             "avg_LEMOD": accepted_metrics["avg_lemod"],
+            "avg_LLM_as_judge": accepted_metrics["avg_llm_as_judge"],
         }
 
     def _write_outputs(self, output_dir: Path, traces: list, summary: dict) -> None:
@@ -547,6 +674,7 @@ class LangGraphSATDWorkflow:
             "BLEU_diff",
             "CrystalBLEU_diff",
             "LEMOD",
+            "LLM_as_judge",
         ]
 
     def _analysis_output_fields(self, repairable_field: str) -> list[str]:
@@ -632,6 +760,7 @@ class LangGraphSATDWorkflow:
                 )
             )
         )
+        row.update(self._llm_judge_row(trace, row))
         if include_workflow:
             row["workflow_output"] = "YES" if trace.status == "accepted" else "NO"
             row["drop_stage"] = self._drop_stage(trace)
@@ -648,20 +777,71 @@ class LangGraphSATDWorkflow:
             row.get("BLEU_diff") not in (None, "")
             and row.get("CrystalBLEU_diff") not in (None, "")
             and row.get("LEMOD") not in (None, "")
+            and (not self.enable_llm_judge or row.get("LLM_as_judge") not in (None, ""))
         ):
             return row
         updated = dict(row)
-        updated.update(
-            metric_result_to_row(
-                calculate_repair_metrics(
-                    updated.get("original_code"),
-                    updated.get("processed_manual_code"),
-                    updated.get("processed_final_repaired_code"),
-                    self._metric_context,
+        if (
+            updated.get("BLEU_diff") in (None, "")
+            or updated.get("CrystalBLEU_diff") in (None, "")
+            or updated.get("LEMOD") in (None, "")
+        ):
+            updated.update(
+                metric_result_to_row(
+                    calculate_repair_metrics(
+                        updated.get("original_code"),
+                        updated.get("processed_manual_code"),
+                        updated.get("processed_final_repaired_code"),
+                        self._metric_context,
+                    )
                 )
             )
-        )
+        if self.enable_llm_judge and updated.get("LLM_as_judge") in (None, ""):
+            updated.update(
+                self._judge_codes_to_row(
+                    original_code=updated.get("original_code"),
+                    manual_code=updated.get("processed_manual_code"),
+                    candidate_code=updated.get("processed_final_repaired_code"),
+                    satd_comment=updated.get("satd_comment"),
+                    exact_match=str(updated.get("exact_match")).strip().lower() in {"true", "1", "yes"},
+                )
+            )
         return updated
+
+    def _llm_judge_row(self, trace, row: dict[str, Any]) -> dict[str, Any]:
+        if not self.enable_llm_judge:
+            return llm_judge_result_to_row(None)
+        return self._judge_codes_to_row(
+            original_code=trace.original_code,
+            manual_code=trace.processed_manual_code,
+            candidate_code=trace.processed_final_repaired_code,
+            satd_comment=trace.satd_comment,
+            exact_match=bool(row.get("exact_match")),
+        )
+
+    def _judge_codes_to_row(
+        self,
+        original_code: str | None,
+        manual_code: str | None,
+        candidate_code: str | None,
+        satd_comment: str | None,
+        exact_match: bool = False,
+    ) -> dict[str, Any]:
+        if not self.enable_llm_judge or self.llm_judge is None:
+            return llm_judge_result_to_row(None)
+        if exact_match:
+            return {"LLM_as_judge": 1.0}
+        try:
+            cache_key = (str(satd_comment or ""), str(candidate_code or ""))
+            if cache_key in self._llm_judge_cache:
+                return {"LLM_as_judge": self._llm_judge_cache[cache_key]}
+            result = self.llm_judge.judge(original_code, manual_code, candidate_code, satd_comment)
+            row = llm_judge_result_to_row(result)
+            self._llm_judge_cache[cache_key] = row.get("LLM_as_judge", "")
+            return row
+        except Exception as exc:
+            self._log(f"[llm_judge] failed task metric type={type(exc).__name__} message={exc}")
+            return {"LLM_as_judge": ""}
 
     def _merge_analysis_row(self, row: dict[str, Any], analysis: dict[str, Any], repairable_field: str) -> None:
         row.update(
@@ -852,7 +1032,7 @@ class LangGraphSATDWorkflow:
         }
 
     def _write_summary_csv(self, path: Path, summary: dict) -> None:
-        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled"]
+        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "avg_LLM_as_judge", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "fixer_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled", "force_route", "llm_judge_enabled", "judge_model"]
         self._write_csv_rows(path, fieldnames, [summary])
 
     def _write_task_progress_csv(self, path: Path, traces: list) -> None:

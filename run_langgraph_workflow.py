@@ -33,6 +33,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run context routing and analyzer only, then stop before fixer/reviewer.",
     )
     parser.add_argument(
+        "--fixer-only",
+        action="store_true",
+        help="Skip analyzer and reviewer; run one fixer attempt and accept its output for metric inspection.",
+    )
+    parser.add_argument(
+        "--force-route",
+        choices=["auto", "no_context", "context_required"],
+        default="context_required",
+        help="Force the context route and skip the LLM context router. Default is context_required; use auto to enable the router.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume from an existing output directory by skipping task_ids already present in results.csv.",
@@ -65,6 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional repo cache directory. By default, random_code.csv uses .repo_cache_random_code.",
     )
+    parser.add_argument(
+        "--llm-judge",
+        dest="enable_llm_judge",
+        action="store_true",
+        default=True,
+        help="Add offline LLM-as-judge metric using the manual repair as evaluation reference. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-llm-judge",
+        dest="enable_llm_judge",
+        action="store_false",
+        help="Disable the per-row offline LLM-as-judge metric.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Optional model name for LLM-as-judge. Defaults to --model.",
+    )
     return parser
 
 
@@ -90,6 +119,10 @@ def main() -> None:
         repair_context_mode=args.repair_context_mode,
         max_method_contexts=args.max_method_contexts,
         analysis_only=args.analysis_only,
+        fixer_only=args.fixer_only,
+        force_route=None if args.force_route == "auto" else args.force_route,
+        enable_llm_judge=args.enable_llm_judge,
+        judge_model=args.judge_model,
     )
     summary = workflow.run_csv(args.input, args.output_dir, limit=args.limit, resume=args.resume)
 
@@ -109,13 +142,18 @@ def main() -> None:
     print(f"Avg BLEU-diff: {summary.get('avg_BLEU_diff')}")
     print(f"Avg CrystalBLEU-diff: {summary.get('avg_CrystalBLEU_diff')}")
     print(f"Avg LEMOD: {summary.get('avg_LEMOD')}")
+    print(f"Avg LLM-as-judge: {summary.get('avg_LLM_as_judge')}")
     print(f"Written tasks: {summary['written_tasks']}")
     print(f"Write batch size: {summary['write_batch_size']}")
     print(f"Analysis only: {summary.get('analysis_only')}")
+    print(f"Fixer only: {summary.get('fixer_only')}")
     print(f"Repair context mode: {summary.get('repair_context_mode')}")
     print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")
     print(f"Context router enabled: {summary.get('context_router_enabled')}")
+    print(f"Force route: {summary.get('force_route') or 'none'}")
     print(f"Max method contexts: {summary.get('max_method_contexts')}")
+    print(f"LLM judge enabled: {summary.get('llm_judge_enabled')}")
+    print(f"Judge model: {summary.get('judge_model') or 'none'}")
     print(f"Git remote base: {os.environ.get('SATD_GIT_REMOTE_BASE') or 'https://mirrors.tuna.tsinghua.edu.cn/git/github.com'}")
     print(f"Git remote template: {os.environ.get('SATD_GIT_REMOTE_TEMPLATE') or 'none'}")
     print(f"Repo cache dir: {os.environ.get('SATD_REPO_CACHE_DIR') or (Path.cwd() / '.repo_cache')}")

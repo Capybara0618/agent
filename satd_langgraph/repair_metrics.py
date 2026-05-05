@@ -85,6 +85,7 @@ def average_metric_rows(rows: Sequence[dict], accepted_only: bool = False) -> di
         "avg_bleu_diff": _avg(_row_float(row, "BLEU_diff") for row in selected),
         "avg_crystalbleu_diff": _avg(_row_float(row, "CrystalBLEU_diff") for row in selected),
         "avg_lemod": _avg(_row_float(row, "LEMOD") or _row_float(row, "LEMOD_LineF") for row in selected),
+        "avg_llm_as_judge": _avg(_row_float(row, "LLM_as_judge") for row in selected),
     }
 
 

@@ -1,11 +1,11 @@
-from __future__ import annotations
+from __future__ import annotations  
 
-import os
+import os  
 from typing import Any
 
 from .openai_client import OpenAICompatClient
 from .schema import (
-    EditConstraint,
+    EditConstraint,  
     GraphState,
     MethodInquiryResult,
     RepairAttempt,
@@ -15,7 +15,7 @@ from .schema import (
 )
 
 
-class OpenAIFixer:
+class OpenAIFixer:  
     """Generate a SATD repair from either snippet-only or analyzer-provided context."""
 
     def __init__(

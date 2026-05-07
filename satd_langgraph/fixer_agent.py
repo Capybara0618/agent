@@ -6,6 +6,7 @@ from typing import Any
 from .openai_client import OpenAICompatClient
 from .schema import (
     EditConstraint,  
+    EvidenceCard,
     GraphState,
     MethodInquiryResult,
     RepairAttempt,
@@ -48,7 +49,8 @@ class OpenAIFixer:
         method_inquiry = state.get("method_inquiry") or MethodInquiryResult()
         contexts = self._contexts_for_mode(state, candidate_mode)
         missing = list(state.get("missing_method_names") or [])
-        effective_mode = self._effective_mode(candidate_mode, contexts)
+        evidence_cards = self._evidence_cards(state)
+        effective_mode = self._effective_mode(candidate_mode, contexts, evidence_cards)
 
         self._checkpoint(
             state,
@@ -58,6 +60,7 @@ class OpenAIFixer:
                 "candidate_mode": effective_mode,
                 "required_methods": list(method_inquiry.required_methods),
                 "retrieved_method_count": len(contexts),
+                "evidence_card_count": len(evidence_cards),
                 "missing_method_names": missing,
             },
         )
@@ -74,8 +77,8 @@ class OpenAIFixer:
             repair_plan=self._repair_plan(state),
             repaired_code=repaired_code,
             changed_scope=self._changed_scope(state["original_code"], repaired_code),
-            confidence=self._confidence(state, repaired_code, contexts),
-            notes=self._notes(method_inquiry, contexts, missing),
+            confidence=self._confidence(state, repaired_code, contexts, evidence_cards),
+            notes=self._notes(method_inquiry, contexts, missing, evidence_cards),
             candidate_mode=effective_mode,
         )
         self._log(
@@ -120,13 +123,13 @@ class OpenAIFixer:
             "You are the fixer agent in a SATD repair workflow. "
             "Return valid JSON only with key: repaired_code. "
         )
-        context_block = self._context_block(method_inquiry, contexts, missing)
-        hard_rules = self._format_generic_constraint_block(state.get("edit_constraints") or [])
+        evidence_block = self._evidence_block(state, contexts)
+        hard_rules = self._short_constraints(state)
         user_prompt = (
             "Repair the code according to the SATD comment. Respond in JSON with key repaired_code.\n\n"
             f"### SATD comment:\n{state['satd_comment']}\n\n"
             f"### Code:\n{self._code_block(state['original_code'])}\n\n"
-            f"### Supporting evidence:\n{context_block}\n\n"
+            f"### Supporting evidence:\n{evidence_block}\n\n"
             f"### Hard rules:\n{hard_rules}\n"
             "- Use supporting evidence only to validate the smallest local repair.\n"
             "- Use normal indentation in repaired_code; do not add tab characters, column-alignment padding, or excessive whitespace.\n"
@@ -149,6 +152,79 @@ class OpenAIFixer:
             f"{feedback_block}"
         )
         return system_prompt, user_prompt
+
+    def _evidence_cards(self, state: GraphState) -> list[EvidenceCard]:
+        return [item for item in (state.get("evidence_cards") or []) if isinstance(item, EvidenceCard)]
+
+    def _evidence_block(self, state: GraphState, contexts: list[RetrievedMethodContext]) -> str:
+        cards = [
+            card
+            for card in self._evidence_cards(state)
+            if card.relevance in {"high", "medium"} and card.polarity != "weak"
+        ][:3]
+        if cards:
+            blocks: list[str] = []
+            for card in cards:
+                lines = [
+                    f"- [{card.tool}] {card.target}",
+                    f"  polarity: {card.polarity}",
+                    f"  fact: {self._evidence_fact(card)}",
+                    f"  patch_use: {self._evidence_patch_use(card)}",
+                ]
+                snippet = self._short_snippet(card.snippet)
+                if snippet:
+                    lines.append("  snippet:")
+                    lines.extend(f"    {line}" for line in snippet.splitlines())
+                blocks.append("\n".join(lines))
+            return "\n".join(blocks)
+        if contexts:
+            cards = []
+            for context in contexts[:3]:
+                snippet = self._short_snippet(context.evidence_slice or context.source)
+                lines = [
+                    f"- [symbol_definition] {context.method_name}",
+                    f"  polarity: support",
+                    f"  fact: Definition found in {context.path}:{context.start_line or ''}.",
+                    "  patch_use: Use the signature or declaration only if it directly constrains the local repair.",
+                ]
+                if snippet:
+                    lines.append("  snippet:")
+                    lines.extend(f"    {line}" for line in snippet.splitlines())
+                cards.append("\n".join(lines))
+            return "\n".join(cards)
+        return "[none]"
+
+    def _evidence_fact(self, card: EvidenceCard) -> str:
+        summary = str(card.summary or "")
+        first = summary.split(". Patch use:", 1)[0]
+        first = first.split(". Decision:", 1)[0]
+        return " ".join(first.split())[:220] or f"{card.tool} evidence for {card.target}."
+
+    def _evidence_patch_use(self, card: EvidenceCard) -> str:
+        summary = str(card.summary or "")
+        marker = "Patch use:"
+        if marker in summary:
+            return " ".join(summary.split(marker, 1)[1].split())[:220]
+        return "Use this evidence only if it directly supports the local SATD repair."
+
+    def _short_constraints(self, state: GraphState) -> str:
+        lines = [
+            "- Make the smallest plausible local edit.",
+            "- Preserve the existing function/class signature unless the SATD explicitly asks for a signature-local fix.",
+            "- Do not add new helpers, new control flow, or unrelated rewrites.",
+            "- Keep unchanged lines unchanged whenever possible.",
+            "- If evidence polarity is anchor_to_delete, do not preserve or reintroduce that behavior.",
+        ]
+        analysis = state.get("analysis")
+        for item in getattr(analysis, "repair_constraints", [])[:3] if analysis else []:
+            text = " ".join(str(item or "").split())
+            if text:
+                lines.append(f"- {text}")
+        return "\n".join(lines)
+
+    def _short_snippet(self, snippet: str, max_lines: int = 8) -> str:
+        lines = [line.rstrip() for line in str(snippet or "").splitlines() if line.strip()]
+        return "\n".join(lines[:max_lines])[:1200]
 
     def _format_generic_constraint_block(self, edit_constraints: list[EditConstraint]) -> str:
         lines = [
@@ -218,7 +294,6 @@ class OpenAIFixer:
         lines = [
             "\n### Reviewer feedback from previous attempt:",
             "Use this only to avoid the previous failed pattern; do not treat it as a new requirement.",
-            "The SATD comment and retrieved method context remain the primary repair source.",
         ]
         if constraints:
             lines.append("Repair constraints: " + ", ".join(constraints[:4]))
@@ -230,9 +305,14 @@ class OpenAIFixer:
         mode = str(candidate_mode or "").strip().lower()
         return not mode.endswith("no_context") and self.repair_context_mode in {"method_query", "clone_treesitter"}
 
-    def _effective_mode(self, candidate_mode: str, contexts: list[RetrievedMethodContext]) -> str:
+    def _effective_mode(
+        self,
+        candidate_mode: str,
+        contexts: list[RetrievedMethodContext],
+        evidence_cards: list[EvidenceCard],
+    ) -> str:
         mode = str(candidate_mode or "").strip() or "single"
-        if not self._uses_context(mode) or contexts:
+        if not self._uses_context(mode) or contexts or evidence_cards:
             return mode
         if mode == "baseline_context":
             return "baseline_no_context"
@@ -250,17 +330,26 @@ class OpenAIFixer:
             comment = comment[:157] + "..."
         return f"Apply the smallest local repair required by the SATD comment: {comment}"
 
-    def _confidence(self, state: GraphState, repaired_code: str, contexts: list[RetrievedMethodContext]) -> float:
+    def _confidence(
+        self,
+        state: GraphState,
+        repaired_code: str,
+        contexts: list[RetrievedMethodContext],
+        evidence_cards: list[EvidenceCard],
+    ) -> float:
         if preprocess_python_code(state["original_code"]) == preprocess_python_code(repaired_code):
             return 0.35
-        return 0.60 if contexts else 0.50
+        return 0.60 if contexts or evidence_cards else 0.50
 
     def _notes(
         self,
         method_inquiry: MethodInquiryResult,
         contexts: list[RetrievedMethodContext],
         missing: list[str],
+        evidence_cards: list[EvidenceCard],
     ) -> str:
+        if evidence_cards:
+            return f"evidence_cards={len(evidence_cards)}"
         if contexts:
             return f"method_contexts={len(contexts)}"
         if method_inquiry.required_methods:

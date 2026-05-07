@@ -40,8 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force-route",
         choices=["auto", "no_context", "context_required"],
-        default="context_required",
-        help="Force the context route and skip the LLM context router. Default is context_required; use auto to enable the router.",
+        default="auto",
+        help="Force the context route and skip Planner routing. Default is auto.",
     )
     parser.add_argument(
         "--resume",
@@ -153,6 +153,8 @@ def main() -> None:
     print(f"Fixer only: {summary.get('fixer_only')}")
     print(f"Repair context mode: {summary.get('repair_context_mode')}")
     print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")
+    print(f"Planner enabled: {summary.get('planner_enabled')}")
+    print(f"Context tools: {summary.get('context_tools')}")
     print(f"Context router enabled: {summary.get('context_router_enabled')}")
     print(f"Force route: {summary.get('force_route') or 'none'}")
     print(f"Max method contexts: {summary.get('max_method_contexts')}")

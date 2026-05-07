@@ -13,6 +13,7 @@ from .analyzer_agent import OpenAIAnalyzer
 from .fixer_agent import OpenAIFixer
 from .llm_judge import LLMRepairJudge, llm_judge_result_to_row
 from .openai_client import OpenAICompatClient
+from .planner_agent import OpenAIPlanner
 from .reviewer_agent import OpenAIReviewer
 from .csv_loader import load_satd_csv
 from .repair_metrics import (
@@ -24,9 +25,11 @@ from .repair_metrics import (
 )
 from .schema import (
     AnalysisResult,
+    EvidenceCard,
     ContextNeedDecision,
     GraphState,
     MethodInquiryResult,
+    PlannerResult,
     RepairAttempt,
     RetrievedMethodContext,
     ReviewResult,
@@ -35,7 +38,7 @@ from .schema import (
     record_to_graph_input,
     trace_from_state,
 )
-from .tools import GitHubDownloadTool, MethodContextTool, MethodRetrievalTool, SimilarCodeRules
+from .tools import GitHubDownloadTool, MethodContextTool, MethodRetrievalTool, PlannedContextTool, SimilarCodeRules
 
 
 class LangGraphSATDWorkflow:
@@ -82,6 +85,12 @@ class LangGraphSATDWorkflow:
             logger=self._log,
             checkpoint_callback=self._record_repair_debug_checkpoint,
         )
+        self.planner = OpenAIPlanner(client, max_queries=1)
+        self.planned_context_tool = PlannedContextTool(
+            self.method_retriever,
+            max_results_per_query=self.max_method_contexts,
+            logger=self._log,
+        )
         self.analyzer = OpenAIAnalyzer(client)
         self.fixer = OpenAIFixer(
             client,
@@ -109,7 +118,9 @@ class LangGraphSATDWorkflow:
             f"commit={(record.commit or '')[:12]} satd={self._compact_satd_comment(record.satd_comment)}"
         )
 
-        context_decision = self._route_context_need(state)
+        planner_result = self._run_planner_stage(state)
+        state["planner_result"] = planner_result
+        context_decision = self._route_context_need(state, planner_result)
         state["context_decision"] = context_decision
         state["satd_route_type"] = context_decision.route
 
@@ -118,11 +129,7 @@ class LangGraphSATDWorkflow:
             self._log(f"{self._task_label(state)} end status={state['status']} fixer_only=True")
             return trace_from_state(state, record.em_label)
 
-        if context_decision.route == "no_context":
-            state["analysis"] = self._bypass_analysis(state, "no_context", "context_router_no_context | analyzer_skipped")
-            state["status"] = "repairable"
-        else:
-            state = self._run_analyzer_stage(state)
+        state = self._run_analyzer_stage(state)
 
         if not state["analysis"] or not state["analysis"].repairable:
             state["status"] = "dropped_by_analyzer"
@@ -146,26 +153,43 @@ class LangGraphSATDWorkflow:
         missing_method_names: list[str] = []
         uncertainty_items = []
         edit_constraints = []
-        method_context_block = "[none]"
+        evidence_cards: list[EvidenceCard] = []
+        evidence_block = "[none]"
 
         rule_drop = self._rule_based_analyzer_drop(state)
         if rule_drop is not None:
             analysis = self.analyzer.build_rule_drop_analysis(notes=rule_drop["notes"])
         else:
             try:
-                (
-                    method_inquiry,
-                    retrieved_method_contexts,
-                    missing_method_names,
-                    uncertainty_items,
-                    edit_constraints,
-                    method_context_block,
-                ) = self.method_context_tool.prepare_method_context(state, candidate_mode="baseline_context")
+                planner_result = state.get("planner_result")
+                context_decision = state.get("context_decision")
+                context_allowed = bool(getattr(context_decision, "context_required", False))
+                if isinstance(planner_result, PlannerResult) and planner_result.context_needed and context_allowed:
+                    (
+                        retrieved_method_contexts,
+                        missing_method_names,
+                        evidence_cards,
+                        evidence_block,
+                    ) = self.planned_context_tool.prepare_context(state, planner_result)
+                    required_methods = [
+                        item.method_name for item in retrieved_method_contexts if item.found and item.method_name
+                    ]
+                    method_inquiry = MethodInquiryResult(
+                        required_methods=required_methods,
+                        reason="planner_context_queries",
+                    )
+                elif isinstance(planner_result, PlannerResult):
+                    method_inquiry = MethodInquiryResult(
+                        reason="planner_no_context" if not context_allowed else "planner_no_executable_context",
+                    )
+                else:
+                    method_inquiry = MethodInquiryResult(reason="planner_result_missing")
                 context_bundle = self._attach_method_context(
                     context_bundle,
                     method_inquiry=method_inquiry,
                     retrieved_method_contexts=retrieved_method_contexts,
                     missing_method_names=missing_method_names,
+                    evidence_cards=evidence_cards,
                 )
                 analyzer_state = {
                     **state,
@@ -175,8 +199,9 @@ class LangGraphSATDWorkflow:
                     "missing_method_names": missing_method_names,
                     "uncertainty_items": uncertainty_items,
                     "edit_constraints": edit_constraints,
+                    "evidence_cards": evidence_cards,
                 }
-                analysis = self.analyzer.run(analyzer_state, method_context_block=method_context_block)
+                analysis = self.analyzer.run(analyzer_state, evidence_block=evidence_block)
             except Exception as exc:
                 if self.context_client._is_content_filter_error(exc):
                     reason = "analyzer_content_filter"
@@ -194,6 +219,7 @@ class LangGraphSATDWorkflow:
             "edit_constraints": edit_constraints,
             "retrieved_method_contexts": retrieved_method_contexts,
             "missing_method_names": missing_method_names,
+            "evidence_cards": evidence_cards,
             "status": "repairable" if analysis.repairable else "dropped_by_analyzer",
         }
         self._log(
@@ -211,17 +237,23 @@ class LangGraphSATDWorkflow:
         missing_method_names: list[str] = []
         uncertainty_items = []
         edit_constraints = []
+        evidence_cards: list[EvidenceCard] = []
 
-        if route != "no_context":
+        planner_result = state.get("planner_result")
+        context_decision = state.get("context_decision")
+        context_allowed = bool(getattr(context_decision, "context_required", False))
+        if isinstance(planner_result, PlannerResult) and planner_result.context_needed and context_allowed:
             try:
                 (
-                    method_inquiry,
                     retrieved_method_contexts,
                     missing_method_names,
-                    uncertainty_items,
-                    edit_constraints,
-                    _method_context_block,
-                ) = self.method_context_tool.prepare_method_context(state, candidate_mode="baseline_context")
+                    evidence_cards,
+                    _evidence_block,
+                ) = self.planned_context_tool.prepare_context(state, planner_result)
+                method_inquiry = MethodInquiryResult(
+                    required_methods=[item.method_name for item in retrieved_method_contexts if item.found],
+                    reason="planner_context_queries",
+                )
             except Exception as exc:
                 reason = (
                     "fixer_only_context_content_filter"
@@ -236,8 +268,19 @@ class LangGraphSATDWorkflow:
             method_inquiry=method_inquiry,
             retrieved_method_contexts=retrieved_method_contexts,
             missing_method_names=missing_method_names,
+            evidence_cards=evidence_cards,
         )
         analysis = self._bypass_analysis(state, route, "fixer_only_analyzer_skipped")
+        has_injectable_evidence = any(
+            item.relevance in {"high", "medium"} and item.polarity != "weak"
+            for item in evidence_cards
+        )
+        if has_injectable_evidence or retrieved_method_contexts:
+            analysis.repair_mode = "evidence_guided"
+            analysis.evidence_used = bool(evidence_cards)
+            analysis.repair_constraints = [
+                "Use only the short evidence cards that directly support the local SATD repair."
+            ]
         repair_state = {
             **state,
             "analysis": analysis,
@@ -247,10 +290,11 @@ class LangGraphSATDWorkflow:
             "missing_method_names": missing_method_names,
             "uncertainty_items": uncertainty_items,
             "edit_constraints": edit_constraints,
+            "evidence_cards": evidence_cards,
             "status": "repairable",
         }
 
-        candidate_mode = "baseline_no_context" if route == "no_context" else "baseline_context"
+        candidate_mode = self._candidate_mode_for_state(repair_state)
         self._log(f"{self._task_label(repair_state)} fixer-only repair start mode={candidate_mode}")
         repair, method_inquiry, contexts, missing, uncertainty_items, edit_constraints = self._run_repair(
             repair_state,
@@ -262,6 +306,7 @@ class LangGraphSATDWorkflow:
             method_inquiry=method_inquiry,
             retrieved_method_contexts=contexts,
             missing_method_names=missing,
+            evidence_cards=repair_state.get("evidence_cards") or [],
         )
         return {
             **repair_state,
@@ -271,7 +316,8 @@ class LangGraphSATDWorkflow:
             "missing_method_names": missing,
             "uncertainty_items": uncertainty_items,
             "edit_constraints": edit_constraints,
-            "repair_context_used": self._repair_attempt_uses_method_evidence(repair, contexts),
+            "evidence_cards": repair_state.get("evidence_cards") or [],
+            "repair_context_used": self._repair_attempt_uses_context(repair, contexts, repair_state.get("evidence_cards") or []),
             "round_id": repair.round_id,
             "latest_repair": repair,
             "latest_review": None,
@@ -286,8 +332,7 @@ class LangGraphSATDWorkflow:
     def _run_repair_review_loop(self, state: GraphState) -> GraphState:
         while state["round_id"] < min(state["max_rounds"], self.max_rounds):
             next_round = int(state["round_id"]) + 1
-            route = str(state.get("satd_route_type") or "context_required")
-            candidate_mode = "baseline_no_context" if route == "no_context" else "baseline_context"
+            candidate_mode = self._candidate_mode_for_state(state)
             self._log(f"{self._task_label(state)} repair start round={next_round} mode={candidate_mode}")
             repair, method_inquiry, contexts, missing, uncertainty_items, edit_constraints = self._run_repair(
                 state,
@@ -299,6 +344,7 @@ class LangGraphSATDWorkflow:
                 method_inquiry=method_inquiry,
                 retrieved_method_contexts=contexts,
                 missing_method_names=missing,
+                evidence_cards=state.get("evidence_cards") or [],
             )
             state = {
                 **state,
@@ -308,7 +354,7 @@ class LangGraphSATDWorkflow:
                 "missing_method_names": missing,
                 "uncertainty_items": uncertainty_items,
                 "edit_constraints": edit_constraints,
-                "repair_context_used": self._repair_attempt_uses_method_evidence(repair, contexts),
+                "repair_context_used": self._repair_attempt_uses_context(repair, contexts, state.get("evidence_cards") or []),
                 "round_id": repair.round_id,
                 "latest_repair": repair,
                 "status": "repairing",
@@ -378,7 +424,31 @@ class LangGraphSATDWorkflow:
             self._log(f"{self._task_label(state)} review failed reason={reason}; using fallback reject")
             return self._fallback_review(state, reason=reason)
 
-    def _route_context_need(self, state: GraphState) -> ContextNeedDecision:
+    def _run_planner_stage(self, state: GraphState) -> PlannerResult:
+        self._log(f"{self._task_label(state)} planner start")
+        try:
+            planner_result = self.planner.run(state)
+        except Exception as exc:
+            reason = (
+                "planner_content_filter"
+                if self.context_client._is_content_filter_error(exc)
+                else f"planner_exception:{type(exc).__name__}"
+            )
+            self._log(f"{self._task_label(state)} planner failed reason={reason}; using local-only fallback")
+            planner_result = PlannerResult(
+                context_needed=False,
+                satd_intent="",
+                local_repair_plan="",
+                blocking_unknowns=[],
+                no_context_reason=reason,
+            )
+        self._log(
+            f"{self._task_label(state)} planner done context_needed={planner_result.context_needed} "
+            f"queries={sum(len(item.queries) for item in planner_result.blocking_unknowns)}"
+        )
+        return planner_result
+
+    def _route_context_need(self, state: GraphState, planner_result: PlannerResult | None = None) -> ContextNeedDecision:
         if self.force_route:
             decision = ContextNeedDecision(
                 route=self.force_route,
@@ -389,6 +459,24 @@ class LangGraphSATDWorkflow:
             )
             self._log(
                 f"{self._task_label(state)} context routing forced route={decision.route} "
+                f"confidence={decision.confidence:.2f}"
+            )
+            return decision
+        if planner_result is not None:
+            blocking_unknowns = [
+                item.unknown
+                for item in planner_result.blocking_unknowns
+                if str(item.unknown or "").strip()
+            ]
+            decision = ContextNeedDecision(
+                route="context_required" if planner_result.context_needed else "no_context",
+                context_required=bool(planner_result.context_needed),
+                confidence=0.85 if planner_result.context_needed else 0.75,
+                reason=planner_result.satd_intent or planner_result.no_context_reason or "planner_result",
+                blocking_unknowns=blocking_unknowns,
+            )
+            self._log(
+                f"{self._task_label(state)} context routing from planner route={decision.route} "
                 f"confidence={decision.confidence:.2f}"
             )
             return decision
@@ -474,7 +562,7 @@ class LangGraphSATDWorkflow:
 
     def _normalize_force_route(self, value: str | None) -> str | None:
         route = str(value or "").strip().lower()
-        if not route:
+        if not route or route == "auto":
             return None
         if route not in {"no_context", "context_required"}:
             raise ValueError("force_route must be 'no_context', 'context_required', or empty.")
@@ -566,11 +654,13 @@ class LangGraphSATDWorkflow:
         summary["use_reviewer"] = not self.analysis_only and not self.fixer_only
         summary["analysis_only"] = self.analysis_only
         summary["fixer_only"] = self.fixer_only
-        summary["repair_prompt_mode"] = "lightweight"
+        summary["repair_prompt_mode"] = "planner_evidence_lightweight"
         summary["repair_context_mode"] = self.repair_context_mode
         summary["max_method_contexts"] = self.max_method_contexts
         summary["single_repair_path"] = True
         summary["method_inquiry_enabled"] = self.repair_context_mode in {"method_query", "clone_treesitter"}
+        summary["planner_enabled"] = True
+        summary["context_tools"] = "symbol_definition|callsite_usage|sibling_pattern"
         summary["context_router_enabled"] = self.force_route is None
         summary["force_route"] = self.force_route or ""
         summary["llm_judge_enabled"] = self.enable_llm_judge
@@ -650,6 +740,7 @@ class LangGraphSATDWorkflow:
     def _trajectory_fieldnames(self) -> list[str]:
         return [
             "task_id", "project", "file_path", "commit", "context_commit", "status", "workflow_output", "drop_stage", "trajectory_summary", "rounds_used", "em_label", "exact_match", "satd_comment", "satd_route_type", "context_route", "context_required", "context_confidence", "context_reason", "context_blocking_unknowns",
+            "planner_context_needed", "planner_satd_intent", "planner_local_repair_plan", "planner_queries_json", "planner_rejected_queries_json", "evidence_cards_json",
             *self._metric_output_fields(),
             *self._analysis_output_fields("analysis_passed"),
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
@@ -662,6 +753,7 @@ class LangGraphSATDWorkflow:
     def _results_fieldnames(self) -> list[str]:
         return [
             "task_id", "project", "file_path", "commit", "context_commit", "satd_comment", "status", "rounds_used", "em_label", "exact_match", "satd_route_type", "context_route", "context_required", "context_confidence", "context_reason", "context_blocking_unknowns",
+            "planner_context_needed", "planner_satd_intent", "planner_local_repair_plan", "planner_queries_json", "planner_rejected_queries_json", "evidence_cards_json",
             *self._metric_output_fields(),
             *self._analysis_output_fields("analysis_repairable"),
             "repair_evidence_mode", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count",
@@ -684,7 +776,7 @@ class LangGraphSATDWorkflow:
             "analysis_decision", repairable_field, "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
             "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
             "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_operation_concrete", "analysis_localizable", "analysis_local_scope", "analysis_end_state_clear", "analysis_comment_evidence", "analysis_code_evidence", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
+            "analysis_repair_strategy", "analysis_repair_mode", "analysis_evidence_used", "analysis_repair_constraints", "analysis_drop_reason", "analysis_notes", "analysis_operation_concrete", "analysis_localizable", "analysis_local_scope", "analysis_end_state_clear", "analysis_comment_evidence", "analysis_code_evidence", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
         ]
 
     def _round_output_fields(self, round_id: int) -> list[str]:
@@ -718,6 +810,11 @@ class LangGraphSATDWorkflow:
         reviews = trace.reviews or []
         context = trace.github_context or {}
         metadata = context.get("metadata") or {}
+        planner = trace.planner_result or {}
+        planner_queries = []
+        for unknown in planner.get("blocking_unknowns") or []:
+            if isinstance(unknown, dict):
+                planner_queries.extend(unknown.get("queries") or [])
         row: dict[str, Any] = {
             "task_id": trace.task_id,
             "project": trace.project,
@@ -735,6 +832,12 @@ class LangGraphSATDWorkflow:
             "context_confidence": trace.context_confidence,
             "context_reason": trace.context_reason,
             "context_blocking_unknowns": " | ".join(trace.context_blocking_unknowns or []),
+            "planner_context_needed": planner.get("context_needed", ""),
+            "planner_satd_intent": planner.get("satd_intent", ""),
+            "planner_local_repair_plan": planner.get("local_repair_plan", ""),
+            "planner_queries_json": json.dumps(planner_queries, ensure_ascii=False),
+            "planner_rejected_queries_json": json.dumps(planner.get("raw_queries_rejected") or [], ensure_ascii=False),
+            "evidence_cards_json": json.dumps(trace.evidence_cards or [], ensure_ascii=False),
             "repair_evidence_mode": self._repair_evidence_mode(trace),
             "retrieved_test_snippets_count": 0,
             "retrieved_callsite_snippets_count": 0,
@@ -868,6 +971,11 @@ class LangGraphSATDWorkflow:
                 "analysis_followup_context_requests": " | ".join(analysis.get("followup_context_requests") or []),
                 "analysis_evidence_summary": analysis.get("evidence_summary", "") or analysis.get("reason", ""),
                 "analysis_repair_strategy": analysis.get("repair_strategy", ""),
+                "analysis_repair_mode": analysis.get("repair_mode", ""),
+                "analysis_evidence_used": analysis.get("evidence_used", ""),
+                "analysis_repair_constraints": json.dumps(analysis.get("repair_constraints") or [], ensure_ascii=False),
+                "analysis_drop_reason": analysis.get("drop_reason", ""),
+                "analysis_notes": analysis.get("notes", ""),
                 "analysis_operation_concrete": analysis.get("operation_concrete", ""),
                 "analysis_localizable": analysis.get("localizable", ""),
                 "analysis_local_scope": analysis.get("local_scope", ""),
@@ -943,11 +1051,11 @@ class LangGraphSATDWorkflow:
         return rows
 
     def _write_github_context_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count", "base_context_json", "repair_context_json", "review_context_json", "method_context_json"]
+        fieldnames = ["task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count", "base_context_json", "repair_context_json", "review_context_json", "method_context_json", "evidence_cards_json"]
         self._write_csv_rows(path, fieldnames, [self._github_context_row(trace) for trace in traces])
 
     def _append_github_context_csv(self, path: Path, traces: list) -> None:
-        fieldnames = ["task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count", "base_context_json", "repair_context_json", "review_context_json", "method_context_json"]
+        fieldnames = ["task_id", "repo_owner", "repo_name", "file_path", "commit", "context_commit", "historical_snapshot_mismatch", "github_evidence_strength", "snapshot_alignment_status", "repair_evidence_mode", "target_file_ok", "satd_window_found", "enclosing_symbol_found", "symbol_name", "satd_line", "related_tests_count", "call_sites_count", "commits_count", "similar_history_count", "retrieved_test_snippets_count", "retrieved_callsite_snippets_count", "retrieved_history_snippets_count", "identified_method_count", "retrieved_method_count", "missing_method_count", "base_context_json", "repair_context_json", "review_context_json", "method_context_json", "evidence_cards_json"]
         self._append_csv_rows(path, fieldnames, [self._github_context_row(trace) for trace in traces])
 
     def _github_context_row(self, trace) -> dict[str, Any]:
@@ -986,6 +1094,7 @@ class LangGraphSATDWorkflow:
             "repair_context_json": json.dumps(repair, ensure_ascii=False),
             "review_context_json": json.dumps(review, ensure_ascii=False),
             "method_context_json": json.dumps(trace.retrieved_method_contexts or [], ensure_ascii=False),
+            "evidence_cards_json": json.dumps(trace.evidence_cards or [], ensure_ascii=False),
         }
 
     def _write_context_cache_csv(self, path: Path, traces: list) -> None:
@@ -1034,7 +1143,7 @@ class LangGraphSATDWorkflow:
         }
 
     def _write_summary_csv(self, path: Path, summary: dict) -> None:
-        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "avg_LLM_as_judge", "llm_judge_count", "llm_judge_pass_count", "llm_judge_fail_count", "llm_judge_pass_rate", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "fixer_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "context_router_enabled", "force_route", "llm_judge_enabled", "judge_model"]
+        fieldnames = ["input_path", "input_limit", "input_satd_count", "analyze_filtered_count", "analyzer_pass_count", "review_rejected_count", "workflow_output_count", "successful_repair_count", "precision", "recall", "avg_BLEU_diff", "avg_CrystalBLEU_diff", "avg_LEMOD", "avg_LLM_as_judge", "llm_judge_count", "llm_judge_pass_count", "llm_judge_fail_count", "llm_judge_pass_rate", "agent_mode", "model", "max_rounds", "written_tasks", "write_batch_size", "use_analyzer", "use_reviewer", "analysis_only", "fixer_only", "repair_prompt_mode", "repair_context_mode", "max_method_contexts", "single_repair_path", "method_inquiry_enabled", "planner_enabled", "context_tools", "context_router_enabled", "force_route", "llm_judge_enabled", "judge_model"]
         self._write_csv_rows(path, fieldnames, [summary])
 
     def _llm_judge_summary_stats(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1133,6 +1242,7 @@ class LangGraphSATDWorkflow:
         method_inquiry: MethodInquiryResult,
         retrieved_method_contexts: list[RetrievedMethodContext],
         missing_method_names: list[str],
+        evidence_cards: list[EvidenceCard] | None = None,
     ) -> dict[str, Any]:
         bundle = dict(context_bundle or {})
         metadata = dict(bundle.get("metadata") or {})
@@ -1148,8 +1258,20 @@ class LangGraphSATDWorkflow:
             },
             "retrieved_method_contexts": [self._serialize_method_context(item) for item in retrieved_method_contexts],
             "missing_method_names": list(missing_method_names),
+            "evidence_cards": [self._serialize_evidence_card(item) for item in (evidence_cards or [])],
         }
         return bundle
+
+    def _serialize_evidence_card(self, item: EvidenceCard) -> dict[str, Any]:
+        return {
+            "query_id": item.query_id,
+            "tool": item.tool,
+            "target": item.target,
+            "relevance": item.relevance,
+            "polarity": item.polarity,
+            "summary": item.summary,
+            "snippet": item.snippet,
+        }
 
     def _serialize_method_context(self, item: RetrievedMethodContext) -> dict[str, Any]:
         return {
@@ -1325,12 +1447,29 @@ class LangGraphSATDWorkflow:
             return False
         return any(marker in haystack for marker in ("apitimeouterror", "apiconnectionerror", "timeout", "connection", "rate limit", "ratelimit"))
 
-    def _repair_attempt_uses_method_evidence(self, repair: RepairAttempt | None, retrieved_method_contexts: list[RetrievedMethodContext]) -> bool:
-        if repair is None or not retrieved_method_contexts:
+    def _candidate_mode_for_state(self, state: GraphState) -> str:
+        analysis = state.get("analysis")
+        repair_mode = str(getattr(analysis, "repair_mode", "") or "").strip()
+        if repair_mode in {"local_only", "no_context_fallback"}:
+            return "baseline_no_context"
+        if state.get("evidence_cards") or state.get("retrieved_method_contexts"):
+            return "baseline_context"
+        route = str(state.get("satd_route_type") or "")
+        return "baseline_no_context" if route == "no_context" else "baseline_context"
+
+    def _repair_attempt_uses_context(
+        self,
+        repair: RepairAttempt | None,
+        retrieved_method_contexts: list[RetrievedMethodContext],
+        evidence_cards: list[EvidenceCard],
+    ) -> bool:
+        if repair is None or (not retrieved_method_contexts and not evidence_cards):
             return False
         return not str(repair.candidate_mode or "").strip().lower().endswith("no_context")
 
     def _repair_evidence_mode(self, trace) -> str:
+        if getattr(trace, "evidence_cards", None):
+            return "planner_evidence"
         return "method_context" if trace.retrieved_method_contexts else "snippet_only"
 
     def _drop_stage(self, trace) -> str:

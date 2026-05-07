@@ -11,7 +11,7 @@ class OpenAIAnalyzer:
     def __init__(self, client: OpenAICompatClient) -> None:
         self.client = client
 
-    def run(self, state: GraphState, method_context_block: str = "[none]") -> AnalysisResult:
+    def run(self, state: GraphState, method_context_block: str = "[none]", evidence_block: str = "[none]") -> AnalysisResult:
         method_inquiry = state.get("method_inquiry")
         required_methods = method_inquiry.required_methods if isinstance(method_inquiry, MethodInquiryResult) else []
         missing_method_names = [str(item) for item in (state.get("missing_method_names") or []) if str(item).strip()]
@@ -22,7 +22,7 @@ class OpenAIAnalyzer:
             "Decide whether this SATD item should enter the automatic fixer.\n"
             "Act as a calibrated evidence gate, not as a brainstorming assistant.\n"
             "Do not repair the code. Do not propose replacement code.\n"
-            "Use only the SATD comment, code snippet, and retrieved method context.\n"
+            "Use only the SATD comment, code snippet, and evidence cards.\n"
             "Return JSON only."
         )
         user_prompt = (
@@ -30,7 +30,7 @@ class OpenAIAnalyzer:
             f"SATD comment:\n{state['satd_comment']}\n\n"
             f"Code:\n```python\n{state['original_code']}\n```\n\n"
             f"Required methods:\n{self._format_list(required_methods)}\n\n"
-            f"Retrieved method context:\n{method_context_block or '[none]'}\n\n"
+            f"Evidence cards:\n{evidence_block or method_context_block or '[none]'}\n\n"
             f"Missing method context:\n{self._format_list(missing_method_names)}\n\n"
             f"Target grounding evidence:\n{self._format_target_grounding(target_grounding)}\n\n"
             "Use a precision-aware evidence gate.\n"
@@ -54,6 +54,8 @@ class OpenAIAnalyzer:
             '  "locality": "high" | "partial" | "low",\n'
             '  "outcome_clarity": "high" | "partial" | "low",\n'
             '  "context_sufficiency": "high" | "partial" | "low",\n'
+            '  "repair_mode": "local_only" | "evidence_guided" | "no_context_fallback",\n'
+            '  "repair_constraints": ["short constraint"],\n'
             '  "comment_evidence": "short phrase from SATD comment",\n'
             '  "code_evidence": "short phrase from code/context",\n'
             '  "reason": "one short sentence"\n'
@@ -106,6 +108,8 @@ class OpenAIAnalyzer:
         locality = self._normalize_level(payload.get("locality") or payload.get("local_scope") or payload.get("localizable"))
         outcome_clarity = self._normalize_level(payload.get("outcome_clarity") or payload.get("end_state_clear"))
         context_sufficiency = self._normalize_level(payload.get("context_sufficiency"))
+        repair_mode = self._normalize_repair_mode(payload.get("repair_mode"), state)
+        repair_constraints = self._coerce_constraints(payload.get("repair_constraints"))
         notes = self._one_line(
             payload.get("reason")
             or payload.get("notes")
@@ -131,6 +135,9 @@ class OpenAIAnalyzer:
             local_scope=locality,
             end_state_clear=outcome_clarity,
             context_sufficiency=context_sufficiency,
+            repair_mode=repair_mode,
+            evidence_used=bool(state.get("evidence_cards")),
+            repair_constraints=repair_constraints,
             notes=notes,
             comment_evidence=comment_evidence,
             code_evidence=code_evidence,
@@ -147,6 +154,9 @@ class OpenAIAnalyzer:
         local_scope: str | None,
         end_state_clear: str | None,
         context_sufficiency: str | None = None,
+        repair_mode: str = "local_only",
+        evidence_used: bool = False,
+        repair_constraints: list[str] | None = None,
         notes: str,
         comment_evidence: str,
         code_evidence: str,
@@ -191,6 +201,11 @@ class OpenAIAnalyzer:
             followup_context_requests=[],
             repair_strategy="Pass to fixer for smallest local edit." if repairable else "Do not attempt automatic repair.",
             github_evidence_strength="method_context_only",
+            repair_mode=repair_mode,
+            evidence_used=evidence_used,
+            repair_constraints=list(repair_constraints or []),
+            drop_reason=reason if not repairable else "",
+            notes=reason,
         )
 
     def _normalize_decision(self, value: Any) -> str:
@@ -208,6 +223,26 @@ class OpenAIAnalyzer:
         if text in {"medium", "med"}:
             return "partial"
         return None
+
+    def _normalize_repair_mode(self, value: Any, state: GraphState) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"local_only", "evidence_guided", "no_context_fallback"}:
+            return text
+        if state.get("evidence_cards"):
+            return "evidence_guided"
+        return "local_only"
+
+    def _coerce_constraints(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        constraints: list[str] = []
+        for item in value:
+            text = self._one_line(item)
+            if text and text not in constraints:
+                constraints.append(text)
+            if len(constraints) >= 4:
+                break
+        return constraints
 
     def _level_score(self, value: str | None) -> float:
         return {"high": 0.8, "partial": 0.499, "low": 0.04}.get(value or "", 0.499)

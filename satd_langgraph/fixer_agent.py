@@ -160,16 +160,17 @@ class OpenAIFixer:
         cards = [
             card
             for card in self._evidence_cards(state)
-            if card.relevance in {"high", "medium"} and card.polarity != "weak"
-        ][:3]
+            if getattr(card, "answer", "") and card.relevance in {"high", "medium"} and card.polarity != "weak"
+        ][:1]
         if cards:
             blocks: list[str] = []
             for card in cards:
                 lines = [
                     f"- [{card.tool}] {card.target}",
                     f"  polarity: {card.polarity}",
-                    f"  fact: {self._evidence_fact(card)}",
-                    f"  patch_use: {self._evidence_patch_use(card)}",
+                    f"  decision: {card.decision}",
+                    f"  answer: {card.answer}",
+                    f"  edit_hint: {card.edit_hint}",
                 ]
                 snippet = self._short_snippet(card.snippet)
                 if snippet:
@@ -193,19 +194,6 @@ class OpenAIFixer:
                 cards.append("\n".join(lines))
             return "\n".join(cards)
         return "[none]"
-
-    def _evidence_fact(self, card: EvidenceCard) -> str:
-        summary = str(card.summary or "")
-        first = summary.split(". Patch use:", 1)[0]
-        first = first.split(". Decision:", 1)[0]
-        return " ".join(first.split())[:220] or f"{card.tool} evidence for {card.target}."
-
-    def _evidence_patch_use(self, card: EvidenceCard) -> str:
-        summary = str(card.summary or "")
-        marker = "Patch use:"
-        if marker in summary:
-            return " ".join(summary.split(marker, 1)[1].split())[:220]
-        return "Use this evidence only if it directly supports the local SATD repair."
 
     def _short_constraints(self, state: GraphState) -> str:
         lines = [

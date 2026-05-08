@@ -89,6 +89,7 @@ class LangGraphSATDWorkflow:
         self.planned_context_tool = PlannedContextTool(
             self.method_retriever,
             max_results_per_query=self.max_method_contexts,
+            evidence_client=client,
             logger=self._log,
         )
         self.analyzer = OpenAIAnalyzer(client)
@@ -654,7 +655,7 @@ class LangGraphSATDWorkflow:
         summary["use_reviewer"] = not self.analysis_only and not self.fixer_only
         summary["analysis_only"] = self.analysis_only
         summary["fixer_only"] = self.fixer_only
-        summary["repair_prompt_mode"] = "planner_evidence_lightweight"
+        summary["repair_prompt_mode"] = "decision_answer_evidence"
         summary["repair_context_mode"] = self.repair_context_mode
         summary["max_method_contexts"] = self.max_method_contexts
         summary["single_repair_path"] = True
@@ -1271,6 +1272,9 @@ class LangGraphSATDWorkflow:
             "polarity": item.polarity,
             "summary": item.summary,
             "snippet": item.snippet,
+            "decision": item.decision,
+            "answer": item.answer,
+            "edit_hint": item.edit_hint,
         }
 
     def _serialize_method_context(self, item: RetrievedMethodContext) -> dict[str, Any]:

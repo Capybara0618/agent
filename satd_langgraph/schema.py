@@ -117,6 +117,10 @@ class PlannerResult:
     context_needed: bool
     satd_intent: str = ""
     local_repair_plan: str = ""
+    repair_intent: str = ""
+    patch_decision: str = ""
+    evidence_need: str = ""
+    need_type: str = ""
     blocking_unknowns: list[BlockingUnknown] = field(default_factory=list)
     no_context_reason: str = ""
     raw_queries_rejected: list[dict[str, Any]] = field(default_factory=list)
@@ -131,6 +135,9 @@ class EvidenceCard:
     polarity: str = "support"
     summary: str = ""
     snippet: str = ""
+    decision: str = ""
+    answer: str = ""
+    edit_hint: str = ""
 
 
 @dataclass

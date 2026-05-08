@@ -5,6 +5,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any
 
+from ..openai_client import OpenAICompatClient
 from ..schema import EvidenceCard, GraphState, PlannerResult, RetrievedMethodContext, RetrievalQuery
 from .method_retriever import MethodRetrievalTool
 
@@ -16,10 +17,12 @@ class PlannedContextTool:
         self,
         method_retriever: MethodRetrievalTool,
         max_results_per_query: int = 3,
+        evidence_client: OpenAICompatClient | None = None,
         logger: Any | None = None,
     ) -> None:
         self.method_retriever = method_retriever
         self.max_results_per_query = max(1, int(max_results_per_query))
+        self.evidence_client = evidence_client
         self.logger = logger
 
     def prepare_context(
@@ -47,14 +50,15 @@ class PlannedContextTool:
             if len(cards) >= self.max_results_per_query * 3:
                 break
 
+        self._build_answer_evidence(state, cards)
         evidence_block = self.format_evidence_cards(cards)
         return method_contexts, missing_symbols, cards, evidence_block
 
-    def format_evidence_cards(self, cards: list[EvidenceCard], max_cards: int = 3) -> str:
+    def format_evidence_cards(self, cards: list[EvidenceCard], max_cards: int = 1) -> str:
         selected = [
             card
             for card in cards
-            if card.relevance in {"high", "medium"} and card.polarity != "weak"
+            if card.answer and card.relevance in {"high", "medium"} and card.polarity != "weak"
         ][:max_cards]
         if not selected:
             return "[none]"
@@ -65,8 +69,9 @@ class PlannedContextTool:
                     [
                         f"- [{card.tool}] {card.target}",
                         f"  polarity: {card.polarity}",
-                        f"  fact: {self._fact(card)}",
-                        f"  patch_use: {self._patch_use(card)}",
+                        f"  decision: {card.decision}",
+                        f"  answer: {card.answer}",
+                        f"  edit_hint: {card.edit_hint}",
                         "  snippet:",
                         *[f"    {line}" for line in self._short_snippet(card.snippet).splitlines()],
                     ]
@@ -115,6 +120,8 @@ class PlannedContextTool:
                     polarity=self._polarity(state, snippet, query),
                     summary=self._summary(query, f"Definition found in {context.path}:{context.start_line or ''}."),
                     snippet=snippet,
+                    decision=query.decision,
+                    edit_hint=query.expected_patch_use,
                 )
             )
         return cards
@@ -134,7 +141,7 @@ class PlannedContextTool:
         symbol = self._target_symbol(query)
         patterns = self._patterns(query)
         if not symbol:
-            return []
+            return self._pattern_usage(state, query, patterns)
         cards: list[EvidenceCard] = []
         for path, content in self._usage_candidate_files(state, query, symbol):
             for line_no, snippet, kind, score in self._usage_windows(content, symbol, patterns):
@@ -149,6 +156,33 @@ class PlannedContextTool:
                         polarity=self._polarity(state, snippet, query),
                         summary=self._summary(query, f"{kind} usage found in {path}:{line_no}."),
                         snippet=snippet,
+                        decision=query.decision,
+                        edit_hint=query.expected_patch_use,
+                    )
+                )
+                if len(cards) >= self.max_results_per_query:
+                    return cards
+        return cards
+
+    def _pattern_usage(self, state: GraphState, query: RetrievalQuery, patterns: list[str]) -> list[EvidenceCard]:
+        if not patterns:
+            return []
+        cards: list[EvidenceCard] = []
+        for path, content in self._candidate_files(state, query):
+            for line_no, snippet in self._matching_windows(content, patterns=patterns, any_match=True):
+                if path == state["file_path"] and self._overlaps_original_code(state, snippet):
+                    continue
+                cards.append(
+                    EvidenceCard(
+                        query_id=query.id,
+                        tool=query.tool,
+                        target="pattern usage",
+                        relevance="high" if path == state["file_path"] else "medium",
+                        polarity=self._polarity(state, snippet, query),
+                        summary=self._summary(query, f"Pattern usage found in {path}:{line_no}."),
+                        snippet=snippet,
+                        decision=query.decision,
+                        edit_hint=query.expected_patch_use,
                     )
                 )
                 if len(cards) >= self.max_results_per_query:
@@ -398,6 +432,8 @@ class PlannedContextTool:
                         polarity=self._polarity(state, snippet, query),
                         summary=self._summary(query, f"Similar local pattern found in {path}:{line_no}."),
                         snippet=snippet,
+                        decision=query.decision,
+                        edit_hint=query.expected_patch_use,
                     )
                 )
                 if len(cards) >= self.max_results_per_query:
@@ -545,18 +581,66 @@ class PlannedContextTool:
             parts.append(f"Patch use: {query.expected_patch_use}")
         return " ".join(parts)[:500]
 
-    def _fact(self, card: EvidenceCard) -> str:
+    def _build_answer_evidence(self, state: GraphState, cards: list[EvidenceCard], max_cards: int = 3) -> None:
+        for card in cards[:max_cards]:
+            if self.evidence_client is None:
+                card.answer = card.answer or self._fallback_answer(card)
+                card.edit_hint = card.edit_hint or "Use this evidence only if it directly answers the repair decision."
+                self._downgrade_if_unhelpful(card)
+                continue
+            try:
+                payload = self.evidence_client.generate_json(
+                    "You turn one retrieved code snippet into one concise repair-decision answer. Return JSON only.",
+                    self._evidence_prompt(state, card),
+                    temperature=0.0,
+                    request_label=f"evidence_builder:task_{state.get('task_id', '?')}:{card.query_id}",
+                    max_tokens=350,
+                )
+                card.answer = self._one_line(payload.get("answer"))
+                card.edit_hint = self._one_line(payload.get("edit_hint")) or card.edit_hint
+                relevance = self._one_line(payload.get("relevance"))
+                if relevance in {"high", "medium", "low"}:
+                    card.relevance = relevance
+            except Exception:
+                card.answer = card.answer or ""
+            self._downgrade_if_unhelpful(card)
+
+    def _evidence_prompt(self, state: GraphState, card: EvidenceCard) -> str:
+        return (
+            "Answer only with a concrete fact supported by the retrieved snippet. "
+            "Do not restate the decision. If the snippet does not answer it, leave answer empty.\n\n"
+            f"SATD comment:\n{state.get('satd_comment') or ''}\n\n"
+            f"Code to repair:\n{state.get('original_code') or ''}\n\n"
+            f"Decision:\n{card.decision}\n\n"
+            f"Retrieved snippet:\n{self._short_snippet(card.snippet, max_lines=8)}\n\n"
+            'Return exactly: {"answer": "...", "edit_hint": "...", "relevance": "high|medium|low"}'
+        )
+
+    def _fallback_answer(self, card: EvidenceCard) -> str:
         summary = str(card.summary or "")
         first = summary.split(". Patch use:", 1)[0]
         first = first.split(". Decision:", 1)[0]
-        return " ".join(first.split())[:220] or f"{card.tool} evidence for {card.target}."
+        return " ".join(first.split())[:220]
 
-    def _patch_use(self, card: EvidenceCard) -> str:
-        summary = str(card.summary or "")
-        marker = "Patch use:"
-        if marker in summary:
-            return " ".join(summary.split(marker, 1)[1].split())[:220]
-        return "Use this evidence only if it directly supports the local SATD repair."
+    def _downgrade_if_unhelpful(self, card: EvidenceCard) -> None:
+        if self._useful_answer(card):
+            return
+        card.answer = ""
+        card.edit_hint = ""
+        card.relevance = "low"
+        card.polarity = "weak"
+
+    def _useful_answer(self, card: EvidenceCard) -> bool:
+        answer = self._normalized(card.answer)
+        if not answer:
+            return False
+        return answer not in {self._normalized(card.decision), self._normalized(card.edit_hint)}
+
+    def _normalized(self, value: Any) -> str:
+        return re.sub(r"\W+", " ", str(value or "").lower()).strip()
+
+    def _one_line(self, value: Any) -> str:
+        return " ".join(str(value or "").split())[:260]
 
     def _short_snippet(self, snippet: str, max_lines: int = 8) -> str:
         lines = [line.rstrip() for line in str(snippet or "").splitlines() if line.strip()]

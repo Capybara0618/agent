@@ -127,11 +127,10 @@ class OpenAIFixer:
             f"### SATD comment:\n{state['satd_comment']}\n\n"
             f"### Code:\n{self._code_block(state['original_code'])}\n\n"
             f"### Supporting evidence:\n{context_block}\n\n"
-            f"### Hard rules:\n{hard_rules}\n"
+            f"### Local repair rules:\n{hard_rules}\n"
             "- Use supporting evidence only to validate the smallest local repair.\n"
             "- Use normal indentation in repaired_code; do not add tab characters, column-alignment padding, or excessive whitespace.\n"
             "- When the SATD requests deleting or removing something, delete the corresponding executable code or statement, not only the SATD comment.\n"
-            "- Edit only the smallest local block nearest to the SATD comment.\n"
             f"{feedback_block}"
         )
         return system_prompt, user_prompt
@@ -154,7 +153,6 @@ class OpenAIFixer:
         lines = [
             "- Make the smallest plausible local edit.",
             "- Preserve the existing function/class signature unless the SATD explicitly asks for a signature-local fix.",
-            "- Do not add new helpers, new control flow, or unrelated rewrites.",
             "- Keep unchanged lines unchanged whenever possible.",
         ]
         for item in edit_constraints[:3]:

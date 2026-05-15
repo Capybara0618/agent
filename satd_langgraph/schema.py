@@ -26,33 +26,10 @@ class SATDRecord:
 class AnalysisResult:
     decision: str
     repairable: bool
-    confidence: float
     reason: str
-    repairability_score: float = 0.0
-    intent_clarity: float = 0.0
-    change_locality: float = 0.0
-    semantic_risk: float = 0.0
-    context_sufficiency: float = 0.0
-    verifiability: float = 0.0
-    analyze_score: float = 0.0
-    satd_type: str = ""
-    evidence_summary: str = ""
-    risk_level: str = ""
-    context_score: float = 0.0
-    clarity_score: float = 0.0
-    scope_radius: str = ""
-    operation_concrete: str | None = None
-    localizable: str | None = None
-    local_scope: str | None = None
-    end_state_clear: str | None = None
-    comment_evidence: str = ""
-    code_evidence: str = ""
-    validation_signals: list[str] = field(default_factory=list)
-    context_gaps: list[str] = field(default_factory=list)
-    followup_context_requests: list[str] = field(default_factory=list)
-    repair_strategy: str = ""
-    historical_snapshot_mismatch: bool = False
-    github_evidence_strength: str = "low"
+    repair_plan: str = ""
+    target_summary: str = ""
+    context_summary: str = ""
 
 
 @dataclass
@@ -137,6 +114,8 @@ class ReviewResult:
     approved: bool
     issues: list[str]
     candidate_mode: str = "single"
+    gate_decision: str = ""
+    failure_modes: list[str] = field(default_factory=list)
     review_score: float = 0.0
     problem_alignment: float = 0.0
     minimality: float = 0.0

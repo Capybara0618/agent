@@ -124,11 +124,6 @@ class LangGraphSATDWorkflow:
         else:
             state = self._run_analyzer_stage(state)
 
-        if not state["analysis"] or not state["analysis"].repairable:
-            state["status"] = "dropped_by_analyzer"
-            self._log(f"{self._task_label(state)} end status={state['status']}")
-            return trace_from_state(state, record.em_label)
-
         if self.analysis_only:
             state["status"] = "repairable"
             self._log(f"{self._task_label(state)} end status={state['status']} analysis_only=True")
@@ -148,42 +143,38 @@ class LangGraphSATDWorkflow:
         edit_constraints = []
         method_context_block = "[none]"
 
-        rule_drop = self._rule_based_analyzer_drop(state)
-        if rule_drop is not None:
-            analysis = self.analyzer.build_rule_drop_analysis(notes=rule_drop["notes"])
-        else:
-            try:
-                (
-                    method_inquiry,
-                    retrieved_method_contexts,
-                    missing_method_names,
-                    uncertainty_items,
-                    edit_constraints,
-                    method_context_block,
-                ) = self.method_context_tool.prepare_method_context(state, candidate_mode="baseline_context")
-                context_bundle = self._attach_method_context(
-                    context_bundle,
-                    method_inquiry=method_inquiry,
-                    retrieved_method_contexts=retrieved_method_contexts,
-                    missing_method_names=missing_method_names,
-                )
-                analyzer_state = {
-                    **state,
-                    "github_context": context_bundle,
-                    "method_inquiry": method_inquiry,
-                    "retrieved_method_contexts": retrieved_method_contexts,
-                    "missing_method_names": missing_method_names,
-                    "uncertainty_items": uncertainty_items,
-                    "edit_constraints": edit_constraints,
-                }
-                analysis = self.analyzer.run(analyzer_state, method_context_block=method_context_block)
-            except Exception as exc:
-                if self.context_client._is_content_filter_error(exc):
-                    reason = "analyzer_content_filter"
-                else:
-                    reason = f"analyzer_exception:{type(exc).__name__}"
-                self._log(f"{self._task_label(state)} analyze failed reason={reason}; using fallback drop")
-                analysis = self._fallback_analysis(reason=reason)
+        try:
+            (
+                method_inquiry,
+                retrieved_method_contexts,
+                missing_method_names,
+                uncertainty_items,
+                edit_constraints,
+                method_context_block,
+            ) = self.method_context_tool.prepare_method_context(state, candidate_mode="baseline_context")
+            context_bundle = self._attach_method_context(
+                context_bundle,
+                method_inquiry=method_inquiry,
+                retrieved_method_contexts=retrieved_method_contexts,
+                missing_method_names=missing_method_names,
+            )
+            analyzer_state = {
+                **state,
+                "github_context": context_bundle,
+                "method_inquiry": method_inquiry,
+                "retrieved_method_contexts": retrieved_method_contexts,
+                "missing_method_names": missing_method_names,
+                "uncertainty_items": uncertainty_items,
+                "edit_constraints": edit_constraints,
+            }
+            analysis = self.analyzer.run(analyzer_state, method_context_block=method_context_block)
+        except Exception as exc:
+            if self.context_client._is_content_filter_error(exc):
+                reason = "analyzer_content_filter"
+            else:
+                reason = f"analyzer_exception:{type(exc).__name__}"
+            self._log(f"{self._task_label(state)} analyze failed reason={reason}; continuing with fallback plan")
+            analysis = self._fallback_analysis(state, reason=reason)
 
         updated = {
             **state,
@@ -194,11 +185,11 @@ class LangGraphSATDWorkflow:
             "edit_constraints": edit_constraints,
             "retrieved_method_contexts": retrieved_method_contexts,
             "missing_method_names": missing_method_names,
-            "status": "repairable" if analysis.repairable else "dropped_by_analyzer",
+            "status": "repairable",
         }
         self._log(
             f"{self._task_label(updated)} analyze done decision={analysis.decision} "
-            f"repairable={analysis.repairable} score={analysis.repairability_score:.2f}"
+            f"repairable={analysis.repairable} context={self._compact_satd_comment(analysis.context_summary)}"
         )
         return updated
 
@@ -284,57 +275,51 @@ class LangGraphSATDWorkflow:
         }
 
     def _run_repair_review_loop(self, state: GraphState) -> GraphState:
-        while state["round_id"] < min(state["max_rounds"], self.max_rounds):
-            next_round = int(state["round_id"]) + 1
-            route = str(state.get("satd_route_type") or "context_required")
-            candidate_mode = "baseline_no_context" if route == "no_context" else "baseline_context"
-            self._log(f"{self._task_label(state)} repair start round={next_round} mode={candidate_mode}")
-            repair, method_inquiry, contexts, missing, uncertainty_items, edit_constraints = self._run_repair(
-                state,
-                next_round,
-                candidate_mode,
-            )
-            context_bundle = self._attach_method_context(
-                state.get("github_context") or self._load_or_build_base_context(state),
-                method_inquiry=method_inquiry,
-                retrieved_method_contexts=contexts,
-                missing_method_names=missing,
-            )
-            state = {
-                **state,
-                "github_context": context_bundle,
-                "method_inquiry": method_inquiry,
-                "retrieved_method_contexts": contexts,
-                "missing_method_names": missing,
-                "uncertainty_items": uncertainty_items,
-                "edit_constraints": edit_constraints,
-                "repair_context_used": self._repair_attempt_uses_method_evidence(repair, contexts),
-                "round_id": repair.round_id,
-                "latest_repair": repair,
-                "status": "repairing",
-            }
+        next_round = int(state["round_id"]) + 1
+        route = str(state.get("satd_route_type") or "context_required")
+        candidate_mode = "baseline_no_context" if route == "no_context" else "baseline_context"
+        self._log(f"{self._task_label(state)} repair start round={next_round} mode={candidate_mode}")
+        repair, method_inquiry, contexts, missing, uncertainty_items, edit_constraints = self._run_repair(
+            state,
+            next_round,
+            candidate_mode,
+        )
+        context_bundle = self._attach_method_context(
+            state.get("github_context") or self._load_or_build_base_context(state),
+            method_inquiry=method_inquiry,
+            retrieved_method_contexts=contexts,
+            missing_method_names=missing,
+        )
+        state = {
+            **state,
+            "github_context": context_bundle,
+            "method_inquiry": method_inquiry,
+            "retrieved_method_contexts": contexts,
+            "missing_method_names": missing,
+            "uncertainty_items": uncertainty_items,
+            "edit_constraints": edit_constraints,
+            "repair_context_used": self._repair_attempt_uses_method_evidence(repair, contexts),
+            "round_id": repair.round_id,
+            "latest_repair": repair,
+            "status": "repairing",
+        }
 
-            review = self._run_review(state)
-            repair_feedback = None if review.approved else self._build_repair_feedback(review)
-            state = {
-                **state,
-                "repair_feedback": repair_feedback,
-                "review_strict_gate_result": "approved" if review.approved else "rejected",
-                "latest_review": review,
-                "repairs": [*state["repairs"], repair],
-                "reviews": [*state["reviews"], review],
-                "status": "accepted" if review.approved else "review_failed",
-                "final_repaired_code": repair.repaired_code if review.approved else state["final_repaired_code"],
-            }
-            self._log(
-                f"{self._task_label(state)} review done round={review.round_id} "
-                f"approved={review.approved} reject_type={review.reject_type or ''}"
-            )
-            if review.approved:
-                return {**state, "status": "accepted", "repair_feedback": None}
-            if not self._should_retry_after_review(state):
-                return {**state, "status": "dropped_after_review"}
-        return {**state, "status": "dropped_after_review"}
+        review = self._run_review(state)
+        state = {
+            **state,
+            "repair_feedback": None,
+            "review_strict_gate_result": review.gate_decision,
+            "latest_review": review,
+            "repairs": [*state["repairs"], repair],
+            "reviews": [*state["reviews"], review],
+            "status": "accepted" if review.approved else "dropped_after_review",
+            "final_repaired_code": repair.repaired_code if review.approved else state["final_repaired_code"],
+        }
+        self._log(
+            f"{self._task_label(state)} review done round={review.round_id} "
+            f"gate={review.gate_decision} approved={review.approved} reject_type={review.reject_type or ''}"
+        )
+        return {**state, "status": "accepted" if review.approved else "dropped_after_review"}
 
     def _run_repair(
         self,
@@ -605,8 +590,8 @@ class LangGraphSATDWorkflow:
             *[self._results_row(trace) for trace in new_traces],
         ]
         total = len(result_rows)
-        analyze_filtered_count = sum(1 for row in result_rows if row.get("status") == "dropped_by_analyzer")
-        analyzer_pass_count = sum(1 for row in result_rows if row.get("status") != "dropped_by_analyzer")
+        analyze_filtered_count = 0
+        analyzer_pass_count = total
         review_rejected_count = sum(1 for row in result_rows if row.get("status") == "dropped_after_review")
         workflow_output_count = sum(1 for row in result_rows if row.get("status") == "accepted")
         successful_repair_count = sum(1 for row in result_rows if str(row.get("exact_match")).lower() == "true")
@@ -681,17 +666,19 @@ class LangGraphSATDWorkflow:
 
     def _analysis_output_fields(self, repairable_field: str) -> list[str]:
         return [
-            "analysis_decision", repairable_field, "analysis_repairability_score", "analysis_confidence", "analysis_satd_type", "analysis_risk_level", "analysis_scope_radius",
-            "analysis_intent_clarity", "analysis_change_locality", "analysis_semantic_risk", "analysis_context_sufficiency", "analysis_verifiability", "analysis_analyze_score",
-            "analysis_context_score", "analysis_clarity_score", "analysis_validation_signals", "analysis_context_gaps", "analysis_followup_context_requests", "analysis_evidence_summary",
-            "analysis_repair_strategy", "analysis_operation_concrete", "analysis_localizable", "analysis_local_scope", "analysis_end_state_clear", "analysis_comment_evidence", "analysis_code_evidence", "analysis_historical_snapshot_mismatch", "analysis_github_evidence_strength", "analysis_snapshot_alignment_status",
+            "analysis_decision",
+            repairable_field,
+            "analysis_reason",
+            "analysis_repair_plan",
+            "analysis_target_summary",
+            "analysis_context_summary",
         ]
 
     def _round_output_fields(self, round_id: int) -> list[str]:
         prefix = f"round_{round_id}"
         return [
             f"{prefix}_candidate_mode", f"{prefix}_repair_plan", f"{prefix}_repaired_code", f"{prefix}_changed_scope", f"{prefix}_fix_confidence",
-            f"{prefix}_review_approved", f"{prefix}_review_score", f"{prefix}_review_problem_alignment", f"{prefix}_review_minimality", f"{prefix}_review_semantic_preservation", f"{prefix}_review_internal_consistency", f"{prefix}_review_softened_gate_used", f"{prefix}_review_reject_type", f"{prefix}_review_issues", f"{prefix}_review_failed_checks", f"{prefix}_review_repair_constraints", f"{prefix}_review_failure_anchor", f"{prefix}_revision_advice",
+            f"{prefix}_review_approved", f"{prefix}_review_gate_decision", f"{prefix}_review_failure_modes", f"{prefix}_review_score", f"{prefix}_review_problem_alignment", f"{prefix}_review_minimality", f"{prefix}_review_semantic_preservation", f"{prefix}_review_internal_consistency", f"{prefix}_review_softened_gate_used", f"{prefix}_review_reject_type", f"{prefix}_review_issues", f"{prefix}_review_failed_checks", f"{prefix}_review_repair_constraints", f"{prefix}_review_failure_anchor", f"{prefix}_revision_advice",
         ]
 
     def _write_trajectory_overview_csv(self, path: Path, traces: list) -> None:
@@ -850,33 +837,10 @@ class LangGraphSATDWorkflow:
             {
                 "analysis_decision": analysis.get("decision", ""),
                 repairable_field: analysis.get("repairable", ""),
-                "analysis_repairability_score": analysis.get("repairability_score", ""),
-                "analysis_confidence": analysis.get("confidence", ""),
-                "analysis_satd_type": analysis.get("satd_type", ""),
-                "analysis_risk_level": analysis.get("risk_level", ""),
-                "analysis_scope_radius": analysis.get("scope_radius", ""),
-                "analysis_intent_clarity": analysis.get("intent_clarity", ""),
-                "analysis_change_locality": analysis.get("change_locality", ""),
-                "analysis_semantic_risk": analysis.get("semantic_risk", ""),
-                "analysis_context_sufficiency": analysis.get("context_sufficiency", ""),
-                "analysis_verifiability": analysis.get("verifiability", ""),
-                "analysis_analyze_score": analysis.get("analyze_score", ""),
-                "analysis_context_score": analysis.get("context_score", ""),
-                "analysis_clarity_score": analysis.get("clarity_score", ""),
-                "analysis_validation_signals": " | ".join(analysis.get("validation_signals") or []),
-                "analysis_context_gaps": " | ".join(analysis.get("context_gaps") or []),
-                "analysis_followup_context_requests": " | ".join(analysis.get("followup_context_requests") or []),
-                "analysis_evidence_summary": analysis.get("evidence_summary", "") or analysis.get("reason", ""),
-                "analysis_repair_strategy": analysis.get("repair_strategy", ""),
-                "analysis_operation_concrete": analysis.get("operation_concrete", ""),
-                "analysis_localizable": analysis.get("localizable", ""),
-                "analysis_local_scope": analysis.get("local_scope", ""),
-                "analysis_end_state_clear": analysis.get("end_state_clear", ""),
-                "analysis_comment_evidence": analysis.get("comment_evidence", ""),
-                "analysis_code_evidence": analysis.get("code_evidence", ""),
-                "analysis_historical_snapshot_mismatch": analysis.get("historical_snapshot_mismatch", ""),
-                "analysis_github_evidence_strength": analysis.get("github_evidence_strength", ""),
-                "analysis_snapshot_alignment_status": analysis.get("snapshot_alignment_status", ""),
+                "analysis_reason": analysis.get("reason", ""),
+                "analysis_repair_plan": analysis.get("repair_plan", ""),
+                "analysis_target_summary": analysis.get("target_summary", ""),
+                "analysis_context_summary": analysis.get("context_summary", ""),
             }
         )
 
@@ -891,6 +855,8 @@ class LangGraphSATDWorkflow:
             f"{prefix}_changed_scope": repair.get("changed_scope", ""),
             f"{prefix}_fix_confidence": repair.get("confidence", ""),
             f"{prefix}_review_approved": review.get("approved", ""),
+            f"{prefix}_review_gate_decision": review.get("gate_decision", ""),
+            f"{prefix}_review_failure_modes": json.dumps(review.get("failure_modes") or [], ensure_ascii=False),
             f"{prefix}_review_score": review.get("review_score", ""),
             f"{prefix}_review_problem_alignment": review.get("problem_alignment", ""),
             f"{prefix}_review_minimality": review.get("minimality", ""),
@@ -922,7 +888,7 @@ class LangGraphSATDWorkflow:
         self._append_csv_rows(path, fieldnames, rows)
 
     def _review_output_fields(self) -> list[str]:
-        return ["task_id", "round_id", "candidate_mode", "approved", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "reject_type", "rationale", "revision_advice", "issues", "failed_checks", "repair_constraints", "failure_anchor", "retry_hint"]
+        return ["task_id", "round_id", "candidate_mode", "approved", "gate_decision", "failure_modes", "review_score", "problem_alignment", "minimality", "semantic_preservation", "internal_consistency", "softened_gate_used", "reject_type", "rationale", "revision_advice", "issues", "failed_checks", "repair_constraints", "failure_anchor", "retry_hint"]
 
     def _write_reviews_csv(self, path: Path, traces: list) -> None:
         self._write_csv_rows(path, self._review_output_fields(), self._review_rows(traces))
@@ -936,6 +902,7 @@ class LangGraphSATDWorkflow:
         for trace in traces:
             for review in trace.reviews:
                 row = dict(review)
+                row["failure_modes"] = json.dumps(row.get("failure_modes", []), ensure_ascii=False)
                 row["issues"] = json.dumps(row.get("issues", []), ensure_ascii=False)
                 row["failed_checks"] = json.dumps(row.get("failed_checks", []), ensure_ascii=False)
                 row["repair_constraints"] = json.dumps(row.get("repair_constraints", []), ensure_ascii=False)
@@ -1192,73 +1159,11 @@ class LangGraphSATDWorkflow:
         with path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
 
-    def _fallback_analysis(self, reason: str) -> AnalysisResult:
-        return AnalysisResult(
-            decision="drop",
-            repairable=False,
-            confidence=0.0,
-            reason=reason,
-            repairability_score=0.0,
-            intent_clarity=0.0,
-            change_locality=0.0,
-            semantic_risk=1.0,
-            context_sufficiency=0.0,
-            verifiability=0.0,
-            analyze_score=0.0,
-            satd_type="context_required",
-            evidence_summary=reason,
-            risk_level="high",
-            context_score=0.0,
-            clarity_score=0.0,
-            scope_radius="unknown",
-            operation_concrete="low",
-            localizable="low",
-            local_scope="low",
-            end_state_clear="low",
-            code_evidence="fallback",
-            validation_signals=[reason],
-            repair_strategy="Do not attempt automatic repair.",
-            github_evidence_strength="low",
-        )
+    def _fallback_analysis(self, state: GraphState, reason: str) -> AnalysisResult:
+        return self.analyzer.fallback_analysis(state, reason)
 
     def _bypass_analysis(self, state: GraphState, satd_route_type: str, reason: str) -> AnalysisResult:
-        return AnalysisResult(
-            decision="pass",
-            repairable=True,
-            confidence=0.60,
-            reason=reason,
-            repairability_score=0.60,
-            intent_clarity=0.70,
-            change_locality=0.70,
-            semantic_risk=0.30,
-            context_sufficiency=0.60,
-            verifiability=0.60,
-            analyze_score=0.60,
-            satd_type=satd_route_type,
-            evidence_summary=reason,
-            risk_level="medium",
-            context_score=0.60,
-            clarity_score=0.70,
-            scope_radius="snippet",
-            operation_concrete="partial",
-            localizable="partial",
-            local_scope="partial",
-            end_state_clear="partial",
-            comment_evidence=state.get("satd_comment", ""),
-            code_evidence="snippet-only route",
-            validation_signals=["context_router_no_context", "analyzer_skipped"],
-            repair_strategy="Pass directly to fixer for snippet-only repair.",
-            github_evidence_strength="none",
-        )
-
-    def _rule_based_analyzer_drop(self, state: GraphState) -> dict | None:
-        comment = (state.get("satd_comment") or "").strip()
-        code = (state.get("original_code") or "").strip()
-        if not comment:
-            return {"notes": "SATD comment is empty, so there is no concrete repair request."}
-        if not code:
-            return {"notes": "Code snippet is empty, so the repair target cannot be localized."}
-        return None
+        return self.analyzer.fallback_analysis(state, reason)
 
     def _fallback_repair(self, state: GraphState, round_id: int, reason: str = "fixer_fallback") -> RepairAttempt:
         return RepairAttempt(
@@ -1277,6 +1182,8 @@ class LangGraphSATDWorkflow:
             approved=False,
             issues=[f"Reviewer fallback triggered: {reason}"],
             candidate_mode=candidate_mode,
+            gate_decision="reject",
+            failure_modes=["invalid_or_noop"],
             review_score=0.0,
             problem_alignment=0.0,
             minimality=0.0,
@@ -1311,6 +1218,8 @@ class LangGraphSATDWorkflow:
         latest_review = state.get("latest_review")
         if latest_review is None or latest_review.approved:
             return False
+        if latest_review.gate_decision != "retry":
+            return False
         if state["round_id"] >= min(state["max_rounds"], 2):
             return False
         if self._repair_failed_due_to_infrastructure(state.get("latest_repair")):
@@ -1334,8 +1243,6 @@ class LangGraphSATDWorkflow:
         return "method_context" if trace.retrieved_method_contexts else "snippet_only"
 
     def _drop_stage(self, trace) -> str:
-        if trace.status == "dropped_by_analyzer":
-            return "analyzer"
         if trace.status == "dropped_after_review":
             return f"review_round_{trace.rounds_used or 1}"
         return ""
@@ -1343,8 +1250,6 @@ class LangGraphSATDWorkflow:
     def _trajectory_summary(self, trace) -> str:
         if trace.status == "accepted":
             return "accepted"
-        if trace.status == "dropped_by_analyzer":
-            return "dropped by analyzer"
         if trace.status == "dropped_after_review":
             return "dropped after review"
         return trace.status

@@ -672,6 +672,10 @@ class LangGraphSATDWorkflow:
             "analysis_repair_plan",
             "analysis_target_summary",
             "analysis_context_summary",
+            "analysis_intent_type",
+            "analysis_target_clarity",
+            "analysis_expected_edit_shape",
+            "analysis_risk_note",
         ]
 
     def _round_output_fields(self, round_id: int) -> list[str]:
@@ -841,6 +845,10 @@ class LangGraphSATDWorkflow:
                 "analysis_repair_plan": analysis.get("repair_plan", ""),
                 "analysis_target_summary": analysis.get("target_summary", ""),
                 "analysis_context_summary": analysis.get("context_summary", ""),
+                "analysis_intent_type": analysis.get("intent_type", ""),
+                "analysis_target_clarity": analysis.get("target_clarity", ""),
+                "analysis_expected_edit_shape": analysis.get("expected_edit_shape", ""),
+                "analysis_risk_note": analysis.get("risk_note", ""),
             }
         )
 

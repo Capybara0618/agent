@@ -51,16 +51,18 @@ class OpenAIReviewer:
             f"Retrieved context:\n{self._repair_context_summary(state)}\n\n"
             f"Diff summary:\n{self._diff_summary(state, repair)}\n\n"
             f"Review evidence profile:\n{json.dumps(self._diff_evidence_profile(state, repair), ensure_ascii=False, indent=2)}\n\n"
-            "Choose one gate_decision:\n"
-            '- "accept": keep the candidate as the final workflow output.\n'
-            '- "reject": discard the candidate because it is clearly not a viable SATD repair.\n\n'
-            "Use a strict evidence-grounded viability gate.\n"
-            "Accept only when the candidate clearly addresses the SATD intent, keeps unrelated behavior stable, and is supported by the SATD comment, original code, retrieved context, or local code evidence.\n"
-            "Reject when the candidate is aimed at the wrong target, is incomplete, relies on unsupported behavior or invented interfaces, changes unrelated behavior, or makes a broad rewrite that is not justified by the SATD evidence.\n"
-            "Treat uncertainty as a reason to reject unless the repair is a small local change directly grounded in the SATD evidence.\n"
-            "Use broad-scope, signature, import, control-flow, or unsupported-call evidence as rejection evidence when it is not directly justified by the SATD and context.\n"
-            "Do not compare against any hidden human patch, and do not require exact-match style edits.\n\n"
-            "Use these failure modes when present: invalid_or_noop, wrong_target, unsupported_invention, overbroad_change, semantic_drift.\n\n"
+            "Choose gate_decision:\n"
+            '- "accept": plausible final SATD repayment.\n'
+            '- "reject": clear failed repair with code evidence.\n\n'
+            "Intent-aware gate policy:\n"
+            "1. Judge the candidate repair, not whether the SATD itself was worth attempting.\n"
+            "2. Protected cleanup intent: remove/delete/drop, temporary/hack/workaround/debug, legacy/compatibility/deprecated, once-fixed/once-upgraded cleanup. Accept focused local deletion or replacement when it matches the SATD target; reject only clear wrong-target, no-op, syntax, opposite-intent, or much-too-broad changes.\n"
+            "3. Proof-required intent: implement/support/add/handle, broad refactor/rewrite, unclear/question intent. Accept only when the candidate visibly adds or grounds the requested behavior; reject comment-only fixes, bypasses, unsupported inventions, broad unguided rewrites, or fixes that only delete the unsupported case.\n"
+            "4. Local correction intent: replace/switch, bug fix/check, return/value/call adjustment. Accept small grounded edits aligned with the SATD target; reject off-target edits, unsupported new calls/names, unrelated control-flow changes, or semantic drift.\n"
+            "5. Treat new names/calls as unsupported only when absent from the SATD, original code, retrieved context, local definitions/imports, and common Python behavior.\n"
+            "Uncertainty in protected cleanup should lean accept; uncertainty in proof-required changes should lean reject.\n"
+            "Do not require exact-match style edits or hidden human-patch knowledge.\n\n"
+            "Failure modes: invalid_or_noop, wrong_target, unsupported_invention, overbroad_change, semantic_drift.\n\n"
             "Return exactly:\n"
             "{\n"
             '  "gate_decision": "accept" | "reject",\n'
@@ -148,6 +150,16 @@ class OpenAIReviewer:
         parts = []
         if getattr(analysis, "context_summary", ""):
             parts.append(f"context: {analysis.context_summary}")
+        if getattr(analysis, "intent_type", ""):
+            parts.append(f"intent_type: {analysis.intent_type}")
+        if getattr(analysis, "target_clarity", ""):
+            parts.append(f"target_clarity: {analysis.target_clarity}")
+        if getattr(analysis, "expected_edit_shape", ""):
+            parts.append(f"expected_edit_shape: {analysis.expected_edit_shape}")
+        if getattr(analysis, "target_summary", ""):
+            parts.append(f"target_summary: {analysis.target_summary}")
+        if getattr(analysis, "risk_note", ""):
+            parts.append(f"risk_note: {analysis.risk_note}")
         return "\n".join(parts) if parts else "[none]"
 
     def _repair_context_summary(self, state: GraphState) -> str:
@@ -424,7 +436,7 @@ class OpenAIReviewer:
         if decision in {"reject", "rejected", "drop", "fail", "failed"}:
             return "reject"
         if decision in {"retry", "revise", "revision", "uncertain", "maybe"}:
-            return "reject"
+            return "accept"
         if isinstance(raw_approved, bool):
             return "accept" if raw_approved else "reject"
         return "accept"

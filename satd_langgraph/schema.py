@@ -30,6 +30,10 @@ class AnalysisResult:
     repair_plan: str = ""
     target_summary: str = ""
     context_summary: str = ""
+    intent_type: str = "unclear"
+    target_clarity: str = "partial"
+    expected_edit_shape: str = "unclear"
+    risk_note: str = ""
 
 
 @dataclass

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .openai_client import OpenAICompatClient
 from .schema import AnalysisResult, GraphState, MethodInquiryResult
 
@@ -14,13 +16,73 @@ class OpenAIAnalyzer:
         retrieved = list(state.get("retrieved_method_contexts") or [])
         found_count = sum(1 for item in retrieved if bool(getattr(item, "found", False)))
         missing = [str(item) for item in (state.get("missing_method_names") or []) if str(item).strip()]
+        context_summary = self._context_summary(required_methods, found_count, missing)
+        system_prompt = (
+            "You are the analyzer agent in a SATD repair workflow.\n"
+            "Do not filter or drop the SATD. Do not predict success. Do not write replacement code.\n"
+            "Extract compact intent labels that help a later reviewer judge whether a candidate repair matches the SATD intent.\n"
+            "Return JSON only."
+        )
+        user_prompt = (
+            "Analyze this function-level SATD for intent labeling:\n\n"
+            f"SATD comment:\n{state['satd_comment']}\n\n"
+            f"Original code:\n```python\n{state['original_code']}\n```\n\n"
+            f"Identified methods:\n{self._format_list(required_methods)}\n\n"
+            f"Retrieved method context:\n{method_context_block or '[none]'}\n\n"
+            f"Missing methods:\n{self._format_list(missing)}\n\n"
+            "Classify the developer intent, the likely target, and the expected edit shape.\n"
+            "Use the labels to describe what a candidate repair should be judged against, not whether this SATD should be attempted.\n\n"
+            "Return exactly:\n"
+            "{\n"
+            '  "reason": "one sentence describing the SATD repayment intent",\n'
+            '  "target_summary": "short description of the code target",\n'
+            '  "intent_type": "delete_or_remove" | "replace_or_switch" | "add_or_support" | "bug_fix_or_check" | "documentation" | "refactor_or_rewrite" | "unclear",\n'
+            '  "target_clarity": "high" | "partial" | "low",\n'
+            '  "expected_edit_shape": "delete_line" | "delete_block" | "replace_call_or_value" | "add_parameter_or_option" | "add_check_or_raise" | "adjust_return" | "documentation_only" | "broad_rewrite" | "unclear",\n'
+            '  "risk_note": "one short note about external conditions, missing context, broadness, or empty string"\n'
+            "}\n"
+        )
+        payload = self.client.generate_json(system_prompt, user_prompt, request_label=f"analyze_intent:task_{state['task_id']}")
+        return self._coerce_analysis(payload, context_summary)
+
+    def _coerce_analysis(self, payload: dict[str, Any], context_summary: str) -> AnalysisResult:
         return AnalysisResult(
             decision="pass",
             repairable=True,
-            reason="method_context_prepared",
+            reason=self._one_line(payload.get("reason")) or "intent_labeled",
             repair_plan="",
-            target_summary="",
-            context_summary=self._context_summary(required_methods, found_count, missing),
+            target_summary=self._one_line(payload.get("target_summary")),
+            context_summary=context_summary,
+            intent_type=self._normalize_choice(
+                payload.get("intent_type"),
+                {
+                    "delete_or_remove",
+                    "replace_or_switch",
+                    "add_or_support",
+                    "bug_fix_or_check",
+                    "documentation",
+                    "refactor_or_rewrite",
+                    "unclear",
+                },
+                "unclear",
+            ),
+            target_clarity=self._normalize_choice(payload.get("target_clarity"), {"high", "partial", "low"}, "partial"),
+            expected_edit_shape=self._normalize_choice(
+                payload.get("expected_edit_shape"),
+                {
+                    "delete_line",
+                    "delete_block",
+                    "replace_call_or_value",
+                    "add_parameter_or_option",
+                    "add_check_or_raise",
+                    "adjust_return",
+                    "documentation_only",
+                    "broad_rewrite",
+                    "unclear",
+                },
+                "unclear",
+            ),
+            risk_note=self._one_line(payload.get("risk_note")),
         )
 
     def fallback_analysis(self, state: GraphState, reason: str) -> AnalysisResult:
@@ -31,6 +93,10 @@ class OpenAIAnalyzer:
             repair_plan="",
             target_summary="",
             context_summary="[none]",
+            intent_type="unclear",
+            target_clarity="partial",
+            expected_edit_shape="unclear",
+            risk_note=reason,
         )
 
     def _context_summary(self, required_methods: list[str], found_count: int, missing: list[str]) -> str:
@@ -41,3 +107,14 @@ class OpenAIAnalyzer:
         if missing:
             parts.append("missing_methods=" + ",".join(missing[:5]))
         return "; ".join(parts)
+
+    def _format_list(self, items: list[str]) -> str:
+        cleaned = [str(item).strip() for item in items if str(item).strip()]
+        return ", ".join(cleaned) if cleaned else "[none]"
+
+    def _normalize_choice(self, value: Any, allowed: set[str], default: str) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in allowed else default
+
+    def _one_line(self, value: Any) -> str:
+        return " ".join(str(value or "").split())[:240]

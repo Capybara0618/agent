@@ -40,8 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force-route",
         choices=["auto", "no_context", "context_required"],
-        default="auto",
-        help="Force the context route and skip Planner routing. Default is auto.",
+        default="context_required",
+        help="Force the context route and skip the LLM context router. Default is context_required; use auto to enable the router.",
     )
     parser.add_argument(
         "--resume",
@@ -59,6 +59,54 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Maximum number of model-identified methods to retrieve as repair context. Default is 2.",
+    )
+    parser.add_argument(
+        "--repository-evidence-mode",
+        choices=["none", "fixed", "adaptive", "two_stage", "policy"],
+        default="none",
+        help="Optional repository-evidence retrieval policy beyond method context.",
+    )
+    parser.add_argument(
+        "--max-repository-evidence",
+        type=int,
+        default=0,
+        help="Maximum repository evidence snippets to inject when repository evidence is enabled.",
+    )
+    parser.add_argument(
+        "--repository-evidence-prompt-mode",
+        choices=["append", "constrained"],
+        default="append",
+        help="How the fixer should use repository evidence once injected.",
+    )
+    parser.add_argument(
+        "--repository-evidence-guidance-mode",
+        choices=["none", "summarize"],
+        default="none",
+        help="Whether to synthesize explicit evidence-backed repair guidance before fixing.",
+    )
+    parser.add_argument(
+        "--repository-evidence-rerank-mode",
+        choices=["none", "llm"],
+        default="none",
+        help="Whether to rerank repository-evidence candidates for repair usefulness before fixing.",
+    )
+    parser.add_argument(
+        "--policy-candidate-strategy",
+        choices=["single", "dual_on_uncertain", "dual_all"],
+        default="single",
+        help="For repository-evidence policy mode, optionally run both snippet-only and evidence-aware candidates.",
+    )
+    parser.add_argument(
+        "--policy-injection-strategy",
+        choices=["llm", "top"],
+        default="llm",
+        help="For repository-evidence policy mode, choose evidence snippets with the LLM policy or inject top candidates.",
+    )
+    parser.add_argument(
+        "--repair-response-format",
+        choices=["json", "plain_text"],
+        default="json",
+        help="Use JSON repair output or lightweight plain-text output with code extraction.",
     )
     parser.add_argument(
         "--git-remote-base",
@@ -118,6 +166,14 @@ def main() -> None:
         write_batch_size=args.write_batch_size,
         repair_context_mode=args.repair_context_mode,
         max_method_contexts=args.max_method_contexts,
+        repository_evidence_mode=args.repository_evidence_mode,
+        max_repository_evidence=args.max_repository_evidence,
+        repository_evidence_prompt_mode=args.repository_evidence_prompt_mode,
+        repository_evidence_guidance_mode=args.repository_evidence_guidance_mode,
+        repository_evidence_rerank_mode=args.repository_evidence_rerank_mode,
+        policy_candidate_strategy=args.policy_candidate_strategy,
+        policy_injection_strategy=args.policy_injection_strategy,
+        repair_response_format=args.repair_response_format,
         analysis_only=args.analysis_only,
         fixer_only=args.fixer_only,
         force_route=None if args.force_route == "auto" else args.force_route,
@@ -151,13 +207,19 @@ def main() -> None:
     print(f"Write batch size: {summary['write_batch_size']}")
     print(f"Analysis only: {summary.get('analysis_only')}")
     print(f"Fixer only: {summary.get('fixer_only')}")
+    print(f"Repair response format: {summary.get('repair_response_format')}")
     print(f"Repair context mode: {summary.get('repair_context_mode')}")
     print(f"Method inquiry enabled: {summary.get('method_inquiry_enabled')}")
-    print(f"Planner enabled: {summary.get('planner_enabled')}")
-    print(f"Context tools: {summary.get('context_tools')}")
     print(f"Context router enabled: {summary.get('context_router_enabled')}")
     print(f"Force route: {summary.get('force_route') or 'none'}")
     print(f"Max method contexts: {summary.get('max_method_contexts')}")
+    print(f"Repository evidence mode: {summary.get('repository_evidence_mode')}")
+    print(f"Max repository evidence: {summary.get('max_repository_evidence')}")
+    print(f"Repository evidence prompt mode: {summary.get('repository_evidence_prompt_mode')}")
+    print(f"Repository evidence guidance mode: {summary.get('repository_evidence_guidance_mode')}")
+    print(f"Repository evidence rerank mode: {summary.get('repository_evidence_rerank_mode')}")
+    print(f"Policy candidate strategy: {summary.get('policy_candidate_strategy')}")
+    print(f"Policy injection strategy: {summary.get('policy_injection_strategy')}")
     print(f"LLM judge enabled: {summary.get('llm_judge_enabled')}")
     print(f"Judge model: {summary.get('judge_model') or 'none'}")
     print(f"Git remote base: {os.environ.get('SATD_GIT_REMOTE_BASE') or 'https://mirrors.tuna.tsinghua.edu.cn/git/github.com'}")

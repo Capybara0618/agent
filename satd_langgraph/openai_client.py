@@ -9,6 +9,8 @@ import re
 import os
 import textwrap
 import time
+import queue
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -95,7 +97,7 @@ class OpenAICompatClient:
                 }
                 if max_tokens is not None:
                     request_kwargs["max_tokens"] = max_tokens
-                response = self.client.chat.completions.create(**request_kwargs)
+                response = self._call_with_timeout(request_kwargs)
                 content = response.choices[0].message.content or "{}"
                 elapsed = time.time() - attempt_started
                 self._emit_log(f"[llm] success label={label} attempt={attempt + 1}/{self.max_attempts} elapsed={elapsed:.2f}s")
@@ -126,83 +128,28 @@ class OpenAICompatClient:
             raise last_error
         raise RuntimeError("OpenAI-compatible request failed unexpectedly.")
 
-    def generate_tool_call(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        tools: list[dict[str, Any]],
-        temperature: float = 0.0,
-        request_label: str = "",
-        max_tokens: int | None = None,
-    ) -> dict[str, Any]:
-        last_error: Exception | None = None
-        active_system_prompt = self._coerce_prompt_text(system_prompt)
-        active_user_prompt = self._coerce_prompt_text(user_prompt)
-        active_model = self.model
-        label = request_label or "tool_call_request"
-        for attempt in range(self.max_attempts):
-            attempt_started = time.time()
-            self._emit_log(
-                f"[llm] start label={label} attempt={attempt + 1}/{self.max_attempts} model={active_model} timeout={self.request_timeout:.0f}s"
-            )
-            try:
-                request_kwargs: dict[str, Any] = {
-                    "model": active_model,
-                    "messages": [
-                        {"role": "system", "content": active_system_prompt},
-                        {"role": "user", "content": active_user_prompt},
-                    ],
-                    "temperature": temperature,
-                    "tools": tools,
-                    "tool_choice": "required",
-                }
-                if max_tokens is not None:
-                    request_kwargs["max_tokens"] = max_tokens
-                response = self.client.chat.completions.create(**request_kwargs)
-                message = response.choices[0].message
-                tool_calls = message.tool_calls or []
-                if not tool_calls:
-                    raise RuntimeError("model returned no tool call")
-                function = tool_calls[0].function
-                elapsed = time.time() - attempt_started
-                self._emit_log(f"[llm] success label={label} attempt={attempt + 1}/{self.max_attempts} elapsed={elapsed:.2f}s")
-                return {
-                    "name": function.name,
-                    "arguments": self._loads_json_object(function.arguments),
-                }
-            except Exception as exc:
-                last_error = exc
-                elapsed = time.time() - attempt_started
-                self._emit_log(
-                    f"[llm] error label={label} attempt={attempt + 1}/{self.max_attempts} "
-                    f"elapsed={elapsed:.2f}s type={type(exc).__name__} message={self._short_error(exc)}"
-                )
-                fallback_model = self._fallback_model_for_error(exc, active_model)
-                if fallback_model and fallback_model != active_model:
-                    self._emit_log(f"[llm] fallback_model label={label} from={active_model} to={fallback_model}")
-                    active_model = fallback_model
-                    self.model = fallback_model
-                    continue
-                if attempt < self.max_attempts - 1:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise
-        if last_error:
-            raise last_error
-        raise RuntimeError("OpenAI-compatible tool call failed unexpectedly.")
-
-    def _loads_json_object(self, value: Any) -> dict[str, Any]:
-        if isinstance(value, dict):
-            return value
-        try:
-            payload = json.loads(str(value or "{}"))
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
     def _emit_log(self, message: str) -> None:
         if self.verbose:
             print(message)
+
+    def _call_with_timeout(self, request_kwargs: dict[str, Any]):
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                result_queue.put(("ok", self.client.chat.completions.create(**request_kwargs)))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        worker = threading.Thread(target=invoke, daemon=True)
+        worker.start()
+        try:
+            status, payload = result_queue.get(timeout=self.request_timeout + 5)
+        except queue.Empty as exc:
+            raise TimeoutError(f"json completion exceeded {self.request_timeout + 5:.0f}s") from exc
+        if status == "error":
+            raise payload
+        return payload
 
     def _short_error(self, exc: Exception) -> str:
         message = " ".join(str(exc).split())

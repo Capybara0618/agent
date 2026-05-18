@@ -26,38 +26,15 @@ class SATDRecord:
 class AnalysisResult:
     decision: str
     repairable: bool
-    confidence: float
     reason: str
-    repairability_score: float = 0.0
-    intent_clarity: float = 0.0
-    change_locality: float = 0.0
-    semantic_risk: float = 0.0
-    context_sufficiency: float = 0.0
-    verifiability: float = 0.0
-    analyze_score: float = 0.0
-    satd_type: str = ""
-    evidence_summary: str = ""
-    risk_level: str = ""
-    context_score: float = 0.0
-    clarity_score: float = 0.0
-    scope_radius: str = ""
-    operation_concrete: str | None = None
-    localizable: str | None = None
-    local_scope: str | None = None
-    end_state_clear: str | None = None
-    comment_evidence: str = ""
-    code_evidence: str = ""
-    validation_signals: list[str] = field(default_factory=list)
-    context_gaps: list[str] = field(default_factory=list)
-    followup_context_requests: list[str] = field(default_factory=list)
-    repair_strategy: str = ""
-    historical_snapshot_mismatch: bool = False
-    github_evidence_strength: str = "low"
-    repair_mode: str = "local_only"
-    evidence_used: bool = False
-    repair_constraints: list[str] = field(default_factory=list)
-    drop_reason: str = ""
-    notes: str = ""
+    repair_plan: str = ""
+    target_summary: str = ""
+    context_summary: str = ""
+    intent_type: str = "unclear"
+    target_clarity: str = "partial"
+    expected_edit_shape: str = "unclear"
+    evidence_requirement: str = "unclear"
+    risk_note: str = ""
 
 
 @dataclass
@@ -89,55 +66,17 @@ class ContextNeedDecision:
 
 
 @dataclass
-class RetrievalQuery:
-    id: str
-    need_type: str
-    target: dict[str, Any] = field(default_factory=dict)
-    tool: str = ""
-    scope: str = "same_project"
-    required: bool = False
-    decision: str = ""
-    target_role: str = "disambiguate"
-    expected_patch_use: str = ""
-    grounding_tokens: list[str] = field(default_factory=list)
-    why: str = ""
-    prevents_wrong_repair: str = ""
-    fallback_if_not_found: str = "continue_without_context"
-
-
-@dataclass
-class BlockingUnknown:
-    unknown: str
-    why_blocking: str = ""
-    queries: list[RetrievalQuery] = field(default_factory=list)
-
-
-@dataclass
-class PlannerResult:
-    context_needed: bool
-    satd_intent: str = ""
-    local_repair_plan: str = ""
-    repair_intent: str = ""
-    patch_decision: str = ""
-    evidence_need: str = ""
-    need_type: str = ""
-    blocking_unknowns: list[BlockingUnknown] = field(default_factory=list)
-    no_context_reason: str = ""
-    raw_queries_rejected: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass
-class EvidenceCard:
-    query_id: str
-    tool: str
-    target: str
-    relevance: str = "medium"
-    polarity: str = "support"
-    summary: str = ""
-    snippet: str = ""
-    decision: str = ""
-    answer: str = ""
-    edit_hint: str = ""
+class ContextPolicyDecision:
+    use_repository_context: bool = False
+    needed_evidence_types: list[str] = field(default_factory=list)
+    context_risk: str = "unknown"
+    inject_evidence: bool = False
+    selected_evidence_indices: list[int] = field(default_factory=list)
+    decision_reason: str = ""
+    retrieval_decision_reason: str = ""
+    injection_decision_reason: str = ""
+    candidate_evidence_count: int = 0
+    selected_evidence_count: int = 0
 
 
 @dataclass
@@ -189,11 +128,28 @@ class RetrievedMethodContext:
 
 
 @dataclass
+class RepositoryEvidenceContext:
+    evidence_type: str
+    evidence_subtype: str
+    support_level: str
+    source_path: str
+    span: str
+    content: str
+    retrieval_method: str
+    query_origin: str
+    score: float
+    why_relevant: str
+    query: str = ""
+
+
+@dataclass
 class ReviewResult:
     round_id: int
     approved: bool
     issues: list[str]
     candidate_mode: str = "single"
+    gate_decision: str = ""
+    failure_modes: list[str] = field(default_factory=list)
     review_score: float = 0.0
     problem_alignment: float = 0.0
     minimality: float = 0.0
@@ -231,12 +187,13 @@ class WorkflowTrace:
     context_confidence: float | None = None
     context_reason: str = ""
     context_blocking_unknowns: list[str] = field(default_factory=list)
-    planner_result: dict[str, Any] | None = None
-    evidence_cards: list[dict[str, Any]] = field(default_factory=list)
+    context_policy_decision: dict[str, Any] | None = None
     method_inquiry: dict[str, Any] | None = None
     uncertainty_items: list[dict[str, Any]] = field(default_factory=list)
     edit_constraints: list[dict[str, Any]] = field(default_factory=list)
     retrieved_method_contexts: list[dict[str, Any]] = field(default_factory=list)
+    retrieved_repository_evidence: list[dict[str, Any]] = field(default_factory=list)
+    repository_evidence_guidance: str = ""
     missing_method_names: list[str] = field(default_factory=list)
     repairs: list[dict[str, Any]] = field(default_factory=list)
     reviews: list[dict[str, Any]] = field(default_factory=list)
@@ -269,12 +226,13 @@ class GraphState(TypedDict):
     analysis: AnalysisResult | None
     satd_route_type: str | None
     context_decision: ContextNeedDecision | None
-    planner_result: PlannerResult | None
-    evidence_cards: list[EvidenceCard]
+    context_policy_decision: ContextPolicyDecision | None
     method_inquiry: MethodInquiryResult | None
     uncertainty_items: list[UncertaintyItem]
     edit_constraints: list[EditConstraint]
     retrieved_method_contexts: list[RetrievedMethodContext]
+    retrieved_repository_evidence: list[RepositoryEvidenceContext]
+    repository_evidence_guidance: str
     missing_method_names: list[str]
     repairs: list[RepairAttempt]
     reviews: list[ReviewResult]
@@ -334,12 +292,13 @@ def record_to_graph_input(record: SATDRecord, max_rounds: int) -> GraphState:
         analysis=None,
         satd_route_type=None,
         context_decision=None,
-        planner_result=None,
-        evidence_cards=[],
+        context_policy_decision=None,
         method_inquiry=None,
         uncertainty_items=[],
         edit_constraints=[],
         retrieved_method_contexts=[],
+        retrieved_repository_evidence=[],
+        repository_evidence_guidance="",
         missing_method_names=[],
         repairs=[],
         reviews=[],
@@ -429,12 +388,15 @@ def trace_from_state(state: GraphState, em_label: str) -> WorkflowTrace:
         context_confidence=context_decision.confidence if context_decision else None,
         context_reason=context_decision.reason if context_decision else "",
         context_blocking_unknowns=list(context_decision.blocking_unknowns) if context_decision else [],
-        planner_result=asdict(state["planner_result"]) if state.get("planner_result") else None,
-        evidence_cards=[asdict(item) for item in state.get("evidence_cards", [])],
+        context_policy_decision=asdict(state["context_policy_decision"])
+        if state.get("context_policy_decision")
+        else None,
         method_inquiry=asdict(state["method_inquiry"]) if state.get("method_inquiry") else None,
         uncertainty_items=[asdict(item) for item in state.get("uncertainty_items", [])],
         edit_constraints=[asdict(item) for item in state.get("edit_constraints", [])],
         retrieved_method_contexts=[asdict(item) for item in state["retrieved_method_contexts"]],
+        retrieved_repository_evidence=[asdict(item) for item in state.get("retrieved_repository_evidence", [])],
+        repository_evidence_guidance=str(state.get("repository_evidence_guidance") or ""),
         missing_method_names=list(state["missing_method_names"]),
         repairs=[asdict(item) for item in state["repairs"]],
         reviews=[asdict(item) for item in state["reviews"]],
